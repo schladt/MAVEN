@@ -1,0 +1,9 @@
+# Explicit owner-reviewed installation and setup
+
+Installation creates local isolated code and private configuration only. It does not authorize cloud spending, deployment, login, Google consent or global harness changes. Explain the selected instance home and optional harness skill destinations before modifying them. Preserve existing configuration and refuse conflicting skill files.
+
+Before cloud provisioning, establish the owner-selected AWS account, region, named profiles, least-privilege roles, resource names, allowed source network, project and budget. Use packaged infrastructure and the shipped deployment preparation command. Review the exact generated template, policy, package digest, capabilities, parameters and cost-bearing resources with the owner. Apply only the reviewed artifact and matching confirmation value using the explicitly selected setup profile. Do not broaden permissions or open network access to make setup pass.
+
+Keep deployment credentials separate from runtime credentials. Record private outputs only in the owner-private environment. Bind the actual caller through the reviewed IAM role trust and preexisting owner-approved assume-role grants. Use `maven-memory install init --confirm-instance UUID` to initialize the exact selected service, verify runtime access, then explicitly create or select the project with `maven-project init`. There is no automatic privilege enrollment or elevation. No example identifier is a valid configuration value.
+
+Prepare starter proposals locally, review each body and dependency, and submit only owner-approved candidates. Request and preserve real activation challenges and exact owner approval evidence. Activate dependencies first. Installation and proposal generation must never auto-activate authority. Google and file-secret stores require separate explicit setup; they are not prerequisites for core memory.

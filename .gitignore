@@ -1,0 +1,13 @@
+# Private local state and hidden configuration, at every directory depth.
+.maven/
+.*/
+.*
+!/.gitignore
+
+# Generated Python environments and build output.
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+venv/

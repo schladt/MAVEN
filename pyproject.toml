@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "maven-cloud-memory"
+version = "0.1.0"
+description = "Owner-controlled cloud memory and explicit project workflows for coding agents"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+  "boto3[crt]>=1.41.0,<2",
+  "aws-encryption-sdk[MPL]>=4,<5",
+  "requests>=2,<3",
+]
+
+[project.optional-dependencies]
+google = ["google-auth-oauthlib>=1.2,<2", "google-api-python-client>=2,<3"]
+
+[project.scripts]
+maven-memory = "tools.memory.cli:main"
+maven-workspace = "tools.workspace:main"
+maven-secrets = "tools.aws.secrets:main"
+maven-google = "tools.google.cli:main"
+maven-project = "tools.project:main"
+maven-start-work = "tools.workflow:start_main"
+maven-checkpoint = "tools.workflow:checkpoint_main"
+maven-stop-work = "tools.workflow:stop_main"
+maven-workflow = "tools.workflow:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tools", "tools.*", "maven_resources"]
+
+[tool.setuptools.package-data]
+maven_resources = ["config/*.json", "templates/*.example", "templates/skills/*/SKILL.md", "templates/authority/*.md", "templates/authority/*.json", "infra/memory/*.json"]
+"tools.memory" = ["migrations/*.sql"]

@@ -1,0 +1,1754 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Private owner memory with structured knowledge, work state, and approved instructions. Reviewed deployment required.",
+  "Metadata": {
+    "Packaging": "tools.memory.deployment.build embeds actual runtime source, removes RuntimeCode parameter, and needs no preexisting artifact bucket.",
+    "Scope": "Owner-private Sensitive knowledge, work records, and approved directives/skills/procedures. No Secret payloads or cloud agent execution.",
+    "CostAllocation": "Activate MavenMemoryInstance user cost allocation tag and qualify coverage. Untagged/shared/request costs, reporting latency, and unavailable forecasts can undercount. Budget is notification only, never a hard cap.",
+    "Retention": "Cluster, writer, required private network/parameter resources, generated credentials, versioned recovery bucket and its TLS policy retained on deletion/replacement. Deletion protection is on. Teardown and old versions require explicit owner disposition.",
+    "TargetGuard": "Every resource/output requires ExpectedAccountId to match AWS::AccountId and AWS::Region to be us-east-1. A mismatch creates no resources or usable outputs; an empty stack can remain. No account/region/engine availability is verified by offline packaging.",
+    "Network": "Private no-ingress database; two local-only route tables. Lambda outside VPC has AWS-managed outbound networking, not an egress sandbox."
+  },
+  "Parameters": {
+    "InstanceName": {
+      "Type": "String",
+      "Default": "maven-memory",
+      "AllowedPattern": "[a-z][a-z0-9-]{0,30}[a-z0-9]",
+      "Description": "Name of the one evolving memory instance; do not create parallel environments."
+    },
+    "ExpectedAccountId": {
+      "Type": "String",
+      "AllowedPattern": "[0-9]{12}",
+      "Description": "Required explicitly reviewed target AWS account; no default account selection."
+    },
+    "CallerPrincipalArn": {
+      "Type": "String",
+      "AllowedPattern": "arn:aws:iam::[0-9]{12}:user/[A-Za-z0-9+=,.@_/-]+",
+      "Description": "Explicit same-account human IAM user ARN; no default identity selection."
+    },
+    "EngineVersion": {
+      "Type": "String",
+      "Default": "18.6",
+      "AllowedPattern": "18\\.(?:[3-9]|[1-9][0-9]+)(?:\\.[0-9]+)?",
+      "Description": "Reviewed Aurora PostgreSQL 18 patch >=18.3. Verify regional availability and auto-pause/Data API support before deployment."
+    },
+    "AvailabilityZones": {
+      "Type": "List<AWS::EC2::AvailabilityZone::Name>",
+      "Description": "Two distinct reviewed us-east-1 zones supporting this account's selected Aurora serverless engine."
+    },
+    "NotificationEmail": {
+      "Type": "String",
+      "AllowedPattern": "[^\\s@]+@[^\\s@]+\\.[^\\s@]+",
+      "MaxLength": 254,
+      "Description": "Owner-approved budget EMAIL recipient."
+    },
+    "InstanceId": {
+      "Type": "String",
+      "AllowedPattern": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+      "Description": "Explicit stable UUID for this logical memory instance; preserve on updates."
+    },
+    "RecoveryEpoch": {
+      "Type": "String",
+      "AllowedPattern": "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+      "Description": "Explicit recovery epoch UUID; change only through approved recovery."
+    },
+    "RuntimeCode": {
+      "Type": "String",
+      "MinLength": 1,
+      "Description": "Actual inline Python runtime supplied by offline tools.memory.deployment.build, which replaces this parameter with the source bundle."
+    }
+  },
+  "Mappings": {
+    "RegionNetwork": {
+      "us-east-1": {
+        "Cidr": "10.87.0.0/16"
+      }
+    }
+  },
+  "Conditions": {
+    "ApprovedTarget": {
+      "Fn::And": [
+        {"Fn::Equals": [{"Ref": "ExpectedAccountId"}, {"Ref": "AWS::AccountId"}]},
+        {"Fn::Equals": [{"Ref": "AWS::Region"}, "us-east-1"]}
+      ]
+    }
+  },
+  "Resources": {
+    "MemoryVpc": {
+      "Type": "AWS::EC2::VPC",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "CidrBlock": {
+          "Fn::FindInMap": [
+            "RegionNetwork",
+            {
+              "Ref": "AWS::Region"
+            },
+            "Cidr"
+          ]
+        },
+        "EnableDnsSupport": true,
+        "EnableDnsHostnames": true,
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "PrivateSubnetA": {
+      "Type": "AWS::EC2::Subnet",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "VpcId": {
+          "Ref": "MemoryVpc"
+        },
+        "CidrBlock": "10.87.0.0/24",
+        "AvailabilityZone": {
+          "Fn::Select": [
+            0,
+            {
+              "Ref": "AvailabilityZones"
+            }
+          ]
+        },
+        "MapPublicIpOnLaunch": false,
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "PrivateRouteTableA": {
+      "Type": "AWS::EC2::RouteTable",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "VpcId": {
+          "Ref": "MemoryVpc"
+        },
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "PrivateRouteAssociationA": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PrivateSubnetA"
+        },
+        "RouteTableId": {
+          "Ref": "PrivateRouteTableA"
+        }
+      }
+    },
+    "PrivateSubnetB": {
+      "Type": "AWS::EC2::Subnet",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "VpcId": {
+          "Ref": "MemoryVpc"
+        },
+        "CidrBlock": "10.87.1.0/24",
+        "AvailabilityZone": {
+          "Fn::Select": [
+            1,
+            {
+              "Ref": "AvailabilityZones"
+            }
+          ]
+        },
+        "MapPublicIpOnLaunch": false,
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "PrivateRouteTableB": {
+      "Type": "AWS::EC2::RouteTable",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "VpcId": {
+          "Ref": "MemoryVpc"
+        },
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "PrivateRouteAssociationB": {
+      "Type": "AWS::EC2::SubnetRouteTableAssociation",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "SubnetId": {
+          "Ref": "PrivateSubnetB"
+        },
+        "RouteTableId": {
+          "Ref": "PrivateRouteTableB"
+        }
+      }
+    },
+    "DatabaseSecurityGroup": {
+      "Type": "AWS::EC2::SecurityGroup",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "GroupDescription": "No client PostgreSQL ingress; Aurora Data API only",
+        "VpcId": {
+          "Ref": "MemoryVpc"
+        },
+        "SecurityGroupIngress": [],
+        "SecurityGroupEgress": [
+          {
+            "IpProtocol": "-1",
+            "CidrIp": "127.0.0.1/32",
+            "Description": "No routable outbound destination"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "DatabaseSubnetGroup": {
+      "Type": "AWS::RDS::DBSubnetGroup",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "DBSubnetGroupDescription": "Two private subnets, one Aurora writer",
+        "SubnetIds": [
+          {
+            "Ref": "PrivateSubnetA"
+          },
+          {
+            "Ref": "PrivateSubnetB"
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "DatabaseParameters": {
+      "Type": "AWS::RDS::DBParameterGroup",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Description": "Prevent SQL and credential-parameter logging",
+        "Family": "aurora-postgresql18",
+        "Parameters": {
+          "log_statement": "none",
+          "log_min_error_statement": "panic",
+          "log_error_verbosity": "terse",
+          "log_parameter_max_length": "0",
+          "log_parameter_max_length_on_error": "0",
+          "pgaudit.log": "none"
+        },
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "AdminSecret": {
+      "Type": "AWS::SecretsManager::Secret",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Description": {
+          "Fn::Sub": "${InstanceName}: database-only maven_admin credential; no scheduled rotation"
+        },
+        "GenerateSecretString": {
+          "SecretStringTemplate": "{\"username\":\"maven_admin\"}",
+          "GenerateStringKey": "password",
+          "PasswordLength": 40,
+          "ExcludeCharacters": "\"'@/\\",
+          "RequireEachIncludedType": true
+        },
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "ApplicationSecret": {
+      "Type": "AWS::SecretsManager::Secret",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Description": {
+          "Fn::Sub": "${InstanceName}: database-only maven_app credential; no scheduled rotation"
+        },
+        "GenerateSecretString": {
+          "SecretStringTemplate": "{\"username\":\"maven_app\"}",
+          "GenerateStringKey": "password",
+          "PasswordLength": 40,
+          "ExcludeCharacters": "\"'@/\\",
+          "RequireEachIncludedType": true
+        },
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "DatabaseCluster": {
+      "Type": "AWS::RDS::DBCluster",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Engine": "aurora-postgresql",
+        "EngineMode": "provisioned",
+        "EngineVersion": {
+          "Ref": "EngineVersion"
+        },
+        "EngineLifecycleSupport": "open-source-rds-extended-support-disabled",
+        "DatabaseName": "maven",
+        "MasterUsername": "maven_admin",
+        "MasterUserPassword": {
+          "Fn::Sub": "{{resolve:secretsmanager:${AdminSecret}:SecretString:password}}"
+        },
+        "DBSubnetGroupName": {
+          "Ref": "DatabaseSubnetGroup"
+        },
+        "VpcSecurityGroupIds": [
+          {
+            "Ref": "DatabaseSecurityGroup"
+          }
+        ],
+        "EnableHttpEndpoint": true,
+        "EnableIAMDatabaseAuthentication": false,
+        "StorageEncrypted": true,
+        "KmsKeyId": {
+          "Fn::Sub": "arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/rds"
+        },
+        "StorageType": "aurora",
+        "BackupRetentionPeriod": 30,
+        "CopyTagsToSnapshot": true,
+        "DeletionProtection": true,
+        "ServerlessV2ScalingConfiguration": {
+          "MinCapacity": 0,
+          "MaxCapacity": 1,
+          "SecondsUntilAutoPause": 300
+        },
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "DatabaseWriter": {
+      "Type": "AWS::RDS::DBInstance",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "DBClusterIdentifier": {
+          "Ref": "DatabaseCluster"
+        },
+        "DBInstanceClass": "db.serverless",
+        "Engine": "aurora-postgresql",
+        "DBParameterGroupName": {
+          "Ref": "DatabaseParameters"
+        },
+        "PubliclyAccessible": false,
+        "AutoMinorVersionUpgrade": false,
+        "MonitoringInterval": 0,
+        "EnablePerformanceInsights": false,
+        "PromotionTier": 0,
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "RecoveryBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {
+              "ServerSideEncryptionByDefault": {
+                "SSEAlgorithm": "AES256"
+              }
+            }
+          ]
+        },
+        "OwnershipControls": {
+          "Rules": [
+            {
+              "ObjectOwnership": "BucketOwnerEnforced"
+            }
+          ]
+        },
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "VersioningConfiguration": {
+          "Status": "Enabled"
+        },
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      },
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain"
+    },
+    "RecoveryBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Bucket": {
+          "Ref": "RecoveryBucket"
+        },
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyInsecureTransport",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {
+                  "Fn::GetAtt": [
+                    "RecoveryBucket",
+                    "Arn"
+                  ]
+                },
+                {
+                  "Fn::Sub": "${RecoveryBucket.Arn}/*"
+                }
+              ],
+              "Condition": {
+                "Bool": {
+                  "aws:SecureTransport": "false"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "SkillBucket": {
+      "Type": "AWS::S3::Bucket",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "BucketEncryption": {
+          "ServerSideEncryptionConfiguration": [
+            {"ServerSideEncryptionByDefault": {"SSEAlgorithm": "AES256"}}
+          ]
+        },
+        "OwnershipControls": {"Rules": [{"ObjectOwnership": "BucketOwnerEnforced"}]},
+        "PublicAccessBlockConfiguration": {
+          "BlockPublicAcls": true,
+          "IgnorePublicAcls": true,
+          "BlockPublicPolicy": true,
+          "RestrictPublicBuckets": true
+        },
+        "VersioningConfiguration": {"Status": "Enabled"},
+        "Tags": [
+          {"Key": "MavenMemoryInstance", "Value": {"Ref": "InstanceName"}},
+          {"Key": "DataScope", "Value": "owner_memory"}
+        ]
+      }
+    },
+    "SkillBucketPolicy": {
+      "Type": "AWS::S3::BucketPolicy",
+      "Condition": "ApprovedTarget",
+      "DeletionPolicy": "Retain",
+      "UpdateReplacePolicy": "Retain",
+      "Properties": {
+        "Bucket": {"Ref": "SkillBucket"},
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "DenyInsecureTransport",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:*",
+              "Resource": [
+                {"Fn::GetAtt": ["SkillBucket", "Arn"]},
+                {"Fn::Sub": "${SkillBucket.Arn}/*"}
+              ],
+              "Condition": {"Bool": {"aws:SecureTransport": "false"}}
+            },
+            {
+              "Sid": "RequireImmutableBundleUpload",
+              "Effect": "Deny",
+              "Principal": "*",
+              "Action": "s3:PutObject",
+              "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
+              "Condition": {"StringNotEquals": {"s3:if-none-match": "*"}}
+            }
+          ]
+        }
+      }
+    },
+    "MemoryApi": {
+      "Type": "AWS::ApiGatewayV2::Api",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Name": {
+          "Ref": "InstanceName"
+        },
+        "ProtocolType": "HTTP",
+        "DisableExecuteApiEndpoint": false,
+        "Tags": {
+          "MavenMemoryInstance": {
+            "Ref": "InstanceName"
+          },
+          "DataScope": "owner_memory"
+        }
+      }
+    },
+    "MemoryClientRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {"Ref": "CallerPrincipalArn"}
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:PrincipalAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "MaxSessionDuration": 3600,
+        "Policies": [
+          {
+            "PolicyName": "InvokeOwnerMemory",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "execute-api:Invoke",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/records/change"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/records/query"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/proposals/create"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/pages/index"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/pages/read"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/operations/lookup"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/write"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/read"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/search"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/context"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/claim"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:GetObject",
+                  "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"}
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:PutObject",
+                  "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
+                  "Condition": {"StringEquals": {"s3:if-none-match": "*"}}
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "MemoryApprovalRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {"Ref": "CallerPrincipalArn"}
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:PrincipalAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "MaxSessionDuration": 3600,
+        "Policies": [
+          {
+            "PolicyName": "ApproveExactInstructions",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": "execute-api:Invoke",
+                  "Resource": [
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/proposals/challenge"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/proposals/resolve"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/operations/lookup"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:GetObject",
+                  "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"}
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "ProposalCreateRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "RouteKey": "POST /v1/proposals/create",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "MemoryIntegration"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "ProposalCreateInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MemoryFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/proposals/create"
+        }
+      }
+    },
+    "ProposalChallengeRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "RouteKey": "POST /v1/proposals/challenge",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "MemoryIntegration"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "ProposalChallengeInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MemoryFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/proposals/challenge"
+        }
+      }
+    },
+    "ProposalResolveRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "RouteKey": "POST /v1/proposals/resolve",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "MemoryIntegration"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "ProposalResolveInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MemoryFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/proposals/resolve"
+        }
+      }
+    },
+    "PageIndexRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "RouteKey": "POST /v1/pages/index",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "MemoryIntegration"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "PageIndexInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MemoryFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/pages/index"
+        }
+      }
+    },
+    "PageReadRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "RouteKey": "POST /v1/pages/read",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "MemoryIntegration"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "PageReadInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MemoryFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/pages/read"
+        }
+      }
+    },
+    "MemoryWriteRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/write",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "MemoryWriteInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/write"}
+      }
+    },
+    "MemoryReadRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/read",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "MemoryReadInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/read"}
+      }
+    },
+    "MemorySearchRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/search",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "MemorySearchInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/search"}
+      }
+    },
+    "MemoryContextRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/context",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "MemoryContextInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/context"}
+      }
+    },
+    "MemoryClaimRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/claim",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "MemoryClaimInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/claim"}
+      }
+    },
+    "MemoryAdminRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "AWS": {"Ref": "CallerPrincipalArn"}
+              },
+              "Action": "sts:AssumeRole",
+              "Condition": {
+                "StringEquals": {
+                  "aws:PrincipalAccount": {
+                    "Ref": "AWS::AccountId"
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "MaxSessionDuration": 3600,
+        "Policies": [
+          {
+            "PolicyName": "ExplicitDatabaseBootstrapAndControl",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "rds-data:BeginTransaction",
+                    "rds-data:ExecuteStatement",
+                    "rds-data:CommitTransaction",
+                    "rds-data:RollbackTransaction"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "DatabaseCluster",
+                      "DBClusterArn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": [
+                    {
+                      "Ref": "AdminSecret"
+                    },
+                    {
+                      "Ref": "ApplicationSecret"
+                    }
+                  ]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject"
+                  ],
+                  "Resource": {
+                    "Fn::Sub": "${RecoveryBucket.Arn}/control.json"
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "RuntimeLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/maven/memory/${AWS::StackName}/runtime"
+        },
+        "RetentionInDays": 14,
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "ApiLogs": {
+      "Type": "AWS::Logs::LogGroup",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "LogGroupName": {
+          "Fn::Sub": "/maven/memory/${AWS::StackName}/api"
+        },
+        "RetentionInDays": 14,
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "MemoryRuntimeRole": {
+      "Type": "AWS::IAM::Role",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "lambda.amazonaws.com"
+              },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "ApplicationDatabaseAndControlReadOnly",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "rds-data:BeginTransaction",
+                    "rds-data:ExecuteStatement",
+                    "rds-data:CommitTransaction",
+                    "rds-data:RollbackTransaction"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "DatabaseCluster",
+                      "DBClusterArn"
+                    ]
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": {
+                    "Ref": "ApplicationSecret"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": "s3:GetObject",
+                  "Resource": {
+                    "Fn::Sub": "${RecoveryBucket.Arn}/control.json"
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": [
+                    "logs:CreateLogStream",
+                    "logs:PutLogEvents"
+                  ],
+                  "Resource": {
+                    "Fn::GetAtt": [
+                      "RuntimeLogs",
+                      "Arn"
+                    ]
+                  }
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      }
+    },
+    "MemoryFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Description": "Private owner knowledge, work state, and approved instruction authority",
+        "Runtime": "python3.15",
+        "Architectures": [
+          "arm64"
+        ],
+        "Handler": "index.handler",
+        "Code": {
+          "ZipFile": {
+            "Ref": "RuntimeCode"
+          }
+        },
+        "Role": {
+          "Fn::GetAtt": [
+            "MemoryRuntimeRole",
+            "Arn"
+          ]
+        },
+        "MemorySize": 512,
+        "Timeout": 25,
+        "ReservedConcurrentExecutions": 4,
+        "LoggingConfig": {
+          "LogGroup": {
+            "Ref": "RuntimeLogs"
+          },
+          "LogFormat": "Text"
+        },
+        "Environment": {
+          "Variables": {
+            "MEMORY_CLUSTER_ARN": {
+              "Fn::GetAtt": [
+                "DatabaseCluster",
+                "DBClusterArn"
+              ]
+            },
+            "MEMORY_SECRET_ARN": {
+              "Ref": "ApplicationSecret"
+            },
+            "MEMORY_DATABASE": "maven",
+            "MEMORY_JOURNAL_BUCKET": {
+              "Ref": "RecoveryBucket"
+            },
+            "MEMORY_INSTANCE_ID": {
+              "Ref": "InstanceId"
+            },
+            "MEMORY_RECOVERY_EPOCH": {
+              "Ref": "RecoveryEpoch"
+            },
+            "MEMORY_APPROVAL_ROLE_ARN": {
+              "Fn::GetAtt": [
+                "MemoryApprovalRole",
+                "Arn"
+              ]
+            },
+            "MEMORY_CLIENT_ROLE_ARN": {
+              "Fn::GetAtt": [
+                "MemoryClientRole",
+                "Arn"
+              ]
+            }
+          }
+        },
+        "Tags": [
+          {
+            "Key": "MavenMemoryInstance",
+            "Value": {
+              "Ref": "InstanceName"
+            }
+          },
+          {
+            "Key": "DataScope",
+            "Value": "owner_memory"
+          }
+        ]
+      },
+      "DependsOn": [
+        "DatabaseWriter"
+      ]
+    },
+    "MemoryIntegration": {
+      "Type": "AWS::ApiGatewayV2::Integration",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "IntegrationType": "AWS_PROXY",
+        "IntegrationUri": {
+          "Fn::GetAtt": [
+            "MemoryFunction",
+            "Arn"
+          ]
+        },
+        "PayloadFormatVersion": "2.0",
+        "TimeoutInMillis": 26000
+      }
+    },
+    "ChangeRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "RouteKey": "POST /v1/records/change",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "MemoryIntegration"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "ChangeInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MemoryFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/records/change"
+        }
+      }
+    },
+    "QueryRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "RouteKey": "POST /v1/records/query",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "MemoryIntegration"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "QueryInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MemoryFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/records/query"
+        }
+      }
+    },
+    "LookupRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "RouteKey": "POST /v1/operations/lookup",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {
+          "Fn::Join": [
+            "/",
+            [
+              "integrations",
+              {
+                "Ref": "MemoryIntegration"
+              }
+            ]
+          ]
+        }
+      }
+    },
+    "LookupInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {
+          "Ref": "MemoryFunction"
+        },
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {
+          "Ref": "AWS::AccountId"
+        },
+        "SourceArn": {
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/operations/lookup"
+        }
+      }
+    },
+    "MemoryStage": {
+      "Type": "AWS::ApiGatewayV2::Stage",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {
+          "Ref": "MemoryApi"
+        },
+        "StageName": "$default",
+        "AutoDeploy": true,
+        "AccessLogSettings": {
+          "DestinationArn": {
+            "Fn::GetAtt": [
+              "ApiLogs",
+              "Arn"
+            ]
+          },
+          "Format": "{\"requestId\":\"$context.requestId\",\"routeKey\":\"$context.routeKey\",\"status\":\"$context.status\",\"responseLatency\":\"$context.responseLatency\"}"
+        },
+        "DefaultRouteSettings": {
+          "ThrottlingBurstLimit": 4,
+          "ThrottlingRateLimit": 4
+        },
+        "Tags": {
+          "MavenMemoryInstance": {
+            "Ref": "InstanceName"
+          },
+          "DataScope": "owner_memory"
+        }
+      }
+    },
+    "MemoryBudget": {
+      "Type": "AWS::Budgets::Budget",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Budget": {
+          "BudgetName": {
+            "Fn::Sub": "${AWS::StackName}-monthly"
+          },
+          "BudgetType": "COST",
+          "TimeUnit": "MONTHLY",
+          "BudgetLimit": {
+            "Amount": 50,
+            "Unit": "USD"
+          },
+          "CostFilters": {
+            "TagKeyValue": [
+              {
+                "Fn::Sub": "user:MavenMemoryInstance$${InstanceName}"
+              }
+            ]
+          }
+        },
+        "NotificationsWithSubscribers": [
+          {
+            "Notification": {
+              "NotificationType": "ACTUAL",
+              "ComparisonOperator": "GREATER_THAN",
+              "Threshold": 25,
+              "ThresholdType": "ABSOLUTE_VALUE"
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          },
+          {
+            "Notification": {
+              "NotificationType": "ACTUAL",
+              "ComparisonOperator": "GREATER_THAN",
+              "Threshold": 50,
+              "ThresholdType": "ABSOLUTE_VALUE"
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          },
+          {
+            "Notification": {
+              "NotificationType": "FORECASTED",
+              "ComparisonOperator": "GREATER_THAN",
+              "Threshold": 50,
+              "ThresholdType": "ABSOLUTE_VALUE"
+            },
+            "Subscribers": [
+              {
+                "SubscriptionType": "EMAIL",
+                "Address": {
+                  "Ref": "NotificationEmail"
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "Outputs": {
+    "Region": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Ref": "AWS::Region"
+      }
+    },
+    "AccountId": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Ref": "AWS::AccountId"
+      }
+    },
+    "ApiEndpoint": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Fn::GetAtt": [
+          "MemoryApi",
+          "ApiEndpoint"
+        ]
+      }
+    },
+    "ClientRoleArn": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Fn::GetAtt": [
+          "MemoryClientRole",
+          "Arn"
+        ]
+      }
+    },
+    "ApprovalRoleArn": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Fn::GetAtt": [
+          "MemoryApprovalRole",
+          "Arn"
+        ]
+      }
+    },
+    "AdminRoleArn": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Fn::GetAtt": [
+          "MemoryAdminRole",
+          "Arn"
+        ]
+      }
+    },
+    "ClusterArn": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Fn::GetAtt": [
+          "DatabaseCluster",
+          "DBClusterArn"
+        ]
+      }
+    },
+    "AdminSecretArn": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Ref": "AdminSecret"
+      }
+    },
+    "AppSecretArn": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Ref": "ApplicationSecret"
+      }
+    },
+    "DatabaseName": {
+      "Condition": "ApprovedTarget",
+      "Value": "maven"
+    },
+    "JournalBucket": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Ref": "RecoveryBucket"
+      }
+    },
+    "SkillBucket": {
+      "Condition": "ApprovedTarget",
+      "Value": {"Ref": "SkillBucket"}
+    },
+    "InstanceId": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Ref": "InstanceId"
+      }
+    },
+    "RecoveryEpoch": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Ref": "RecoveryEpoch"
+      }
+    },
+    "SchemaVersion": {
+      "Condition": "ApprovedTarget",
+      "Value": "1"
+    },
+    "DataScope": {
+      "Condition": "ApprovedTarget",
+      "Value": "owner_memory"
+    },
+    "BudgetName": {
+      "Condition": "ApprovedTarget",
+      "Value": {
+        "Ref": "MemoryBudget"
+      }
+    }
+  }
+}

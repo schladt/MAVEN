@@ -1,0 +1,3 @@
+# Install the package and its declared core dependencies.
+# For Google integrations use: python -m pip install '.[google]'
+.

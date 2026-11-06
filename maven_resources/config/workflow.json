@@ -1,0 +1,19 @@
+{
+  "schema": 1,
+  "memory": {"mode": "cloud"},
+  "repository": {"branch_policy": "explicit-current"},
+  "checkpoint": {"max_commit_message_chars": 200},
+  "discovery_links": {},
+  "ignored_probes": [".maven/project.json", ".maven/runtime/workflow-probe"],
+  "eligible_probes": [],
+  "excluded_prefixes": [".maven/", ".venv/", "venv/", "browser-profile/"],
+  "excluded_globs": [".env", ".env.*", "*.pyc", "*.pyo", "*.sqlite-wal", "*.sqlite-shm", "*.db-wal", "*.db-shm"],
+  "allowed_excluded_globs": [".env.example"],
+  "control_plane_paths": ["AGENTS.md", ".gitignore", ".github/", ".agents/", ".claude/"],
+  "secret_scan": {
+    "max_file_bytes": 5242880,
+    "forbidden_name_globs": [".env", ".env.*", "*.pem", "*.key", "id_rsa", "id_ed25519", "credentials.json"],
+    "allowed_name_globs": [".env.example"]
+  },
+  "project_checks": []
+}

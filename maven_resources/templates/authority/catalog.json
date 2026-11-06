@@ -1,0 +1,75 @@
+{
+  "schema": 1,
+  "pages": [
+    {
+      "slug": "maven",
+      "page_kind": "directive",
+      "title": "MAVEN owner-controlled operating contract",
+      "requires": []
+    },
+    {
+      "slug": "maven-memory",
+      "page_kind": "skill",
+      "title": "Cloud memory and revision-safe records",
+      "requires": [
+        "maven"
+      ]
+    },
+    {
+      "slug": "maven-connect",
+      "page_kind": "skill",
+      "title": "Connect an isolated client to configured memory",
+      "requires": [
+        "maven-memory"
+      ]
+    },
+    {
+      "slug": "maven-setup",
+      "page_kind": "skill",
+      "title": "Explicit owner-reviewed installation and setup",
+      "requires": [
+        "maven"
+      ]
+    },
+    {
+      "slug": "maven-skill-use",
+      "page_kind": "skill",
+      "title": "Discover and load approved cloud skills",
+      "requires": [
+        "maven-connect"
+      ]
+    },
+    {
+      "slug": "maven-workflow",
+      "page_kind": "skill",
+      "title": "Explicit multi-session project lifecycle",
+      "requires": [
+        "maven-memory"
+      ]
+    },
+    {
+      "slug": "maven-secrets",
+      "page_kind": "skill",
+      "title": "Explicit secret and encrypted-file handling",
+      "requires": [
+        "maven"
+      ]
+    },
+    {
+      "slug": "maven-workspace",
+      "page_kind": "skill",
+      "title": "Governed local workspace originals and metadata",
+      "requires": [
+        "maven-workflow"
+      ]
+    },
+    {
+      "slug": "maven-google",
+      "page_kind": "skill",
+      "title": "Optional explicit-account Google operations",
+      "requires": [
+        "maven-secrets"
+      ]
+    }
+  ]
+}

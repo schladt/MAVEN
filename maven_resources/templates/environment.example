@@ -1,0 +1,54 @@
+# Instance-wide private configuration. Created as ~/.maven/.env by install.py.
+# MAVEN_HOME can explicitly select a different instance directory.
+# Keep mode 0600. Never source this file: values are literals, not shell syntax.
+# Use unquoted literals or JSON double-quoted strings; no empty active values.
+# No credentials, tokens, project IDs or Git destination belong here.
+# Project selection is explicit in PROJECT_ROOT/.maven/project.json.
+# Uncomment only needed fields and supply real owner-selected values.
+
+# Existing routine login, selected and verified without automatic login:
+# MAVEN_AWS_PROFILE=
+# MAVEN_AWS_EXPECTED_PRINCIPAL=
+# MAVEN_AWS_LOGIN_CACHE=
+# MAVEN_AWS_REGION=us-east-1
+# Cache directories must be owner-private (0700); use separate routine/deploy caches.
+# A per-process AWS_CA_BUNDLE may select an owner-approved CA file, never verify=False.
+
+# Connection fields populated by reviewed install connect/apply outputs:
+# MAVEN_MEMORY_CLUSTER_ARN=
+# MAVEN_MEMORY_APP_SECRET_ARN=
+# MAVEN_MEMORY_ADMIN_SECRET_ARN=
+# MAVEN_MEMORY_DATABASE=maven
+# MAVEN_MEMORY_JOURNAL_BUCKET=
+# MAVEN_MEMORY_SKILL_BUCKET=
+# MAVEN_MEMORY_INSTANCE_ID=
+# MAVEN_MEMORY_RECOVERY_EPOCH=
+# MAVEN_MEMORY_REGION=us-east-1
+# MAVEN_MEMORY_CLIENT_ROLE_ARN=
+# MAVEN_MEMORY_ADMIN_ROLE_ARN=
+# MAVEN_MEMORY_APPROVAL_ROLE_ARN=
+# MAVEN_MEMORY_ENDPOINT=
+# MAVEN_MEMORY_SCHEMA_VERSION=1
+
+# Separately selected deploy identity; never a fallback for routine failures:
+# MAVEN_DEPLOY_PROFILE=
+# MAVEN_DEPLOY_EXPECTED_PRINCIPAL=
+# MAVEN_DEPLOY_LOGIN_CACHE=
+# MAVEN_STACK_NAME=
+# MAVEN_INSTANCE_NAME=
+# MAVEN_ACCOUNT_ID=
+# MAVEN_CALLER_PRINCIPAL_ARN=
+# MAVEN_NOTIFICATION_EMAIL=
+# MAVEN_AVAILABILITY_ZONES=
+# MAVEN_ENGINE_VERSION=18.6
+# Existing IDs must be retained for updates:
+# MAVEN_INSTANCE_ID=
+# MAVEN_RECOVERY_EPOCH=
+
+# Optional integration locators, never secret values:
+# MAVEN_SECRETS_BUCKET=
+# MAVEN_SECRETS_KEY_ID=
+# MAVEN_SECRETS_PARAMETER_PREFIX=
+# MAVEN_SECRETS_FILE_KEY_PREFIX=
+# MAVEN_SECRETS_OBJECT_PREFIX=
+# MAVEN_GOOGLE_PARAMETER_PREFIX=
