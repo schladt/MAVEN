@@ -32,12 +32,19 @@ PATH; it is **not** the private `.env`. Never source `.env`.
 
 ### Pick the connection path
 
-**Existing instance:** import a private nonsecret `.env` from an existing configured
-installation, or select an existing CloudFormation stack using a separately selected
-metadata/deployment identity. The wizard derives locators from actual stack outputs
-and asks you to confirm instance and principal identities. It does not redeploy,
-initialize an existing database, or activate replacement authority. Existing authority
-must already be available; missing authority is a blocker, not permission to reset it.
+**Existing instance:** choose one of these connection methods:
+
+1. **Import settings from another installation’s `.env` file**, usually
+   `~/.maven/.env`. This imports private connection settings, not credentials.
+2. **Find the existing deployment in AWS**, using its CloudFormation stack—the
+   named group of resources for that instance—and a separately selected identity
+   permitted to read its details.
+
+The wizard derives locators from the imported file or actual stack outputs and asks
+you to confirm instance and principal identities. Neither method redeploys,
+initializes an existing database, or activates replacement authority. Existing
+authority must already be available; missing authority is a blocker, not permission
+to reset it.
 
 **New instance:** provide the AWS account, stack/instance name, notification email,
 two availability zones and explicit routine and deployment identities. Review the

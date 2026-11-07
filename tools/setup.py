@@ -238,8 +238,12 @@ class Wizard:
         from tools.memory import bootstrap
         from tools.memory.environment import load_environment, memory_config, transport_ca_bundle
         if not self.values.get('MAVEN_MEMORY_INSTANCE_ID'):
-            method = self.state.get('existing_source') or ask(
-                'Existing connection: import private settings or select stack? (import/stack)', 'import')
+            method = self.state.get('existing_source')
+            if method is None:
+                print('How would you like to connect to your existing MAVEN instance?')
+                print('  1. Import settings from another installation’s .env file (usually ~/.maven/.env)')
+                print('  2. Find the existing deployment in AWS (CloudFormation stack)')
+                method = {'1': 'import', '2': 'stack'}.get(ask('Choose 1 or 2', '1'))
             if method == 'import':
                 source = Path(ask('Absolute path to the existing owner-private .env (0600)')).expanduser()
                 if not source.is_absolute():
@@ -256,7 +260,7 @@ class Wizard:
                 self.settings(imported)
                 print('Imported connection and identity selections. Login caches are selected locally; credentials are never copied.')
             elif method != 'stack':
-                raise SetupPending('Choose import or stack when resuming.')
+                raise SetupPending('Choose 1 or 2 when resuming.')
             else:
                 self.state['existing_source'] = 'stack'
                 self.save()

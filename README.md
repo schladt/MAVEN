@@ -54,10 +54,11 @@ These are installation targets, not a claim that every harness has been runtime-
 
 The wizard offers two paths:
 
-- **Connect an existing MAVEN instance:** import a private nonsecret environment file
-  from a configured installation, or select an existing CloudFormation stack. Confirm
-  the actual instance and routine AWS principal. This path does not redeploy,
-  initialize the database, or replace active authority.
+- **Connect an existing MAVEN instance:** choose **Import settings from another
+  installation’s `.env` file** (usually `~/.maven/.env`), or **Find the existing
+  deployment in AWS** using its CloudFormation stack—the named group of AWS
+  resources for that instance. Confirm the actual instance and routine AWS principal.
+  This path does not redeploy, initialize the database, or replace active authority.
 - **Create a new MAVEN instance:** supply your account, stack/instance name,
   notification email, two availability zones and a separately selected deployment
   identity. Review costs and generated artifacts, then separately approve the change
