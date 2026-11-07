@@ -1,9 +1,15 @@
 # Getting started
 
+Install/connect the cloud instance once, optionally defer project setup, then open
+OMP in the intended project and invoke `/skill:maven-start-work`. First use guides
+your choices in chat; later sessions reuse that project's selection and load cloud
+memory. You do not need to generate new UUIDs or assemble lifecycle commands.
+
 Start with the [README prerequisites](../README.md#before-you-start). A source
 checkout does not supply a configured virtual environment, private `.env`, or your
 project's `.maven` directory. The installer creates them in the selected locations;
-you do not need to prepare them manually.
+you do not need to prepare them manually. Installing tools in a checkout does not
+register that checkout as a project.
 
 ## Guided first-time setup
 
@@ -65,14 +71,24 @@ folder (Enter accepts the created default). An existing approved local cache can
 selected explicitly. See [AWS command-line sign-in](https://docs.aws.amazon.com/signin/latest/userguide/command-line-sign-in.html)
 for account/identity prerequisites and login permissions.
 
-Select and confirm the **project folder** separately. The checkout used to install
-MAVEN is only the initial suggestion, not automatic permission to register it. Choose
-an existing cloud project or create one using genuine owner source evidence. Confirm
-the accepted Git remote and branch, or choose no Git. The wizard uses `maven-project`
-to create `.maven/project.json`, runtime directories and ignore rules; it preserves
-existing project selections and never commits, pushes, pulls or switches branches.
+### Optional project setup
 
-### Resume and first use
+After verified instance access and complete approved authority, the wizard offers
+an optional project step; you can defer it and configure the project in OMP later.
+Instance readiness and project readiness are distinct. To set up now, select and
+confirm the **project folder** separately. Filesystem `/` is not permitted; an
+ambiguous/subdirectory root needs an explicit choice rather than silent rebinding.
+The MAVEN source checkout is a development project only if you explicitly choose it.
+
+Choose an existing cloud project or authorize a named new one with genuine source
+evidence. Confirm the detected Git checkout root, remote, actual push URL and current
+branch, or explicitly choose no-Git. Setup creates `.maven/project.json`, runtime
+directories and ignore rules without committing, pushing, pulling or switching
+branches. New project/request UUIDs are generated and durably journaled for you
+before mutation. Private project state is mode `0700`/`0600` and ignored before
+personal configuration is written.
+
+### Resume instance setup
 
 After activating the installed commands, resume interrupted or declined setup with:
 
@@ -92,16 +108,52 @@ review files and pending request receipts intact. The wizard resumes the same re
 there is no reset/redeploy flag. Unknown outcomes must be reconciled before retrying
 mutations. Existing infrastructure must never be reinitialized to recover onboarding.
 
-Completion requires verified routine cloud access, complete applicable authority and
-project configuration. The wizard prints actual paths and a first-use command.
-From the selected project folder, for example with Codex:
+Instance completion requires verified routine cloud access and complete applicable
+authority. A declined optional project step does not invent project readiness.
+For an interrupted project operation, preserve the selected root's `.maven/runtime`
+setup receipts and repeat its original `maven-project setup` choices. The command
+reconciles the original IDs before an explicitly resumed mutation. Legacy
+instance-wizard pending/saved project requests retain their original IDs and receipts;
+do not discard them or create a second project to get past an uncertain response.
 
-```sh
-maven-start-work --root "$PWD" --harness codex
+### First use and everyday work in OMP
+
+Make the selected home's installed commands available to OMP, install/discover the
+generic skills safely as described below, and open OMP in the actual project folder:
+
+```text
+/skill:maven-start-work
 ```
 
-Choose your actual harness and retain the returned session UUID. See
-[Project workflow](workflow.md) for checkpoint, stop, no-Git and recovery details.
+On first use, the assistant confirms the root and asks whether to select an existing
+cloud project or create a named one, and whether to use the confirmed Git destination
+or no-Git. It obtains real owner source evidence for creation, then uses the
+noninteractive project setup interface with those choices. It does not guess answers
+or ask you to invent new UUIDs. For a configured project it preserves and validates
+the existing selection, reads complete cloud instructions/dependencies and project
+handover/tasks/blockers, and starts this session. Missing authority blocks work;
+having no previous handover is normal for a new project.
+
+Each new OMP session has its own MAVEN session UUID, including parallel sessions in
+one checkout. The assistant retains that root/project/MAVEN binding across cwd
+changes. Repeating start in the same chat checks/refreshes its existing binding
+rather than creating another session. Resuming a prior session is explicit, never
+inferred from the newest file or another transcript. OMP's own session ID is only an
+optional association when reliably exposed; the assistant omits it otherwise and
+never invents one. Cloud memory, not OMP history, preserves work between sessions.
+
+Use `/skill:maven-checkpoint` to preserve progress and `/skill:maven-stop-work` to
+close only the current session. These coordinate writers, save truthful summaries
+and references, and require explicit approval of the exact publication candidate.
+Invoking a skill is not blanket commit/push approval. No-Git projects get memory-only
+closure, and credentials shared by active peers are not logged out by one stop.
+See [Project workflow](workflow.md) for the full approval and recovery contract.
+
+For another project, open OMP in its explicitly chosen folder and use the same
+start skill. Do not rerun instance provisioning or use the instance wizard's first
+saved project as an additional-project pointer. An owner who prefers interactive
+terminal project setup can use `maven-project setup --root /absolute/path/to/project`;
+the normal in-harness path does not require that extra terminal step.
 
 ### Installer options and harnesses
 
@@ -115,6 +167,14 @@ destination. Close affected harnesses before confirming skill installation; a
 noninteractive `--local-only` install also requires `--harness-stopped` when selecting
 harness files. Conflicting files are preserved; interactive setup can continue without
 changing them. Start a new harness afterward to discover the generic skills.
+
+The installed generic skills are maven-setup, maven-connect, maven-skill-use,
+maven-start-work, maven-checkpoint and maven-stop-work. Existing older copies are
+conflicts too; the installer does not overwrite them as an upgrade. If integration
+is deferred, stage the generic skills in a separate explicit `--skill-dir PATH`,
+review differences, and arrange an owner-controlled cutover only after affected
+harnesses stop. Never replace active instructions from within a running session.
+No MCP server, daemon or auto-start hook is needed for these lifecycle skills.
 
 | Harness | Default user skill root |
 | --- | --- |
@@ -169,10 +229,10 @@ an unverified certificate merely to get past an error.
 
 ## Advanced manual reference
 
-The guided flow above is the normal entrypoint. The remaining sections document the
-underlying commands for deliberate manual administration, not extra prerequisites
-for `python3 install.py`. All shell variables below mean actual owner-reviewed values:
-define them from your private settings and command results before running examples.
+The guided installation and in-harness skills above are the normal entrypoints.
+The remaining sections document underlying commands for deliberate manual
+administration, not extra prerequisites for routine work. All shell variables below
+mean actual owner-reviewed values: define them from private settings and command results.
 MAVEN provides no preconfigured account, endpoint, credentials or owner authority.
 
 ### Deployment limitations and costs
@@ -316,10 +376,13 @@ write outcome is unknown, reconcile the exact request key with `maven-memory loo
 
 ### Select the project manually
 
-Bind an existing cloud project or create a new owner-approved project using the
-explicit `maven-project init` interface in [Project workflow](workflow.md). Start with
-an explicit root, keep the returned session UUID, and load the complete applicable
-cloud authority. A new project need not have a previous handover.
+Use `maven-project setup --root "$PROJECT_ROOT"` for interactive project onboarding.
+For an agent that has already obtained every owner choice, the noninteractive
+interface in [Project workflow](workflow.md#manual-project-setup-reference) generates
+new identities safely and preserves an existing selection. `maven-project init`
+remains a low-level explicit-ID API, not the ordinary first-use path. Manual starts
+also require an explicit root and complete authority; retain the returned MAVEN
+session UUID, distinct from any optional harness identity.
 
 Review [Security and privacy](security.md) before sharing retrieved context with an
 external model. Configure [optional integrations](integrations.md) only when needed;

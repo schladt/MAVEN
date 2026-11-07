@@ -108,33 +108,23 @@ class GuidedSetupTests(unittest.TestCase):
             self.assertEqual(review.read_bytes(), before)
             self.assertNotIn('applied', read_private(wizard.state_path))
 
-    def test_project_unknown_write_reuses_saved_request_and_does_not_mark_ready(self):
+    def test_project_selection_is_optional_after_authority_verification(self):
         with tempfile.TemporaryDirectory() as directory:
             wizard = self.wizard(directory)
-            root = Path(directory).resolve()
-            request = str(uuid4())
-            project = str(uuid4())
-            wizard.state['project'] = {
-                'root': str(root), 'project_id': project, 'existing': False, 'create': True,
-                'name': 'Owner project', 'request_key': request, 'source_origin': 'Owner terminal',
-                'source_excerpt': 'Create this project', 'check': [], 'no_git': True,
-                'remote': None, 'accepted_url': None, 'branch': None,
-            }
+            wizard.settings({'MAVEN_MEMORY_INSTANCE_ID': str(uuid4())})
+            saved = {'root': str(Path(directory).resolve()), 'project_id': str(uuid4())}
+            wizard.state['project'] = saved
             wizard.save()
-            client = Mock()
-            client.invoke.side_effect = MemoryClientError('operation_unavailable')
-            with patch('tools.project._initialize', side_effect=MemoryClientError('outcome_unknown', request_key=request)) as initialize, \
-                    patch('tools.memory.environment.configured_client', return_value=client), \
-                    patch('tools.setup.approve'):
-                for attempt in range(2):
-                    current = wizard if attempt == 0 else self.wizard(directory)
-                    with self.assertRaises(MemoryClientError):
-                        current.project()
-            self.assertEqual([call.args[0].request_key for call in initialize.call_args_list], [request, request])
-            self.assertEqual([call.args[0].project_id for call in initialize.call_args_list], [project, project])
-            client.invoke.assert_called_once_with('/v1/operations/lookup', {'request_key': request})
-            self.assertNotIn('ready_project', read_private(wizard.state_path))
-            self.assertFalse((root / '.maven' / 'project.json').exists())
+            with patch.object(wizard, 'existing'), \
+                    patch.object(wizard, 'verify_authority', return_value=7) as authority, \
+                    patch.object(wizard, 'project') as project, \
+                    patch('tools.setup.confirm', return_value=False), redirect_stdout(io.StringIO()):
+                self.assertEqual(wizard.run(), 0)
+            authority.assert_called_once_with()
+            project.assert_not_called()
+            state = read_private(wizard.state_path)
+            self.assertEqual(state['project'], saved)
+            self.assertNotIn('ready_project', state)
 
 
 if __name__ == '__main__':

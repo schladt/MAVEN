@@ -5,6 +5,12 @@ project state, tasks and handovers that survive individual assistant sessions. Y
 choose the AWS instance, identities and project folder. MAVEN is not a hosted model
 or a free cloud service.
 
+**Normal use:** install/connect your cloud instance once, optionally defer project
+setup, then open OMP in the folder you want to work in and invoke
+`/skill:maven-start-work`. First use guides project choices in chat; configured
+projects reuse their selection. The assistant retains this chat's separate MAVEN
+session—no manual UUID generation or terminal lifecycle assembly.
+
 ## Before you start
 
 - **macOS or Linux**, or **Windows through WSL**. Run all commands inside WSL, not
@@ -77,33 +83,49 @@ or grant administrator permissions. Setup/deployment access is selected separate
 AWS sign-in may also offer AWS skills and an AWS MCP connection. These are optional
 and separate from MAVEN; see [the AWS toolkit note](docs/getting-started.md#optional-aws-agent-toolkit).
 
-Next, explicitly select the folder you want to work in and an existing cloud project
-or a new project with real source evidence. The installer checkout is not automatically
-your project. Confirm the Git remote and branch, or choose **no Git** for memory-only
-work. Setup creates private `.maven/project.json` and runtime state in that folder;
-it does not commit, push, pull, or switch branches.
+Project setup is optional during installation. You can finish instance setup now,
+then choose your project in OMP later. If you choose it now, explicitly confirm the
+folder and an existing cloud project or creation with real source evidence. Confirm
+the Git remote, push URL and current branch, or explicitly choose **no Git**.
+Setup creates private ignored `.maven/project.json` and `.maven/runtime` state in
+that folder; it does not commit, push, pull or switch branches. The installer checkout
+is never automatically your project, and filesystem `/` cannot be a project root.
 
-## Start work or resume setup
+## Work inside OMP
 
-At the default installation location, enable the installed commands in your shell:
+Make the installed commands available to OMP before launching it. For the default
+home, your shell can source `"$HOME/.maven/activate"`; use your selected home's path
+if different. This sets PATH and MAVEN_HOME, not credentials. Never source `.env`.
+Once the generic skills are installed and discovered, open OMP in your actual
+project folder and use:
 
-```sh
-source "$HOME/.maven/activate"
+```text
+/skill:maven-start-work
 ```
 
-Use your actual selected home's `activate` path if you changed it. Source this file
-in each new shell (or add that line to your shell's startup file); never source `.env`.
-Setup prints the actual paths and a first-use command for your selected project.
-Open a terminal in that project and,
-for example when using Codex, run:
+- **First use in a project:** confirm the root, choose an existing cloud project or
+  authorize a named new one, and confirm Git destination/branch or no-Git. The
+  assistant obtains these choices in chat before using `maven-project setup`;
+  setup generates and journals new IDs safely. You do not have to generate UUIDs.
+- **Configured project:** the existing selection is preserved and validated. Start
+  reads complete applicable cloud instructions, prior handover, tasks and blockers.
+  Missing access or authority blocks work; a new project's absent handover is normal.
+- **Additional projects:** open OMP in another explicitly chosen folder and invoke
+  the same skill. There is no instance reinstall or global current-project pointer.
+- **Multiple sessions:** each new harness session gets its own MAVEN UUID, even in
+  one checkout. The assistant keeps that root/session binding across cwd changes.
+  Repeating start in the same chat checks its binding, not another new session.
+  Resume is explicit. OMP's own session identity is optional and is used only if
+  reliably exposed; it is never invented or substituted for MAVEN's UUID.
 
-```sh
-maven-start-work --root "$PWD" --harness codex
-```
+During work use `/skill:maven-checkpoint`; to finish this session use
+`/skill:maven-stop-work`. The assistant saves truthful memory, coordinates peers and
+presents the exact candidate before any commit/push. Invoking either skill is **not**
+approval of an unseen publication. Stop closes only your session and respects
+credentials still needed by peers. See [Project workflow](docs/workflow.md) for
+approval, memory-only closure, recovery and manual CLI reference.
 
-Use your actual harness name. Keep the returned session UUID for checkpoint/stop;
-[Project workflow](docs/workflow.md) explains those commands and approval gates.
-A start requires verified cloud access and complete applicable approved authority.
+## Resume instance setup
 
 If setup stops, you decline an approval, or login expires, preserve the private home
 and resume with:
@@ -114,8 +136,9 @@ maven-setup
 
 Reruns preserve configuration and pending review/request identities. An unknown cloud
 outcome must be reconciled using the same artifacts, not bypassed by starting a new
-installation. Setup is not complete until cloud access, authority and project
-configuration have been verified; a local package installation alone is not readiness.
+installation. Instance readiness requires verified cloud access and complete
+applicable authority; project readiness is reported separately if you defer that
+optional step. A local package installation alone is not readiness.
 
 ## Options and safety
 
@@ -126,6 +149,10 @@ configuration have been verified; a local package installation alone is not read
 - For noninteractive native skill installation, close the affected harnesses and pass
   `--local-only --harness NAME --harness-stopped`. Without that confirmation, their
   files are not changed.
+- Existing conflicting skills—including older copies—are preserved, not upgraded
+  in place. You may defer harness integration, stage generic skills in a separate
+  explicit `--skill-dir PATH`, and review a later owner-controlled cutover after the
+  affected harnesses stop. Do not overwrite active skills to enable the new workflow.
 - Behind a VPN or corporate TLS proxy, pass `--ca-bundle PATH` with a trusted PEM
   bundle supplied by your owner/administrator. A new private `activate` snippet retains
   this explicit selection; existing snippets are preserved and any required exports

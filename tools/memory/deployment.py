@@ -39,6 +39,8 @@ _LOCAL_REVIEW_FILES = (
     "tools/memory/display.py",
     "tools/memory/boundary.py",
     "tools/setup.py",
+    "tools/setup_common.py",
+    "tools/project_setup.py",
     "tools/project.py",
     "tools/coordination.py",
     "tools/workflow.py",

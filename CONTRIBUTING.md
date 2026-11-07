@@ -7,9 +7,17 @@ publication, durable records or concurrency before changing their contracts.
 ## Local development
 
 For first-time use, follow the [guided installer](README.md#install-and-set-up):
-`python3 install.py` creates its own private environment and offers cloud/project
-setup. No preexisting `.venv` or project `.maven` directory is required. For local
-package installation without the cloud wizard, use `python3 install.py --local-only`.
+`python3 install.py` creates its own private environment and offers instance setup.
+The project step is optional: open OMP in an explicitly chosen project and invoke
+`/skill:maven-start-work` to obtain first-use project choices in chat. Configured
+projects retain their selection; new harness sessions get distinct MAVEN sessions.
+Use `/skill:maven-checkpoint` and `/skill:maven-stop-work` for exact approval and
+peer-aware closure, not a required out-of-harness terminal ritual.
+
+No preexisting `.venv` or project `.maven` directory is required. The MAVEN source
+checkout is not automatically a development project: explicitly choose/approve that
+root before registration. Filesystem `/` is never valid. For local package
+installation without the cloud wizard, use `python3 install.py --local-only`.
 The development environment below is a separate, optional contributor workflow.
 
 Use a virtual environment with Python 3.11 or newer:
@@ -26,9 +34,26 @@ Keep a separate private `MAVEN_HOME` for any explicitly authorized manual work.
 The repository must not contain your environment file, credentials, runtime state,
 project receipts or downloaded originals.
 
+For onboarding changes, keep smoke checks small: install into a disposable home,
+verify native skill discovery, defer project setup, then configure/revisit two
+disposable project roots. Exercise two sessions in one root and a session in the
+other, including handover isolation and mismatched-resume rejection. Simulate cloud
+boundaries for this local smoke; it is not proof of live AWS deployment or an
+end-to-end model-driven chat.
+
 ## Change requirements
 
 - Preserve explicit project/session selection and complete cloud-authority loading.
+- Keep packaged lifecycle skills thin wrappers over the existing CLI. Bind the
+  absolute root and returned MAVEN UUID to one harness session across cwd changes;
+  no global current-session file, guessed OMP identity or implicit resume.
+- Keep instance setup separate from additional-project setup. Noninteractive
+  creation needs explicit owner choices and genuine source evidence, and generated
+  IDs must be journaled before mutation. Preserve legacy pending-request identities.
+- Edit only generic source templates, never an active installation's skills or
+  private cloud instruction bodies. Existing skill conflicts remain protected;
+  stage/review separately and activate only after affected harnesses stop. Template
+  changes are not approval to activate cloud authority.
 - Keep runtime credentials distinct from setup/admin credentials. Never add ambient
   profile fallback, silent login, relaxed TLS verification or unreviewed activation.
 - Update callers, relevant behavioral tests and the focused public documentation

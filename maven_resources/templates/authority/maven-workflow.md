@@ -1,12 +1,14 @@
 # Explicit multi-session project lifecycle
 
-Use `maven-project` to select the exact existing project root and cloud project UUID. Use `maven-start-work --root ROOT` with explicit harness identity when available. Record its returned MAVEN session UUID and use that UUID for all later lifecycle commands. Resume only the exact requested session. No instance-global current project exists.
+Normal OMP use is `/skill:maven-start-work`, `/skill:maven-checkpoint` and `/skill:maven-stop-work`; these are thin entrypoints to the installed CLI, not alternate authority. Confirm the absolute project root, reject `/`, and ask about ambiguous or subdirectory roots rather than silently rebinding. Never auto-use the MAVEN installation checkout. Read `maven-project show --root ROOT`; if absent, obtain the owner's project/create and Git/no-Git choices in chat before `maven-project setup --root ROOT --non-interactive`. New UUIDs are generated and durably journaled by setup; preserve original pending receipts. Additional projects are independent of instance setup's saved first project.
+
+Use `maven-start-work --root ROOT --harness NAME` once per new harness session. Record the returned MAVEN session UUID and retain root/project/session binding in that session across cwd changes. Add `--harness-session ID` only when the current harness reliably exposes it; omission is supported and the MAVEN UUID is distinct. Never invent an OMP identity or reuse another chat's binding. Repeated invocation in a bound chat checks status and refreshes context, not another new start. Resume only the exact explicitly requested session. No global current-session file exists, and a transcript is not persistent memory.
 
 Read the prior completed handover, active tasks, blockers, peer sessions and full applicable instructions returned or referenced by start. No handover is normal for a new project. Starting must not pull, merge, rebase, reset or switch branches. Preserve existing dirty work and unrelated local commits.
 
 Keep cloud session memory current while working. All cooperating writers must use the session registry. Before checkpoint or stop, pause registered peer writers, obtain the repository reservation, inspect the exact candidate and give the owner its current-branch destination and change summary. Run only project-configured checks. Do not attribute shared checkout files to a session automatically.
 
-Commit and push only after approval of the exact current candidate. Revalidation must catch changed bytes or HEAD; changed candidates require new review. Never silently publish pre-existing local commits. Unknown commit/push outcomes require reconciliation using saved receipts, not blind retry or destructive Git repair. Cancel and recovery preserve evidence and require explicit decisions.
+Commit and push only after approval of the exact current action-specific candidate. Asking to checkpoint or stop is not approval of an unseen proposal. Revalidation must catch changed bytes or HEAD; changed candidates require new review. Never silently publish pre-existing local commits. Unknown commit/push outcomes require reconciliation using saved receipts, not blind retry or destructive Git repair. Cancel and recovery preserve evidence and require explicit decisions.
 
 Checkpoint leaves the requesting session active. Stop closes only that session after durable closure; no-Git projects receive memory-only closure without a Git success claim. One stop must not log out shared credentials used by active peer sessions. Report the distinction between invocation-client closure and last-session credential cleanup. Local coordination cannot prevent arbitrary unregistered editor or shell writes.
 
@@ -17,10 +19,14 @@ never literal example identities. `ROOT` is the selected project root; `SESSION`
 the MAVEN UUID. Keep every JSON report and pending receipt private.
 
 ```sh
-maven-start-work --root "$ROOT" --harness "$HARNESS" --harness-session "$HARNESS_SESSION" --json
+maven-start-work --root "$ROOT" --harness "$HARNESS" --json
 maven-workflow status --root "$ROOT" --session "$SESSION" --json
 maven-workflow refresh-context --root "$ROOT" --session "$SESSION" --json
 ```
+
+Add `--harness-session "$HARNESS_SESSION"` only if that identity is reliably exposed
+by the current harness. These are manual reference commands, not a requirement for
+the owner to assemble identifiers outside the harness.
 
 Stop all relevant writes before attesting quiescence. Begin inspection to obtain the
 reservation. A peer-related block retains coordination state; inspect `status` for the

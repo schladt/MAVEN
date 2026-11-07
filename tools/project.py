@@ -166,10 +166,22 @@ def _ensure_ignore(root: Path) -> None:
             os.fsync(stream.fileno())
 
 
+def validate_git(root: Path, project: dict) -> None:
+    if not project['git_enabled']:
+        return
+    if Path(_git(root, 'rev-parse', '--show-toplevel')).resolve() != root:
+        raise ProjectError('--root must select the Git checkout root; rerun with an explicitly chosen root')
+    if _git(root, 'remote', 'get-url', '--push', project['remote']) != project['accepted_url']:
+        raise ProjectError('configured remote push URL differs from --accepted-url')
+    _git(root, 'check-ref-format', '--branch', project['branch'])
+    if _git(root, 'symbolic-ref', '--short', 'HEAD') != project['branch']:
+        raise ProjectError('--branch must select the current branch')
+
+
 def _initialize(args) -> dict:
     root = args.root.expanduser().resolve(strict=True)
-    if not root.is_dir():
-        raise ProjectError('project root must be an existing directory')
+    if not root.is_dir() or root == Path(root.anchor):
+        raise ProjectError('project root must be an existing directory, never filesystem /')
     checks = []
     for command in args.check:
         try:
@@ -181,6 +193,7 @@ def _initialize(args) -> dict:
         'remote': args.remote, 'accepted_url': args.accepted_url, 'branch': args.branch,
         'git_enabled': not args.no_git, 'checks': checks,
     }, root)
+    validate_git(root, project)
     directory = root / '.maven'
     if directory.exists() or directory.is_symlink():
         _private_directory(directory)
@@ -191,14 +204,6 @@ def _initialize(args) -> dict:
             raise ProjectError('project already initialized; existing configuration was preserved')
         _ensure_ignore(root)
         return {'status': 'unchanged', 'project': existing}
-    if project['git_enabled']:
-        if Path(_git(root, 'rev-parse', '--show-toplevel')).resolve() != root:
-            raise ProjectError('--root must select the Git checkout root')
-        if _git(root, 'remote', 'get-url', '--push', project['remote']) != project['accepted_url']:
-            raise ProjectError('configured remote push URL differs from --accepted-url')
-        _git(root, 'check-ref-format', '--branch', project['branch'])
-        if _git(root, 'symbolic-ref', '--short', 'HEAD') != project['branch']:
-            raise ProjectError('--branch must select the current branch')
     if args.create:
         if not all((args.name, args.source_origin, args.source_excerpt, args.request_key)):
             raise ProjectError('--create requires --name, --source-origin, --source-excerpt and --request-key')
@@ -206,7 +211,7 @@ def _initialize(args) -> dict:
     elif any((args.name, args.source_origin, args.source_excerpt, args.request_key)):
         raise ProjectError('project creation arguments require --create')
     from tools.memory.environment import configured_client
-    client = configured_client(args.env)
+    client = configured_client(args.env, values=getattr(args, 'values', None))
     try:
         if args.create:
             client.invoke('/v1/memory/write', {
@@ -252,15 +257,39 @@ def main(argv=None) -> int:
     initialize.add_argument('--source-excerpt')
     initialize.add_argument('--request-key', help='Stable UUID; reuse unchanged after an unknown outcome')
     initialize.add_argument('--json', action='store_true')
+    setup = commands.add_parser('setup', help='Guide project selection with private, resumable request receipts')
+    setup.add_argument('--root', type=Path, required=True)
+    setup.add_argument('--env', type=Path, default=default_environment())
+    setup.add_argument('--non-interactive', action='store_true', help='Use explicit choices already approved by the owner')
+    selection = setup.add_mutually_exclusive_group()
+    selection.add_argument('--create', action='store_true')
+    selection.add_argument('--project-id')
+    setup.add_argument('--name')
+    setup.add_argument('--source-origin')
+    setup.add_argument('--source-excerpt')
+    setup.add_argument('--no-git', action='store_true')
+    setup.add_argument('--remote')
+    setup.add_argument('--accepted-url')
+    setup.add_argument('--branch')
+    setup.add_argument('--check', action='append', default=[], metavar='JSON_ARGV')
+    setup.add_argument('--json', action='store_true')
     show = commands.add_parser('show', help='Show the explicit local project, without cloud access')
     show.add_argument('--root', type=Path, required=True)
     show.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
+    from tools.setup_common import SetupPending
     try:
-        result = _initialize(args) if args.command == 'init' else load_project(args.root)
+        if args.command == 'setup':
+            from tools.project_setup import setup_project
+            result = setup_project(args)
+        else:
+            result = _initialize(args) if args.command == 'init' else load_project(args.root)
         print(json.dumps(result, indent=2))
         return 0
-    except (ProjectError, OSError) as exc:
+    except (EOFError, KeyboardInterrupt):
+        print('Project setup paused; preserve .maven/runtime/project-setup and rerun the same --root.', file=sys.stderr)
+        return 1
+    except (ProjectError, SetupPending, OSError, json.JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except Exception as exc:
@@ -268,6 +297,10 @@ def main(argv=None) -> int:
         if not isinstance(exc, MemoryClientError):
             raise
         print(str(exc), file=sys.stderr)
+        if exc.request_key:
+            print('Preserved request key: ' + exc.request_key, file=sys.stderr)
+        if args.command == 'setup':
+            print('Preserve the private .maven/runtime/project-setup receipt and rerun setup with the same --root. Never replace IDs or choose another root to retry an unknown outcome.', file=sys.stderr)
         return 1
 
 

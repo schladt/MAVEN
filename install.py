@@ -29,7 +29,10 @@ HARNESS_PATHS = {
     'gemini': Path('.gemini/skills'),
     'antigravity': Path('.gemini/config/skills'),
 }
-SKILLS = ('maven-setup', 'maven-connect', 'maven-skill-use')
+SKILLS = (
+    'maven-setup', 'maven-connect', 'maven-skill-use',
+    'maven-start-work', 'maven-checkpoint', 'maven-stop-work',
+)
 
 
 def _private_directory(path: Path) -> None:
@@ -202,7 +205,6 @@ def main(argv=None) -> int:
         _no_symlink_parents(home)
         ca_bundle = _configure_ca(args.ca_bundle)
         source = Path(__file__).resolve().parent
-        project_root = Path.cwd().resolve()
         if 'claude' in args.harness and os.environ.get('CLAUDE_CONFIG_DIR'):
             raise ValueError('CLAUDE_CONFIG_DIR is set; use --skill-dir with its skills directory instead of --harness claude.')
         if 'omp' in args.harness and any(os.environ.get(key) for key in (
@@ -266,7 +268,7 @@ def main(argv=None) -> int:
         for command in activation:
             print(f'  {command}')
         if roots:
-            print('Bootstrap skills installed/preserved. Start a new harness session to discover them.')
+            print('Bootstrap and lifecycle skills installed/preserved. Start a new harness session to discover them.')
         elif deferred:
             print('Harness integration is still pending. After closing the harness, rerun this installer '
                   'with --local-only and the desired --harness/--skill-dir plus --harness-stopped.')
@@ -274,12 +276,11 @@ def main(argv=None) -> int:
             print('No harness was modified; native skill installation remains optional.')
         if args.local_only:
             print('\nLocal-only installation complete; AWS and project setup have NOT been performed.')
-            print('After activation, run maven-setup to configure an existing or new instance and your project.')
+            print('After activation, run maven-setup to configure an existing or new instance; project setup is optional.')
             return 0
-        print('\nStep 4/4 — Configure an existing or new AWS instance and choose your project')
+        print('\nStep 4/4 — Configure an existing or new AWS instance (project setup is optional)')
         result = subprocess.run(
-            [str(installation / 'bin' / 'maven-setup'), '--home', str(home),
-             '--project-root', str(project_root)],
+            [str(installation / 'bin' / 'maven-setup'), '--home', str(home)],
             cwd=home, env=dict(os.environ, MAVEN_HOME=str(home)),
         )
         if result.returncode:

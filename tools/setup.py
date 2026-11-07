@@ -2,114 +2,20 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
-import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import shlex
-import stat
 import subprocess
 import sys
-import tempfile
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 
-class SetupPending(Exception):
-    """A safe stop, not a successful setup."""
-
-
-def ask(prompt, default=None):
-    suffix = f' [{default}]' if default is not None else ''
-    while True:
-        value = input(prompt + suffix + ': ').strip()
-        value = value or default
-        if value and not any(ord(c) < 32 for c in value):
-            return value
-        print('Enter a value, or press Ctrl-C to pause setup.')
-
-
-def confirm(prompt):
-    return input(prompt + ' [y/N]: ').strip().lower() in ('y', 'yes')
-
-
-def approve(prompt, token):
-    print(prompt)
-    if input(f'Type {token} exactly to approve (anything else pauses): ').strip() != token:
-        raise SetupPending('Approval declined; no subsequent action was performed.')
-
-
-def private_directory(path):
-    path = Path(path)
-    if not path.exists() and not path.is_symlink():
-        private_directory(path.parent) if not path.parent.exists() else None
-        path.mkdir(mode=0o700)
-    info = path.lstat()
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) & 0o077):
-        raise SetupPending(f'Use an owner-owned, non-symlink directory with mode 0700: {path}')
-    # A private leaf underneath a symlink is not an independent installation.
-    if path.absolute() != path.resolve():
-        raise SetupPending(f'Select a path without symlink components: {path}')
-
-
-def read_private(path):
-    from tools.memory.client import MemoryClientError, read_json
-    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
-    try:
-        info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o600):
-            raise MemoryClientError('setup_artifact_must_be_owner_private')
-    finally:
-        os.close(fd)
-    return read_json(path, maximum=4 * 1024 * 1024)
-
-
-def atomic_private(path, text):
-    if path.exists() or path.is_symlink():
-        info = path.lstat()
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o600):
-            raise SetupPending(f'Existing file must be owner-private (0600), not a symlink: {path}')
-    fd, temporary = tempfile.mkstemp(prefix='.setup-', dir=path.parent)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-            stream.write(text)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
-
-def save_json(path, document):
-    atomic_private(path, json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + '\n')
-
-
-@contextmanager
-def setup_lock(directory):
-    path = directory / 'lock'
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-    try:
-        info = os.fstat(fd)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o600):
-            raise SetupPending('The setup lock must be an owner-private regular file.')
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SetupPending('Another setup is running for this home. Close it before resuming.') from None
-        yield
-    finally:
-        os.close(fd)
+from tools.setup_common import (
+    SetupPending, approve, ask, atomic_private, confirm, private_directory,
+    read_private, save_json, setup_lock, verify_authority,
+)
 
 
 class Wizard:
@@ -469,96 +375,23 @@ class Wizard:
             self.save()
 
     def verify_authority(self, project_id=None):
-        from tools.memory.environment import configured_client
-        client = configured_client(self.env, values=self.values)
-        try:
-            scope = {'workflow': 'start-work', 'operation': 'start-work'}
-            if project_id:
-                scope['project_id'] = project_id
-            context = client.load_context(scope)
-            instructions = context['data']['instructions']
-            if not any(page.get('page_kind') == 'directive' for page in instructions):
-                raise SetupPending('Routine cloud access succeeded, but applicable approved MAVEN authority is missing. Ask the instance owner to approve its complete authority, then resume; existing mode will not replace it.')
-            if project_id:
-                record = client.invoke('/v1/memory/read', {'record_id': project_id})['data']
-                if (record.get('kind') != 'entity' or record.get('data_scope') != 'owner'
-                        or record.get('data', {}).get('entity_type') != 'project'):
-                    raise SetupPending('The selected cloud record is not an owner project entity.')
-            return context['data']['authority_generation']
-        finally:
-            client.close()
+        return verify_authority(self.env, project_id, values=self.values)
 
     def project(self):
-        from tools.project import _git, _initialize, load_project, validate_accepted_url
+        from tools.project_setup import setup_project
         saved = self.state.get('project')
-        if saved is None:
-            root = Path(ask('Project directory (selection is not permission to commit/push)', str(self.project_root))).expanduser()
-            if not root.is_dir():
-                raise SetupPending(f'Project folder does not exist or is not a directory: {root}. '
-                                   'Create it or select an existing folder when resuming.')
-            root = root.resolve(strict=True)
-            approve(f'Configure this project directory: {root}. No commit, push, pull or branch switch will occur.', str(root))
-            target = root / '.maven' / 'project.json'
-            if target.exists() or target.is_symlink():
-                existing = load_project(root)
-                self.verify_authority(existing['project_id'])
-                print('Preserving compatible existing project configuration.')
-                saved = {'root': str(root), 'project_id': existing['project_id'], 'existing': True}
-            else:
-                create = ask('Cloud project: create a project entity or use an existing UUID? (create/existing)', 'create')
-                if create not in ('create', 'existing'):
-                    raise SetupPending('Choose create or existing when resuming.')
-                saved = {'root': str(root), 'project_id': str(uuid4()) if create == 'create' else ask('Existing cloud project UUID'),
-                         'existing': False, 'create': create == 'create', 'check': [], 'remote': None,
-                         'accepted_url': None, 'branch': None, 'name': None, 'source_origin': None,
-                         'source_excerpt': None, 'request_key': None}
-                if str(UUID(saved['project_id'])) != saved['project_id']:
-                    raise SetupPending('Use a canonical cloud project UUID.')
-                if saved['create']:
-                    saved.update(name=ask('Truthful project name'), request_key=str(uuid4()),
-                                 source_origin='owner terminal setup',
-                                 source_excerpt=f'Owner explicitly requested creation of the project for {root}.')
-                saved['no_git'] = not confirm('Use Git lifecycle for this project? (No selects explicit memory-only/no-Git mode)')
-                if not saved['no_git']:
-                    print('Enter the existing remote, its exact push URL and the currently checked-out branch. MAVEN validates but never changes them.')
-                    saved['remote'] = ask('Git remote name', 'origin')
-                    saved['accepted_url'] = validate_accepted_url(ask('Accepted Git push destination URL (no embedded credentials)'))
-                    saved['branch'] = ask('Current accepted branch')
-                    approve(f'Accept Git destination {saved["accepted_url"]}, remote {saved["remote"]}, branch {saved["branch"]}?', saved['branch'])
-                else:
-                    print('Explicit no-Git project: no Git synchronization will be performed.')
-            self.state['project'] = saved
-            self.save()
-        root = Path(saved['root'])
-        approve(f'Use the saved project selection {root}, cloud project {saved["project_id"]}?', str(root))
-        if not saved['existing']:
-            if saved['create']:
-                approve(f'Create/reconcile exactly the sourced project {saved["name"]!r} with stable request {saved["request_key"]}. No new request ID is generated on resume.', 'PROJECT ' + saved['project_id'])
-                from tools.memory.environment import configured_client
-                client = configured_client(self.env, values=self.values)
-                try:
-                    self.before_request(client, saved['request_key'])
-                finally:
-                    client.close()
-            args = {key: value for key, value in saved.items() if key != 'existing'}
-            args.update(root=root, env=self.env)
-            _initialize(argparse.Namespace(**args))
-        project = load_project(root)
-        if project['project_id'] != saved['project_id']:
-            raise SetupPending('Existing local project differs from the saved selection; it was not overwritten.')
-        if saved['existing']:
-            if project['git_enabled']:
-                approve(f'Preserve Git remote {project["remote"]}, accepted push URL {project["accepted_url"]}, and current branch {project["branch"]}?', project['branch'])
-                if (Path(_git(root, 'rev-parse', '--show-toplevel')).resolve() != root
-                        or _git(root, 'remote', 'get-url', '--push', project['remote']) != project['accepted_url']
-                        or _git(root, 'symbolic-ref', '--short', 'HEAD') != project['branch']):
-                    raise SetupPending('The existing Git checkout differs from its accepted project configuration; nothing was changed. Select the matching checkout/branch before resuming.')
-            elif not confirm('Preserve this explicitly memory-only/no-Git project?'):
-                raise SetupPending('Project selection paused; existing configuration was preserved.')
-        private_directory(root / '.maven' / 'runtime')
-        private_directory(root / '.maven' / 'runtime' / 'sessions')
-        generation = self.verify_authority(project['project_id'])
-        return root, generation
+        if saved and not self.state.get('ready_project'):
+            root = Path(saved['root'])
+            approve(f'Resume the original pending project at {root}? Its exact IDs and receipts will be preserved.', str(root))
+        else:
+            root = Path(ask('Actual project directory (not the tool installation checkout)',
+                            str(self.project_root) if self.project_root else None)).expanduser()
+        result = setup_project(argparse.Namespace(
+            root=root, env=self.env, non_interactive=False, create=False, project_id=None,
+            name=None, source_origin=None, source_excerpt=None, no_git=False,
+            remote=None, accepted_url=None, branch=None, check=[],
+        ))
+        return Path(result['project']['root']), result['authority_generation']
 
     def run(self):
         print('MAVEN guided configuration: private settings, explicit AWS identity, reviewed cloud actions, then your selected project. Never enter access keys, tokens or passwords here. Ctrl-C pauses safely.')
@@ -579,26 +412,35 @@ class Wizard:
             self.fresh()
         else:
             raise SetupPending('Invalid saved setup mode; preserve and inspect the state.')
-        self.verify_authority()
-        root, generation = self.project()
-        self.state['ready_project'] = str(root)
-        self.save()
-        print(f'\nReady: routine cloud access, complete applicable authority generation {generation}, and the cloud/local project were verified.')
-        print(f'Home: {self.home}\nPrivate settings: {self.env}\nVirtual environment: {sys.prefix}\nProject selection: {root / ".maven" / "project.json"}')
+        generation = self.verify_authority()
+        root = None
+        if confirm('Configure a project now? (No: instance ready; choose the actual project later in OMP)'):
+            root, generation = self.project()
+            self.state['ready_project'] = str(root)
+            self.save()
+            print(f'\nReady: routine cloud access, complete applicable authority generation {generation}, and the cloud/local project were verified.')
+            print(f'Project selection: {root / ".maven" / "project.json"}')
+        else:
+            print('\ninstance ready, project not configured in this run')
+            if self.state.get('project') and not self.state.get('ready_project'):
+                print('The original interrupted project receipt is preserved; resume its exact root before creating another project.')
+        print(f'Home: {self.home}\nPrivate settings: {self.env}\nVirtual environment: {sys.prefix}')
         print('For a new shell (never source .env):')
         print('export MAVEN_HOME=' + shlex.quote(str(self.home)))
         print('export PATH=' + shlex.quote(str(Path(sys.executable).parent)) + ':"$PATH"')
         if (self.home / 'activate').exists():
             print('Or load the installer environment, including any explicitly selected CA:')
             print('source ' + shlex.quote(str(self.home / 'activate')))
-        print('First command: maven-start-work --root ' + shlex.quote(str(root)))
+        print('Open the actual project directory in OMP and invoke /skill:maven-start-work.')
+        if root:
+            print('Verify selection: maven-project show --root ' + shlex.quote(str(root)))
         return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, default=Path(os.environ.get('MAVEN_HOME', str(Path.home() / '.maven'))))
-    parser.add_argument('--project-root', type=Path, default=Path.cwd())
+    parser.add_argument('--project-root', type=Path, help='Explicit project suggestion; still requires confirmation')
     args = parser.parse_args(argv)
     home = args.home.expanduser().absolute()
     os.environ['MAVEN_HOME'] = str(home)
@@ -625,7 +467,10 @@ def main(argv=None):
         print('Setup pending: selected AWS operation failed. Check the selected profile login, permissions, region and trusted CA; no fallback identity was used.', file=sys.stderr)
     except (OSError, ValueError, KeyError, TypeError, ProjectError):
         print('Setup pending: invalid or unavailable local settings/artifacts/project. Preserve existing files, check their paths and private permissions, and resume. No readiness was declared.', file=sys.stderr)
-    print('Resume: ' + shlex.join([str(Path(sys.executable).parent / 'maven-setup'), '--home', str(home), '--project-root', str(args.project_root)]), file=sys.stderr)
+    resume = [str(Path(sys.executable).parent / 'maven-setup'), '--home', str(home)]
+    if args.project_root is not None:
+        resume.extend(['--project-root', str(args.project_root)])
+    print('Resume: ' + shlex.join(resume), file=sys.stderr)
     print('Preserved setup artifacts: ' + str(home / 'runtime' / 'setup'), file=sys.stderr)
     return 1
 

@@ -64,7 +64,7 @@ class ProjectPackagingTests(unittest.TestCase):
                 client.close.assert_called_once()
                 before = (root / '.maven/project.json').read_bytes()
                 self.assertEqual(_initialize(args)['status'], 'unchanged')
-                factory.assert_called_once_with(args.env)
+                factory.assert_called_once_with(args.env, values=None)
                 self.assertEqual((root / '.maven/project.json').read_bytes(), before)
                 self.assertEqual((root / '.gitignore').read_text(), 'existing-pattern\n/.maven/\n')
                 args.project_id = str(uuid4())
