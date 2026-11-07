@@ -100,9 +100,11 @@ checkpoint reservations.
 
 ## Optional Google
 
-Install with `python3 install.py --google`, or install the package's `google` extra
-in your chosen environment. No Google API is called on import. The core package does
-not need this extra or a Google account.
+Choose Google dependencies in the guided `python3 install.py` flow or pass `--google`.
+To install local tools and the optional extra without opening cloud setup, use
+`python3 install.py --local-only --google`; an existing development environment can
+install the package's `google` extra directly. This does not request Google consent.
+No Google API is called on import. Core memory needs neither this extra nor a Google account.
 
 The owner must enable the needed APIs in their chosen Google Cloud project, configure
 the OAuth consent screen, create a Desktop OAuth client and review the requested

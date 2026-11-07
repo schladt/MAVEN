@@ -6,6 +6,12 @@ publication, durable records or concurrency before changing their contracts.
 
 ## Local development
 
+For first-time use, follow the [guided installer](README.md#install-and-set-up):
+`python3 install.py` creates its own private environment and offers cloud/project
+setup. No preexisting `.venv` or project `.maven` directory is required. For local
+package installation without the cloud wizard, use `python3 install.py --local-only`.
+The development environment below is a separate, optional contributor workflow.
+
 Use a virtual environment with Python 3.11 or newer:
 
 ```sh

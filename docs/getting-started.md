@@ -1,59 +1,154 @@
 # Getting started
 
-This guide distinguishes local installation, cloud preparation, cloud mutation and
-instruction activation. Do not run the later stages merely because installation
-succeeded. All shell variables denote your own reviewed values; MAVEN supplies no
-preconfigured account, endpoint, credentials or active owner authority.
+Start with the [README prerequisites](../README.md#before-you-start). A source
+checkout does not supply a configured virtual environment, private `.env`, or your
+project's `.maven` directory. The installer creates them in the selected locations;
+you do not need to prepare them manually.
 
-## 1. Install local tools
+## Guided first-time setup
 
-From the reviewed source checkout:
+From the cloned or extracted source folder:
 
 ```sh
 python3 install.py
-export PATH="$HOME/.maven/venv/bin:$PATH"
-maven-memory --help
 ```
 
-Requires Python 3.11+ and macOS/Linux (or WSL). Git is needed for Git projects;
-the AWS CLI is needed for the owner's interactive AWS login. The installer reports
-missing external tools without installing them or blocking local package setup.
-It creates an isolated environment and a private configuration template at
-`~/.maven/.env`. It does not execute AWS login, deploy or activate cloud instructions.
-Use `--home PATH` and set `MAVEN_HOME` to that path for a separate instance. No global
-current project is created.
+The default is interactive: choose the private installation home (default
+`~/.maven`), optional harness integrations and optional Google dependencies, then
+follow the cloud/project wizard. Python 3.11+ with `venv` is required. The installer
+checks Git and an AWS CLI with `aws login` support and gives installation guidance;
+it never silently installs system packages. Git is unnecessary for a no-Git project
+when you obtained the source through an archive.
 
-Optional `--harness NAME` installs generic bootstrap skills for `codex`, `claude`,
-`omp`, `copilot`, `gemini` or `antigravity`; repeat it to select multiple harnesses.
-Only the selected harnesses' documented user skill roots are modified. Copilot here
-means the local CLI; cloud-hosted agents need separately provisioned skills.
-The installer refuses conflicting existing files. For a custom active harness profile,
-select its skill directory with `--skill-dir PATH`; the installer does not guess
-custom profile locations. `--google` installs optional Google dependencies but does
-not request Google consent. Harness instructions explain connection only, not a
-hidden local replacement for owner cloud authority.
+The local installation creates `venv/`, `.env` when absent, private runtime/login
+cache directories and an `activate` shell snippet under the selected home. Afterward:
 
-Default skill locations follow the harness documentation:
+```sh
+source "$HOME/.maven/activate"
+```
 
-| Harness | User skill root |
+Use your selected home's `activate` path if different. This sets `MAVEN_HOME` and
+PATH; it is **not** the private `.env`. Never source `.env`.
+
+### Pick the connection path
+
+**Existing instance:** import a private nonsecret `.env` from an existing configured
+installation, or select an existing CloudFormation stack using a separately selected
+metadata/deployment identity. The wizard derives locators from actual stack outputs
+and asks you to confirm instance and principal identities. It does not redeploy,
+initialize an existing database, or activate replacement authority. Existing authority
+must already be available; missing authority is a blocker, not permission to reset it.
+
+**New instance:** provide the AWS account, stack/instance name, notification email,
+two availability zones and explicit routine and deployment identities. Review the
+limitations and costs below. The wizard prepares real artifacts, asks permission to
+create a change set, requires the actual review digest before execution, and separately
+asks approval for database initialization and exact starter authority candidates.
+Read the complete generated artifacts and candidate bodies before approving them.
+Declining any stage leaves setup pending, not complete.
+
+Use a named `aws login` profile and confirm the actual STS principal; never use root
+for routine access. A profile is a local label, not an access key. The wizard can
+create/authenticate that selected CLI profile through normal interactive AWS sign-in
+after your approval. Saved static-key profiles and implicit credential chains are
+not accepted by guided setup. Metadata/deployment access is selected separately and
+never becomes a silent fallback. Importing another installation's `.env` does not
+copy credentials or reuse another machine's cache paths: choose a local private cache
+folder (Enter accepts the created default). An existing approved local cache can be
+selected explicitly. See [AWS command-line sign-in](https://docs.aws.amazon.com/signin/latest/userguide/command-line-sign-in.html)
+for account/identity prerequisites and login permissions.
+
+Select and confirm the **project folder** separately. The checkout used to install
+MAVEN is only the initial suggestion, not automatic permission to register it. Choose
+an existing cloud project or create one using genuine owner source evidence. Confirm
+the accepted Git remote and branch, or choose no Git. The wizard uses `maven-project`
+to create `.maven/project.json`, runtime directories and ignore rules; it preserves
+existing project selections and never commits, pushes, pulls or switches branches.
+
+### Resume and first use
+
+After activating the installed commands, resume interrupted or declined setup with:
+
+```sh
+maven-setup
+```
+
+For a separate home or a different suggested project folder:
+
+```sh
+maven-setup --home /absolute/path/to/private-home --project-root /absolute/path/to/project
+```
+
+Those paths must be your actual selected directories. `--project-root` is a prompt
+default, not authorization to bind that folder. Keep the home, `runtime/setup` artifacts,
+review files and pending request receipts intact. The wizard resumes the same requests;
+there is no reset/redeploy flag. Unknown outcomes must be reconciled before retrying
+mutations. Existing infrastructure must never be reinitialized to recover onboarding.
+
+Completion requires verified routine cloud access, complete applicable authority and
+project configuration. The wizard prints actual paths and a first-use command.
+From the selected project folder, for example with Codex:
+
+```sh
+maven-start-work --root "$PWD" --harness codex
+```
+
+Choose your actual harness and retain the returned session UUID. See
+[Project workflow](workflow.md) for checkpoint, stop, no-Git and recovery details.
+
+### Installer options and harnesses
+
+`python3 install.py --local-only` installs local tools without invoking cloud setup.
+Use it for a package-only installation; downloads still require network access or an
+appropriate package cache, and it does not establish cloud readiness. `--home PATH`
+chooses another private home, `--google` installs
+optional client libraries without granting Google account access, and `--harness NAME`
+selects a harness (repeat for several). `--skill-dir PATH` explicitly selects a custom
+destination. Close affected harnesses before confirming skill installation; a
+noninteractive `--local-only` install also requires `--harness-stopped` when selecting
+harness files. Conflicting files are preserved; interactive setup can continue without
+changing them. Start a new harness afterward to discover the generic skills.
+
+| Harness | Default user skill root |
 | --- | --- |
-| [Codex](https://developers.openai.com/codex/skills) | `~/.agents/skills` |
-| [Claude Code](https://code.claude.com/docs/en/skills) | `~/.claude/skills` |
-| [OMP](https://github.com/can1357/oh-my-pi/blob/main/docs/skills.md) | `~/.omp/agent/skills` |
-| [Copilot CLI](https://docs.github.com/en/copilot/concepts/customizations/agent-skills) | `~/.copilot/skills` |
-| [Gemini CLI](https://geminicli.com/docs/cli/skills/) | `~/.gemini/skills` |
-| [Antigravity](https://antigravity.google/docs/skills) | `~/.gemini/config/skills` |
+| Codex | `~/.agents/skills` |
+| Claude Code | `~/.claude/skills` |
+| OMP | `~/.omp/agent/skills` |
+| Copilot CLI | `~/.copilot/skills` |
+| Gemini CLI | `~/.gemini/skills` |
+| Antigravity | `~/.gemini/config/skills` |
 
-Custom profile overrides require an explicit `--skill-dir` instead of assuming these
-default locations. Installing bootstrap skills does not configure cloud-hosted clients
-or grant them credentials.
+Custom profiles need an explicit destination; these are local installation targets,
+not a guarantee of runtime behavior for every harness version. Cloud-hosted clients
+require separately provisioned skills and credentials.
 
-Initial runtime exercise is limited to OMP. Codex, Claude Code, Copilot CLI, Gemini CLI
-and Antigravity have supported installation targets, but their end-to-end runtime
-behavior remains unverified. A documented skill location is not evidence that a
-particular harness version loaded or executed the workflow correctly.
+### VPNs and corporate certificates
 
-## 2. Choose identity, infrastructure and costs
+Ask your administrator for a trusted PEM CA bundle if your network requires one.
+Pass its actual path explicitly, for example:
+
+```sh
+python3 install.py --ca-bundle /absolute/path/to/approved-ca-bundle.pem
+```
+
+The installer validates the bundle and sets `AWS_CA_BUNDLE`, `SSL_CERT_FILE` and
+`REQUESTS_CA_BUNDLE` for its children. An explicitly selected bundle is recorded in
+a new private `activate` snippet for later sessions, never in `.env`. Existing
+activation snippets are preserved; if the CA selection differs, the installer prints
+the required exports instead. Use those commands before resuming setup. The PEM bundle
+must include the trusted roots needed by your network; obtain it from your administrator.
+No corporate roots ship in MAVEN, and TLS verification stays enabled. Do not accept
+an unverified certificate merely to get past an error.
+
+## Advanced manual reference
+
+The guided flow above is the normal entrypoint. The remaining sections document the
+underlying commands for deliberate manual administration, not extra prerequisites
+for `python3 install.py`. All shell variables below mean actual owner-reviewed values:
+define them from your private settings and command results before running examples.
+MAVEN provides no preconfigured account, endpoint, credentials or owner authority.
+
+### Deployment limitations and costs
 
 Edit the private `.env` as literal settings (mode `0600`); do not source it as a shell
 script. Uncomment only selected fields. Keep credentials in their designated provider
@@ -76,7 +171,7 @@ Configure these owner-selected groups:
 - Separate setup login: `MAVEN_DEPLOY_PROFILE`, `MAVEN_DEPLOY_EXPECTED_PRINCIPAL`,
   `MAVEN_DEPLOY_LOGIN_CACHE`. Keep login-cache directories private (`0700`) and
   separate. Authenticate these profiles explicitly using your approved AWS login
-  method before cloud commands; there is no automatic login or default-profile fallback.
+  method before manual cloud commands; there is no silent login or default-profile fallback.
 - Deployment: `MAVEN_STACK_NAME`, `MAVEN_INSTANCE_NAME`, `MAVEN_ACCOUNT_ID`,
   `MAVEN_CALLER_PRINCIPAL_ARN`, `MAVEN_NOTIFICATION_EMAIL`,
   `MAVEN_AVAILABILITY_ZONES` (two comma-separated selected zones), and optionally
@@ -97,7 +192,7 @@ are not spending caps and tagging/reporting may undercount or lag. Retained reso
 old versions and deletion protection mean deleting the stack is not full teardown;
 resource disposal requires separate review and approval.
 
-## 3. Prepare, review and apply the exact deployment
+### Prepare, review and apply an exact deployment
 
 Choose a private output directory that does not already contain an installation
 package. Preparation is offline:
@@ -148,7 +243,7 @@ initialization establishes the service schema/state, not a new arbitrary identit
 Use `install migrate --confirm-instance "$INSTANCE_ID"` only for a separately reviewed
 migration to an existing deployment. Initialization does not activate starter authority.
 
-## 4. Review and activate a complete starter authority
+### Review and activate a complete starter authority
 
 Starter preparation is offline and creates new proposal/page UUIDs, bodies and a
 manifest with dependency-safe `activation_order`:
@@ -192,7 +287,7 @@ approve the entire catalog. Activate every selected page's dependencies first. I
 write outcome is unknown, reconcile the exact request key with `maven-memory lookup
 --request-key "$REQUEST_KEY"` (add `--approval` for activation) before repeating it.
 
-## 5. Select the project and begin
+### Select the project manually
 
 Bind an existing cloud project or create a new owner-approved project using the
 explicit `maven-project init` interface in [Project workflow](workflow.md). Start with

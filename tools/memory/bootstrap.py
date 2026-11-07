@@ -18,7 +18,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 
 from .client import OPTIONAL_CONFIG_KEYS, MemoryClient, MemoryClientError, read_json, selected_session, validate_config
 from .deployment import OUTPUT_CONFIG, build
-from .environment import load_environment, selected_aws_session
+from .environment import load_environment, selected_aws_session, transport_ca_bundle
 
 
 def _digest(value):
@@ -31,6 +31,13 @@ def _private_json(path, value):
     with os.fdopen(fd, 'w', encoding='utf-8') as stream:
         json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
         stream.write('\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    directory = os.open(Path(path).parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 
 
 def _read_private(path):
@@ -42,8 +49,9 @@ def _read_private(path):
 
 def _cloud(values):
     session = selected_aws_session(values, deploy=True, region=values.get('MAVEN_AWS_REGION', 'us-east-1'))
-    return session.client('cloudformation', config=Config(connect_timeout=3, read_timeout=15,
-                                                         retries={'total_max_attempts': 1}))
+    return session.client('cloudformation', verify=transport_ca_bundle(),
+                          config=Config(connect_timeout=3, read_timeout=15,
+                                        retries={'total_max_attempts': 1}))
 
 
 def prepare(values, destination):

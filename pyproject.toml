@@ -19,6 +19,7 @@ dependencies = [
 google = ["google-auth-oauthlib>=1.2,<2", "google-api-python-client>=2,<3"]
 
 [project.scripts]
+maven-setup = "tools.setup:main"
 maven-memory = "tools.memory.cli:main"
 maven-workspace = "tools.workspace:main"
 maven-secrets = "tools.aws.secrets:main"
