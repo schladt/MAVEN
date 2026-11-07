@@ -207,6 +207,8 @@ class Wizard:
                 print('If a VPN/proxy requires a CA, source your installation activate file or set AWS_CA_BUNDLE to your trusted PEM bundle; TLS stays enabled.')
                 command = ['aws', 'login', '--profile', profile, '--region', region]
                 print('Owner login command: ' + shlex.join(command))
+                print('AWS sign-in may also offer AWS Agent Toolkit skills and an AWS MCP connection.')
+                print('Those are optional AWS integrations, separate from MAVEN; declining them does not block MAVEN setup.')
                 if attempt or not confirm('Run that interactive login now, using this terminal?'):
                     raise SetupPending('Complete the selected profile login, then resume this same setup.') from None
                 try:

@@ -74,6 +74,9 @@ wizard can open the normal AWS sign-in flow after you approve. You need an exist
 AWS identity with the required access; the installer does not create your AWS account
 or grant administrator permissions. Setup/deployment access is selected separately.
 
+AWS sign-in may also offer AWS skills and an AWS MCP connection. These are optional
+and separate from MAVEN; see [the AWS toolkit note](docs/getting-started.md#optional-aws-agent-toolkit).
+
 Next, explicitly select the folder you want to work in and an existing cloud project
 or a new project with real source evidence. The installer checkout is not automatically
 your project. Confirm the Git remote and branch, or choose **no Git** for memory-only

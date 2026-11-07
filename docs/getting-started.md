@@ -129,6 +129,26 @@ Custom profiles need an explicit destination; these are local installation targe
 not a guarantee of runtime behavior for every harness version. Cloud-hosted clients
 require separately provisioned skills and credentials.
 
+### Optional AWS Agent Toolkit
+
+During AWS sign-in, you may be offered AWS skills and an AWS MCP server connection.
+This is AWS's optional Agent Toolkit, not MAVEN. You can install it separately or
+decline it without blocking MAVEN setup. Fetching/listing skills such as Bedrock or
+billing does not itself deploy or enable those services.
+
+AWS installs skills globally for the selected agents. OMP supports Claude-format
+skills, but current upstream OMP requires opting into foreign user-level discovery
+through `enabledProviders`; the installed version and settings determine whether
+Claude's skills are picked up. Start a new OMP session afterward. AWS detecting
+Claude but not OMP does not establish incompatibility, and skill discovery alone
+does not establish an MCP connection.
+
+Skills influence agent behavior; MCP tools can read or change AWS resources where
+permissions allow. Use a least-privileged identity, not root or a broad deployment
+identity. MAVEN's approval gates do not automatically govern separate AWS MCP calls.
+See [AWS toolkit setup](https://docs.aws.amazon.com/agent-toolkit/latest/userguide/aws-cli.html)
+and [OMP skill discovery](https://github.com/can1357/oh-my-pi/blob/main/docs/skills.md).
+
 ### VPNs and corporate certificates
 
 Ask your administrator for a trusted PEM CA bundle if your network requires one.
