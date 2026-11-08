@@ -225,3 +225,17 @@ claims provider-side token revocation. Resume only after the owner's explicit fr
 login; no automatic renewal occurs. Authentication, identity, and validated-response
 integrity failures also request shared-access cleanup and report affected sessions.
 Transient transport failures preserve session state and receipts for explicit recovery.
+
+## Detach or retire instead of stopping work
+
+Stopping a session is not uninstalling MAVEN. Use the separately reviewed
+[`maven-uninstall` workflow](getting-started.md#uninstall-and-retirement) to detach
+a project, remove selected local installations, or retire/purge an instance.
+These scopes never imply one another.
+
+Project detachment retains cloud history by default. Explicit archival blocks new
+project work without hiding history; reactivation is separately planned. Uninstall
+barriers reject new local registrations and writer entry while leaving status and
+recovery readable. Offline detachment preserves exact unresolved local evidence and
+does not claim remote closure. Do not silently start another session to bypass a
+removal or retirement barrier.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
 import os
 from pathlib import Path
@@ -173,6 +174,7 @@ def main(argv=None) -> int:
     parser.add_argument('--local-only', action='store_true',
                         help='Install local tools only; no prompts, login, cloud setup, or project initialization')
     args = parser.parse_args(argv)
+    installation_locks = contextlib.ExitStack()
     try:
         if not args.local_only and not sys.stdin.isatty():
             raise ValueError('Guided setup needs an interactive terminal. Run python3 install.py in your terminal, '
@@ -230,6 +232,11 @@ def main(argv=None) -> int:
                 raise
             deferred, roots, plan = True, [], []
         _private_directory(home)
+        from tools.uninstall.local import _lock, reinstall_marker, finish_reinstallation
+        installation_locks.enter_context(_lock(home / 'runtime/registry.lock'))
+        completed_marker = reinstall_marker(home)
+        new_caches = [home / 'runtime' / name for name in ('aws-login-cache', 'aws-deploy-login-cache')
+                      if not (home / 'runtime' / name).exists()]
         for folder in ('runtime', 'runtime/aws-login-cache', 'runtime/aws-deploy-login-cache'):
             _private_directory(home / folder)
         environment = home / '.env'
@@ -237,6 +244,16 @@ def main(argv=None) -> int:
             _private_file(environment)
         installation = home / 'venv'
         _no_symlink_parents(installation)
+        # Never adopt a pre-existing virtual environment or pre-existing skills.
+        # Existing receipts are refreshed only for the runtime we actually upgrade.
+        from tools.uninstall.common import read_private
+        from tools.uninstall.local import MANIFEST, record_installation
+        receipt = home / MANIFEST
+        ownership = read_private(receipt) if receipt.exists() else {}
+        if ownership and (ownership.get('schema') != 1 or ownership.get('home') != str(home)):
+            raise ValueError('Installer ownership receipt does not match this home; preserved for review.')
+        own_runtime = not installation.exists() or str(installation) in ownership.get('owned', {})
+        own_activation = not (home / 'activate').exists()
         if installation.exists() and not (installation / 'pyvenv.cfg').is_file():
             raise ValueError(f'Existing non-venv target preserved: {installation}')
         print('\nStep 3/4 — Create/reuse the virtual environment and install MAVEN')
@@ -263,6 +280,16 @@ def main(argv=None) -> int:
             with target.open('xb') as stream:
                 stream.write(body)
         activation = _activation(home, ca_bundle)
+        owned_paths = [target for target, _ in plan]
+        if own_runtime:
+            owned_paths.append(installation)
+        if own_activation:
+            owned_paths.append(home / 'activate')
+        record_installation(home, source, owned_paths,
+                            [root / name / 'SKILL.md' for root in roots for name in SKILLS],
+                            cache_roots=new_caches)
+        finish_reinstallation(home, completed_marker)
+        installation_locks.close()
         print(f'\nLocal tools installed in {installation}. Private settings: {environment}')
         print('In each new terminal, activate this installation (no shell profiles were modified):')
         for command in activation:
@@ -295,6 +322,8 @@ def main(argv=None) -> int:
         print('If TLS verification failed on a corporate VPN, use --ca-bundle with an IT-approved PEM bundle. '
               'TLS verification must remain enabled.', file=sys.stderr)
         return 1
+    finally:
+        installation_locks.close()
 
 
 if __name__ == '__main__':

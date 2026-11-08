@@ -193,7 +193,7 @@ class MemoryClient:
                                'proposal_unavailable', 'page_unavailable', 'proposal_conflict', 'approval_invalid',
                                'invalid_request', 'not_authorized', 'authentication_required', 'context_stale',
                                'client_incompatible', 'dependency_unavailable', 'dependency_conflict',
-                               'context_incomplete', 'claim_conflict'}
+                               'context_incomplete', 'claim_conflict', 'project_archived'}
                     raise MemoryClientError(code if code in allowed else 'service_failure', request_key=request_key)
             remaining = deadline-time.monotonic()
             if remaining > 0:

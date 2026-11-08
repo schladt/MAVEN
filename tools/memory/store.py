@@ -56,6 +56,9 @@ def parameter(name, value):
 
 def safe_provider_error(error):
     code = getattr(error, "response", {}).get("Error", {}).get("Code")
+    message = getattr(error, "response", {}).get("Error", {}).get("Message", "")
+    if code == "DatabaseErrorException" and "project_archived" in message and "55000" in message:
+        return MemoryError("project_archived", 409)
     return MemoryError("warming" if code == "DatabaseResumingException"
                        else "temporarily_unavailable")
 
@@ -68,10 +71,16 @@ def control_document(config, state):
 def parse_control(raw, config, *, allow_maintenance=False, allow_legacy=False):
     try:
         document = decode_json(raw)
-        fields(document, CONTROL_KEYS)
+        fields(document, CONTROL_KEYS, {"uninstall"})
         uuid_string(document["instance_id"])
         uuid_string(document["recovery_epoch"])
         expected = control_document(config, document["state"])
+        if "uninstall" in document:
+            marker = document["uninstall"]
+            if (document["state"] != "maintenance" or not isinstance(marker, str)
+                    or len(marker) != 64 or any(char not in "0123456789abcdef" for char in marker)):
+                raise ValueError
+            expected["uninstall"] = marker
         if allow_legacy and document["data_scope"] in {"synthetic", "synthetic_and_owner_instructions"}:
             expected["data_scope"] = document["data_scope"]
         if document != expected or type(document["schema_version"]) is not int:

@@ -29,6 +29,7 @@ maven-start-work = "tools.workflow:start_main"
 maven-checkpoint = "tools.workflow:checkpoint_main"
 maven-stop-work = "tools.workflow:stop_main"
 maven-workflow = "tools.workflow:main"
+maven-uninstall = "tools.uninstall.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -41,6 +41,17 @@ other, including handover isolation and mismatched-resume rejection. Simulate cl
 boundaries for this local smoke; it is not proof of live AWS deployment or an
 end-to-end model-driven chat.
 
+For uninstall changes, use the existing interpreter and focused offline checks:
+
+```sh
+python3 -B -m unittest discover -s tests -p 'test_uninstall*.py'
+```
+
+These use temporary filesystem fixtures and mocked provider responses, not a new
+virtual environment or live AWS resources. Keep verification narrow: scope isolation,
+preservation/export, exact approval, and uncertain-outcome recovery. Do not claim
+live teardown, SQL concurrency, or successful restoration from these tests.
+
 ## Change requirements
 
 - Preserve explicit project/session selection and complete cloud-authority loading.

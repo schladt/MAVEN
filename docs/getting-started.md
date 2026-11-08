@@ -387,3 +387,184 @@ session UUID, distinct from any optional harness identity.
 Review [Security and privacy](security.md) before sharing retrieved context with an
 external model. Configure [optional integrations](integrations.md) only when needed;
 neither Google nor a secrets-file bucket is required to start core memory work.
+
+## Uninstall and retirement
+
+The installed `maven-uninstall` command offers an interactive guide when invoked
+without arguments. From this checkout, `python3 -m tools.uninstall` provides the
+same interface without reinstalling MAVEN. Local removal needs only system Python
+3.11+; cloud actions require the existing AWS dependencies and selected logins.
+
+### Select independent scopes
+
+`plan` inspects targets and writes private review/recovery files; it does not remove
+the selected targets. All paths and identifiers below mean your actual selections.
+
+| Selection passed to `maven-uninstall plan` | Effect |
+| --- | --- |
+| `--project "$PROJECT_ROOT"` | Detach that checkout; retain cloud memory |
+| `--machine --home "$MAVEN_HOME"` | Remove attributable tools/integration for that installation; leave project bindings and cloud resources |
+| `--cloud --home "$MAVEN_HOME"` | Retire the configured cloud instance; leave local installations and project files |
+
+Combine selectors to request more than one scope. Repeat `--project` or machine
+`--home` to select several targets. `--project-home` and `--cloud-home` explicitly
+choose different installations for their cloud operations; otherwise the first
+selected home is used. Overlapping installation homes require separate plans.
+Machine `--all-homes` covers current-user homes discovered from `~/.maven`,
+`MAVEN_HOME`, explicit paths, and the private installer registry
+`~/.maven-installations/installations.json`. It is not a filesystem-wide search or
+permission to remove another OS user's installation.
+
+For example, prepare local removal without contacting AWS:
+
+```sh
+maven-uninstall plan --project "$PROJECT_ROOT" --machine --home "$MAVEN_HOME" \
+  --offline --output "$PRIVATE_OPERATION_DIRECTORY"
+```
+
+The operation directory must be outside selected project/installation roots and
+export destinations. The default is `~/.maven-uninstall/<UUID>`. It contains
+`plan.json`, `journal.json`, and a hash-bound `runner/` copy of the implementation.
+Keep the whole directory private and intact; it is needed after installed tools
+have been removed. Review the entire plan, its targets, inventories, warnings,
+retained artifacts, and `plan_digest`.
+
+### Approve, inspect, and resume
+
+Stop affected local writers and close affected assistant harnesses before applying.
+These flags are truthful attestations, not commands that stop processes:
+
+```sh
+maven-uninstall apply --plan "$PRIVATE_OPERATION_DIRECTORY/plan.json" \
+  --confirm "$PLAN_DIGEST" --writers-quiescent --harnesses-stopped
+
+maven-uninstall status --plan "$PRIVATE_OPERATION_DIRECTORY/plan.json"
+
+maven-uninstall resume --plan "$PRIVATE_OPERATION_DIRECTORY/plan.json" \
+  --confirm "$PLAN_DIGEST" --writers-quiescent --harnesses-stopped
+```
+
+Use the exact digest from the reviewed plan. Purge additionally requires
+`--confirm-purge "$INSTANCE_ID"`; administrative abandonment additionally requires
+`--confirm-abandon "$INSTANCE_ID"`. Repeat those confirmations on resume.
+Changed identities/content require review, not an edited plan or deleted journal.
+
+`status` reads local receipts without contacting AWS and reports each selected
+scope separately. A completed scope is not a claim that retained artifacts are
+gone. Exit 2/`blocked` may mean an external effect occurred or deletion is pending;
+inspect the recorded action before resuming. Exit 130 indicates interruption.
+There is no automatic rollback of irreversible actions.
+
+The returned `recovery_command` uses a verified Python interpreter outside selected
+installation homes. Use that command after self-removal; to resume, replace its
+`status` arguments with the approved `resume` arguments above. The recovery runner
+is dependency-free for local cleanup, not a bundled AWS environment. Keep the
+cloud-capable interpreter, configuration, and selected login available until cloud
+actions finish. Combined plans perform cloud work before removing installed tools.
+
+### Project memory and local originals
+
+`--archive-project` explicitly archives the cloud project, affecting **all**
+checkouts using that project, not only the selected folder. History stays readable;
+new project work is blocked. Clean closure/reconciliation is required for archival.
+Archive/reactivate requires explicit migration using current tooling:
+
+```sh
+maven-memory install migrate --confirm-instance "$INSTANCE_ID"
+maven-uninstall plan --reactivate-project "$PROJECT_ROOT" \
+  --home "$MAVEN_HOME" --output "$PRIVATE_OPERATION_DIRECTORY"
+```
+
+Review migration separately before running it; uninstall never migrates implicitly.
+Reactivation uses the current binding or one unambiguous, digest-verified preserved
+`detached-project-*.json` binding. It restores cloud eligibility, not local attachment;
+select the project again through `maven-project setup` when ready.
+
+Local removal preserves originals, receipts, and ignore protection by default.
+`--export "$PRIVATE_EXPORT_DIRECTORY"` produces verified private ZIP archives,
+moving resolved originals/settings only after verification. Archives contain
+`inventory.json` and `data/` entries. Unresolved recovery evidence and a minimal
+detached project binding remain in place; the report distinguishes copies from moves.
+Credential caches are not included in recovery exports. Do not remove ignore rules
+while protected `.maven` artifacts remain.
+
+`--offline` permits local detachment when cloud access or packages are unavailable.
+After actual local writers stop, it archives exact selected local session/lease
+evidence and invalidates those local registrations. It does **not** close cloud
+sessions, archive cloud projects, or recover unsaved work. Offline mode cannot
+perform cloud removal, archival, or reactivation.
+
+### Machine ownership and legacy installations
+
+New installs record artifact ownership in `<home>/installation.json`; project
+integration ownership is separate from the existing project configuration schema.
+Uninstall preserves modified, shared, or uncertain artifacts and never deletes a
+source checkout. Dedicated installer-owned local caches can be removed only when
+no unselected installation is known to need them. External/shared caches and
+general AWS configuration remain; local deletion does not claim provider token
+revocation.
+
+Older installations without ownership receipts are preserved unless you explicitly
+add `--adopt-legacy` to a machine plan. Adoption verifies a dedicated, non-editable
+MAVEN virtual environment and inventories its exact contents for approval. It does
+not claim ownership of arbitrary old skills or unrelated directories.
+
+Completed machine removal marks the installation inactive and removes its discovery
+registration while retaining recovery evidence. Explicit reinstallation can clear
+only a matching completed-removal barrier; pending removal must be reconciled first.
+
+### Cloud retirement, purge, and retained charges
+
+Cloud planning verifies the actual account, region, instance, stack, resources, and
+selected administrative identities. Use a separately selected deployment login
+whose permissions survive stack deletion, plus the configured database-admin role
+for the write barrier. Permissions are not granted automatically. Missing access
+blocks the operation; no default/root or administrator fallback is used.
+
+Default `--cloud-mode retire` establishes persistent maintenance, drains service
+writes, creates and checks a final database snapshot, and preserves required
+versioned resources, secrets, encryption dependencies, deployed runtime code, and
+recovery metadata before removing running infrastructure. The recovery manifest is
+saved locally and in the recovery bucket. Snapshot availability and manifest/object
+verification are **not** proof of a successful restore.
+
+`--cloud-mode purge` requires the separate instance confirmation and removes only
+reviewed instance resources. It handles retained infrastructure, deletion
+protection, object versions, and delete markers rather than assuming stack deletion
+is sufficient. Unselected backups and encryption keys remain. Secrets Manager
+deletion uses a seven-day recovery window and remains pending until absence is
+confirmed; it is not reported as immediate erasure.
+
+Clean session closure is the default. `--abandon-sessions` is a separate reviewed
+choice for unreachable clients. It preserves unfinished session/request evidence,
+blocks new cloud writes across machines, and makes no normal-closure or unsaved-work
+recovery claim. Bootstrap/migrate cannot silently clear this retirement barrier.
+
+Optional resources outside the stack are preserved unless individually selected:
+
+- `--optional-resource s3:BUCKET`
+- `--optional-resource ssm:/absolute/prefix/`
+- `--optional-resource secret:SECRET_ARN`
+- `--retained-resource ARN` for an exact retained S3 bucket, cluster snapshot,
+  automated-backup set, or supported retired secret.
+
+Dedicated external resources need exact instance/exclusive ownership evidence
+(`MavenInstanceId`, `MavenExclusive=true`, `DataScope=owner_memory`) and dependency
+checks. Tags are not permission to misclassify shared storage. Uncertain resources
+stay protected. Retirement records ownership for its proven retained resources so
+a later individually reviewed purge can identify them after the stack is gone.
+Wrapping keys cannot be selected for removal while retained encrypted-file storage
+still needs them. Removing stored Google credentials does not delete Google content,
+accounts, or prove grant revocation.
+
+Review all retained resources and charges. Retention locks, permission failures,
+concurrent changes, and asynchronous provider deletion may leave work pending.
+Preserve the original operation directory and resume; do not treat a timeout as
+permission to start a replacement operation.
+
+### Verification limits
+
+Uninstall verification uses focused temporary-file tests, stateful mocked AWS
+responses, and a local CLI smoke scenario. No cloud resources or separate testing
+environment are created. Live IAM permissions, PostgreSQL concurrency, AWS teardown,
+and restoration have not been exercised by those checks.

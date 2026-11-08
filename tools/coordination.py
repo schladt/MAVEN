@@ -83,10 +83,37 @@ class SessionRegistry:
                     result.append(item)
         return result
 
+    def _allow_work(self, root):
+        """Called only under registry.lock, shared with uninstall marker writes."""
+        path = private_path(self.home, 'runtime/uninstall.json')
+        if not path.exists():
+            return
+        marker = read_private(self.home, 'runtime/uninstall.json')
+        roots = marker.get('project_roots')
+        actions = marker.get('actions', {})
+        if (set(marker) - {'schema', 'whole_home', 'project_roots', 'actions'}
+                or type(marker.get('schema')) is not int or marker['schema'] != 1
+                or type(marker.get('whole_home')) is not bool or not isinstance(roots, list)
+                or any(not isinstance(value, str) or not Path(value).is_absolute()
+                       or self.key(value) != value for value in roots)):
+            raise CoordinationError('uninstall marker is malformed; preserve it for recovery')
+        if (not isinstance(actions, dict) or any(
+                not isinstance(key, str) or len(key) != 64
+                or any(char not in '0123456789abcdef' for char in key)
+                or not isinstance(value, dict) or set(value) != {'root'}
+                or (value['root'] is not None and
+                    (not isinstance(value['root'], str) or value['root'] not in roots))
+                or (value['root'] is None and not marker['whole_home'])
+                for key, value in actions.items())):
+            raise CoordinationError('uninstall action identity is malformed; preserve it for recovery')
+        if marker['whole_home'] or self.key(root) in roots:
+            raise CoordinationError('uninstall barrier prohibits new work; status and recovery remain available')
+
     def register(self, root, project_id, session_id, values, *, harness=None, harness_session=None):
         session_uuid(session_id)
         key = self.key(root)
         with self.transaction() as state:
+            self._allow_work(root)
             if session_id in state['sessions']:
                 raise CoordinationError('session is already registered; explicitly resume it')
             if key in state['reservations']:
@@ -111,6 +138,7 @@ class SessionRegistry:
 
     def activate(self, root, session_id):
         with self.transaction() as state:
+            self._allow_work(root)
             item = self._session(state, root, session_id)
             if self.key(root) in state['reservations']:
                 raise CoordinationError('repository reservation prevents writer resume')
@@ -178,6 +206,7 @@ class SessionRegistry:
                 raise CoordinationError('cannot release another session reservation')
             state['reservations'].pop(self.key(root), None)
             if activate:
+                self._allow_work(root)
                 item['state'] = 'active'
                 item.pop('pause_ack', None)
 
@@ -185,6 +214,7 @@ class SessionRegistry:
     def writer(self, root, session_id):
         token = str(uuid.uuid4())
         with self.transaction() as state:
+            self._allow_work(root)
             item = self._session(state, root, session_id)
             if item['state'] != 'active' or self.key(root) in state['reservations'] or self.pending(root, session_id):
                 raise CoordinationError('session is paused or repository is reserved; writes are prohibited')

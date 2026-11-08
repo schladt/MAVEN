@@ -60,6 +60,25 @@ retrying. In particular, an ambiguous Gmail send retains its reservation; deleti
 to retry can send duplicates. Google credential locking is local, not a cross-host SSM
 compare-and-swap guarantee.
 
+## Uninstall boundaries
+
+Project, machine, and cloud removal require separate explicit selections. Plans
+bind targets and implementation hashes; private operation journals and recovery
+code remain outside deletion roots. Never delete that evidence to bypass a blocked
+uninstall. Local artifacts with uncertain ownership, modified skills, shared caches,
+and unselected cloud resources remain protected and must be reported as retained.
+
+Offline detachment invalidates selected local registrations only after stopped-writer
+attestation and lock checks; archived local evidence does not prove cloud closure.
+Cloud retirement uses persistent maintenance plus database transaction draining.
+Administrative abandonment preserves unfinished records rather than fabricating
+completion. Irreversible actions cannot be rolled back automatically.
+
+Exports contain sensitive originals and metadata; keep them private. A verified
+snapshot/manifest is not a live restore test. Remaining backups, keys, object
+versions, and provider deletion windows can retain data and incur charges.
+See [uninstall guidance](getting-started.md#uninstall-and-retirement).
+
 ## Practical limits
 
 Secret-pattern scans are heuristics and can miss sensitive content. Cryptography does

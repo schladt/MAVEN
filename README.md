@@ -140,6 +140,21 @@ installation. Instance readiness requires verified cloud access and complete
 applicable authority; project readiness is reported separately if you defer that
 optional step. A local package installation alone is not readiness.
 
+## Uninstall selected scopes
+
+Run `maven-uninstall` for guided removal, or `python3 -m tools.uninstall` from
+this checkout. **Project, machine, and cloud removal are independent choices**;
+select any combination without implicitly removing the others.
+
+Project memory and protected local artifacts are retained by default. Cloud removal
+defaults to recoverable retirement; permanent purge requires separate approval.
+Every operation has an exact reviewed plan and an external recovery directory.
+Local offline detachment works without AWS packages or login.
+
+Close affected harnesses and writers before applying removal. See
+[Uninstall and retirement](docs/getting-started.md#uninstall-and-retirement) for
+scope selection, legacy installations, export, retained charges, and recovery.
+
 ## Options and safety
 
 - `python3 install.py --local-only` installs local tools without running cloud setup.

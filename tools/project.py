@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -152,7 +153,7 @@ def _git(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _ensure_ignore(root: Path) -> None:
+def _ensure_ignore(root: Path) -> dict:
     """Append only the local runtime exclusion, retaining all existing content."""
     target = root / '.gitignore'
     fd = os.open(target, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0), 0o644)
@@ -160,10 +161,29 @@ def _ensure_ignore(root: Path) -> None:
         if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
             raise ProjectError('.gitignore must be a regular file')
         content = stream.read()
+        appended = b'/.maven/' not in content.splitlines()
         if b'/.maven/' not in content.splitlines():
             stream.write((b'\n' if content and not content.endswith(b'\n') else b'') + b'/.maven/\n')
             stream.flush()
             os.fsync(stream.fileno())
+        stream.seek(0)
+        return {'path': str(target), 'appended': appended,
+                'sha256': hashlib.sha256(stream.read()).hexdigest()}
+
+
+def _record_integration(root: Path, payload: bytes, ignore: dict) -> None:
+    """Separate ownership history; project.json's schema remains unchanged."""
+    from tools.uninstall.common import read_private, save_private
+    target = root / '.maven/integration.json'
+    receipt = read_private(target) if target.exists() else {
+        'schema': 1, 'root': str(root), 'integrations': []}
+    if (receipt.get('schema') != 1 or receipt.get('root') != str(root)
+            or not isinstance(receipt.get('integrations'), list)):
+        raise ProjectError('existing integration ownership receipt is invalid; preserved')
+    entry = {'project_sha256': hashlib.sha256(payload).hexdigest(), 'ignore': ignore}
+    if entry not in receipt['integrations']:
+        receipt['integrations'].append(entry)
+    save_private(target, receipt)
 
 
 def validate_git(root: Path, project: dict) -> None:
@@ -179,6 +199,15 @@ def validate_git(root: Path, project: dict) -> None:
 
 
 def _initialize(args) -> dict:
+    # Serialize binding with uninstall's persistent local removal marker.
+    from tools.coordination import SessionRegistry, private_lock
+    home = Path(args.env).expanduser().absolute().parent
+    with private_lock(home, 'runtime/registry.lock', blocking=False):
+        SessionRegistry(home)._allow_work(args.root)
+        return _initialize_bound(args)
+
+
+def _initialize_bound(args) -> dict:
     root = args.root.expanduser().resolve(strict=True)
     if not root.is_dir() or root == Path(root.anchor):
         raise ProjectError('project root must be an existing directory, never filesystem /')
@@ -229,13 +258,14 @@ def _initialize(args) -> dict:
     finally:
         client.close()
     _private_directory(directory, create=True)
-    _ensure_ignore(root)
+    ignore = _ensure_ignore(root)
     payload = (json.dumps(project, indent=2) + '\n').encode()
     fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
     with os.fdopen(fd, 'wb') as stream:
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
+    _record_integration(root, payload, ignore)
     return {'status': 'initialized', 'project': project}
 
 

@@ -17,7 +17,8 @@ MIGRATION_SEPARATOR = "\n-- statement\n"
 MIGRATION_FILES = ("001_foundation.sql", "002_fact_change.sql", "003_current_versions.sql",
                    "004_instructions.sql", "005_owner_instructions.sql", "006_owner_memory.sql",
                    "007_memory_instruction_guards.sql", "008_service_state_lock.sql",
-                   "009_named_skill_context.sql", "010_skill_resources.sql")
+                   "009_named_skill_context.sql", "010_skill_resources.sql",
+                   "011_project_lifecycle.sql")
 
 
 def migrations():
@@ -240,6 +241,8 @@ def _run(config, session, *, upgrade=False):
         db = DataAPI(data, config, admin=True)
         _check_logging(db)
         control, etag = _control(s3, config)
+        if control.get("uninstall"):
+            _refuse()
         if upgrade and (control["state"] == "ready" or control["data_scope"] != ROLLOUT_SCOPE):
             _put_control(s3, config, "maintenance", etag=etag)
             control, _ = fetch_control(s3, config, allow_maintenance=True)
@@ -248,6 +251,8 @@ def _run(config, session, *, upgrade=False):
         _install(db, config, session.client("secretsmanager", **kwargs), control, upgrade=upgrade)
         _verify_application(DataAPI(data, config), config)
         control, etag = fetch_control(s3, config, allow_maintenance=True)
+        if control.get("uninstall"):
+            _refuse()
         with db.transaction() as tx:
             db.execute("SELECT 1 FROM pg_advisory_xact_lock(1967318421)", transaction=tx)
             _identity(_state(db, tx), config)
