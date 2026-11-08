@@ -68,6 +68,19 @@ code remain outside deletion roots. Never delete that evidence to bypass a block
 uninstall. Local artifacts with uncertain ownership, modified skills, shared caches,
 and unselected cloud resources remain protected and must be reported as retained.
 
+TUI confirmations show complete targets but require only their first six characters
+(or the whole shorter identity). That entry is an accidental-click guard, not a
+unique identifier or authorization lookup. Execution remains bound to the complete
+reviewed target and plan digest; changed plans invalidate approval. Purge and
+administrative abandonment remain separate approvals.
+
+The uninstall UI runs from a private offline snapshot outside installation homes;
+its worker uses the exact reviewed runner. Dependency snapshots retain installed
+package code and license notices, not credential caches. The temporary UI copy is
+removed after exit; operation-local worker dependencies remain with recovery evidence.
+Quit requests a safe action boundary, not termination of an in-flight mutation.
+Remote operations already submitted may continue after the local worker stops.
+
 Offline detachment invalidates selected local registrations only after stopped-writer
 attestation and lock checks; archived local evidence does not prove cloud closure.
 Cloud retirement uses persistent maintenance plus database transaction draining.

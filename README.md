@@ -50,13 +50,22 @@ Alternatively, download and extract this repository's source archive, open a ter
 in the extracted folder, and run `python3 install.py`. You do **not** need an existing
 virtual environment, private `.env`, or project `.maven` directory.
 
-The interactive installer asks where to install (default `~/.maven`), which assistant
-harnesses to integrate, and whether to include optional Google dependencies. It
+The full-screen Textual installer asks where to install (default `~/.maven`), which
+assistant harnesses to integrate, and whether to include optional Google dependencies.
+If UI dependencies are missing, a brief bootstrap prompt asks permission to download
+them into a temporary private runtime; system Python is never modified. The installer
 creates a private home, login-cache/runtime directories and its own `venv`, installs
-the commands, and opens the setup wizard. Harness choices are `codex`, `claude`,
-`omp`, `copilot`, `gemini`, `antigravity`, or none. Close affected harnesses before
+the commands and UI dependencies, and opens the full-screen setup wizard. Harness
+choices are `codex`, `claude`, `omp`, `copilot`, `gemini`, `antigravity`, or none. Close affected harnesses before
 approving skill installation; existing conflicting skills are never overwritten.
 These are installation targets, not a claim that every harness has been runtime-tested.
+
+Use Tab/Shift+Tab, arrow keys, Space and Enter, or the mouse. Ctrl+Q/Ctrl+C requests
+a safe pause; it does not undo completed work or cancel an AWS operation already
+submitted. AWS sign-in temporarily takes over the terminal, then returns to setup.
+Reviews show full artifacts and identities. Destructive approvals require only the
+first six characters of the displayed target identity (the entire identity if shorter);
+the backend still receives the complete reviewed identity and digest.
 
 The wizard offers two paths:
 
@@ -142,14 +151,18 @@ optional step. A local package installation alone is not readiness.
 
 ## Uninstall selected scopes
 
-Run `maven-uninstall` for guided removal, or `python3 -m tools.uninstall` from
-this checkout. **Project, machine, and cloud removal are independent choices**;
-select any combination without implicitly removing the others.
+Run `maven-uninstall` for the full-screen operation dashboard, or
+`python3 -m tools.uninstall` from this checkout using an interpreter with the `[ui]`
+dependencies. Inspect or resume a saved operation, or start a new guided plan.
+**Project, machine, and cloud removal are independent choices**; selecting one
+never implicitly selects the others.
 
 Project memory and protected local artifacts are retained by default. Cloud removal
 defaults to recoverable retirement; permanent purge requires separate approval.
 Every operation has an exact reviewed plan and an external recovery directory.
-Local offline detachment works without AWS packages or login.
+The TUI stays available through self-removal using an offline private runtime copy.
+Noninteractive `plan`, `apply`, `resume`, and `status` remain available; local offline
+detachment and recovery require neither Textual nor AWS packages or login.
 
 Close affected harnesses and writers before applying removal. See
 [Uninstall and retirement](docs/getting-started.md#uninstall-and-retirement) for

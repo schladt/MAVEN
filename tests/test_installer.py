@@ -1,13 +1,17 @@
 """Local bootstrap failure boundaries; no cloud calls or package installs."""
+import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import install
+from tools.interaction import OperationPaused, using
 
 
 class InstallerTests(unittest.TestCase):
@@ -40,6 +44,41 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual({key: os.environ.get(key) for key in keys}, before)
             self.assertFalse(home.exists())
+
+    def test_declined_local_review_creates_no_installation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve() / 'not-created'
+            args = argparse.Namespace(home=home, google=False, harness=[], skill_dir=[],
+                                      ca_bundle=None, local_only=True, harness_stopped=False)
+            ui = Mock()
+            ui.review.return_value = False
+            with using(ui), patch.object(install, '_prerequisites'), \
+                    patch.object(install, '_install_command') as command:
+                with self.assertRaises(OperationPaused):
+                    install._install(args)
+            command.assert_not_called()
+            self.assertFalse(home.exists())
+
+    def test_failed_package_command_cannot_leak_its_output_into_terminal(self):
+        script = """
+import sys
+import install
+from tools.interaction import using
+with using(object()):
+    try:
+        install._install_command([sys.executable, '-c',
+            "import sys; print('private-output'); print('private-error', file=sys.stderr); sys.exit(1)"])
+    except ValueError as error:
+        print(error)
+    else:
+        raise SystemExit('failed command was accepted')
+"""
+        result = subprocess.run([sys.executable, '-B', '-c', script],
+                                cwd=Path(install.__file__).parent,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('private-output', result.stdout + result.stderr)
+        self.assertNotIn('private-error', result.stdout + result.stderr)
 
 
 if __name__ == '__main__':

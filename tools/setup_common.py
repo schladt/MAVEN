@@ -7,28 +7,28 @@ from pathlib import Path
 import stat
 import tempfile
 
+from tools.interaction import Field, checkpoint, require
+
 
 class SetupPending(Exception):
     """A safe stop, not a successful setup."""
 
 
 def ask(prompt, default=None):
-    suffix = f' [{default}]' if default is not None else ''
-    while True:
-        value = input(prompt + suffix + ': ').strip()
-        value = value or default
-        if value and not any(ord(c) < 32 for c in value):
-            return value
-        print('Enter a value, or press Ctrl-C to pause setup.')
+    values = require().form(prompt, [Field('value', prompt, default or '')])
+    if values is None:
+        raise SetupPending('Selection paused; existing artifacts are preserved.')
+    return values['value']
 
 
 def confirm(prompt):
-    return input(prompt + ' [y/N]: ').strip().lower() in ('y', 'yes')
+    return require().confirm(prompt)
 
 
-def approve(prompt, token):
-    print(prompt)
-    if input(f'Type {token} exactly to approve (anything else pauses): ').strip() != token:
+def approve(prompt, token, *, body='', destructive=False):
+    checkpoint()
+    if not require().review(prompt, body or str(token), identity=str(token),
+                            destructive=destructive):
         raise SetupPending('Approval declined; no subsequent action was performed.')
 
 

@@ -19,12 +19,23 @@ From the cloned or extracted source folder:
 python3 install.py
 ```
 
-The default is interactive: choose the private installation home (default
-`~/.maven`), optional harness integrations and optional Google dependencies, then
-follow the cloud/project wizard. Python 3.11+ with `venv` is required. The installer
-checks Git and an AWS CLI with `aws login` support and gives installation guidance;
-it never silently installs system packages. Git is unnecessary for a no-Git project
-when you obtained the source through an archive.
+The default is a full-screen Textual interface: choose the private installation home
+(default `~/.maven`), optional harness integrations and optional Google dependencies,
+then follow the cloud/project screens. Python 3.11+ with `venv` is required. If UI
+dependencies are missing, a brief initial prompt requests consent to download them
+into a temporary private runtime. It never modifies system Python.
+
+Use Tab/Shift+Tab to move focus, arrows to select, Space to toggle checkboxes and
+Enter or the mouse to activate controls. Review panes are scrollable. At narrow
+widths the step sidebar is hidden; use at least an 80-column, 24-row terminal.
+Ctrl+Q or Ctrl+C requests a safe pause. The current action may need to finish first;
+already-submitted AWS work can continue remotely. Closing is not rollback and does
+not leave a persistent MAVEN background worker.
+
+The installer checks Git and an AWS CLI with `aws login` support and gives
+installation guidance; it never silently installs system packages. Choose local
+tools only when AWS prerequisites are unavailable. Git is unnecessary for a no-Git
+project when you obtained the source through an archive.
 
 The local installation creates `venv/`, `.env` when absent, private runtime/login
 cache directories and an `activate` shell snippet under the selected home. Afterward:
@@ -54,10 +65,13 @@ to reset it.
 
 **New instance:** provide the AWS account, stack/instance name, notification email,
 two availability zones and explicit routine and deployment identities. Review the
-limitations and costs below. The wizard prepares real artifacts, asks permission to
-create a change set, requires the actual review digest before execution, and separately
-asks approval for database initialization and exact starter authority candidates.
-Read the complete generated artifacts and candidate bodies before approving them.
+limitations and costs below. The wizard displays the generated package and complete
+change-set review, asks permission to create a change set, and binds the execution
+button to its exact review digest. Database initialization and each starter
+authority proposal/activation have separate review screens. Routine approvals use
+buttons; destructive approvals require the first six characters of the displayed
+target identity, or the full identity if shorter. You never need to copy a full hash
+into the TUI. Read the complete artifacts and candidate bodies before approving.
 Declining any stage leaves setup pending, not complete.
 
 Use a named `aws login` profile and confirm the actual STS principal; never use root
@@ -70,6 +84,10 @@ copy credentials or reuse another machine's cache paths: choose a local private 
 folder (Enter accepts the created default). An existing approved local cache can be
 selected explicitly. See [AWS command-line sign-in](https://docs.aws.amazon.com/signin/latest/userguide/command-line-sign-in.html)
 for account/identity prerequisites and login permissions.
+
+For interactive AWS sign-in, the TUI temporarily restores the normal terminal and
+resumes afterward. Authentication output is not captured into the progress log.
+The actual returned principal is verified before any subsequent cloud action.
 
 ### Optional project setup
 
@@ -107,6 +125,11 @@ default, not authorization to bind that folder. Keep the home, `runtime/setup` a
 review files and pending request receipts intact. The wizard resumes the same requests;
 there is no reset/redeploy flag. Unknown outcomes must be reconciled before retrying
 mutations. Existing infrastructure must never be reinitialized to recover onboarding.
+
+`maven-setup` opens the same setup screens and reads the existing receipts.
+After local installation finishes, choose **Open instance setup** to continue into
+the installed setup TUI, or decline to finish locally. If you pause instead, activate
+that installation and run `maven-setup` explicitly when ready.
 
 Instance completion requires verified routine cloud access and complete applicable
 authority. A declined optional project step does not invent project readiness.
@@ -390,10 +413,17 @@ neither Google nor a secrets-file bucket is required to start core memory work.
 
 ## Uninstall and retirement
 
-The installed `maven-uninstall` command offers an interactive guide when invoked
-without arguments. From this checkout, `python3 -m tools.uninstall` provides the
-same interface without reinstalling MAVEN. Local removal needs only system Python
-3.11+; cloud actions require the existing AWS dependencies and selected logins.
+The installed `maven-uninstall` opens a full-screen operation dashboard. From this
+checkout, `python3 -m tools.uninstall` opens the same interface when run with the
+installed `[ui]` dependencies. Dashboard discovery and inspection use local receipts,
+not live AWS queries. Choose a listed operation or open a custom `plan.json` path;
+start a new plan to select independent scopes and review their exact inventories.
+
+The TUI never downloads dependencies during uninstall. Activate the installed
+environment first. For an older manual installation, install this checkout's `[ui]`
+extra into that existing virtual environment before using the TUI. The noninteractive
+`plan`, `apply`, `resume`, and `status` interfaces remain dependency-free for local
+removal with Python 3.11+; cloud operations still need AWS packages and selected logins.
 
 ### Select independent scopes
 
@@ -429,7 +459,29 @@ Keep the whole directory private and intact; it is needed after installed tools
 have been removed. Review the entire plan, its targets, inventories, warnings,
 retained artifacts, and `plan_digest`.
 
+The interactive launcher stages a disposable private UI outside installation homes,
+so the screen survives removal of its original environment. Worker execution uses
+the exact hash-bound runner and offline copies of installed dependencies in
+`ui-runtime/` beside the plan. Those worker copies remain for recovery; the disposable
+launcher copy is removed after the TUI closes. No AWS credentials are copied into
+either dependency snapshot. Keep the entire operation directory private.
+
 ### Approve, inspect, and resume
+
+In the TUI, review the complete plan, then confirm each selected destructive target
+using only its first six characters (the full identity if shorter). The full target
+is shown, and the prefix never selects a target or substitutes for backend identity
+checks. Purge and administrative abandonment retain separate confirmations.
+Changed plans invalidate all collected approvals.
+
+Ctrl+Q/Ctrl+C stops dispatching new actions at the next saved action boundary, then
+closes the UI without a persistent background worker. In-flight remote operations
+may continue; resume reconciles the same plan. Do not delete its journal or start a
+replacement operation to bypass an uncertain outcome.
+
+Existing recovery snapshots created before the TUI worker protocol remain immutable:
+the dashboard can inspect them and shows their original CLI recovery command rather
+than replacing the approved implementation.
 
 Stop affected local writers and close affected assistant harnesses before applying.
 These flags are truthful attestations, not commands that stop processes:
@@ -452,15 +504,16 @@ Changed identities/content require review, not an edited plan or deleted journal
 `status` reads local receipts without contacting AWS and reports each selected
 scope separately. A completed scope is not a claim that retained artifacts are
 gone. Exit 2/`blocked` may mean an external effect occurred or deletion is pending;
-inspect the recorded action before resuming. Exit 130 indicates interruption.
-There is no automatic rollback of irreversible actions.
+inspect the recorded action before resuming. Exit 3 indicates a saved worker pause;
+exit 130 indicates an interactive pause/interruption. There is no automatic rollback.
 
 The returned `recovery_command` uses a verified Python interpreter outside selected
 installation homes. Use that command after self-removal; to resume, replace its
 `status` arguments with the approved `resume` arguments above. The recovery runner
-is dependency-free for local cleanup, not a bundled AWS environment. Keep the
-cloud-capable interpreter, configuration, and selected login available until cloud
-actions finish. Combined plans perform cloud work before removing installed tools.
+itself remains dependency-free for local cleanup. CLI-only cloud recovery needs the
+cloud-capable interpreter, configuration and selected login until cloud actions
+finish; the TUI also retains its verified dependency snapshot. Combined plans perform
+cloud work before removing installed tools.
 
 ### Project memory and local originals
 
@@ -564,7 +617,7 @@ permission to start a replacement operation.
 
 ### Verification limits
 
-Uninstall verification uses focused temporary-file tests, stateful mocked AWS
-responses, and a local CLI smoke scenario. No cloud resources or separate testing
-environment are created. Live IAM permissions, PostgreSQL concurrency, AWS teardown,
-and restoration have not been exercised by those checks.
+Verification stays local: focused temporary-file checks, simulated provider/package
+boundaries, headless Textual interactions and real-terminal smoke checks. No cloud
+resources or separate testing environment are required. Local removal/recovery checks
+are not proof of live IAM permissions, PostgreSQL concurrency, AWS teardown or restoration.

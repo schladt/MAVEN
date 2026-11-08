@@ -311,6 +311,12 @@ def main(argv=None) -> int:
     try:
         if args.command == 'setup':
             from tools.project_setup import setup_project
+            if not args.non_interactive:
+                from tools.tui import run_workflow
+                from tools.project_setup import interactive_project
+                return run_workflow('MAVEN project setup', [
+                    'Project selection', 'Project binding',
+                ], lambda ui: interactive_project(args))
             result = setup_project(args)
         else:
             result = _initialize(args) if args.command == 'init' else load_project(args.root)

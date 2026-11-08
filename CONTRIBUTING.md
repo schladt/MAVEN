@@ -24,11 +24,11 @@ Use a virtual environment with Python 3.11 or newer:
 
 ```sh
 python3 -m venv .venv
-.venv/bin/python -m pip install -e .
+.venv/bin/python -m pip install -e '.[ui]'
 .venv/bin/python -m unittest discover -s tests
 ```
 
-Install `-e '.[google]'` instead to exercise the optional Google tests. Those tests
+Install `-e '.[ui,google]'` instead to exercise the optional Google tests. Those tests
 use synthetic accounts and mocked services; no live Google access is required.
 Keep a separate private `MAVEN_HOME` for any explicitly authorized manual work.
 The repository must not contain your environment file, credentials, runtime state,
@@ -51,6 +51,19 @@ These use temporary filesystem fixtures and mocked provider responses, not a new
 virtual environment or live AWS resources. Keep verification narrow: scope isolation,
 preservation/export, exact approval, and uncertain-outcome recovery. Do not claim
 live teardown, SQL concurrency, or successful restoration from these tests.
+
+For TUI/controller changes, reuse the installed MAVEN virtual environment with the
+`[ui]` extra rather than creating a separate test environment:
+
+```sh
+PYTHONPATH=tests "$MAVEN_HOME/venv/bin/python" -B -m unittest \
+  test_tui test_uninstall_cli test_installer test_setup test_project_setup
+```
+
+Use temporary filesystem fixtures and simulated package/provider results. A brief
+real-terminal check should cover navigation, resizing and safe quit; do not deploy
+or delete cloud resources to verify presentation. Core local recovery must still
+work using system Python without importing Textual or AWS packages.
 
 ## Change requirements
 

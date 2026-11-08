@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from tools.memory.client import MemoryClientError
+from tools.interaction import OperationPaused, using
 from tools.setup import SetupPending, Wizard, read_private, save_json
 
 
@@ -40,7 +41,7 @@ class GuidedSetupTests(unittest.TestCase):
             session.client.return_value.get_caller_identity.return_value = {
                 'Arn': 'arn:aws:iam::123456789012:root', 'Account': '123456789012'}
             with patch('boto3.Session', return_value=session), patch('tools.setup.approve') as approve, \
-                    patch('builtins.input', return_value=''):
+                    using(Mock(form=Mock(return_value={'cache': str(wizard.home / 'runtime/aws-login-cache')}))):
                 with self.assertRaises(SetupPending):
                     wizard.identity()
             approve.assert_not_called()
@@ -55,7 +56,8 @@ class GuidedSetupTests(unittest.TestCase):
             wizard.settings({'MAVEN_AWS_REGION': 'us-east-1', 'MAVEN_AWS_PROFILE': 'selected'})
             session = Mock()
             session.get_credentials.return_value.method = 'shared-credentials-file'
-            with patch('boto3.Session', return_value=session), patch('builtins.input', return_value=''):
+            with patch('boto3.Session', return_value=session), \
+                    using(Mock(form=Mock(return_value={'cache': str(wizard.home / 'runtime/aws-login-cache')}))):
                 with self.assertRaises(SetupPending):
                     wizard.identity()
             session.client.assert_not_called()
@@ -69,12 +71,14 @@ class GuidedSetupTests(unittest.TestCase):
             wizard.settings({'MAVEN_STACK_NAME': 'selected-stack'})
             save_json(wizard.directory / 'change-set.json', {'review_sha256': 'exact-reviewed-digest'})
             manifest = {'deployment_inputs': {'InstanceId': instance}}
+            ui = Mock()
+            ui.review.return_value = False
             with patch.object(wizard, 'region'), patch.object(wizard, 'identity', return_value=(Mock(), {})), \
                     patch('tools.memory.bootstrap._package', return_value=(manifest, '', [])), \
                     patch('tools.memory.bootstrap.plan') as plan, \
                     patch('tools.memory.bootstrap.apply') as apply, \
                     patch('tools.memory.bootstrap.initialize') as initialize, \
-                    patch('builtins.input', return_value='some-other-digest'):
+                    using(ui):
                 with self.assertRaises(SetupPending):
                     wizard.fresh()
             plan.assert_not_called()
@@ -125,6 +129,21 @@ class GuidedSetupTests(unittest.TestCase):
             state = read_private(wizard.state_path)
             self.assertEqual(state['project'], saved)
             self.assertNotIn('ready_project', state)
+
+    def test_pause_before_request_keeps_original_submitted_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wizard = self.wizard(directory)
+            key = str(uuid4())
+            wizard.state['submitted_requests'] = [key]
+            wizard.save()
+            ui = Mock()
+            ui.checkpoint.side_effect = OperationPaused('pause')
+            client = Mock()
+            with using(ui), self.assertRaises(OperationPaused):
+                wizard.before_request(client, key)
+            client.invoke.assert_not_called()
+            self.assertEqual(read_private(wizard.state_path)['submitted_requests'], [key])
+
 
 
 if __name__ == '__main__':

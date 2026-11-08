@@ -7,9 +7,10 @@ import os
 from pathlib import Path
 import re
 import shlex
-import subprocess
 import sys
 from uuid import uuid4
+
+from tools.interaction import Field, OperationPaused, checkpoint, message, require, stage
 
 
 from tools.setup_common import (
@@ -39,6 +40,7 @@ class Wizard:
 
     def before_request(self, client, request_key):
         """Reconcile an explicitly resumed write before retrying its original request."""
+        checkpoint()
         from tools.memory.client import MemoryClientError
         submitted = self.state.setdefault('submitted_requests', [])
         if request_key in submitted:
@@ -70,18 +72,27 @@ class Wizard:
         from tools.memory.environment import selected_aws_session, transport_ca_bundle
         prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
         purpose = 'metadata/deployment' if deploy else 'routine'
+        stage('AWS identities')
         profile = self.values.get(prefix + 'PROFILE')
-        if profile is None:
-            profiles = [p for p in boto3.Session().available_profiles if re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', p)]
-            print('Configured AWS profiles: ' + (', '.join(profiles) or '(none)'))
-            print('Select a named profile; no ambient/default identity or privilege fallback is used.')
-            profile = ask(f'AWS {purpose} profile name')
+        cache_setting = self.values.get(prefix + 'LOGIN_CACHE')
+        if profile is None or cache_setting is None:
+            profiles = ([p for p in boto3.Session().available_profiles if re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', p)]
+                        if profile is None else [profile])
+            default_cache = self.home / 'runtime' / ('aws-deploy-login-cache' if deploy else 'aws-login-cache')
+            fields = []
+            if profile is None:
+                fields.append(Field('profile', f'Named AWS {purpose} profile'))
+            if cache_setting is None:
+                fields.append(Field('cache', f'Private {purpose} login-cache folder', str(default_cache)))
+            values = require().form(f'Select {purpose} identity', fields,
+                                    description='Configured profiles: ' + (', '.join(profiles) or '(none)') +
+                                    '\nNo ambient identity or privilege fallback. Never enter credentials.')
+            if values is None:
+                raise SetupPending('Identity selection paused.')
+            profile = profile or values['profile']
+            cache_setting = cache_setting or values['cache']
         if not re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', profile):
             raise SetupPending('Invalid profile name. Configure a named AWS CLI login profile, then resume.')
-        cache_setting = self.values.get(prefix + 'LOGIN_CACHE')
-        if cache_setting is None:
-            default_cache = self.home / 'runtime' / ('aws-deploy-login-cache' if deploy else 'aws-login-cache')
-            cache_setting = ask(f'Private {purpose} login-cache folder (Enter creates the default)', str(default_cache))
         cache = Path(cache_setting).expanduser()
         if not cache.is_absolute():
             raise SetupPending('The selected login cache must be an absolute private directory.')
@@ -109,16 +120,16 @@ class Wizard:
                     sts.close()
                 break
             except (BotoCoreError, ClientError):
-                print(f'Login unavailable for selected profile {profile}. Configure it with your owner-approved AWS login flow.')
-                print('If a VPN/proxy requires a CA, source your installation activate file or set AWS_CA_BUNDLE to your trusted PEM bundle; TLS stays enabled.')
+                message(f'Login unavailable for selected profile {profile}. Configure it with your owner-approved AWS login flow.')
+                message('If a VPN/proxy requires a CA, source your installation activate file or set AWS_CA_BUNDLE to your trusted PEM bundle; TLS stays enabled.')
                 command = ['aws', 'login', '--profile', profile, '--region', region]
-                print('Owner login command: ' + shlex.join(command))
-                print('AWS sign-in may also offer AWS Agent Toolkit skills and an AWS MCP connection.')
-                print('Those are optional AWS integrations, separate from MAVEN; declining them does not block MAVEN setup.')
+                message('Owner login command: ' + shlex.join(command))
+                message('AWS sign-in may also offer AWS Agent Toolkit skills and an AWS MCP connection.')
+                message('Those are optional AWS integrations, separate from MAVEN; declining them does not block MAVEN setup.')
                 if attempt or not confirm('Run that interactive login now, using this terminal?'):
                     raise SetupPending('Complete the selected profile login, then resume this same setup.') from None
                 try:
-                    result = subprocess.run(command, check=False)
+                    result = require().external(command, check=False)
                 except FileNotFoundError:
                     raise SetupPending('Install AWS CLI v2 with aws login support, then run the displayed login command.') from None
                 if result.returncode:
@@ -129,8 +140,9 @@ class Wizard:
         expected = self.values.get(prefix + 'EXPECTED_PRINCIPAL')
         if expected and arn != expected:
             raise SetupPending('The selected login does not match the saved expected principal. Log in as that principal; settings and pending requests are preserved.')
-        print(f'Actual {purpose} principal: {arn}\nAccount: {identity.get("Account", "unknown")}\nRegion: {region}')
-        approve(f'Confirm this explicitly selected {purpose} identity.', arn)
+        message(f'Actual {purpose} principal: {arn}\nAccount: {identity.get("Account", "unknown")}\nRegion: {region}')
+        approve(f'Confirm this explicitly selected {purpose} identity.', arn,
+                body=f'Principal: {arn}\nAccount: {identity.get("Account", "unknown")}\nRegion: {region}\nProfile: {profile}\nLogin cache: {cache}')
         self.settings({prefix + 'EXPECTED_PRINCIPAL': arn})
         return selected_aws_session(self.values, deploy=deploy, region=region), identity
 
@@ -148,10 +160,10 @@ class Wizard:
         if not self.values.get('MAVEN_MEMORY_INSTANCE_ID'):
             method = self.state.get('existing_source')
             if method is None:
-                print('How would you like to connect to your existing MAVEN instance?')
-                print('  1. Import settings from another installation’s .env file (usually ~/.maven/.env)')
-                print('  2. Find the existing deployment in AWS (CloudFormation stack)')
-                method = {'1': 'import', '2': 'stack'}.get(ask('Choose 1 or 2', '1'))
+                method = require().choose('Connect existing instance', (
+                    ('Import private settings', 'import'),
+                    ('Select an existing CloudFormation stack', 'stack')),
+                    description='Existing mode never deploys, initializes, or replaces authority.')
             if method == 'import':
                 source = Path(ask('Absolute path to the existing owner-private .env (0600)')).expanduser()
                 if not source.is_absolute():
@@ -166,7 +178,7 @@ class Wizard:
                 if conflicts:
                     raise SetupPending('Imported settings conflict with saved selections (' + ', '.join(sorted(conflicts)) + '). Use the matching installation home; nothing was overwritten.')
                 self.settings(imported)
-                print('Imported connection and identity selections. Login caches are selected locally; credentials are never copied.')
+                message('Imported connection and identity selections. Login caches are selected locally; credentials are never copied.')
             elif method != 'stack':
                 raise SetupPending('Choose 1 or 2 when resuming.')
             else:
@@ -176,22 +188,26 @@ class Wizard:
         self.identity()
         if not self.values.get('MAVEN_MEMORY_INSTANCE_ID'):
             session, _ = self.identity(deploy=True)
-            print('This separately selected identity is used only for CloudFormation metadata; existing mode never deploys or initializes.')
+            message('This separately selected identity is used only for CloudFormation metadata; existing mode never deploys or initializes.')
             cloud = session.client('cloudformation', verify=transport_ca_bundle())
             try:
                 stack = self.values.get('MAVEN_STACK_NAME')
                 if not stack:
                     if confirm('List existing CloudFormation stacks with this selected metadata identity?'):
+                        stacks = []
                         for page in cloud.get_paginator('list_stacks').paginate(StackStatusFilter=['CREATE_COMPLETE', 'UPDATE_COMPLETE']):
-                            for item in page['StackSummaries']:
-                                print(item['StackName'])
-                    stack = ask('Exact existing CloudFormation stack name or ARN')
+                            stacks.extend((item['StackName'], item['StackId']) for item in page['StackSummaries'])
+                        stack = require().choose('Select the exact existing stack',
+                                                 tuple(stacks) + (('Enter another exact name or ARN', ''),))
+                    if not stack:
+                        stack = ask('Exact existing CloudFormation stack name or ARN')
                     self.settings({'MAVEN_STACK_NAME': stack})
                 result = cloud.describe_stacks(StackName=stack)['Stacks']
                 if len(result) != 1:
                     raise SetupPending('Select exactly one existing stack.')
                 config = bootstrap._outputs(result[0])
-                approve(f'Bind existing stack {stack}, instance {config["instance_id"]}, recovery epoch {config["recovery_epoch"]}?', config['instance_id'])
+                approve(f'Bind existing stack {stack} without deployment or initialization?', config['instance_id'],
+                        body=json.dumps({'stack': stack, 'connection': config}, indent=2))
                 bootstrap.connect(self.values, self.env, confirm_instance=config['instance_id'], cloud=cloud)
                 self.values = load_environment(self.env)
             finally:
@@ -218,16 +234,26 @@ class Wizard:
             package = self.directory / 'package'
             has_package = package.exists()
             updates = {'MAVEN_ACCOUNT_ID': account, 'MAVEN_CALLER_PRINCIPAL_ARN': caller}
-            for key, prompt, default in (
-                ('MAVEN_STACK_NAME', 'New CloudFormation stack name (must not be an existing stack)', None),
-                ('MAVEN_INSTANCE_NAME', 'Instance name (2–32 lowercase letters/digits/hyphens, starting with a letter)', None),
-                ('MAVEN_NOTIFICATION_EMAIL', 'Notification email (confirm the AWS subscription when it arrives)', None),
-                ('MAVEN_AVAILABILITY_ZONES', 'Two distinct reviewed us-east-1 AZs, comma-separated', None),
-                ('MAVEN_ENGINE_VERSION', 'Reviewed Aurora PostgreSQL 18 patch >=18.3 available in this account/region', '18.6'),
-            ):
-                updates[key] = self.values.get(key) if has_package else ask(prompt, self.values.get(key) or default)
-                if key == 'MAVEN_AVAILABILITY_ZONES' and not has_package:
-                    updates[key] = ','.join(zone.strip() for zone in updates[key].split(','))
+            specifications = (
+                ('MAVEN_STACK_NAME', 'New CloudFormation stack name', ''),
+                ('MAVEN_INSTANCE_NAME', 'Instance name (2–32 lowercase letters/digits/hyphens)', ''),
+                ('MAVEN_NOTIFICATION_EMAIL', 'Notification email', ''),
+                ('MAVEN_AVAILABILITY_ZONES', 'Two distinct reviewed us-east-1 AZs, comma-separated', ''),
+                ('MAVEN_ENGINE_VERSION', 'Reviewed Aurora PostgreSQL 18 patch >=18.3', '18.6'),
+            )
+            stage('Deployment review')
+            if has_package:
+                updates.update({key: self.values.get(key) for key, _, _ in specifications})
+            else:
+                fields = [Field(key, label, self.values.get(key) or default)
+                          for key, label, default in specifications]
+                selected = require().form('New instance provisioning', fields,
+                                          description='Select actual account/region-supported AZs and engine patch. Confirm the notification subscription when it arrives.')
+                if selected is None:
+                    raise SetupPending('Provisioning selection paused.')
+                updates.update(selected)
+                updates['MAVEN_AVAILABILITY_ZONES'] = ','.join(
+                    zone.strip() for zone in updates['MAVEN_AVAILABILITY_ZONES'].split(','))
             updates['MAVEN_INSTANCE_ID'] = self.values.get('MAVEN_INSTANCE_ID') or str(uuid4())
             updates['MAVEN_RECOVERY_EPOCH'] = self.values.get('MAVEN_RECOVERY_EPOCH') or str(uuid4())
             self.settings(updates)
@@ -256,20 +282,24 @@ class Wizard:
             self.state.update(prepared=True, instance_id=manifest['deployment_inputs']['InstanceId'])
             self.save()
         package = self.directory / 'package'
-        manifest, _, _ = bootstrap._package(package)
+        manifest, template, parameters = bootstrap._package(package)
         if manifest['deployment_inputs']['InstanceId'] != self.state['instance_id']:
             raise SetupPending('Prepared instance identity changed; preserve and inspect the exact package.')
+        stage('Deployment review')
+        package_body = self.package_review(package, manifest, template, parameters)
         review = self.directory / 'change-set.json'
         if not self.state.get('applied'):
-            print(f'Review all real deployment artifacts: {package}')
-            print('This creates billable Aurora, networking, API, storage and logging resources. Review IAM, notification recipient, live engine/AZ availability and current AWS prices. Retained databases, snapshots and buckets may continue to incur costs after stack deletion. Nothing is free or automatically cleaned up.')
+            message(f'Review all real deployment artifacts: {package}')
+            message('This creates billable Aurora, networking, API, storage and logging resources. Review IAM, notification recipient, live engine/AZ availability and current AWS prices. Retained databases, snapshots and buckets may continue to incur costs after stack deletion. Nothing is free or automatically cleaned up.')
             if not review.exists():
-                approve('Authorize creation/reconciliation of one CREATE change set for this exact package, NOT its execution.', 'PLAN ' + self.values['MAVEN_STACK_NAME'])
+                approve('Create/reconcile one CREATE change set, NOT execute it.', self.values['MAVEN_STACK_NAME'],
+                        body=package_body)
                 bootstrap.plan(self.values, package, review, change_type='CREATE')
             document = read_private(review)
             digest = document['review_sha256']
-            print(f'Actual CloudFormation review: {review}\nReview digest: {digest}')
-            approve('Read the complete change-set review and package before authorizing execution of this exact digest. A resumed unknown outcome reconciles this same change set.', digest)
+            message(f'Actual CloudFormation review: {review}\nReview digest: {digest}')
+            approve('Execute this exact reviewed change set? Unknown outcomes reconcile the same change set.', digest,
+                    body=package_body + '\n\nComplete CloudFormation review\n' + json.dumps(document, indent=2))
             bootstrap.apply(self.values, package, review, self.env, confirm_review=digest)
             self.values = load_environment(self.env)
             self.state['applied'] = True
@@ -278,7 +308,9 @@ class Wizard:
         if config['instance_id'] != self.state['instance_id']:
             raise SetupPending('Connected instance differs from the prepared deployment; refusing initialization.')
         if not self.state.get('initialized'):
-            approve('Initialize only this newly deployed database through the configured, separately assumed admin role. A resume repeats only the exact installed SQL bundle, never an upgrade.', 'INIT ' + config['instance_id'])
+            stage('Initialize')
+            approve('Initialize only this newly deployed database through the separate admin role. Resume repeats the exact SQL bundle, never an upgrade.',
+                    config['instance_id'], body=package_body, destructive=True)
             self.state['initialization_pending'] = True
             self.save()
             bootstrap.initialize(self.values, confirm_instance=config['instance_id'])
@@ -286,8 +318,25 @@ class Wizard:
             self.save()
         self.starter()
 
+    @staticmethod
+    def package_review(package, manifest, template, parameters):
+        sections = [
+            'Billable Aurora, networking, API, storage and logging resources. Review IAM, notification recipient, live engine/AZ availability and current AWS prices. Retained databases, snapshots and buckets may continue to cost money after stack deletion. No automatic cleanup or cloud rollback.',
+            'Package: ' + str(package),
+            'Manifest and artifact hashes\n' + json.dumps(manifest, indent=2),
+            'CloudFormation template\n' + template,
+            'Parameters\n' + json.dumps(parameters, indent=2),
+        ]
+        for name in manifest.get('artifact_sha256', {}):
+            if Path(name).name != name:
+                raise SetupPending('Invalid deployment artifact path.')
+            if name not in ('template.json', 'parameters.json'):
+                sections.append(name + '\n' + (package / name).read_text(encoding='utf-8'))
+        return '\n\n'.join(sections)
+
     def starter(self):
         from tools.memory import onboarding
+        stage('Starter authority')
         from tools.memory.environment import configured_client
         from tools.memory.validation import digest, validate_create, validate_resolve
         directory = self.directory / 'starter'
@@ -321,8 +370,9 @@ class Wizard:
                 raise SetupPending('Starter candidate changed; refusing to submit or activate it.')
             if slug in completed:
                 continue
-            print(f'Exact starter candidate: {draft_path}\nCandidate digest: {candidate_hash}')
-            approve('Review the complete candidate body, scope and dependencies. Authorize proposing this exact candidate (not activation).', 'PROPOSE ' + candidate_hash)
+            candidate_body = json.dumps(draft, ensure_ascii=False, indent=2)
+            approve('Propose this exact starter candidate (not activation). Review its complete body, scope and dependencies.',
+                    candidate_hash, body=candidate_body)
             self.state['starter_submitted'] = True
             self.save()
             client = configured_client(self.env, values=self.values)
@@ -334,7 +384,8 @@ class Wizard:
                     raise SetupPending('Cloud proposal does not match the reviewed candidate.')
             finally:
                 client.close()
-            approve('Authorize activation of this exact candidate through the separate approval role. This makes its instructions operative in this new instance.', 'ACTIVATE ' + candidate_hash)
+            approve('Activate this exact candidate through the separate approval role? Its instructions become operative in this new instance.',
+                    candidate_hash, body=candidate_body)
             selection = self.state.setdefault('starter_approvals', {})
             name = selection.get(slug, slug + '.approval.json')
             if Path(name).name != name:
@@ -349,8 +400,8 @@ class Wizard:
                         challenge_path = approval_path.with_suffix('.challenge.json')
                         save_json(challenge_path, challenge)
                         onboarding.approval(draft_path, challenge_path, approval_path,
-                                            approval_origin='owner terminal setup',
-                                            approval_excerpt='Owner typed ACTIVATE ' + candidate_hash + ' after reviewing the complete candidate.')
+                                            approval_origin='owner MAVEN setup TUI',
+                                            approval_excerpt='Owner approved activation using the review button after viewing the complete candidate, scope and dependencies. Candidate SHA256: ' + candidate_hash)
                     selection[slug] = approval_path.name
                     self.save()
                     request = validate_resolve(read_private(approval_path))
@@ -379,6 +430,7 @@ class Wizard:
 
     def project(self):
         from tools.project_setup import setup_project
+        stage('Project selection')
         saved = self.state.get('project')
         if saved and not self.state.get('ready_project'):
             root = Path(saved['root'])
@@ -394,14 +446,18 @@ class Wizard:
         return Path(result['project']['root']), result['authority_generation']
 
     def run(self):
-        print('MAVEN guided configuration: private settings, explicit AWS identity, reviewed cloud actions, then your selected project. Never enter access keys, tokens or passwords here. Ctrl-C pauses safely.')
+        stage('Instance selection')
+        checkpoint()
+        message('MAVEN guided configuration: private settings, explicit AWS identity, reviewed cloud actions, then your selected project. Never enter access keys, tokens or passwords here. Quit pauses at a safe boundary.')
         mode = self.state.get('mode')
         if mode is None:
             if self.values.get('MAVEN_MEMORY_INSTANCE_ID'):
                 mode = 'existing'
-                print('An existing connection is present; preserving it. Redeployment is disabled.')
+                message('An existing connection is present; preserving it. Redeployment is disabled.')
             else:
-                mode = ask('Connect existing infrastructure or create a new instance? (existing/new)', 'existing')
+                mode = require().choose('Select instance setup', (
+                    ('Connect existing infrastructure', 'existing'),
+                    ('Provision a new instance', 'new')))
             if mode not in ('existing', 'new'):
                 raise SetupPending('Choose existing or new when resuming.')
             self.state['mode'] = mode
@@ -412,28 +468,32 @@ class Wizard:
             self.fresh()
         else:
             raise SetupPending('Invalid saved setup mode; preserve and inspect the state.')
+        stage('Verify readiness')
+        checkpoint()
         generation = self.verify_authority()
         root = None
         if confirm('Configure a project now? (No: instance ready; choose the actual project later in OMP)'):
             root, generation = self.project()
+            stage('Verify readiness')
             self.state['ready_project'] = str(root)
             self.save()
-            print(f'\nReady: routine cloud access, complete applicable authority generation {generation}, and the cloud/local project were verified.')
-            print(f'Project selection: {root / ".maven" / "project.json"}')
+            message(f'\nReady: routine cloud access, complete applicable authority generation {generation}, and the cloud/local project were verified.')
+            message(f'Project selection: {root / ".maven" / "project.json"}')
         else:
-            print('\ninstance ready, project not configured in this run')
+            message('\ninstance ready, project not configured in this run')
             if self.state.get('project') and not self.state.get('ready_project'):
-                print('The original interrupted project receipt is preserved; resume its exact root before creating another project.')
-        print(f'Home: {self.home}\nPrivate settings: {self.env}\nVirtual environment: {sys.prefix}')
-        print('For a new shell (never source .env):')
-        print('export MAVEN_HOME=' + shlex.quote(str(self.home)))
-        print('export PATH=' + shlex.quote(str(Path(sys.executable).parent)) + ':"$PATH"')
+                message('The original interrupted project receipt is preserved; resume its exact root before creating another project.')
+        message(f'Home: {self.home}\nPrivate settings: {self.env}\nVirtual environment: {sys.prefix}')
+        message('For a new shell (never source .env):')
+        message('export MAVEN_HOME=' + shlex.quote(str(self.home)))
+        message('export PATH=' + shlex.quote(str(Path(sys.executable).parent)) + ':"$PATH"')
         if (self.home / 'activate').exists():
-            print('Or load the installer environment, including any explicitly selected CA:')
-            print('source ' + shlex.quote(str(self.home / 'activate')))
-        print('Open the actual project directory in OMP and invoke /skill:maven-start-work.')
+            message('Or load the installer environment, including any explicitly selected CA:')
+            message('source ' + shlex.quote(str(self.home / 'activate')))
+        message('Open the actual project directory in OMP and invoke /skill:maven-start-work.')
         if root:
-            print('Verify selection: maven-project show --root ' + shlex.quote(str(root)))
+            message('Verify selection: maven-project show --root ' + shlex.quote(str(root)))
+        checkpoint()
         return 0
 
 
@@ -444,34 +504,46 @@ def main(argv=None):
     args = parser.parse_args(argv)
     home = args.home.expanduser().absolute()
     os.environ['MAVEN_HOME'] = str(home)
-    # The entrypoint runs only after install.py has built the isolated environment.
+    from tools.tui import run_workflow
+    return run_workflow('MAVEN instance setup', [
+        'Instance selection', 'AWS identities', 'Deployment review', 'Initialize',
+        'Starter authority', 'Project selection', 'Project binding', 'Verify readiness',
+    ], lambda ui: _run(args, home))
+
+
+def _run(args, home):
+    # All SDK operations stay on the workflow worker under the durable setup lock.
     from botocore.exceptions import BotoCoreError, ClientError
     from tools.memory.client import MemoryClientError
     from tools.project import ProjectError
+    paused = False
     try:
         private_directory(home)
         private_directory(home / 'runtime')
         private_directory(home / 'runtime' / 'setup')
         with setup_lock(home / 'runtime' / 'setup'):
             return Wizard(home, args.project_root).run()
-    except (EOFError, KeyboardInterrupt):
-        print('\nSetup paused; readiness was not declared.', file=sys.stderr)
+    except (OperationPaused, EOFError, KeyboardInterrupt):
+        paused = True
+        message('Setup paused at a safe boundary; readiness was not declared.')
     except SetupPending as exc:
-        print('Setup pending: ' + str(exc), file=sys.stderr)
+        message('Setup pending: ' + str(exc))
     except MemoryClientError as exc:
-        print('Setup pending: ' + exc.code, file=sys.stderr)
+        message('Setup pending: ' + exc.code)
         if exc.request_key:
-            print('Preserved request key: ' + exc.request_key, file=sys.stderr)
-        print('Check the selected profile/role permissions, service availability and exact saved review. Unknown outcomes must use these same artifacts and request keys; never delete them or switch homes to retry the operation.', file=sys.stderr)
+            message('Preserved request key: ' + exc.request_key)
+        message('Check the selected profile/role permissions, service availability and exact saved review. Unknown outcomes must use these same artifacts and request keys; never delete them or switch homes to retry the operation.')
     except (BotoCoreError, ClientError):
-        print('Setup pending: selected AWS operation failed. Check the selected profile login, permissions, region and trusted CA; no fallback identity was used.', file=sys.stderr)
+        message('Setup pending: selected AWS operation failed. Check the selected profile login, permissions, region and trusted CA; no fallback identity was used.')
     except (OSError, ValueError, KeyError, TypeError, ProjectError):
-        print('Setup pending: invalid or unavailable local settings/artifacts/project. Preserve existing files, check their paths and private permissions, and resume. No readiness was declared.', file=sys.stderr)
+        message('Setup pending: invalid or unavailable local settings/artifacts/project. Preserve existing files, check their paths and private permissions, and resume. No readiness was declared.')
     resume = [str(Path(sys.executable).parent / 'maven-setup'), '--home', str(home)]
     if args.project_root is not None:
         resume.extend(['--project-root', str(args.project_root)])
-    print('Resume: ' + shlex.join(resume), file=sys.stderr)
-    print('Preserved setup artifacts: ' + str(home / 'runtime' / 'setup'), file=sys.stderr)
+    message('Resume: ' + shlex.join(resume))
+    message('Preserved setup artifacts: ' + str(home / 'runtime' / 'setup'))
+    if paused:
+        raise OperationPaused('Setup paused; resume the same home with the preserved artifacts.')
     return 1
 
 

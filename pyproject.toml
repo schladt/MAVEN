@@ -16,6 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+ui = ["textual>=2.1,<3", "packaging>=24,<27"]
 google = ["google-auth-oauthlib>=1.2,<2", "google-api-python-client>=2,<3"]
 
 [project.scripts]

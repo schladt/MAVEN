@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from datetime import datetime, timezone
 import fcntl
 import importlib
@@ -10,9 +10,12 @@ import json
 import os
 from pathlib import Path
 import shutil
+import select
+import signal
 import stat
 import subprocess
 import sys
+import time
 import uuid
 
 from .common import (UninstallError, canonical, checked_path, digest, file_digest,
@@ -199,7 +202,7 @@ def build_plan(args):
     private_directory(directory)
     runner = _snapshot(directory / 'runner')
     plan = _fragment()
-    plan.update(schema=1, operation_id=identifier, created_at=_utc(), operation_dir=str(directory),
+    plan.update(schema=1, tui_worker_protocol=1, operation_id=identifier, created_at=_utc(), operation_dir=str(directory),
                 runner=runner, machine_homes=homes if args.machine else [],
                 recovery_python=_external_python(homes if args.machine else []),
                 scopes=[scope for scope, enabled in [('project', bool(project_roots or reactivate)),
@@ -317,6 +320,10 @@ def _journal(path, plan):
 def status(path):
     path, plan = _load_plan(path)
     journal = _journal(path, plan)
+    return _status(plan, journal)
+
+
+def _status(plan, journal):
     actions = {}
     by_scope = {scope: [] for scope in plan['scopes']}
     for action in plan['actions']:
@@ -343,6 +350,8 @@ def status(path):
             'plan_digest': plan['plan_digest'], 'scopes': plan['scopes'],
             'scope_status': scope_status, 'targets': plan['targets'], 'actions': actions,
             'retained': plan['retained'], 'warnings': plan['warnings'],
+            'last_action': journal.get('last_action'),
+            'pending': [identity for identity, entry in actions.items() if entry['state'] != 'completed'],
             'last_error': journal.get('last_error'), 'live_state_checked': False}
 
 
@@ -386,19 +395,33 @@ def _reexec_runner(path, plan, args, *, system=False):
     os.execve(executable, [executable, '-B', str(runner), *_resume_arguments(args)], environment)
 
 
-def apply(args, *, reexec=True):
+def apply(args, *, reexec=True, progress=None, should_pause=None):
     path, plan = _load_plan(args.plan)
     _approve(plan, args)
     _verify_runner(plan, path.parent)
+    if getattr(args, 'tui_worker', False):
+        _verify_worker(path, plan)
+        reexec = False
     # Execute exactly the reviewed implementation even if the installation was updated.
     if reexec and Path(__file__).resolve() != path.parent / 'runner/tools/uninstall/cli.py':
         _reexec_runner(path, plan, args)
     journal_path = path.parent / 'journal.json'
     with _operation_lock(path.parent):
         journal = _journal(path, plan)
+        last_progress_at, last_transition = 0.0, None
         def save():
+            nonlocal last_progress_at, last_transition
             journal['updated_at'] = _utc()
             save_private(journal_path, journal)
+            if progress is not None:
+                current = journal.get('last_action', {}).get('id')
+                transition = (journal['state'], current, journal['actions'].get(current, {}).get('state'))
+                now = time.monotonic()
+                # Durable writes remain per-effect; rendering must not reread the
+                # entire inventory for each file removed from a large runtime.
+                if transition != last_transition or now - last_progress_at >= 0.25:
+                    progress(_status(plan, journal))
+                    last_progress_at, last_transition = now, transition
         if journal['state'] == 'completed':
             return status(path)
         journal['state'] = 'applying'
@@ -408,6 +431,10 @@ def apply(args, *, reexec=True):
             entry = journal['actions'].setdefault(action['id'], {'state': 'pending', 'progress': {}})
             if entry['state'] == 'completed':
                 continue
+            if should_pause is not None and should_pause():
+                journal['state'] = 'paused'
+                save()
+                return status(path)
             if action['handler'] not in HANDLERS:
                 raise UninstallError('unrecognized uninstall action handler')
             # Cloud and project work run while dependencies exist. Re-enter with system
@@ -417,6 +444,8 @@ def apply(args, *, reexec=True):
                 save()
                 _reexec_runner(path, plan, args, system=True)
             entry['state'] = 'started'
+            journal['last_action'] = {'id': action['id'], 'kind': action['kind'],
+                                      'target': action['target']}
             save()
             try:
                 module = importlib.import_module('tools.uninstall.' + action['handler'])
@@ -476,92 +505,91 @@ def parser():
         command.add_argument('--harnesses-stopped', action='store_true')
         command.add_argument('--confirm-purge', metavar='INSTANCE_UUID')
         command.add_argument('--confirm-abandon', metavar='INSTANCE_UUID')
+        command.add_argument('--tui-worker', action='store_true', help=argparse.SUPPRESS)
     inspect = commands.add_parser('status', help='Read local receipts without cloud calls')
     inspect.add_argument('--plan', required=True, type=Path)
     return root
 
 
-def _yes(question):
-    while True:
-        value = input(question + ' [y/N]: ').strip().lower()
-        if value in ('', 'n', 'no'):
-            return False
-        if value in ('y', 'yes'):
-            return True
-        print('Enter yes or no.')
+def _verify_worker(path, plan):
+    """Only the reviewed recovery snapshot may run without normal re-execution."""
+    expected = path.parent / 'runner/tools/uninstall/cli.py'
+    if Path(__file__).resolve() != expected:
+        raise UninstallError('TUI worker must execute the exact snapshotted recovery CLI')
+    locations = [Path(sys.executable).absolute(), Path(sys.executable).resolve(),
+                 Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve()]
+    if any(_inside(location, Path(home)) for home in plan['machine_homes'] for location in locations):
+        raise UninstallError('TUI worker interpreter must be outside every selected installation home')
 
 
-def _guided(root):
-    if not sys.stdin.isatty():
-        raise UninstallError('guided uninstall requires a terminal; use plan/apply for explicit noninteractive choices')
-    print('Select independent scopes. Nothing is removed until you review and approve a plan.')
-    scopes = input('Scopes (project machine cloud, separated by spaces): ').split()
-    if not scopes or set(scopes) - {'project', 'machine', 'cloud'}:
-        raise UninstallError('select project, machine, cloud, or a combination')
-    argv = ['plan']
-    home = input('MAVEN installation home [' + _default_home() + ']: ').strip() or _default_home()
-    argv.extend(['--home', home])
-    if 'project' in scopes:
-        while True:
-            selected = input('Exact project root (blank ends selection): ').strip()
-            if not selected:
+class _PauseInput:
+    """Read control lines only at safe boundaries; EOF means the UI was lost."""
+
+    def __init__(self):
+        self.requested = False
+        self.buffer = b''
+        self.descriptor = sys.stdin.fileno()
+
+    def request(self, *_):
+        self.requested = True
+
+    def __call__(self):
+        while not self.requested and select.select([self.descriptor], [], [], 0)[0]:
+            chunk = os.read(self.descriptor, 4096)
+            if not chunk:
+                self.requested = True
                 break
-            argv.extend(['--project', selected])
-        if '--project' not in argv:
-            raise UninstallError('project scope requires an explicit project root')
-        if _yes('Archive these cloud projects too (affects all their checkouts)?'):
-            argv.append('--archive-project')
-    if 'machine' in scopes:
-        argv.append('--machine')
-        if _yes('Select all discovered current-user installations instead of only this home?'):
-            argv.append('--all-homes')
-        else:
-            while True:
-                selected = input('Additional installation home (blank ends selection): ').strip()
-                if not selected:
-                    break
-                argv.extend(['--home', selected])
-        if _yes('Include recognized legacy MAVEN runtimes without ownership receipts in the exact reviewed inventory?'):
-            argv.append('--adopt-legacy')
-    if 'cloud' in scopes:
-        argv.append('--cloud')
-        mode = input('Cloud mode [retire] (retire/purge): ').strip() or 'retire'
-        argv.extend(['--cloud-mode', mode])
-        if _yes('Plan administrative abandonment of unreachable cloud sessions?'):
-            argv.append('--abandon-sessions')
-        for flag, prompt in [('--optional-resource', 'Optional dedicated resource selector'),
-                             ('--retained-resource', 'Previously retained resource ARN')]:
-            while True:
-                selected = input(prompt + ' (blank ends selection): ').strip()
-                if not selected:
-                    break
-                argv.extend([flag, selected])
-    elif '--archive-project' not in argv and _yes('Detach locally without cloud access?'):
-        argv.append('--offline')
-    if 'project' in scopes or 'machine' in scopes:
-        export = input('Private artifact export directory (blank preserves in place): ').strip()
-        if export:
-            argv.extend(['--export', export])
-    output = input('Private plan/recovery directory (blank uses ~/.maven-uninstall/<UUID>): ').strip()
-    if output:
-        argv.extend(['--output', output])
-    result = build_plan(root.parse_args(argv))
-    print(json.dumps(result, indent=2))
-    print('Read the full plan above, including retained resources and warnings.')
-    confirmation = input('Type the complete plan digest to apply, or Enter to leave it planned: ').strip()
-    if not confirmation:
-        return result
-    argv = ['apply', '--plan', result['plan_path'], '--confirm', confirmation]
-    required = result['plan']['requires']
-    if 'writers-quiescent' in required and _yes('Have all affected local writers actually stopped?'):
-        argv.append('--writers-quiescent')
-    if 'harnesses-stopped' in required and _yes('Are affected assistant harnesses closed?'):
-        argv.append('--harnesses-stopped')
-    for name in ('purge', 'abandon'):
-        if name in result['plan']['confirmations']:
-            value = input('Type the exact instance UUID to separately approve ' + name + ': ').strip()
-            argv.extend(['--confirm-' + name, value])
-    return apply(root.parse_args(argv))
+            self.buffer += chunk
+            while b'\n' in self.buffer:
+                line, self.buffer = self.buffer.split(b'\n', 1)
+                if line.strip() == b'pause':
+                    self.requested = True
+            if len(self.buffer) > 4096:
+                self.requested = True
+        return self.requested
+
+
+def _worker(args):
+    control = _PauseInput()
+    stream = sys.stdout
+
+    def emit(event, data):
+        try:
+            stream.write(json.dumps({'event': event, 'data': data}, ensure_ascii=False,
+                                    allow_nan=False) + '\n')
+            stream.flush()
+        except (BrokenPipeError, OSError):
+            control.request()
+
+    previous = {number: signal.signal(number, control.request)
+                for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    try:
+        # Reserve stdout for the protocol, including when handlers use libraries
+        # that write diagnostics. Those diagnostics are never parsed as progress.
+        with redirect_stdout(sys.stderr):
+            try:
+                result = apply(args, progress=lambda data: emit('progress', data),
+                               should_pause=control)
+            except Exception as error:
+                result = {'status': 'blocked',
+                          'error': str(error) if isinstance(error, UninstallError) else type(error).__name__,
+                          'guidance': 'Preserve the operation directory and inspect status before resuming.'}
+        emit('result', result)
+        return _exit_status(result)
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+def _exit_status(result):
+    return {'blocked': 2, 'paused': 3}.get(result['status'], 0)
+
+
+def _interactive():
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        raise UninstallError('interactive uninstall requires a terminal; use plan/apply/status/resume for noninteractive recovery')
+    from tools.tui.runtime import launch_uninstaller
+    return launch_uninstaller()
 
 
 def main(argv=None):
@@ -569,15 +597,17 @@ def main(argv=None):
     args = root.parse_args(argv)
     try:
         if args.command is None:
-            result = _guided(root)
+            return _interactive()
         elif args.command == 'plan':
             result = build_plan(args)
         elif args.command == 'status':
             result = status(args.plan)
         else:
+            if args.tui_worker:
+                return _worker(args)
             result = apply(args)
         print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))
-        return 2 if result['status'] == 'blocked' else 0
+        return _exit_status(result)
     except (UninstallError, OSError, ValueError, ImportError) as error:
         message = str(error) if isinstance(error, UninstallError) else type(error).__name__
         print(json.dumps({'status': 'blocked', 'error': message,

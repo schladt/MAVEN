@@ -15,6 +15,15 @@ import stat
 import subprocess
 import sys
 
+from tools.interaction import Field, OperationPaused, checkpoint, current, message, require, stage
+
+
+def _notify(text, *, file=None):
+    if current() is None:
+        print(text, file=file)
+    else:
+        message(text)
+
 # Primary discovery documentation:
 # https://developers.openai.com/codex/skills
 # https://code.claude.com/docs/en/skills
@@ -69,19 +78,6 @@ def _skill_plan(source: Path, roots: list[Path]) -> list[tuple[Path, bytes]]:
     return plan
 
 
-def _ask(label: str, default: str = '') -> str:
-    suffix = f' [{default}]' if default else ''
-    return input(f'{label}{suffix}: ').strip() or default
-
-
-def _yes(label: str, default: bool = False) -> bool:
-    while True:
-        answer = _ask(f'{label} {"[Y/n]" if default else "[y/N]"}').lower()
-        if not answer:
-            return default
-        if answer in ('y', 'yes', 'n', 'no'):
-            return answer in ('y', 'yes')
-        print('Enter yes or no.')
 
 
 def _prerequisites(require_aws: bool) -> None:
@@ -95,11 +91,11 @@ def _prerequisites(require_aws: bool) -> None:
             f'Python is missing {", ".join(missing)}. On Debian/Ubuntu install the venv package '
             'matching your Python (for example sudo apt install python3-venv), then rerun. '
             'On macOS use a complete Python installation from python.org or Homebrew.')
-    print(f'Python {sys.version.split()[0]}: ready; venv and pip bootstrap available.')
+    _notify(f'Python {sys.version.split()[0]}: ready; venv and pip bootstrap available.')
     if shutil.which('git'):
-        print('Git: available.')
+        _notify('Git: available.')
     else:
-        print('Git is not installed. Install Git for repository workflows, or choose a memory-only project.')
+        _notify('Git is not installed. Install Git for repository workflows, or choose a memory-only project.')
     aws = shutil.which('aws')
     version = None
     if aws:
@@ -108,14 +104,14 @@ def _prerequisites(require_aws: bool) -> None:
         if result.returncode == 0 and match:
             version = tuple(int(part) for part in match.groups())
     if version is None or version < (2, 32, 0):
-        message = ('AWS CLI v2 version 2.32.0 or newer is required for aws login. '
-                   'Install/update it from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html '
-                   '(macOS/Homebrew: brew install awscli), then rerun this installer.')
+        notice = ('AWS CLI v2 version 2.32.0 or newer is required for aws login. '
+                  'Install/update it from https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html '
+                  '(macOS/Homebrew: brew install awscli), then rerun this installer.')
         if require_aws:
-            raise ValueError(message + ' Use --local-only only to install tools without configuring AWS.')
-        print(f'Not configured yet: {message}')
+            raise ValueError(notice + ' Use --local-only only to install tools without configuring AWS.')
+        _notify(f'Not configured yet: {notice}')
     else:
-        print(f'AWS CLI {".".join(map(str, version))}: ready.')
+        _notify(f'AWS CLI {".".join(map(str, version))}: ready.')
 
 
 def _configure_ca(path: Path | None) -> Path | None:
@@ -151,7 +147,7 @@ def _activation(home: Path, ca_bundle: Path | None) -> list[str]:
     if target.exists() or target.is_symlink():
         _private_file(target)
         if ca_bundle and target.read_text() != body:
-            print('Existing activation snippet preserved; use the explicit exports below for the selected CA.')
+            _notify('Existing activation snippet preserved; use the explicit exports below for the selected CA.')
             return commands
     else:
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
@@ -174,35 +170,101 @@ def main(argv=None) -> int:
     parser.add_argument('--local-only', action='store_true',
                         help='Install local tools only; no prompts, login, cloud setup, or project initialization')
     args = parser.parse_args(argv)
+    try:
+        # Bootstrap pip must inherit explicitly approved corporate trust settings.
+        _configure_ca(args.ca_bundle)
+        if args.local_only:
+            return _install(args)
+        if not sys.stdin.isatty():
+            raise ValueError('Guided setup needs an interactive terminal; use --local-only for unconfigured tools.')
+        from tools.tui.bootstrap import ensure_ui
+        result = ensure_ui([str(Path(__file__).resolve()), *(sys.argv[1:] if argv is None else argv)])
+        if result is not None:
+            return result
+        from tools.tui import run_workflow
+        handoff = {}
+
+        def operation(ui):
+            _options(args)
+            result = _install(args, handoff)
+            if result == 0 and handoff:
+                body = (f'Local tools are installed in {handoff["home"]}.\n\n'
+                        'Shell activation:\n' + '\n'.join(handoff['activation']) +
+                        '\n\nOpen instance setup now? Decline to finish locally; activate this '
+                        'installation and run maven-setup later. No cloud readiness is implied yet.')
+                if not ui.review('Local installation complete', body, accept='Open instance setup'):
+                    handoff.clear()
+                ui.close_when_finished()
+            return result
+
+        result = run_workflow('Install MAVEN', [
+            'Prerequisites', 'Installation options', 'Review installation', 'Install tools', 'Local completion',
+        ], operation)
+        if result or not handoff:
+            return result
+        # The first app is closed before the installed setup app owns the terminal.
+        home = handoff['home']
+        from tools.tui.bootstrap import run_terminal
+        return run_terminal(
+            [str(home / 'venv/bin/maven-setup'), '--home', str(home)],
+            cwd=home, env=dict(os.environ, MAVEN_HOME=str(home)),
+        )
+    except (EOFError, KeyboardInterrupt, OperationPaused):
+        _notify('Installation paused; existing private configuration is preserved.', file=sys.stderr)
+        return 130
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        _notify(f'Installation stopped: {exc}', file=sys.stderr)
+        return 1
+
+
+def _options(args):
+    stage('Prerequisites')
+    _prerequisites(require_aws=False)
+    stage('Installation options')
+    fields = [
+        Field('home', 'Private MAVEN installation folder',
+              str(args.home or Path(os.environ.get('MAVEN_HOME', '~/.maven')).expanduser())),
+        Field('google', 'Install optional Google dependencies', args.google, kind='bool'),
+        Field('local_only', 'Install local tools only (required without a login-capable AWS CLI)',
+              False, kind='bool'),
+        Field('ca', 'Optional trusted PEM CA bundle', str(args.ca_bundle or ''), required=False),
+        Field('skill_dirs', 'Custom skill roots (one absolute path per line)',
+              '\n'.join(map(str, args.skill_dir)), kind='multiline', required=False),
+    ]
+    fields.extend(Field(name, f'Install {name} skills at {Path.home() / root}',
+                        name in args.harness, kind='bool') for name, root in HARNESS_PATHS.items())
+    selected = require().form('Local installation options', fields,
+                              description='No shell profile or existing differing skill will be replaced. Google dependencies do not authorize account access. Never enter credentials.')
+    if selected is None:
+        raise OperationPaused('Installation options paused.')
+    args.home = Path(selected['home'])
+    args.google = selected['google']
+    args.local_only = selected['local_only']
+    args.ca_bundle = Path(selected['ca']) if selected['ca'] else None
+    args.harness = [name for name in HARNESS_PATHS if selected[name]]
+    args.skill_dir = [Path(line.strip()) for line in selected['skill_dirs'].splitlines() if line.strip()]
+
+
+def _install_command(command):
+    if current() is None:
+        return subprocess.run(command, check=True)
+    # Local installation is one coherent unit through its ownership receipt. Do
+    # not honor a pause between pip's mutation and recording that ownership.
+    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if result.returncode:
+        raise ValueError('Local dependency installation failed. Check network access and the trusted CA bundle; existing private settings and skills are preserved.')
+    return result
+
+
+def _install(args, handoff=None):
     installation_locks = contextlib.ExitStack()
     try:
-        if not args.local_only and not sys.stdin.isatty():
-            raise ValueError('Guided setup needs an interactive terminal. Run python3 install.py in your terminal, '
-                             'or explicitly choose --local-only to install unconfigured tools.')
-        print('\nStep 1/4 — Check prerequisites')
+        if current() is None:
+            _notify('\nStep 1/4 — Check prerequisites')
+        else:
+            stage('Prerequisites')
         _prerequisites(require_aws=not args.local_only)
         home = args.home or Path(os.environ.get('MAVEN_HOME', '~/.maven')).expanduser()
-        if not args.local_only:
-            print('\nStep 2/4 — Choose local installation options')
-            if args.home is None:
-                home = Path(_ask('Private MAVEN installation folder', str(home)))
-            if not args.google:
-                args.google = _yes('Install optional Google integration dependencies?')
-            if not args.harness and not args.skill_dir:
-                choices = ', '.join(HARNESS_PATHS)
-                print(f'Optional harness integration: {choices}. Choose none to install it later.')
-                while True:
-                    selection = _ask('Harness names (comma separated)', 'none').lower()
-                    names = [name.strip() for name in selection.split(',')]
-                    if selection == 'none':
-                        break
-                    if all(name in HARNESS_PATHS for name in names):
-                        args.harness = list(dict.fromkeys(names))
-                        break
-                    print(f'Choose names from {choices}, or none.')
-            if args.ca_bundle is None:
-                selected = _ask('Optional trusted PEM CA bundle for a corporate VPN (Enter to keep current TLS settings)')
-                args.ca_bundle = Path(selected) if selected else None
         home = home.expanduser().absolute()
         _no_symlink_parents(home)
         ca_bundle = _configure_ca(args.ca_bundle)
@@ -217,20 +279,35 @@ def main(argv=None) -> int:
         roots.extend(path.expanduser().absolute() for path in args.skill_dir)
         deferred = False
         if roots and not args.harness_stopped:
-            if args.local_only:
+            if current() is None:
                 raise ValueError('Close the selected harnesses, then add --harness-stopped. No skills were changed.')
-            if not _yes('Are all harnesses using these skill folders closed?'):
+            if not require().confirm('Are all harnesses using these skill folders closed?'):
                 deferred, roots = True, []
-                print('Harness integration deferred; active harness files will not be changed.')
+                _notify('Harness integration deferred; active harness files will not be changed.')
         try:
             plan = _skill_plan(source, roots)
         except ValueError as exc:
-            if args.local_only:
+            if current() is None:
                 raise
-            print(str(exc))
-            if not _yes('Continue cloud/project setup without changing any harness skills?', default=True):
-                raise
+            message(str(exc))
+            if not require().confirm('Continue without changing any harness skills?'):
+                raise OperationPaused('Skill conflict preserved; installation paused.')
             deferred, roots, plan = True, [], []
+        if current() is not None:
+            stage('Review installation')
+            body = '\n'.join([
+                f'Private home: {home}', f'Runtime: {home / "venv"}',
+                f'Settings: {home / ".env"} (existing settings preserved)',
+                f'Package source: {source}', f'Extras: ui{", google" if args.google else ""}',
+                f'Trusted CA: {ca_bundle or "current TLS configuration"}',
+                f'Next: {"local tools only; no AWS/project setup" if args.local_only else "installed maven-setup for explicit cloud selection"}',
+                'Shell profiles: unchanged',
+                'Skill roots:\n' + ('\n'.join(map(str, roots)) or '(none)'),
+                'New skill files:\n' + ('\n'.join(str(target) for target, _ in plan) or '(none; existing identical skills preserved)'),
+            ])
+            if not require().review('Approve exact local installation', body):
+                raise OperationPaused('Installation declined before local mutation.')
+        checkpoint()
         _private_directory(home)
         from tools.uninstall.local import _lock, reinstall_marker, finish_reinstallation
         installation_locks.enter_context(_lock(home / 'runtime/registry.lock'))
@@ -256,7 +333,10 @@ def main(argv=None) -> int:
         own_activation = not (home / 'activate').exists()
         if installation.exists() and not (installation / 'pyvenv.cfg').is_file():
             raise ValueError(f'Existing non-venv target preserved: {installation}')
-        print('\nStep 3/4 — Create/reuse the virtual environment and install MAVEN')
+        if current() is None:
+            _notify('\nStep 3/4 — Create/reuse the virtual environment and install MAVEN')
+        else:
+            stage('Install tools')
         import venv
         if not installation.exists():
             venv.EnvBuilder(with_pip=True).create(installation)
@@ -266,9 +346,9 @@ def main(argv=None) -> int:
                              'Preserve it for review and choose another --home, or repair that environment.')
         pip_ready = subprocess.run([str(python), '-m', 'pip', '--version'], capture_output=True, text=True)
         if pip_ready.returncode:
-            subprocess.run([str(python), '-m', 'ensurepip', '--upgrade'], check=True)
-        package = str(source) + ('[google]' if args.google else '')
-        subprocess.run([str(python), '-m', 'pip', 'install', '--upgrade', package], check=True)
+            _install_command([str(python), '-m', 'ensurepip', '--upgrade'])
+        package = str(source) + ('[ui,google]' if args.google else '[ui]')
+        _install_command([str(python), '-m', 'pip', 'install', '--upgrade', package])
         if not environment.exists():
             body = (source / 'maven_resources' / 'templates' / 'environment.example').read_bytes()
             fd = os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
@@ -290,36 +370,37 @@ def main(argv=None) -> int:
                             cache_roots=new_caches)
         finish_reinstallation(home, completed_marker)
         installation_locks.close()
-        print(f'\nLocal tools installed in {installation}. Private settings: {environment}')
-        print('In each new terminal, activate this installation (no shell profiles were modified):')
+        if current() is not None:
+            stage('Local completion')
+        _notify(f'\nLocal tools installed in {installation}. Private settings: {environment}')
+        _notify('In each new terminal, activate this installation (no shell profiles were modified):')
         for command in activation:
-            print(f'  {command}')
+            _notify(f'  {command}')
         if roots:
-            print('Bootstrap and lifecycle skills installed/preserved. Start a new harness session to discover them.')
+            _notify('Bootstrap and lifecycle skills installed/preserved. Start a new harness session to discover them.')
         elif deferred:
-            print('Harness integration is still pending. After closing the harness, rerun this installer '
+            _notify('Harness integration is still pending. After closing the harness, rerun this installer '
                   'with --local-only and the desired --harness/--skill-dir plus --harness-stopped.')
         else:
-            print('No harness was modified; native skill installation remains optional.')
+            _notify('No harness was modified; native skill installation remains optional.')
+        checkpoint()
         if args.local_only:
-            print('\nLocal-only installation complete; AWS and project setup have NOT been performed.')
-            print('After activation, run maven-setup to configure an existing or new instance; project setup is optional.')
+            _notify('\nLocal-only installation complete; AWS and project setup have NOT been performed.')
+            _notify('After activation, run maven-setup to configure an existing or new instance; project setup is optional.')
             return 0
-        print('\nStep 4/4 — Configure an existing or new AWS instance (project setup is optional)')
-        result = subprocess.run(
-            [str(installation / 'bin' / 'maven-setup'), '--home', str(home)],
-            cwd=home, env=dict(os.environ, MAVEN_HOME=str(home)),
-        )
-        if result.returncode:
-            print('Setup is not complete. After activation, run maven-setup to resume; existing state is preserved.')
-        return result.returncode
+        if handoff is not None:
+            handoff['home'] = home
+            handoff['activation'] = activation
+        return 0
+    except OperationPaused:
+        raise
     except (EOFError, KeyboardInterrupt):
-        print('\nInstallation paused. Rerun python3 install.py; existing private configuration is preserved.',
+        _notify('\nInstallation paused. Rerun python3 install.py; existing private configuration is preserved.',
               file=sys.stderr)
         return 130
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        print(f'Installation stopped: {exc}', file=sys.stderr)
-        print('If TLS verification failed on a corporate VPN, use --ca-bundle with an IT-approved PEM bundle. '
+        _notify(f'Installation stopped: {exc}', file=sys.stderr)
+        _notify('If TLS verification failed on a corporate VPN, use --ca-bundle with an IT-approved PEM bundle. '
               'TLS verification must remain enabled.', file=sys.stderr)
         return 1
     finally:

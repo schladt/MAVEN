@@ -1,6 +1,7 @@
 """Root-scoped onboarding receipts and boundaries; no real cloud operations."""
 import argparse
 from contextlib import ExitStack
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,8 +9,9 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from tools.memory.client import MemoryClientError
+from tools.interaction import using
 from tools.project import ProjectError, load_project
-from tools.project_setup import setup_project
+from tools.project_setup import _selection, setup_project
 from tools.setup_common import SetupPending, private_directory, read_private, save_json
 
 
@@ -138,6 +140,27 @@ class ProjectSetupTests(unittest.TestCase):
             second.mkdir()
             setup_project(self.args(second, home / '.env'))
             self.assertNotEqual(load_project(second)['project_id'], legacy['project_id'])
+
+    def test_interactive_selection_reviews_complete_provenance_and_stable_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            args = self.args(root, root / '.env', non_interactive=False)
+            ui = Mock()
+            ui.form.side_effect = [
+                {'mode': 'create', 'lifecycle': 'no-git'},
+                {'name': 'Actual owner project', 'source_origin': 'Owner setup review',
+                 'source_excerpt': 'Track the explicitly selected project.', 'checks': '["python", "-V"]'},
+            ]
+            ui.review.return_value = True
+            with using(ui):
+                selected = _selection(args, root)
+            reviewed = json.loads(ui.review.call_args.args[1])
+            self.assertEqual(reviewed, selected)
+            self.assertEqual(ui.review.call_args.kwargs['identity'], selected['project_id'])
+            self.assertTrue(selected['request_key'])
+            self.assertEqual(selected['source_excerpt'], 'Track the explicitly selected project.')
+            self.assertEqual(selected['check'], ['["python", "-V"]'])
+            self.assertFalse((root / '.maven').exists())
 
 
 if __name__ == '__main__':
