@@ -51,22 +51,25 @@ Alternatively, download and extract this repository's source archive, open a ter
 in the extracted folder, and run `python3 install.py`. You do **not** need an existing
 virtual environment, private `.env`, or project `.maven` directory.
 
-The full-screen Textual installer asks where to install (default `~/.maven`), which
-assistant harnesses to integrate, and whether to include optional Google dependencies.
-If UI dependencies are missing, a brief bootstrap prompt asks permission to download
-them into a temporary private runtime; system Python is never modified. The installer
-creates a private home, login-cache/runtime directories and its own `venv`, installs
-the commands with MCP/UI dependencies, and opens setup. Harness choices are
-`codex`, `claude`, `omp`, `copilot`, `gemini`, or none. Close affected harnesses before
-approving integration changes; conflicting skills/configuration are preserved.
-These are installation targets, not a claim that every harness has been runtime-tested.
+The full-screen Textual installer starts with a task: connect existing memory or
+create a new instance. For an existing installation it shows saved, **unverified**
+account/instance settings and offers check/repair, local software update, or a
+separate installation. Software-only installation and optional Google/certificate
+settings live under **Advanced options**. The private home defaults to `~/.maven`.
+If UI dependencies are missing, a bootstrap prompt requests permission to download
+them into a temporary private runtime; system Python is never modified.
+
+After verified cloud setup, optionally review local integration for OMP, Claude Code,
+Codex, Copilot or Gemini. Close affected harnesses before approving writes; conflicts
+are preserved. Files written, cloud readiness and an actual harness connection are
+reported separately. A written configuration is **not** a verified MCP connection.
 
 Use Tab/Shift+Tab, arrow keys, Space and Enter, or the mouse. Ctrl+Q/Ctrl+C requests
 a safe pause; it does not undo completed work or cancel an AWS operation already
 submitted. AWS sign-in temporarily takes over the terminal, then returns to setup.
-Reviews show full artifacts and identities. Destructive approvals require only the
-first six characters of the displayed target identity (the entire identity if shorter);
-the backend still receives the complete reviewed identity and digest.
+Back revises unsubmitted choices without undoing completed actions. Plain-language
+reviews explain purpose, changes and consequences; expandable technical details
+retain complete artifacts and review digests. Destructive confirmations remain separate.
 
 The wizard offers two paths:
 
@@ -75,30 +78,31 @@ The wizard offers two paths:
   deployment in AWS** using its CloudFormation stack—the named group of AWS
   resources for that instance. Confirm the actual instance and routine AWS principal.
   This path does not redeploy, initialize the database, or replace active authority.
-- **Create a new MAVEN instance:** supply your account, stack/instance name,
-  notification email, two availability zones and a separately selected deployment
-  identity. Review costs and generated artifacts, then separately approve the change
-  set, its exact execution digest, database initialization and each starter authority
+- **Create a new MAVEN instance:** confirm the account discovered after sign-in,
+  then provide the stack/instance name, notification email and two availability zones.
+  Select maintenance access separately. Review costs and generated artifacts, then
+  approve the change set, its exact execution, database initialization and each starter authority
   candidate. The current deployment template is restricted to `us-east-1` and a
   same-account human IAM user; see [deployment limitations](docs/getting-started.md#deployment-limitations-and-costs)
   before choosing this path. Deployment is not permission to activate instructions.
 
-Normal work uses the explicitly selected routine identity, **never root or an implicit
-administrator fallback**. Guided setup uses named `aws login` profiles, not static
-access keys. A profile is a local label such as `maven`; if it is new or expired, the
-wizard can open the normal AWS sign-in flow after you approve. You need an existing
-AWS identity with the required access; the installer does not create your AWS account
-or grant administrator permissions. Setup/deployment access is selected separately.
+**Daily-use access** operates memory; **maintenance access** manages infrastructure
+or reads necessary stack metadata. These are purposes, not necessarily different AWS
+accounts. Existing configured connections do not require a maintenance login.
+Named `aws login` profiles are local labels, not proof of identity or permissions.
+Setup displays known expected account/principal details before login, explicitly
+marks unknown values, then verifies and asks you to confirm the actual identity.
+Saved-account mismatches block progress; root is never a daily-use fallback.
+Read-only preflights report **Passed**, **Missing access**, or **Could not verify**
+with limitations and remediation. They do not grant permissions or guarantee deployment.
 
 AWS sign-in may also offer AWS skills and an AWS MCP connection. These are optional
 and separate from MAVEN; see [the AWS toolkit note](docs/getting-started.md#optional-aws-agent-toolkit).
 
-Project setup is optional during installation. Confirm an explicit folder and an
-existing cloud project or creation with real source evidence. Memory enablement
-needs no repository, remote, branch or explicit no-Git choice. Optional Git setup
-is separate. Private `.maven` selection/runtime files belong to that folder; setup
-never commits, pushes, pulls or switches branches. The installation checkout is
-not automatically a project, and `/` cannot be a project root.
+Project enablement happens **in your harness, not the installer**. Open the actual
+project and ask **“Enable MAVEN for this project.”** Review the proposed root,
+instance and scope before approving. Memory needs no repository, remote or branch;
+Git assistance is separate. The installation checkout is never automatically bound.
 
 ## Work with your assistant
 
@@ -144,8 +148,8 @@ maven-setup
 Reruns preserve configuration and pending review/request identities. An unknown cloud
 outcome must be reconciled using the same artifacts, not bypassed by starting a new
 installation. Instance readiness requires verified cloud access and complete
-applicable authority; project readiness is reported separately if you defer that
-optional step. A local package installation alone is not readiness.
+applicable authority. Project enablement remains a separate harness task; a local
+package installation alone is not readiness.
 
 ## Uninstall selected scopes
 

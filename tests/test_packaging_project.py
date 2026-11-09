@@ -96,15 +96,14 @@ class ProjectPackagingTests(unittest.TestCase):
                 load_project(root)
 
     def test_skill_conflicts_are_preserved(self):
-        import install
-        source = Path(install.__file__).parent
+        from tools.harness import skill_plan
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             target = root / 'maven/SKILL.md'
             target.parent.mkdir()
             target.write_text('existing owner instructions')
             with self.assertRaises(ValueError):
-                install._skill_plan(source, [root])
+                skill_plan([root])
             self.assertEqual(target.read_text(), 'existing owner instructions')
 
 

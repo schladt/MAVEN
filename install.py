@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -15,8 +16,12 @@ import stat
 import subprocess
 import sys
 
+from uuid import UUID
 from tools.interaction import Field, OperationPaused, checkpoint, current, message, require, stage
-from tools.harness import HARNESS_PATHS as INTEGRATIONS, SKILLS, apply_integration, integration_plan
+from tools.harness import (
+    HARNESS_PATHS as INTEGRATIONS, SKILLS, apply_integration, integration_plan,
+    skill_plan, retired_skill_plan, retire_skills, validate_default_profiles,
+)
 
 
 def _notify(text, *, file=None):
@@ -26,6 +31,10 @@ def _notify(text, *, file=None):
         message(text)
 
 HARNESS_PATHS = {name: Path(paths[2]) for name, paths in INTEGRATIONS.items()}
+
+
+class BackToOptions(OperationPaused):
+    """Return from an unsubmitted local review without rolling back anything."""
 
 
 def _private_directory(path: Path) -> None:
@@ -42,50 +51,6 @@ def _no_symlink_parents(path: Path) -> None:
             raise ValueError(f'refusing symlink target: {parent}')
 
 
-def _skill_plan(source: Path, roots: list[Path]) -> list[tuple[Path, bytes]]:
-    plan = []
-    for root in dict.fromkeys(roots):
-        _no_symlink_parents(root)
-        for name in SKILLS:
-            target = root / name / 'SKILL.md'
-            _no_symlink_parents(target)
-            body = (source / 'maven_resources' / 'templates' / 'skills' / name / 'SKILL.md').read_bytes()
-            if target.exists():
-                if not target.is_file() or target.read_bytes() != body:
-                    raise ValueError(f'existing skill differs; preserved without changes: {target}. '
-                                     'Use --skill-dir with a separate staging directory for manual review.')
-            else:
-                if target.parent.exists() and any(target.parent.iterdir()):
-                    raise ValueError(f'existing nonempty skill directory preserved: {target.parent}')
-                plan.append((target, body))
-    return plan
-
-
-def _retired_skill_plan(home: Path, roots: list[Path]):
-    """Retire only exact installer-owned CLI-ritual skills during cutover."""
-    from tools.uninstall.common import read_private
-    from tools.uninstall.local import MANIFEST, _shared_skills, inventory
-    receipt = home / MANIFEST
-    prior = read_private(receipt) if receipt.exists() else {}
-    if prior and (prior.get('schema') != 1 or prior.get('home') != str(home)):
-        raise ValueError('Installer ownership receipt does not match this home.')
-    retired = ('maven-setup', 'maven-connect', 'maven-skill-use',
-               'maven-start-work', 'maven-checkpoint', 'maven-stop-work')
-    candidates = [root / name / 'SKILL.md' for root in dict.fromkeys(roots) for name in retired]
-    existing = [path for path in candidates if path.exists() or path.is_symlink()]
-    if not existing:
-        return []
-    shared, unknown = _shared_skills(home, [])
-    result = []
-    for path in existing:
-        _no_symlink_parents(path)
-        expected = prior.get('owned', {}).get(str(path))
-        if (not expected or str(path) not in prior.get('skill_references', [])
-                or str(path) in shared or unknown or inventory(path) != expected):
-            raise ValueError(f'Legacy skill is modified, shared or unowned; preserved: {path}. '
-                             'Review its removal separately or use an inactive staging home.')
-        result.append((path, expected))
-    return result
 
 
 
@@ -201,29 +166,53 @@ def main(argv=None) -> int:
         handoff = {}
 
         def operation(ui):
-            _options(args)
-            result = _install(args, handoff)
-            if result == 0 and handoff:
-                body = (f'Local tools are installed in {handoff["home"]}.\n\n'
-                        'Shell activation:\n' + '\n'.join(handoff['activation']) +
-                        '\n\nOpen instance setup now? Decline to finish locally; activate this '
-                        'installation and run maven-setup later. No cloud readiness is implied yet.')
-                if not ui.review('Local installation complete', body, accept='Open instance setup'):
+            while True:
+                _options(args)
+                home = args.home.expanduser().absolute()
+                if args.check_existing and (home / 'venv/bin/python').is_file():
+                    review = ui.review('Check or repair this connection',
+                                       'Use the installed Python runtime to inspect this saved connection.\n'
+                                       'No package update or cloud changes are approved by this screen.\n'
+                                       'Sign-in and any repair that changes resources require their own review.',
+                                       details=f'Home: {home}\nSetup code: {Path(__file__).resolve().parent}',
+                                       back=True, accept='Continue to connection checks')
+                    if review is None:
+                        continue
+                    if not review:
+                        raise OperationPaused('Connection checks declined; saved settings are unchanged.')
+                    handoff.update(home=home)
+                else:
+                    try:
+                        result = _install(args, handoff)
+                    except BackToOptions:
+                        continue
+                    if result:
+                        return result
+                if args.local_only:
+                    from tools.tui.harness import show_completion
+                    show_completion(ui, home, handoff['integration'])
                     handoff.clear()
+                    return 0
+                handoff.update(mode=args.setup_mode, operation=args.setup_operation)
                 ui.close_when_finished()
-            return result
+                return 0
 
-        result = run_workflow('Install MAVEN', [
-            'Prerequisites', 'Installation options', 'Review installation', 'Install tools', 'Local completion',
+        result = run_workflow('Set up MAVEN', [
+            'Choose a task', 'Installation folder', 'Review installation', 'Install tools',
+            'Connect cloud memory',
         ], operation)
         if result or not handoff:
             return result
         # The first app is closed before the installed setup app owns the terminal.
         home = handoff['home']
         from tools.tui.bootstrap import run_terminal
+        command = [str(home / 'venv/bin/python'), '-m', 'tools.setup', '--home', str(home),
+                   '--mode', handoff['mode']]
+        if handoff.get('operation'):
+            command.extend(['--operation', handoff['operation']])
         return run_terminal(
-            [str(home / 'venv/bin/maven-setup'), '--home', str(home)],
-            cwd=home, env=dict(os.environ, MAVEN_HOME=str(home)),
+            command, cwd=Path(__file__).resolve().parent,
+            env=dict(os.environ, MAVEN_HOME=str(home), PYTHONPATH=str(Path(__file__).resolve().parent)),
         )
     except (EOFError, KeyboardInterrupt, OperationPaused):
         _notify('Installation paused; existing private configuration is preserved.', file=sys.stderr)
@@ -233,35 +222,172 @@ def main(argv=None) -> int:
         return 1
 
 
+def _saved_installation(home):
+    """Display saved labels only; never treat this SDK-free overview as verified config."""
+    values, notice, pending = {}, '', None
+    path = home / '.env'
+    if path.exists() or path.is_symlink():
+        try:
+            _no_symlink_parents(path)
+            _private_file(path)
+            with path.open('rb') as stream:
+                raw = stream.read(65537)
+            if len(raw) > 65536:
+                raise ValueError('oversized settings')
+            display_keys = {
+                'MAVEN_INSTANCE_NAME', 'MAVEN_MEMORY_INSTANCE_ID', 'MAVEN_STACK_NAME',
+                'MAVEN_ACCOUNT_ID', 'MAVEN_MEMORY_CLIENT_ROLE_ARN', 'MAVEN_MEMORY_REGION',
+                'MAVEN_AWS_REGION', 'MAVEN_AWS_PROFILE', 'MAVEN_DEPLOY_PROFILE',
+            }
+            for line in raw.decode('utf-8').splitlines():
+                key, separator, value = line.strip().partition('=')
+                if not separator or key not in display_keys:
+                    continue
+                value = value.strip()
+                if value.startswith('"'):
+                    value = json.loads(value)
+                elif value.startswith("'") and value.endswith("'"):
+                    value = value[1:-1]
+                if (key in values or not isinstance(value, str)
+                        or any(ord(char) < 32 for char in value)):
+                    raise ValueError('invalid saved label')
+                values[key] = value
+        except (OSError, ValueError, UnicodeError):
+            values = {}
+            notice = '\nSaved settings could not be read safely. Preserve them; check ownership, mode 0600 and literal values.'
+    account = values.get('MAVEN_ACCOUNT_ID')
+    role = re.fullmatch(r'arn:aws:iam::([0-9]{12}):role/.+', values.get('MAVEN_MEMORY_CLIENT_ROLE_ARN', ''))
+    if role:
+        account = role[1]
+    if not account or not re.fullmatch(r'[0-9]{12}', account):
+        account = 'Unknown until sign-in and confirmation'
+    summary = '\n'.join([
+        f'Installation: {home}', 'Saved configuration — NOT verified against AWS in this run.',
+        'Instance: ' + (values.get('MAVEN_INSTANCE_NAME') or values.get('MAVEN_STACK_NAME')
+                       or values.get('MAVEN_MEMORY_INSTANCE_ID') or 'Not connected yet'),
+        f'AWS account: {account}',
+        'Region: ' + (values.get('MAVEN_MEMORY_REGION') or values.get('MAVEN_AWS_REGION') or 'Not selected'),
+        'Daily-use profile: ' + (values.get('MAVEN_AWS_PROFILE') or 'Not selected'),
+        'Maintenance profile: ' + (values.get('MAVEN_DEPLOY_PROFILE') or 'Not selected; requested only when needed'),
+    ]) + notice
+    state_path = home / 'runtime/setup/state.json'
+    if state_path.exists():
+        try:
+            from tools.uninstall.common import read_private
+            saved = read_private(state_path)
+            identifier = saved.get('administration_operation')
+            if identifier:
+                if str(UUID(identifier)) != identifier:
+                    raise ValueError('invalid operation')
+                state = read_private(home / 'runtime/administration' / (identifier + '.json'))
+                if state['state'] not in ('completed', 'cancelled'):
+                    pending = identifier
+                    steps = ', '.join(receipt['step'] for receipt in state.get('receipts', [])) or 'None yet'
+                    summary += (f'\n\nUnfinished setup: {identifier}\nCompleted checkpoints: {steps}'
+                                f'\nNext saved step: {state["step"]}\nResume retains the exact requests and approvals; nothing is rolled back.')
+        except (OSError, ValueError, KeyError, TypeError):
+            summary += '\nSetup receipts need inspection; do not delete them or start over to bypass an unresolved operation.'
+    return summary, pending
+
+
+def _advanced_options(args):
+    selected = require().form('Advanced software options', [
+        Field('google', 'Include optional Google integrations', args.google, kind='bool',
+              help='Adds Google client dependencies. Does not sign in to Google or send any data.'),
+        Field('ca', 'Trusted PEM certificate bundle', str(args.ca_bundle or ''), required=False,
+              help='Only for a corporate/private certificate authority. Leave blank to keep normal TLS verification.'),
+        Field('skill_dirs', 'Custom skill folders, one absolute path per line',
+              '\n'.join(map(str, args.skill_dir)), kind='multiline', required=False,
+              help='For custom harness profiles or inactive staging, not your project folder.'),
+        Field('stage_harnesses', 'Inactive staging home', str(args.stage_harnesses or ''), required=False,
+              help='Write explicitly selected integrations away from live harness configuration.'),
+    ], description='These affect local software only. No AWS account, login or cloud resources are changed.',
+       back=True)
+    if selected is not None:
+        args.google = selected['google']
+        args.ca_bundle = Path(selected['ca']) if selected['ca'] else None
+        args.skill_dir = [Path(line.strip()) for line in selected['skill_dirs'].splitlines() if line.strip()]
+        args.stage_harnesses = Path(selected['stage_harnesses']) if selected['stage_harnesses'] else None
+
+
 def _options(args):
-    stage('Prerequisites')
-    _prerequisites(require_aws=False)
-    stage('Installation options')
-    fields = [
-        Field('home', 'Private MAVEN installation folder',
-              str(args.home or Path(os.environ.get('MAVEN_HOME', '~/.maven')).expanduser())),
-        Field('google', 'Install optional Google dependencies', args.google, kind='bool'),
-        Field('local_only', 'Install local tools only (required without a login-capable AWS CLI)',
-              False, kind='bool'),
-        Field('ca', 'Optional trusted PEM CA bundle', str(args.ca_bundle or ''), required=False),
-        Field('skill_dirs', 'Custom skill roots (one absolute path per line)',
-              '\n'.join(map(str, args.skill_dir)), kind='multiline', required=False),
-        Field('stage_harnesses', 'Optional inactive staging home (leaves live harness config unchanged)',
-              str(getattr(args, 'stage_harnesses', None) or ''), required=False),
-    ]
-    fields.extend(Field(name, f'Install {name} MCP, startup guidance and skills',
-                        name in args.harness, kind='bool') for name, root in HARNESS_PATHS.items())
-    selected = require().form('Local installation options', fields,
-                              description='Unrelated configuration and differing MAVEN entries are preserved. Live integration changes require stopped harnesses; staging does not. Never enter credentials.')
-    if selected is None:
-        raise OperationPaused('Installation options paused.')
-    args.home = Path(selected['home'])
-    args.google = selected['google']
-    args.local_only = selected['local_only']
-    args.ca_bundle = Path(selected['ca']) if selected['ca'] else None
-    args.harness = [name for name in HARNESS_PATHS if selected[name]]
-    args.skill_dir = [Path(line.strip()) for line in selected['skill_dirs'].splitlines() if line.strip()]
-    args.stage_harnesses = Path(selected['stage_harnesses']) if selected['stage_harnesses'] else None
+    ui = require()
+    while True:
+        stage('Choose a task')
+        home = (args.home or Path(os.environ.get('MAVEN_HOME', '~/.maven'))).expanduser().absolute()
+        _no_symlink_parents(home)
+        existing = any((home / name).exists() for name in ('.env', 'venv', 'runtime/setup/state.json'))
+        summary, pending = _saved_installation(home) if existing else ('', None)
+        ui.set_context('Local setup • No AWS identity verified yet • No cloud changes approved')
+        if existing:
+            task = ui.choose('Your existing MAVEN installation', [
+                ('Resume unfinished setup — keep the original requests and approvals' if pending else
+                 'Check or repair this connection — verify the saved instance; no automatic redeployment', 'existing'),
+                ('Update local MAVEN software — preserve cloud settings; no AWS login or cloud changes', 'update'),
+                ('Set up a separate instance — choose another private installation folder', 'separate'),
+                ('Advanced options — software-only installation and custom local settings', 'advanced'),
+            ], description=summary)
+        else:
+            task = ui.choose('What would you like to do?', [
+                ('Connect to existing MAVEN — install software and connect to existing cloud memory', 'existing'),
+                ('Create a new MAVEN instance — review and provision billable AWS infrastructure', 'new'),
+                ('Advanced options — install software without connecting to cloud memory', 'advanced'),
+            ], description='Choose your goal. The wizard explains each step before asking you to decide.\n'
+                           'Maintenance access manages infrastructure; daily-use access operates memory.\n'
+                           'They may be separate identities in the same AWS account. Neither is assumed yet.')
+        separate = task == 'separate'
+        if separate:
+            task = ui.choose('Set up a separate installation', [
+                ('Connect to an existing cloud instance from another private home', 'existing'),
+                ('Create new cloud infrastructure in another private home', 'new'),
+                ('Back — keep the current installation unchanged', 'back'),
+            ], description='The current installation will not be overwritten or disconnected.')
+            if task == 'back':
+                continue
+        if task == 'advanced':
+            advanced = ui.choose('Advanced options', [
+                ('Install software without connecting to cloud memory — no AWS login or cloud changes', 'local'),
+                ('Change optional software, certificate or staging settings', 'settings'),
+                ('Back to task selection', 'back'),
+            ], description='Software-only installs the MCP server and recovery tools. Memory will not work until you connect an instance.')
+            if advanced == 'settings':
+                _advanced_options(args)
+                continue
+            if advanced == 'back':
+                continue
+            task = 'local'
+        stage('Installation folder')
+        default_home = home.with_name(home.name + '-new') if separate else home
+        selected = ui.form('Where should MAVEN keep this installation?', [
+            Field('home', 'Private MAVEN installation folder', str(default_home),
+                  help='Stores software, private connection settings and recovery receipts. This is NOT a project folder.'),
+        ], description=('Use an unused folder for this separate installation. Existing files will not be replaced.'
+                        if separate else 'Keep the suggested folder unless you need a separate installation. '
+                        'Existing settings and recovery receipts are preserved.'),
+           details='Google dependencies, certificate bundles and custom staging paths are under Advanced options.',
+           back=True)
+        if selected is None:
+            continue
+        chosen = Path(selected['home']).expanduser().absolute()
+        _no_symlink_parents(chosen)
+        if (separate or task == 'new') and chosen.exists() and any(chosen.iterdir()):
+            ui.review('Choose an unused installation folder',
+                      'Creating a separate/new instance must not reuse existing settings or receipts. '
+                      'Nothing was changed. Choose another folder, or connect/check the existing installation.',
+                      accept='Return to task selection')
+            continue
+        if chosen != home and not separate:
+            # Reclassify a different saved home before offering any operation on it.
+            if any((chosen / name).exists() for name in ('.env', 'venv', 'runtime/setup/state.json')):
+                args.home = chosen
+                continue
+            pending = None
+        args.home = chosen
+        args.local_only = task in ('local', 'update')
+        args.check_existing = task == 'existing' and existing and chosen == home and not separate
+        args.setup_mode = 'new' if task == 'new' else 'existing'
+        args.setup_operation = pending if args.check_existing else None
+        return
 
 
 def _install_command(command):
@@ -311,18 +437,8 @@ def _install(args, handoff=None):
         if staging and configs:
             raise ValueError('Stage under the inactive home first; custom live paths require --harness-stopped.')
         custom = {name: (path, contexts[name]) for name, path in configs.items()}
-        overrides = {
-            'claude': ('CLAUDE_CONFIG_DIR',),
-            'omp': ('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR'),
-            'codex': ('CODEX_HOME',),
-            'copilot': ('COPILOT_HOME',),
-            'gemini': ('GEMINI_CLI_HOME',),
-        }
         if not staging:
-            for name in args.harness:
-                if name not in custom and any(os.environ.get(key) for key in overrides[name]):
-                    raise ValueError(f'{name} configuration override is set; select its explicit '
-                                     '--harness-config, --harness-context and --skill-dir, or stage first.')
+            validate_default_profiles(name for name in args.harness if name not in custom)
         roots = [integration_home / HARNESS_PATHS[name] for name in args.harness if name not in custom]
         roots.extend(path.expanduser().absolute() for path in args.skill_dir)
         selected_harnesses = list(args.harness)
@@ -335,10 +451,10 @@ def _install(args, handoff=None):
                 deferred, roots, selected_harnesses = True, [], []
                 _notify('Harness integration deferred; active harness files will not be changed.')
         try:
-            plan = _skill_plan(source, roots)
+            plan = skill_plan(roots)
             integrations = integration_plan(home, selected_harnesses,
                                             user_home=integration_home, ca_bundle=ca_bundle, paths=custom)
-            retired_skills = _retired_skill_plan(home, roots)
+            retired_skills = retired_skill_plan(home, roots)
         except ValueError as exc:
             if current() is None:
                 raise
@@ -364,7 +480,16 @@ def _install(args, handoff=None):
                     f'{change.path}\n{change.receipt["value"]}' for change in integrations
                     if change.receipt is not None) or '(none)'),
             ])
-            if not require().review('Approve exact local installation', body):
+            summary = (f'Install/update MAVEN software in {home}.\n'
+                       'This step downloads Python dependencies and writes local software and ownership receipts.\n'
+                       'It does not log in to AWS, create cloud resources, or enable any project.\n'
+                       'Existing private connection settings and unrelated harness configuration are preserved.\n'
+                       'Quit after installation does not uninstall the software; rerun to continue setup.')
+            review = require().review('Review local software installation', summary, details=body,
+                                      back=True, accept='Install software')
+            if review is None:
+                raise BackToOptions('Return to installation choices; no local mutation was started.')
+            if not review:
                 raise OperationPaused('Installation declined before local mutation.')
         checkpoint()
         _private_directory(home)
@@ -433,12 +558,7 @@ def _install(args, handoff=None):
             if change.receipt is not None:
                 record_installation(home, source, [], [], integrations=[change.receipt])
             apply_integration(change)
-        from tools.uninstall.local import inventory
-        for path, expected in retired_skills:
-            _no_symlink_parents(path)
-            if inventory(path) != expected:
-                raise ValueError(f'Legacy skill changed since review; preserved: {path}')
-            path.unlink()
+        retire_skills(retired_skills)
         finish_reinstallation(home, completed_marker)
         installation_locks.close()
         if current() is not None:
@@ -460,13 +580,22 @@ def _install(args, handoff=None):
         else:
             _notify('No harness configuration was modified.')
         checkpoint()
-        if args.local_only:
-            _notify('\nLocal-only installation complete; AWS and project setup have NOT been performed.')
-            _notify('After activation, run maven-setup to configure an existing or new instance; project setup is optional.')
-            return 0
         if handoff is not None:
             handoff['home'] = home
             handoff['activation'] = activation
+            changed = ([str(target) for target, _ in plan] +
+                       [str(change.path) for change in integrations if change.before != change.after] +
+                       [str(target) for target, _ in retired_skills])
+            handoff['integration'] = {
+                'status': 'written' if changed else 'unchanged' if selected_harnesses else 'skipped',
+                'selected': selected_harnesses, 'written': changed,
+                'reason': ('Harness integration deferred; live files were not changed.' if deferred else
+                           'Cloud access was not checked during this software installation.'),
+            }
+        if args.local_only:
+            _notify('\nLocal-only installation complete; AWS and project setup have NOT been performed.')
+            _notify('After activation, run maven-setup to connect an instance. Enable projects later in your harness.')
+            return 0
         return 0
     except OperationPaused:
         raise

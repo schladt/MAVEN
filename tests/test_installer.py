@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 import install
 from tools.interaction import OperationPaused, using
 from tools.harness import (
-    HARNESS_PATHS, apply_integration, integration_plan, removal_content, remove_integration,
+    HARNESS_PATHS, apply_integration, integration_plan, removal_content, remove_integration, retired_skill_plan,
 )
 
 
@@ -63,6 +63,64 @@ class InstallerTests(unittest.TestCase):
                     install._install(args)
             command.assert_not_called()
             self.assertFalse(home.exists())
+
+    def test_back_from_local_review_preserves_uncreated_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / 'not-created'
+            args = argparse.Namespace(home=home, google=False, harness=[], skill_dir=[],
+                                      ca_bundle=None, local_only=True, harness_stopped=False)
+            ui = Mock()
+            ui.review.return_value = None
+            with using(ui), patch.object(install, '_prerequisites'), \
+                    patch.object(install, '_install_command') as command:
+                with self.assertRaises(install.BackToOptions):
+                    install._install(args)
+            command.assert_not_called()
+            self.assertFalse(home.exists())
+
+    def test_switching_home_selects_its_exact_unfinished_operation(self):
+        from tools.uninstall.common import save_private
+        from uuid import uuid4
+        with tempfile.TemporaryDirectory() as directory:
+            homes = [Path(directory) / name for name in ('first', 'second')]
+            identifiers = [str(uuid4()), str(uuid4())]
+            for home, identifier in zip(homes, identifiers):
+                save_private(home / 'runtime/setup/state.json', {'administration_operation': identifier})
+                save_private(home / 'runtime/administration' / (identifier + '.json'), {
+                    'state': 'blocked', 'step': 'identity_inspect', 'receipts': []})
+                (home / '.env').write_text('MAVEN_AWS_PROFILE=owner\n')
+                (home / '.env').chmod(0o600)
+            args = argparse.Namespace(home=homes[0])
+            ui = Mock()
+            ui.choose.side_effect = ['existing', 'existing']
+            ui.form.side_effect = [{'home': str(homes[1])}, {'home': str(homes[1])}]
+            with using(ui):
+                install._options(args)
+            self.assertEqual(args.home, homes[1])
+            self.assertEqual(args.setup_operation, identifiers[1])
+            self.assertTrue(args.check_existing)
+            self.assertFalse(args.local_only)
+            self.assertEqual((homes[0] / '.env').read_text(), 'MAVEN_AWS_PROFILE=owner\n')
+
+    def test_separate_instance_cannot_reuse_existing_installation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / 'existing'
+            home.mkdir(mode=0o700)
+            environment = home / '.env'
+            environment.write_text('MAVEN_AWS_PROFILE=keep\n')
+            environment.chmod(0o600)
+            unused = home.parent / 'unused'
+            args = argparse.Namespace(home=home)
+            ui = Mock()
+            ui.choose.side_effect = ['separate', 'new', 'advanced', 'local']
+            ui.form.side_effect = [{'home': str(home)}, {'home': str(unused)}]
+            with using(ui):
+                install._options(args)
+            self.assertEqual(environment.read_text(), 'MAVEN_AWS_PROFILE=keep\n')
+            self.assertEqual(args.home, unused)
+            self.assertTrue(args.local_only)
+            self.assertIsNone(args.setup_operation)
+            self.assertFalse(unused.exists())
 
     def test_failed_package_command_cannot_leak_its_output_into_terminal(self):
         script = """
@@ -197,15 +255,16 @@ with using(object()):
             target = skills / 'maven-connect/SKILL.md'
             target.parent.mkdir(parents=True)
             target.write_text('old installed skill')
+            target.chmod(0o600)
             manifest = {'schema': 1, 'home': str(home),
                         'owned': {str(target): inventory(target)}, 'skill_references': [str(target)]}
             with patch('tools.uninstall.common.read_private', return_value=manifest), \
                     patch('tools.uninstall.local._shared_skills', return_value=(set(), False)):
-                plan = install._retired_skill_plan(home, [skills])
+                plan = retired_skill_plan(home, [skills])
                 self.assertEqual([path for path, _ in plan], [target])
                 target.write_text('owner modified guidance')
                 with self.assertRaises(ValueError):
-                    install._retired_skill_plan(home, [skills])
+                    retired_skill_plan(home, [skills])
                 self.assertEqual(target.read_text(), 'owner modified guidance')
 
     def test_startup_targets_follow_native_context_selection(self):

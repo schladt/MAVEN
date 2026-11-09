@@ -1,15 +1,15 @@
 # Getting started
 
-Install/connect the selected instance once, optionally defer project setup, then ask
-your assistant to enable MAVEN for an explicitly chosen folder. Subsequent supported
-sessions initialize visibly through native guidance and stdio MCP. No manually
+Install/connect the selected instance once, then ask your assistant to enable MAVEN
+for an explicitly chosen folder. Project enablement is not part of installation.
+Supported sessions initialize visibly through native guidance and stdio MCP. No manually
 assembled UUIDs, JSON requests or lifecycle commands are needed for ordinary work.
 
 Start with the [README prerequisites](../README.md#before-you-start). A source
 checkout does not supply a configured virtual environment, private `.env`, or your
-project's `.maven` directory. The installer creates them in the selected locations;
-you do not need to prepare them manually. Installing tools in a checkout does not
-register that checkout as a project.
+project's `.maven` directory. The installer creates the private installation home;
+project state is created separately through explicit harness enablement. Installing
+tools in a checkout does not register that checkout as a project.
 
 ## Guided first-time setup
 
@@ -19,23 +19,32 @@ From the cloned or extracted source folder:
 python3 install.py
 ```
 
-The default is a full-screen Textual interface: choose the private installation home
-(default `~/.maven`), optional harness integrations and optional Google dependencies,
-then follow the cloud/project screens. Python 3.11+ with `venv` is required. If UI
-dependencies are missing, a brief initial prompt requests consent to download them
-into a temporary private runtime. It never modifies system Python.
+The full-screen Textual interface starts with your goal: **connect existing memory**
+or **create a new instance**. An existing installation shows its saved, unverified
+instance/account/region/profiles and offers **check or repair**, **update local
+software**, or **set up a separate instance**. Check/repair does not reinstall packages
+or automatically redeploy. A separate instance requires an unused private home.
+Software-only installation and optional Google/certificate settings are under
+**Advanced options**. The private installation home defaults to `~/.maven`.
+
+Python 3.11+ with `venv` is required. If UI dependencies are missing, a brief initial
+prompt requests consent to download them into a temporary private runtime; system
+Python is never modified.
 
 Use Tab/Shift+Tab to move focus, arrows to select, Space to toggle checkboxes and
-Enter or the mouse to activate controls. Review panes are scrollable. At narrow
-widths the step sidebar is hidden; use at least an 80-column, 24-row terminal.
+Enter or the mouse to activate controls. Back revises unsubmitted choices; it never
+silently undoes external effects. Reviews explain what changes and why, with complete
+artifacts under expandable technical details. The current access purpose, selected
+profile and account remain visible. At narrow widths the step sidebar is hidden;
+use at least an 80-column, 24-row terminal.
 Ctrl+Q or Ctrl+C requests a safe pause. The current action may need to finish first;
 already-submitted AWS work can continue remotely. Closing is not rollback and does
 not leave a persistent MAVEN background worker.
 
 The installer checks Git and an AWS CLI with `aws login` support and gives
-installation guidance; it never silently installs system packages. Choose local
-tools only when AWS prerequisites are unavailable. Git is unnecessary for a no-Git
-project when you obtained the source through an archive.
+installation guidance; it never silently installs system packages. Under Advanced,
+choose **Install software without connecting to cloud memory** when AWS prerequisites
+are unavailable. Git is unnecessary for a no-Git project obtained through an archive.
 
 The local installation creates `venv/`, `.env` when absent, private runtime/login
 cache directories and an `activate` shell snippet under the selected home. Afterward:
@@ -63,46 +72,63 @@ initializes an existing database, or activates replacement authority. Existing
 authority must already be available; missing authority is a blocker, not permission
 to reset it.
 
-**New instance:** provide the AWS account, stack/instance name, notification email,
-two availability zones and explicit routine and deployment identities. Review the
-limitations and costs below. The wizard displays the generated package and complete
-change-set review, asks permission to create a change set, and binds the execution
-button to its exact review digest. Database initialization and each starter
-authority proposal/activation have separate review screens. Routine approvals use
-buttons; destructive approvals require the first six characters of the displayed
-target identity, or the full identity if shorter. You never need to copy a full hash
-into the TUI. Read the complete artifacts and candidate bodies before approving.
+**New instance:** sign in and confirm the discovered account/principal, then provide
+the stack/instance name, notification email and two availability zones. Select
+daily-use and maintenance access explicitly. Review the limitations and costs below.
+The wizard displays the generated package and complete change-set review, asks
+permission to create a change set, and binds execution to the exact review digest.
+Database initialization and each starter authority proposal/activation have separate
+reviews. Changed candidates require fresh approval. Routine terminal approvals use
+buttons and record the actual selection; destructive confirmations remain separate.
+Read the complete artifacts and candidate bodies before approving.
 Declining any stage leaves setup pending, not complete.
 
-Use a named `aws login` profile and confirm the actual STS principal; never use root
-for routine access. A profile is a local label, not an access key. The wizard can
-create/authenticate that selected CLI profile through normal interactive AWS sign-in
-after your approval. Saved static-key profiles and implicit credential chains are
-not accepted by guided setup. Metadata/deployment access is selected separately and
-never becomes a silent fallback. Importing another installation's `.env` does not
-copy credentials or reuse another machine's cache paths: choose a local private cache
-folder (Enter accepts the created default). An existing approved local cache can be
-selected explicitly. See [AWS command-line sign-in](https://docs.aws.amazon.com/signin/latest/userguide/command-line-sign-in.html)
+**Daily-use access** operates memory. **Maintenance access** manages CloudFormation
+or reads required stack metadata; it is requested only when needed. These purposes
+can use identities in the same AWS account. A configured existing connection does
+not require maintenance access just to verify memory.
+
+Use a named `aws login` profile, not root or static access keys. A profile is a local
+label, not an access grant. Saved/imported account and principal details are labelled
+as expected, not verified. On a first install they may be unknown until sign-in;
+setup then explicitly confirms the actual STS account and principal before changes.
+An identity differing from saved bindings is blocked, not silently substituted.
+Choose **Sign in**, manual instructions, Back or pause; login is never launched
+without that choice. A failed login offers manual recovery, not a readiness claim.
+
+Read-only access preflights distinguish **Passed**, **Missing access**, and
+**Could not verify**. Missing access blocks the affected phase with remediation and
+retry of the same operation. Unknown checks remain disclosed in reviews, not relabelled
+as success. IAM simulation covers representative actions, not every resource
+condition, organization control, quota or dependency; role assumption and reads
+cannot prove write permissions. No test resources are created by these probes.
+
+Importing `.env` does not copy credentials or reuse another machine's cache paths.
+Choose owner-private local login caches, separate for daily-use and maintenance.
+See [AWS command-line sign-in](https://docs.aws.amazon.com/signin/latest/userguide/command-line-sign-in.html)
 for account/identity prerequisites and login permissions.
 
 For interactive AWS sign-in, the TUI temporarily restores the normal terminal and
 resumes afterward. Authentication output is not captured into the progress log.
 The actual returned principal is verified before any subsequent cloud action.
 
-### Optional project setup
+### Optional harness connection and project enablement
 
-After verified instance access and complete approved authority, the wizard offers
-an optional project step; you can defer it and enable the project in your assistant later.
-Instance readiness and project readiness are distinct. To set up now, select and
-confirm the **project folder** separately. Filesystem `/` is not permitted; an
-ambiguous/subdirectory root needs an explicit choice rather than silent rebinding.
-The MAVEN source checkout is a development project only if you explicitly choose it.
+After verified cloud access and complete approved authority, optionally configure
+OMP, Claude Code, Codex, Copilot or Gemini. Review exact local MCP, startup-guidance
+and skill changes, then confirm affected harnesses are stopped before any writes.
+Skip leaves their files unchanged. Conflicting or modified files are preserved;
+partial completed writes remain recorded in selective-uninstall ownership receipts.
 
-Choose an existing cloud project or authorize a named new one with genuine source
-evidence. Memory works without Git configuration or an explicit no-Git choice.
-Optional Git assistance separately confirms the remote, push URL and current branch.
-Setup creates private selection/runtime state without committing, pushing, pulling
-or switching branches. New project/request identities are journaled before mutation.
+Completion distinguishes **cloud verified**, **harness files written/skipped/conflict**,
+**restart needed**, and **harness MCP connection not yet verified**.
+Open the actual project in a new selected-harness session and ask:
+**“Enable MAVEN for this project.”** Review the root, instance and scope before approval.
+The installer never chooses a project folder or binds its source checkout.
+
+Project enablement can select an existing cloud project or create a named one with
+genuine source evidence. Memory needs no Git configuration; optional Git assistance
+is separate. Project selection does not commit, push, pull or switch branches.
 
 ### Resume instance setup
 
@@ -112,30 +138,33 @@ After activating the installed commands, resume interrupted or declined setup wi
 maven-setup
 ```
 
-For a separate home or a different suggested project folder:
+For a separate home:
 
 ```sh
-maven-setup --home /absolute/path/to/private-home --project-root /absolute/path/to/project
+maven-setup --home /absolute/path/to/private-home
 ```
 
-Those paths must be your actual selected directories. `--project-root` is a prompt
-default, not authorization to bind that folder. Keep the home, `runtime/setup` artifacts,
-review files and pending request receipts intact. The wizard resumes the same requests;
-there is no reset/redeploy flag. Unknown outcomes must be reconciled before retrying
-mutations. Existing infrastructure must never be reinitialized to recover onboarding.
+Use your actual installation directory. Keep `runtime/setup`, review files and
+pending receipts intact. Resume retains the exact operation, requests and approvals,
+and reports its saved phase. Back only revises safe, unsubmitted choices.
+Unknown outcomes must be reconciled before retrying mutations; existing infrastructure
+must never be reinitialized to recover onboarding.
 
-`maven-setup` opens the same setup screens and reads the existing receipts.
-After local installation finishes, choose **Open instance setup** to continue into
-the installed setup TUI, or decline to finish locally. If you pause instead, activate
-that installation and run `maven-setup` explicitly when ready.
+`maven-setup` opens the same setup screens and reads existing receipts. Guided
+installation continues directly into cloud setup; if paused, activate that home and
+run `maven-setup` when ready. `--mode existing|new` selects the task without asking
+again. After verified completion, a separately reviewed check/repair can start a
+new operation; `--fresh-operation` never discards an unfinished or unverified one.
 
-Instance completion requires verified routine cloud access and complete applicable
-authority. A declined optional project step does not invent project readiness.
-For an interrupted project operation, preserve the selected root's `.maven/runtime`
-setup receipts and repeat its original `maven-project setup` choices. The command
-reconciles the original IDs before an explicitly resumed mutation. Legacy
-instance-wizard pending/saved project requests retain their original IDs and receipts;
-do not discard them or create a second project to get past an uncertain response.
+Instance completion requires verified daily-use cloud access and complete applicable
+authority. Project enablement is separate. For an interrupted project operation,
+preserve its `.maven/runtime` receipts and resume its original `maven-project setup`
+choices. Legacy installer project receipts are retained, not executed or deleted
+by the redesigned installer; unresolved submitted effects require reconciliation.
+
+The `maven_admin` Back action exposes the same safe navigation to harnesses: it
+returns a fresh editable interaction while retaining historical approvals and
+receipts. It refuses to cross submitted or unresolved effects.
 
 Conversational setup preserves a durable operation identity. The agent records a
 response, then advances one explicit phase; recording consent alone does not execute

@@ -33,6 +33,78 @@ class Change:
     receipt: dict | None
 
 
+
+def validate_default_profiles(harnesses) -> None:
+    """Refuse ambiguous live targets; custom profiles need explicit paths."""
+    overrides = {
+        'claude': ('CLAUDE_CONFIG_DIR',),
+        'omp': ('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR'),
+        'codex': ('CODEX_HOME',),
+        'copilot': ('COPILOT_HOME',),
+        'gemini': ('GEMINI_CLI_HOME',),
+    }
+    for name in harnesses:
+        if any(os.environ.get(key) for key in overrides[name]):
+            raise ValueError(f'{name} configuration override is set; select its explicit '
+                             '--harness-config, --harness-context and --skill-dir, or stage first.')
+
+
+def skill_plan(roots: list[Path]) -> list[tuple[Path, bytes]]:
+    """Plan only absent shipped skills, never adopting or replacing user files."""
+    bodies = {name: resource_path(f'templates/skills/{name}/SKILL.md').read_bytes()
+              for name in SKILLS}
+    plan = []
+    for root in dict.fromkeys(roots):
+        for name, body in bodies.items():
+            target = root / name / 'SKILL.md'
+            before = _read(target)
+            if before is not None:
+                if before != body:
+                    raise ValueError(f'Existing skill differs; preserved without changes: {target}. '
+                                     'Use --skill-dir with a separate staging directory for manual review.')
+            else:
+                if target.parent.exists() and any(target.parent.iterdir()):
+                    raise ValueError(f'Existing nonempty skill directory preserved: {target.parent}')
+                plan.append((target, body))
+    return plan
+
+
+def retired_skill_plan(home: Path, roots: list[Path]):
+    """Retire only exact installer-owned CLI-ritual skills during cutover."""
+    from tools.uninstall.common import read_private
+    from tools.uninstall.local import MANIFEST, _shared_skills, inventory
+    receipt = home / MANIFEST
+    prior = read_private(receipt) if receipt.exists() else {}
+    if prior and (prior.get('schema') != 1 or prior.get('home') != str(home)):
+        raise ValueError('Installer ownership receipt does not match this home.')
+    retired = ('maven-setup', 'maven-connect', 'maven-skill-use',
+               'maven-start-work', 'maven-checkpoint', 'maven-stop-work')
+    candidates = [root / name / 'SKILL.md' for root in dict.fromkeys(roots) for name in retired]
+    existing = [path for path in candidates if path.exists() or path.is_symlink()]
+    if not existing:
+        return []
+    shared, unknown = _shared_skills(home, [])
+    result = []
+    for path in existing:
+        _read(path)
+        expected = prior.get('owned', {}).get(str(path))
+        if (not expected or str(path) not in prior.get('skill_references', [])
+                or str(path) in shared or unknown or inventory(path) != expected):
+            raise ValueError(f'Legacy skill is modified, shared or unowned; preserved: {path}. '
+                             'Review its removal separately or use an inactive staging home.')
+        result.append((path, expected))
+    return result
+
+
+def retire_skills(plan) -> None:
+    """Remove reviewed legacy files only while their pinned inventory matches."""
+    from tools.uninstall.local import inventory
+    for path, expected in plan:
+        _read(path)
+        if inventory(path) != expected:
+            raise ValueError(f'Legacy skill changed since review; preserved: {path}')
+        path.unlink()
+
 def _read(path: Path) -> bytes | None:
     for part in (path, *path.parents):
         if part.is_symlink():

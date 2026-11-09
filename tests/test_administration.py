@@ -1,4 +1,5 @@
 """Restartable administration behavior with temporary evidence and simulated AWS."""
+from argparse import Namespace
 from datetime import datetime, timedelta, timezone
 import json
 import os
@@ -10,8 +11,10 @@ from uuid import uuid4
 
 from tools.administration import AdminOperations
 from tools.memory.client import MemoryClientError
-from tools.setup import Wizard
-from tools.setup_common import read_private, save_json
+from tools.setup import Wizard, _present
+from tools.setup_common import (SetupPending, read_private, save_json, expected_account,
+                                check_login_identity, permission_preflight as inspect_permissions,
+                                inspect_login_identity)
 from tools.uninstall.common import save_private
 
 
@@ -33,12 +36,20 @@ class AdministrationTests(unittest.TestCase):
         binding = patch.object(AdminOperations, '_project_binding', side_effect=lambda: self.project_binding)
         binding.start()
         self.addCleanup(binding.stop)
+        preflight = patch('tools.setup_common.permission_preflight', return_value={
+            'status': 'Passed', 'checks': [{'check': 'Fixture access', 'status': 'Passed'}],
+            'limitations': ['Fixture result; not live AWS evidence.'], 'remediation': 'Inspect IAM permissions.'})
+        self.preflight = preflight.start()
+        self.addCleanup(preflight.stop)
 
     def respond(self, result, values=None):
         question = result['pending_interaction']
         if question['kind'] == 'review':
             values = {'approved': True, 'review_digest': question['review_digest'],
                       'source': self.source, 'confirmations': question['confirmations']}
+        elif question['key'] == 'selection':
+            names = {field['name'] for field in question['fields']}
+            values = {key: value for key, value in values.items() if key in names}
         return self.controller.respond(result['operation_id'], question['interaction_id'], question['revision'], values)
 
     def advance_to_question(self, result):
@@ -75,7 +86,7 @@ class AdministrationTests(unittest.TestCase):
         self.assertEqual((self.controller.directory / (result['operation_id'] + '.json')).stat().st_mode & 0o777, 0o600)
 
     def test_existing_setup_reaches_verified_readiness_without_provisioning(self):
-        wizard = Wizard(self.home, None)
+        wizard = Wizard(self.home)
         instance = str(uuid4())
         wizard.settings({'MAVEN_MEMORY_INSTANCE_ID': instance, 'MAVEN_AWS_REGION': 'us-east-1'})
         identity = {'Arn': 'arn:aws:iam::123456789012:user/owner', 'Account': '123456789012'}
@@ -89,7 +100,7 @@ class AdministrationTests(unittest.TestCase):
             result = self.controller.begin('setup', {})
             answers = {'selection': {'mode': 'existing', 'connection': '', 'region': 'us-east-1'},
                        'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
-                       'upgrade': {'migrate': False}, 'optional_project': {'configure': False, 'root': ''}}
+                       'upgrade': {'migrate': False}}
             for _ in range(30):
                 result = self.advance_to_question(result)
                 if result['state'] == 'completed':
@@ -100,13 +111,19 @@ class AdministrationTests(unittest.TestCase):
                 self.controller = AdminOperations(self.home)
             self.assertEqual(result['state'], 'completed')
             self.assertTrue(any(receipt['result'].get('instance_ready') for receipt in result['receipts']))
+            self.assertEqual(result['outcome']['home'], str(self.home))
+            self.assertEqual(result['outcome']['account'], identity['Account'])
+            self.assertTrue(result['outcome']['instance_ready'])
+            self.assertFalse(result['outcome']['project_configured'])
+            self.assertNotIn('optional_project', result['answers'])
+            self.assertNotIn('deploy_identity', result['answers'])
             prepare.assert_not_called()
             apply.assert_not_called()
             initialize.assert_not_called()
 
         original_path = self.controller._path(result['operation_id'])
         original_operation = original_path.read_bytes()
-        wizard = Wizard(self.home, None)
+        wizard = Wizard(self.home)
         wizard.state['submitted_requests'] = [str(uuid4())]
         wizard.save()
         original_setup = wizard.state_path.read_bytes()
@@ -139,7 +156,7 @@ class AdministrationTests(unittest.TestCase):
                 saved = controller._load(original['operation_id'])
                 saved.update(state=phase, pending_interaction=None)
                 controller._save(saved)
-                wizard = Wizard(home, None)
+                wizard = Wizard(home)
                 wizard.state['submitted_requests'] = [str(uuid4())]
                 wizard.save()
                 evidence = wizard.state_path.read_bytes()
@@ -154,7 +171,7 @@ class AdministrationTests(unittest.TestCase):
         for evidence_kind in ('legacy', 'artifact_only', 'missing_owner'):
             with self.subTest(evidence_kind=evidence_kind):
                 home = self.base / evidence_kind
-                wizard = Wizard(home, None)
+                wizard = Wizard(home)
                 if evidence_kind == 'legacy':
                     wizard.state.update(mode='new', ready_project=str(self.base),
                                         submitted_requests=[str(uuid4())])
@@ -176,7 +193,7 @@ class AdministrationTests(unittest.TestCase):
                      receipts=[{'step': 'verify', 'result': {'instance_ready': True, 'authority_generation': 7}}])
         self.controller._save(saved)
         original_operation = self.controller._path(original['operation_id']).read_bytes()
-        wizard = Wizard(self.home, None)
+        wizard = Wizard(self.home)
         original_setup = wizard.state_path.read_bytes()
         with patch.object(Wizard, 'save', side_effect=OSError('interrupted owner write')):
             next_operation = self.controller.begin('setup', {})
@@ -186,7 +203,7 @@ class AdministrationTests(unittest.TestCase):
         self.assertEqual(archive.read_bytes(), original_setup)
         next_operation = AdminOperations(self.home).advance(next_operation['operation_id'])
         self.assertEqual(next_operation['state'], 'awaiting_decision')
-        self.assertEqual(Wizard(self.home, None).state['administration_operation'], next_operation['operation_id'])
+        self.assertEqual(Wizard(self.home).state['administration_operation'], next_operation['operation_id'])
         self.assertEqual(archive.read_bytes(), original_setup)
         self.assertEqual(self.controller._path(original['operation_id']).read_bytes(), original_operation)
 
@@ -209,7 +226,7 @@ class AdministrationTests(unittest.TestCase):
             return {'status': 'prepared'}
 
         def apply_package(values, package, review, env, **kwargs):
-            Wizard(self.home, None).settings({'MAVEN_MEMORY_INSTANCE_ID': instance})
+            Wizard(self.home).settings({'MAVEN_MEMORY_INSTANCE_ID': instance})
             return {'status': 'connected', 'instance_id': instance}
 
         def plan(values, package, destination, **kwargs):
@@ -252,8 +269,7 @@ class AdministrationTests(unittest.TestCase):
                        'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
                        'deploy_identity': {'profile': 'deployment', 'cache': str(self.home / 'runtime/deploy-login')},
                        'provision': {'MAVEN_STACK_NAME': 'test', 'MAVEN_INSTANCE_NAME': 'test',
-                           'MAVEN_NOTIFICATION_EMAIL': 'owner@example.com', 'MAVEN_AVAILABILITY_ZONES': 'us-east-1a,us-east-1b', 'MAVEN_ENGINE_VERSION': '18.6'},
-                       'optional_project': {'configure': False, 'root': ''}}
+                           'MAVEN_NOTIFICATION_EMAIL': 'owner@example.com', 'MAVEN_AVAILABILITY_ZONES': 'us-east-1a,us-east-1b', 'MAVEN_ENGINE_VERSION': '18.6'}}
             for _ in range(60):
                 result = self.advance_to_question(result)
                 if result['state'] == 'completed':
@@ -274,7 +290,7 @@ class AdministrationTests(unittest.TestCase):
         self.assertNotIn('TUI', json.dumps(result['approvals']))
         operation_path = self.controller._path(result['operation_id'])
         operation_before = operation_path.read_bytes()
-        wizard = Wizard(self.home, None)
+        wizard = Wizard(self.home)
         setup_before = wizard.state_path.read_bytes()
         artifact_paths = [path for path in wizard.directory.rglob('*') if path.is_file()]
         artifacts_before = {path: path.read_bytes() for path in artifact_paths}
@@ -331,7 +347,6 @@ class AdministrationTests(unittest.TestCase):
         ui = Mock()
         ui.form.side_effect = [
             {'root': str(self.base), 'mode': 'create', 'name': 'Terminal project', 'project_id': ''},
-            {'excerpt': 'I approve this project in the terminal.'},
         ]
         ui.review.return_value = True
         with patch('tools.project_setup.setup_project', return_value={'status': 'ready'}) as backend:
@@ -339,7 +354,6 @@ class AdministrationTests(unittest.TestCase):
         actual = AdminOperations(self.home).status(result['operation_id'])
         self.assertEqual(actual['state'], 'completed')
         self.assertEqual(backend.call_args.args[0].source_origin, 'owner MAVEN administration TUI')
-        self.assertEqual(actual['approvals'][0]['source']['excerpt'], 'I approve this project in the terminal.')
 
     def test_declined_review_stays_paused_and_requires_a_new_revision(self):
         result = self.controller.begin('project', {'root': str(self.base)})
@@ -371,7 +385,7 @@ class AdministrationTests(unittest.TestCase):
 
     def test_every_starter_phase_refuses_changed_instance_or_identity_before_cloud_dispatch(self):
         result = self.controller.begin('setup', {})
-        wizard = Wizard(self.home, None)
+        wizard = Wizard(self.home)
         original = {'MAVEN_MEMORY_INSTANCE_ID': str(uuid4()), 'MAVEN_AWS_PROFILE': 'original-owner'}
         wizard.settings(original)
         binding = dict(wizard.values)
@@ -379,7 +393,7 @@ class AdministrationTests(unittest.TestCase):
             for phase in ('starter_prepare_review', 'starter_prepare', 'starter_submit',
                           'starter_challenge', 'starter_activate', 'starter_renew'):
                 with self.subTest(field=field, phase=phase):
-                    wizard = Wizard(self.home, None)
+                    wizard = Wizard(self.home)
                     wizard.settings({**original, field: changed})
                     state = self.controller._load(result['operation_id'])
                     state.update(step=phase, state='pending', pending_interaction=None, starter_binding=binding)
@@ -389,6 +403,310 @@ class AdministrationTests(unittest.TestCase):
                         self.assertEqual(observed['state'], 'blocked')
                         self.assertIn('original initialization', observed['error'])
                         client.assert_not_called()
+
+    def test_explicit_setup_task_is_not_asked_again_or_overridden_by_form(self):
+        result = self.controller.begin('setup', {'mode': 'new'})
+        question = result['pending_interaction']
+        self.assertEqual({field['name'] for field in question['fields']}, {'region'})
+        with self.assertRaises(ValueError):
+            self.controller.respond(result['operation_id'], question['interaction_id'], question['revision'],
+                                    {'mode': 'existing', 'region': 'us-east-1'})
+        result = self.controller.respond(result['operation_id'], question['interaction_id'], question['revision'],
+                                         {'region': 'us-east-1'})
+        self.assertEqual(result['answers']['selection'], {'mode': 'new', 'connection': '', 'region': 'us-east-1'})
+        self.assertEqual(result['responses'][-1]['response'], {'region': 'us-east-1'})
+
+    def test_unknown_account_offers_typed_external_login_without_starting_it(self):
+        result = self.controller.begin('setup', {'mode': 'existing'})
+        result = self.respond(result, {'mode': 'existing', 'connection': 'saved-stack', 'region': 'us-east-1'})
+        result = self.advance_to_question(result)
+        result = self.advance_to_question(self.respond(result))
+        question = result['pending_interaction']
+        self.assertIn('Unknown', question['description'])
+        self.assertTrue(all(field['help'] for field in question['fields']))
+        result = self.respond(result, {'profile': 'daily-owner', 'cache': str(self.home / 'runtime/daily-login')})
+        with patch('tools.setup_common.inspect_login_identity', side_effect=RuntimeError('expired')), \
+                patch('subprocess.run') as launch:
+            result = self.controller.advance(result['operation_id'])
+        launch.assert_not_called()
+        self.assertEqual(result['handoff']['type'], 'aws_login')
+        self.assertEqual(result['handoff']['command'],
+                         ['aws', 'login', '--profile', 'daily-owner', '--region', 'us-east-1'])
+        self.assertIn('Unknown', result['handoff']['account'])
+        self.assertIn('Daily-use', result['handoff']['purpose'])
+        self.assertEqual(result['handoff']['environment'],
+                         {'AWS_LOGIN_CACHE_DIRECTORY': str(self.home / 'runtime/daily-login')})
+        self.assertFalse(result['presentation']['verified'])
+
+    def test_saved_account_blocks_other_login_before_confirmation_or_cloud_work(self):
+        wizard = Wizard(self.home)
+        wizard.settings({'MAVEN_MEMORY_CLUSTER_ARN': 'arn:aws:rds:us-east-1:123456789012:cluster:memory'})
+        result = self.controller.begin('setup', {})
+        result = self.respond(result, {'mode': 'existing', 'connection': 'memory', 'region': 'us-east-1'})
+        result = self.advance_to_question(self.respond(self.advance_to_question(result)))
+        self.assertIn('123456789012', result['pending_interaction']['description'])
+        result = self.respond(result, {'profile': 'other', 'cache': str(self.home / 'runtime/login')})
+        with patch('tools.setup_common.inspect_login_identity', return_value={
+                'Account': '999999999999', 'Arn': 'arn:aws:iam::999999999999:user/other'}), \
+                patch('tools.memory.bootstrap.plan') as plan:
+            result = self.controller.advance(result['operation_id'])
+        plan.assert_not_called()
+        self.assertEqual(result['pending_interaction']['kind'], 'form')
+        self.assertNotIn('identity_approval', result['answers'])
+        self.assertNotIn('MAVEN_AWS_EXPECTED_PRINCIPAL', Wizard(self.home).values)
+
+    def test_back_revises_unsubmitted_choice_with_fresh_review_and_keeps_approval_history(self):
+        result = self.controller.begin('project', {'root': str(self.base)})
+        result = self.respond(result, {'root': str(self.base), 'mode': 'create', 'name': 'First', 'project_id': ''})
+        result = self.advance_to_question(result)
+        first = result['pending_interaction']
+        result = self.respond(result)
+        approvals = result['approvals']
+        result = self.controller.back(result['operation_id'])
+        self.assertEqual(result['approvals'], approvals)
+        self.assertEqual(result['pending_interaction']['key'], 'project')
+        self.assertEqual(next(field['default'] for field in result['pending_interaction']['fields']
+                              if field['name'] == 'name'), 'First')
+        result = self.respond(result, {'root': str(self.base), 'mode': 'create', 'name': 'Revised', 'project_id': ''})
+        result = self.advance_to_question(result)
+        self.assertNotEqual(result['pending_interaction']['review_digest'], first['review_digest'])
+        with self.assertRaisesRegex(ValueError, 'Stale'):
+            self.controller.respond(result['operation_id'], first['interaction_id'], first['revision'],
+                                    {'approved': True, 'review_digest': first['review_digest'], 'source': self.source})
+        self.assertEqual(result['approvals'], approvals)
+
+    def test_back_refuses_unknown_submitted_effect_without_erasing_evidence(self):
+        result = self.controller.begin('project', {'root': str(self.base)})
+        result = self.respond(result, {'root': str(self.base), 'mode': 'create', 'name': 'First', 'project_id': ''})
+        result = self.respond(self.advance_to_question(result))
+        with patch('tools.project_setup.setup_project', side_effect=MemoryClientError('operation_outcome_unknown')):
+            result = self.controller.advance(result['operation_id'])
+        before = self.controller._path(result['operation_id']).read_bytes()
+        self.assertEqual(result['state'], 'uncertain')
+        self.assertNotIn('back', result['next_actions'])
+        with self.assertRaisesRegex(SetupPending, 'submitted or unresolved'):
+            self.controller.back(result['operation_id'])
+        self.assertEqual(self.controller._path(result['operation_id']).read_bytes(), before)
+
+    def test_old_optional_project_checkpoint_finishes_without_project_mutation(self):
+        result = self.controller.begin('setup', {})
+        state = self.controller._load(result['operation_id'])
+        old = {'interaction_id': str(uuid4()), 'revision': state['revision'] + 1,
+               'kind': 'form', 'key': 'optional_project', 'title': 'Old project question',
+               'fields': [], 'next_step': 'optional_project'}
+        state.update(step='verify', pending_interaction=old)
+        self.controller._save(state)
+        observed = self.controller.status(result['operation_id'])
+        self.assertIsNone(observed['pending_interaction'])
+        self.assertIn('advance', observed['next_actions'])
+        with patch.object(Wizard, 'verify_authority', return_value=19), \
+                patch('tools.project_setup.setup_project') as project:
+            result = self.controller.advance(result['operation_id'])
+        project.assert_not_called()
+        self.assertEqual(result['state'], 'completed')
+        self.assertTrue(result['outcome']['instance_ready'])
+        self.assertFalse(result['outcome']['project_configured'])
+        self.assertEqual(result['retired_interactions'], [old])
+
+    def test_new_reviewed_operation_never_discards_unfinished_setup(self):
+        result = self.controller.begin('setup', {'mode': 'existing'})
+        args = Namespace(operation=None, fresh_operation=True, mode='existing')
+        ui = Mock()
+        with patch('tools.tui.administration.present') as present:
+            with self.assertRaisesRegex(SetupPending, 'unfinished'):
+                _present(ui, args, self.home)
+            present.assert_not_called()
+            ui.review.assert_not_called()
+            state = self.controller._load(result['operation_id'])
+            state.update(state='completed', pending_interaction=None)
+            state['receipts'].append({'step': 'verify', 'result': {'instance_ready': True}})
+            self.controller._save(state)
+            before = self.controller._path(result['operation_id']).read_bytes()
+            ui.review.return_value = True
+            _present(ui, args, self.home)
+            self.assertIsNone(present.call_args.kwargs['operation_id'])
+            self.assertEqual(present.call_args.kwargs['mode'], 'existing')
+            self.assertEqual(self.controller._path(result['operation_id']).read_bytes(), before)
+
+    def test_resume_retains_exact_operation_and_summarizes_saved_phase(self):
+        result = self.controller.begin('setup', {'mode': 'existing'})
+        args = Namespace(operation=None, fresh_operation=False, mode='existing')
+        ui = Mock()
+        with patch('tools.tui.administration.present') as present:
+            _present(ui, args, self.home)
+        self.assertEqual(present.call_args.kwargs['operation_id'], result['operation_id'])
+        self.assertIn(result['operation_id'], ui.message.call_args.args[0])
+        ui.review.assert_not_called()
+
+    def test_missing_access_blocks_plan_before_any_cloud_mutation(self):
+        result = self.controller.begin('setup', {'mode': 'new'})
+        state = self.controller._load(result['operation_id'])
+        self.preflight.return_value = {'status': 'Missing access', 'checks': [],
+            'limitations': ['Simulation is not a live deployment.'], 'remediation': 'Ask the IAM owner.'}
+        with self.assertRaisesRegex(SetupPending, 'Missing access'):
+            self.controller._preflight(state, {}, 'infrastructure')
+        self.assertEqual(state['receipts'][-1]['result']['status'], 'Missing access')
+
+    def test_revising_unsubmitted_package_preserves_old_artifacts_and_requires_new_review(self):
+        result = self.controller.begin('setup', {'mode': 'new'})
+        state = self.controller._load(result['operation_id'])
+        identity = {'Account': '123456789012', 'Arn': 'arn:aws:iam::123456789012:user/owner'}
+        state.update(step='provision', pending_interaction=None, state='pending',
+                     identity_actual=identity, deploy_identity_actual=identity)
+        state['answers']['selection'] = {'mode': 'new', 'connection': '', 'region': 'us-east-1'}
+        self.controller._save(state)
+        result = self.controller.advance(result['operation_id'])
+        chosen = {'MAVEN_STACK_NAME': 'first-stack', 'MAVEN_INSTANCE_NAME': 'memory',
+                  'MAVEN_NOTIFICATION_EMAIL': 'owner@example.com',
+                  'MAVEN_AVAILABILITY_ZONES': 'us-east-1a,us-east-1b', 'MAVEN_ENGINE_VERSION': '18.6'}
+        instance = str(uuid4())
+        prepared = []
+        def prepare(values, destination):
+            destination.mkdir(mode=0o700)
+            marker = destination / 'original.json'
+            save_json(marker, {'stack': values['MAVEN_STACK_NAME']})
+            prepared.append(marker)
+        with patch('tools.memory.bootstrap.prepare', side_effect=prepare), \
+                patch('tools.memory.bootstrap._package', return_value=(
+                    {'deployment_inputs': {'InstanceId': instance}, 'artifact_sha256': {}}, '{}', [])), \
+                patch('tools.memory.bootstrap.plan') as plan:
+            result = self.advance_to_question(self.respond(result, chosen))
+            first_review = result['pending_interaction']['review_digest']
+            original = prepared[0].read_bytes()
+            result = self.respond(result)
+            result = self.controller.back(result['operation_id'])
+            result = self.advance_to_question(self.respond(result, {**chosen, 'MAVEN_STACK_NAME': 'revised-stack'}))
+        plan.assert_not_called()
+        self.assertEqual(result['pending_interaction']['key'], 'plan')
+        self.assertNotEqual(result['pending_interaction']['review_digest'], first_review)
+        self.assertEqual(prepared[0].read_bytes(), original)
+        self.assertEqual(len(prepared), 2)
+        self.assertNotEqual(prepared[0].parent, prepared[1].parent)
+        self.assertEqual(len(result['approvals']), 1)
+
+    def test_cloud_removal_uses_maintenance_handoff_before_planning(self):
+        wizard = Wizard(self.home)
+        wizard.settings({'MAVEN_AWS_REGION': 'us-east-1', 'MAVEN_STACK_NAME': 'memory',
+            'MAVEN_DEPLOY_PROFILE': 'maintainer', 'MAVEN_DEPLOY_LOGIN_CACHE': str(self.home / 'runtime/maintenance'),
+            'MAVEN_DEPLOY_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/maintainer'})
+        with patch('tools.setup_common.inspect_login_identity', side_effect=RuntimeError('expired')), \
+                patch('tools.uninstall.cli.build_plan') as plan, \
+                patch('subprocess.run') as launch:
+            result = self.controller.begin('uninstall', {'cloud': True})
+        plan.assert_not_called()
+        launch.assert_not_called()
+        self.assertEqual(result['handoff']['type'], 'aws_login')
+        self.assertIn('Maintenance', result['handoff']['purpose'])
+        self.assertEqual(result['handoff']['account'], '123456789012')
+
+    def test_completed_explicit_operation_starts_only_after_new_operation_review(self):
+        from tools.interaction import OperationPaused
+        result = self.controller.begin('setup', {'mode': 'existing'})
+        state = self.controller._load(result['operation_id'])
+        state.update(state='completed', pending_interaction=None)
+        state['receipts'].append({'step': 'verify', 'result': {'instance_ready': True}})
+        self.controller._save(state)
+        args = Namespace(operation=result['operation_id'], fresh_operation=False, mode='existing')
+        ui = Mock(review=Mock(return_value=False))
+        with patch('tools.tui.administration.present') as present:
+            with self.assertRaises(OperationPaused):
+                _present(ui, args, self.home)
+            present.assert_not_called()
+            ui.review.return_value = True
+            _present(ui, args, self.home)
+            self.assertIsNone(present.call_args.kwargs['operation_id'])
+
+
+class PermissionPreflightTests(unittest.TestCase):
+    def values(self):
+        return {'MAVEN_AWS_REGION': 'us-east-1', 'MAVEN_DEPLOY_EXPECTED_PRINCIPAL':
+                'arn:aws:iam::123456789012:user/maintenance', 'MAVEN_STACK_NAME': 'memory'}
+
+    def test_actual_reads_and_meaningful_simulation_never_mutate_resources(self):
+        cloud, iam, session = Mock(), Mock(), Mock()
+        session.client.side_effect = lambda service, **kwargs: {'cloudformation': cloud, 'iam': iam}[service]
+        iam.simulate_principal_policy.side_effect = lambda **kwargs: {'EvaluationResults': [
+            {'EvalActionName': action, 'EvalDecision': 'allowed'} for action in kwargs['ActionNames']]}
+        with patch('tools.memory.environment.selected_aws_session', return_value=session):
+            result = inspect_permissions(self.values(), 'infrastructure')
+        self.assertEqual(result['status'], 'Passed')
+        cloud.describe_account_limits.assert_called_once_with()
+        actions = iam.simulate_principal_policy.call_args.kwargs['ActionNames']
+        self.assertIn('cloudformation:ExecuteChangeSet', actions)
+        self.assertIn('iam:PassRole', actions)
+        self.assertIn('rds:CreateDBCluster', actions)
+        self.assertEqual({call[0] for call in cloud.method_calls}, {'describe_account_limits', 'close'})
+        self.assertEqual({call[0] for call in iam.method_calls}, {'simulate_principal_policy', 'close'})
+        self.assertIn('cannot guarantee', ' '.join(result['limitations']))
+
+    def test_denied_read_is_missing_access_not_sts_success(self):
+        from botocore.exceptions import ClientError
+        cloud, iam, session = Mock(), Mock(), Mock()
+        session.client.side_effect = lambda service, **kwargs: {'cloudformation': cloud, 'iam': iam}[service]
+        cloud.describe_account_limits.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDenied', 'Message': 'denied'}}, 'DescribeAccountLimits')
+        iam.simulate_principal_policy.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDenied', 'Message': 'denied'}}, 'SimulatePrincipalPolicy')
+        with patch('tools.memory.environment.selected_aws_session', return_value=session):
+            result = inspect_permissions(self.values(), 'infrastructure')
+        self.assertEqual(result['status'], 'Missing access')
+        self.assertIn('STS identity alone is not proof', result['limitations'][0])
+
+    def test_simulation_access_denial_does_not_claim_target_permissions_are_missing(self):
+        from botocore.exceptions import ClientError
+        cloud, iam, session = Mock(), Mock(), Mock()
+        session.client.side_effect = lambda service, **kwargs: {'cloudformation': cloud, 'iam': iam}[service]
+        iam.simulate_principal_policy.side_effect = ClientError(
+            {'Error': {'Code': 'AccessDenied', 'Message': 'simulation is not granted'}}, 'SimulatePrincipalPolicy')
+        with patch('tools.memory.environment.selected_aws_session', return_value=session):
+            result = inspect_permissions(self.values(), 'infrastructure')
+        self.assertEqual(result['status'], 'Could not verify')
+        self.assertEqual(result['checks'][0]['status'], 'Passed')
+
+    def test_unknown_simulation_remains_explicitly_unverified(self):
+        cloud, iam, session = Mock(), Mock(), Mock()
+        session.client.side_effect = lambda service, **kwargs: {'cloudformation': cloud, 'iam': iam}[service]
+        iam.simulate_principal_policy.side_effect = RuntimeError('unavailable')
+        with patch('tools.memory.environment.selected_aws_session', return_value=session):
+            result = inspect_permissions(self.values(), 'infrastructure')
+        self.assertEqual(result['status'], 'Could not verify')
+        self.assertTrue(result['remediation'])
+
+    def test_sql_preflight_uses_existing_daily_principal_admin_trust_and_read_only_sql(self):
+        config = {'region': 'us-east-1', 'cluster_arn': 'cluster', 'admin_secret_arn': 'secret',
+                  'database': 'maven', 'admin_role_arn': 'admin'}
+        values = {'MAVEN_AWS_PROFILE': 'daily', 'MAVEN_DEPLOY_PROFILE': 'maintenance'}
+        session = Mock()
+        with patch('tools.memory.environment.migration_config', return_value=config), \
+                patch('tools.memory.client.selected_session', return_value=session) as selected:
+            result = inspect_permissions(values, 'sql')
+        selected.assert_called_once_with(config, admin=True, approval=False, environment=values)
+        session.client.return_value.execute_statement.assert_called_once_with(
+            resourceArn='cluster', secretArn='secret', database='maven', sql='SELECT 1')
+        self.assertEqual(result['status'], 'Passed')
+        self.assertIn('trusts are unchanged', ' '.join(result['limitations']))
+
+    def test_expected_saved_account_and_principal_are_independent_login_guards(self):
+        values = {'MAVEN_MEMORY_CLUSTER_ARN': 'arn:aws:rds:us-east-1:123456789012:cluster:memory',
+                  'MAVEN_AWS_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/owner'}
+        self.assertEqual(expected_account(values), '123456789012')
+        for identity in ({'Account': '999999999999', 'Arn': 'arn:aws:iam::999999999999:user/owner'},
+                         {'Account': '123456789012', 'Arn': 'arn:aws:iam::123456789012:user/other'}):
+            with self.assertRaises(SetupPending):
+                check_login_identity(values, identity)
+        self.assertIn('Unknown', expected_account({}))
+        check_login_identity({}, {'Account': '123456789012', 'Arn': 'arn:aws:iam::123456789012:user/owner'})
+
+    def test_missing_credentials_require_signin_without_treating_them_as_static_keys(self):
+        from botocore.exceptions import NoCredentialsError
+        session = Mock()
+        session.get_credentials.return_value = None
+        values = {'MAVEN_AWS_PROFILE': 'daily', 'MAVEN_AWS_LOGIN_CACHE': '/private/cache',
+                  'MAVEN_AWS_REGION': 'us-east-1'}
+        with patch('boto3.Session', return_value=session):
+            with self.assertRaises(NoCredentialsError):
+                inspect_login_identity(values)
+        session.client.assert_not_called()
 
 
 if __name__ == '__main__':

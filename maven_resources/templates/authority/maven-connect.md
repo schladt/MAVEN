@@ -4,7 +4,7 @@ Proposed skill: apply only after owner review/activation as current applicable c
 
 Validate actual endpoint and runtime identity. Do not search unrelated home directories, discover arbitrary AWS profiles or open credentials to repair configuration. Missing access requires the owner's explicit approved login/handoff; never log in or switch identities silently. If no deployment is configured, use setup rather than inventing one. An incompatible schema requires a separately reviewed rollout, not bypassed validation.
 
-Require explicit first-time project enablement and scope. Confirm the root independently from installation; reject `/` and resolve ambiguous/subdirectory roots. Select an existing project or authorize creation with real source evidence. Memory needs no repository, remote, branch or explicit no-Git choice. An instance may be ready while optional project setup is deferred.
+Require explicit first-time project enablement and scope in the harness, separately from installation. Confirm the root independently from installation; reject `/` and resolve ambiguous/subdirectory roots. Select an existing project or authorize creation with real source evidence. Memory needs no repository, remote, branch or explicit no-Git choice. Verified instance setup does not enable a project.
 
 For an enabled project, native startup guidance should initialize the session visibly. Announce initializing, then ready only when the actual binding and complete current context are loaded, or blocked with the reason. If startup guidance cannot execute reliably, disclose that limitation and use explicit foreground initialization. Tool availability, stderr or a connected MCP process alone is not readiness or capture permission.
 

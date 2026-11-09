@@ -471,12 +471,12 @@ def create_server(application=None):
 
     @server.tool()
     @guarded
-    def maven_admin(action: Literal['begin', 'respond', 'advance', 'status'],
+    def maven_admin(action: Literal['begin', 'respond', 'advance', 'back', 'status'],
                      kind: Literal['setup', 'project', 'install', 'uninstall', 'recovery'] | None = None,
                      parameters: dict[str, Any] | None = None, operation_id: str | None = None,
                      interaction_id: str | None = None, revision: int | None = None,
                      response: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Drive real resumable administration. Present persisted questions/full exact reviews, capture actual owner responses, then explicitly advance. Project/machine/cloud removal are independent. Login, secrets and affected-harness shutdown use secure external handoffs."""
+        """Drive real resumable administration. Present persisted questions/full exact reviews, capture actual owner responses, then explicitly advance. Back revises unsubmitted choices only, never rolls back external effects. Project/machine/cloud removal are independent. Login, secrets and affected-harness shutdown use secure external handoffs."""
         admin = app.admin()
         if action == 'begin':
             if kind is None:
@@ -488,6 +488,8 @@ def create_server(application=None):
             return admin.status(operation_id)
         if action == 'advance':
             return admin.advance(operation_id)
+        if action == 'back':
+            return admin.back(operation_id)
         if interaction_id is None or revision is None or response is None:
             raise MaintenanceError('respond requires exact interaction identity, revision and owner response')
         return admin.respond(operation_id, interaction_id, revision, response)

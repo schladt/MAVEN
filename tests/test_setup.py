@@ -15,7 +15,7 @@ from tools.setup import SetupPending, Wizard, read_private, save_json
 class GuidedSetupTests(unittest.TestCase):
     def wizard(self, directory):
         root = Path(directory).resolve()
-        return Wizard(root / 'home', root)
+        return Wizard(root / 'home')
 
     def test_existing_connection_cannot_enter_deployment_or_declare_ready_early(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -24,7 +24,7 @@ class GuidedSetupTests(unittest.TestCase):
             output = io.StringIO()
             with patch.object(wizard, 'existing'), patch.object(wizard, 'fresh') as fresh, \
                     patch.object(wizard, 'verify_authority', side_effect=MemoryClientError('not_authorized')), \
-                    patch.object(wizard, 'project') as project, redirect_stdout(output):
+                    patch('tools.project_setup.setup_project') as project, redirect_stdout(output):
                 with self.assertRaises(MemoryClientError):
                     wizard.run()
             fresh.assert_not_called()
@@ -75,6 +75,7 @@ class GuidedSetupTests(unittest.TestCase):
             ui.review.return_value = False
             with patch.object(wizard, 'region'), patch.object(wizard, 'identity', return_value=(Mock(), {})), \
                     patch('tools.memory.bootstrap._package', return_value=(manifest, '', [])), \
+                    patch.object(wizard, 'preflight', return_value={'status': 'Passed'}), \
                     patch('tools.memory.bootstrap.plan') as plan, \
                     patch('tools.memory.bootstrap.apply') as apply, \
                     patch('tools.memory.bootstrap.initialize') as initialize, \
@@ -99,6 +100,7 @@ class GuidedSetupTests(unittest.TestCase):
             manifest = {'deployment_inputs': {'InstanceId': instance}}
             with patch.object(Wizard, 'region'), patch.object(Wizard, 'identity', return_value=(Mock(), {})), \
                     patch('tools.memory.bootstrap._package', return_value=(manifest, '', [])), \
+                    patch.object(Wizard, 'preflight', return_value={'status': 'Passed'}), \
                     patch('tools.memory.bootstrap.plan') as plan, \
                     patch('tools.memory.bootstrap.apply', side_effect=MemoryClientError('stack_execution_outcome_unknown')) as apply, \
                     patch('tools.setup.approve'):
@@ -112,7 +114,7 @@ class GuidedSetupTests(unittest.TestCase):
             self.assertEqual(review.read_bytes(), before)
             self.assertNotIn('applied', read_private(wizard.state_path))
 
-    def test_project_selection_is_optional_after_authority_verification(self):
+    def test_project_enablement_is_never_part_of_legacy_installer_setup(self):
         with tempfile.TemporaryDirectory() as directory:
             wizard = self.wizard(directory)
             wizard.settings({'MAVEN_MEMORY_INSTANCE_ID': str(uuid4())})
@@ -121,11 +123,12 @@ class GuidedSetupTests(unittest.TestCase):
             wizard.save()
             with patch.object(wizard, 'existing'), \
                     patch.object(wizard, 'verify_authority', return_value=7) as authority, \
-                    patch.object(wizard, 'project') as project, \
-                    patch('tools.setup.confirm', return_value=False), redirect_stdout(io.StringIO()):
+                    patch('tools.project_setup.setup_project') as project, \
+                    patch('tools.setup.confirm') as confirm, redirect_stdout(io.StringIO()):
                 self.assertEqual(wizard.run(), 0)
             authority.assert_called_once_with()
             project.assert_not_called()
+            confirm.assert_not_called()
             state = read_private(wizard.state_path)
             self.assertEqual(state['project'], saved)
             self.assertNotIn('ready_project', state)

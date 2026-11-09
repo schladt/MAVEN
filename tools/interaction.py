@@ -19,6 +19,7 @@ class Field:
     kind: str = "text"  # text, multiline, bool, select
     choices: tuple[tuple[str, str], ...] = ()  # (label, value)
     required: bool = True
+    help: str = ""
 
 
 _current: ContextVar[Any] = ContextVar("maven_interaction", default=None)

@@ -1,4 +1,4 @@
-"""Interactive owner-selected cloud and project setup; run from the installed venv."""
+"""Interactive owner-selected cloud setup; project enablement is a separate task."""
 from __future__ import annotations
 
 import argparse
@@ -15,12 +15,13 @@ from tools.interaction import Field, OperationPaused, checkpoint, message, requi
 
 from tools.setup_common import (
     SetupPending, approve, ask, atomic_private, confirm, private_directory,
-    read_private, save_json, setup_lock, verify_authority,
+    read_private, save_json, setup_lock, verify_authority, expected_account,
+    check_login_identity, permission_preflight,
 )
 
 
 class Wizard:
-    def __init__(self, home, project_root):
+    def __init__(self, home):
         from tools.memory.environment import load_environment
         self.home = home
         self.env = home / '.env'
@@ -33,7 +34,6 @@ class Wizard:
         if self.state.get('schema') != 1:
             raise SetupPending('Unsupported setup state; preserve the artifacts and use the matching installed version.')
         self.values = load_environment(self.env) if self.env.exists() or self.env.is_symlink() else {}
-        self.project_root = project_root
 
     def save(self):
         save_json(self.state_path, self.state)
@@ -71,8 +71,12 @@ class Wizard:
         from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
         from tools.memory.environment import selected_aws_session, transport_ca_bundle
         prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
-        purpose = 'metadata/deployment' if deploy else 'routine'
+        purpose = 'maintenance (CloudFormation or necessary metadata discovery)' if deploy else 'daily-use memory'
         stage('AWS identities')
+        message('Purpose: ' + purpose + '\nExpected account: ' + expected_account(self.values) +
+                '\nExpected principal: ' + self.values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown — confirm actual identity after sign-in'))
+        require().set_context('Purpose: ' + purpose + '\nExpected account: ' + expected_account(self.values) +
+                              '\nHome: ' + str(self.home))
         profile = self.values.get(prefix + 'PROFILE')
         cache_setting = self.values.get(prefix + 'LOGIN_CACHE')
         if profile is None or cache_setting is None:
@@ -81,9 +85,11 @@ class Wizard:
             default_cache = self.home / 'runtime' / ('aws-deploy-login-cache' if deploy else 'aws-login-cache')
             fields = []
             if profile is None:
-                fields.append(Field('profile', f'Named AWS {purpose} profile'))
+                fields.append(Field('profile', f'Named AWS {purpose} profile',
+                                    help='A local AWS CLI login-only profile name selects who signs in; it does not grant access. Never enter keys or tokens.'))
             if cache_setting is None:
-                fields.append(Field('cache', f'Private {purpose} login-cache folder', str(default_cache)))
+                fields.append(Field('cache', f'Private {purpose} login-cache folder', str(default_cache),
+                                    help='Absolute owner-private folder for sign-in tokens. Keep daily-use and maintenance caches separate.'))
             values = require().form(f'Select {purpose} identity', fields,
                                     description='Configured profiles: ' + (', '.join(profiles) or '(none)') +
                                     '\nNo ambient identity or privilege fallback. Never enter credentials.')
@@ -137,14 +143,20 @@ class Wizard:
         arn = identity.get('Arn', '')
         if not deploy and arn.endswith(':root'):
             raise SetupPending('Root cannot be used for routine access. Select a named non-root profile in the private settings and resume.')
-        expected = self.values.get(prefix + 'EXPECTED_PRINCIPAL')
-        if expected and arn != expected:
-            raise SetupPending('The selected login does not match the saved expected principal. Log in as that principal; settings and pending requests are preserved.')
+        check_login_identity(self.values, identity, deploy=deploy)
         message(f'Actual {purpose} principal: {arn}\nAccount: {identity.get("Account", "unknown")}\nRegion: {region}')
         approve(f'Confirm this explicitly selected {purpose} identity.', arn,
                 body=f'Principal: {arn}\nAccount: {identity.get("Account", "unknown")}\nRegion: {region}\nProfile: {profile}\nLogin cache: {cache}')
         self.settings({prefix + 'EXPECTED_PRINCIPAL': arn})
+        require().set_context(f'{purpose}\nAccount: {identity["Account"]}\nPrincipal: {arn}\nProfile: {profile}\nRegion: {region}\nHome: {self.home}')
         return selected_aws_session(self.values, deploy=deploy, region=region), identity
+
+    def preflight(self, task):
+        report = permission_preflight(self.values, task)
+        message('Access preflight: ' + report['status'] + '\n' + json.dumps(report, indent=2))
+        if report['status'] == 'Missing access':
+            raise SetupPending(report['remediation'])
+        return report
 
     def region(self):
         region = self.values.get('MAVEN_AWS_REGION') or self.values.get('MAVEN_MEMORY_REGION')
@@ -292,12 +304,14 @@ class Wizard:
             message(f'Review all real deployment artifacts: {package}')
             message('This creates billable Aurora, networking, API, storage and logging resources. Review IAM, notification recipient, live engine/AZ availability and current AWS prices. Retained databases, snapshots and buckets may continue to incur costs after stack deletion. Nothing is free or automatically cleaned up.')
             if not review.exists():
+                self.preflight('infrastructure')
                 approve('Create/reconcile one CREATE change set, NOT execute it.', self.values['MAVEN_STACK_NAME'],
                         body=package_body)
                 bootstrap.plan(self.values, package, review, change_type='CREATE')
             document = read_private(review)
             digest = document['review_sha256']
             message(f'Actual CloudFormation review: {review}\nReview digest: {digest}')
+            self.preflight('infrastructure')
             approve('Execute this exact reviewed change set? Unknown outcomes reconcile the same change set.', digest,
                     body=package_body + '\n\nComplete CloudFormation review\n' + json.dumps(document, indent=2))
             bootstrap.apply(self.values, package, review, self.env, confirm_review=digest)
@@ -309,8 +323,14 @@ class Wizard:
             raise SetupPending('Connected instance differs from the prepared deployment; refusing initialization.')
         if not self.state.get('initialized'):
             stage('Initialize')
+            self.preflight('sql')
+            from importlib.resources import files
+            from tools.memory.admin import MIGRATION_FILES
+            sql_review = {'instance': config, 'sql': {
+                name: files('tools.memory').joinpath('migrations', name).read_text(encoding='utf-8')
+                for name in MIGRATION_FILES}}
             approve('Initialize only this newly deployed database through the separate admin role. Resume repeats the exact SQL bundle, never an upgrade.',
-                    config['instance_id'], body=package_body, destructive=True)
+                    config['instance_id'], body=json.dumps(sql_review, indent=2), destructive=True)
             self.state['initialization_pending'] = True
             self.save()
             bootstrap.initialize(self.values, confirm_instance=config['instance_id'])
@@ -321,6 +341,9 @@ class Wizard:
     @staticmethod
     def package_review(package, manifest, template, parameters):
         sections = [
+            'Account: ' + str(manifest.get('deployment_inputs', {}).get('AccountId', 'See exact parameters')) +
+            '\nRegion: us-east-1\nInstance: ' + str(manifest.get('deployment_inputs', {}).get('InstanceId', 'Unknown')) +
+            '\nAurora capacity/storage, retained snapshots, API requests, networking and logs are cost drivers. Interruptions may leave infrastructure in flight; resume the exact operation and change set, never start a replacement.',
             'Billable Aurora, networking, API, storage and logging resources. Review IAM, notification recipient, live engine/AZ availability and current AWS prices. Retained databases, snapshots and buckets may continue to cost money after stack deletion. No automatic cleanup or cloud rollback.',
             'Package: ' + str(package),
             'Manifest and artifact hashes\n' + json.dumps(manifest, indent=2),
@@ -339,6 +362,8 @@ class Wizard:
         stage('Starter authority')
         from tools.memory.environment import configured_client
         from tools.memory.validation import digest, validate_create, validate_resolve
+        self.preflight('routine')
+        self.preflight('authority')
         directory = self.directory / 'starter'
         if directory.exists() and not (directory / 'manifest.json').exists():
             if self.state.get('starter_submitted'):
@@ -428,27 +453,10 @@ class Wizard:
     def verify_authority(self, project_id=None):
         return verify_authority(self.env, project_id, values=self.values)
 
-    def project(self):
-        from tools.project_setup import setup_project
-        stage('Project selection')
-        saved = self.state.get('project')
-        if saved and not self.state.get('ready_project'):
-            root = Path(saved['root'])
-            approve(f'Resume the original pending project at {root}? Its exact IDs and receipts will be preserved.', str(root))
-        else:
-            root = Path(ask('Actual project directory (not the tool installation checkout)',
-                            str(self.project_root) if self.project_root else None)).expanduser()
-        result = setup_project(argparse.Namespace(
-            root=root, env=self.env, non_interactive=False, create=False, project_id=None,
-            name=None, source_origin=None, source_excerpt=None, no_git=False,
-            remote=None, accepted_url=None, branch=None, check=[],
-        ))
-        return Path(result['project']['root']), result['authority_generation']
-
     def run(self):
         stage('Instance selection')
         checkpoint()
-        message('MAVEN guided configuration: private settings, explicit AWS identity, reviewed cloud actions, then your selected project. Never enter access keys, tokens or passwords here. Quit pauses at a safe boundary.')
+        message('MAVEN guided configuration: private settings, explicit AWS identity, reviewed cloud actions, then verified instance readiness. Project enablement is separate. Never enter access keys, tokens or passwords here. Quit pauses at a safe boundary.')
         mode = self.state.get('mode')
         if mode is None:
             if self.values.get('MAVEN_MEMORY_INSTANCE_ID'):
@@ -471,18 +479,12 @@ class Wizard:
         stage('Verify readiness')
         checkpoint()
         generation = self.verify_authority()
-        root = None
-        if confirm('Configure a project now? (No: instance ready; select the actual project later in your harness)'):
-            root, generation = self.project()
-            stage('Verify readiness')
-            self.state['ready_project'] = str(root)
-            self.save()
-            message(f'\nReady: routine cloud access, complete applicable authority generation {generation}, and the cloud/local project were verified.')
-            message(f'Project selection: {root / ".maven" / "project.json"}')
-        else:
-            message('\ninstance ready, project not configured in this run')
-            if self.state.get('project') and not self.state.get('ready_project'):
-                message('The original interrupted project receipt is preserved; resume its exact root before creating another project.')
+        self.state['instance_ready'] = True
+        self.state['authority_generation'] = generation
+        self.save()
+        message('\nInstance ready; no project was enabled by installer setup.')
+        if self.state.get('project') and not self.state.get('ready_project'):
+            message('An original interrupted project receipt remains preserved. Reconcile that exact standalone project operation separately; setup did not retry it.')
         message(f'Home: {self.home}\nPrivate settings: {self.env}\nVirtual environment: {sys.prefix}')
         message('For a new shell (never source .env):')
         message('export MAVEN_HOME=' + shlex.quote(str(self.home)))
@@ -490,9 +492,7 @@ class Wizard:
         if (self.home / 'activate').exists():
             message('Or load the installer environment, including any explicitly selected CA:')
             message('source ' + shlex.quote(str(self.home / 'activate')))
-        message('Open the actual enabled project in your configured harness and ask MAVEN to initialize.')
-        if root:
-            message('Verify selection: maven-project show --root ' + shlex.quote(str(root)))
+        message('Open your actual project in a configured harness to request project enablement separately.')
         checkpoint()
         return 0
 
@@ -500,29 +500,64 @@ class Wizard:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, default=Path(os.environ.get('MAVEN_HOME', str(Path.home() / '.maven'))))
-    parser.add_argument('--project-root', type=Path, help='Explicit project suggestion; still requires confirmation')
     parser.add_argument('--operation', help='Resume the exact persisted administration operation UUID')
+    parser.add_argument('--mode', choices=('existing', 'new'), help='Connect an existing instance or review new provisioning')
+    parser.add_argument('--fresh-operation', action='store_true', help='Review a new administration operation after verified completion; unresolved operations are never discarded')
     args = parser.parse_args(argv)
+    if args.operation and args.fresh_operation:
+        parser.error('--operation resumes exact evidence and cannot be combined with --fresh-operation')
     home = args.home.expanduser().absolute()
     os.environ['MAVEN_HOME'] = str(home)
     from tools.tui import run_workflow
     return run_workflow('MAVEN instance setup', [
         'Instance selection', 'AWS identities', 'Deployment review', 'Initialize',
-        'Starter authority', 'Project selection', 'Project binding', 'Verify readiness',
+        'Starter authority', 'Verify readiness',
     ], lambda ui: _present(ui, args, home))
 
 
 def _present(ui, args, home):
     from tools.tui.administration import present
+    from tools.administration import AdminOperations
     identifier = args.operation
     state_path = home / 'runtime' / 'setup' / 'state.json'
     if identifier is None and state_path.exists():
-        state = read_private(state_path)
-        identifier = state.get('administration_operation')
-        if identifier is None and any(key in state for key in ('mode', 'prepared', 'submitted_requests', 'project')):
-            # Old pending receipts retain their original controller semantics.
-            return _run(args, home)
-    return present(ui, home, operation_id=identifier, project_root=args.project_root)
+        saved = read_private(state_path)
+        identifier = saved.get('administration_operation')
+        if identifier is None and any(key in saved for key in ('mode', 'prepared', 'submitted_requests', 'project')):
+            if args.fresh_operation:
+                raise SetupPending('Legacy setup evidence is unresolved. Resume it without --fresh-operation; no receipts were discarded.')
+            result = _run(args, home)
+            if result == 0:
+                from tools.tui.harness import finish_setup
+                wizard = Wizard(home)
+                return finish_setup(ui, home, {'home': str(home), 'account': expected_account(wizard.values),
+                    'region': wizard.values.get('MAVEN_AWS_REGION'), 'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
+                    'profile': wizard.values.get('MAVEN_AWS_PROFILE'), 'instance_ready': True,
+                    'authority_generation': wizard.state['authority_generation'], 'project_configured': False})
+            return result
+    previous = AdminOperations(home).status(identifier) if identifier else None
+    if previous and previous['kind'] != 'setup':
+        raise SetupPending('Select the exact setup operation, not another administration kind.')
+    verified = previous and previous['state'] == 'completed' and any(
+        receipt['step'] == 'verify' and receipt['result'].get('instance_ready') is True
+        for receipt in previous['receipts'])
+    if args.fresh_operation and previous and not verified:
+        raise SetupPending('Cannot start fresh while the saved operation is unfinished or unverified. Resume its exact UUID; original requests and receipts are retained.')
+    if args.fresh_operation or verified:
+        if not ui.review('Start a new instance check/repair operation?',
+                         'Home: ' + str(home) + '\nPrevious operation: ' + str(identifier or 'None') +
+                         '\nMode: ' + (args.mode or 'existing') +
+                         '\nOriginal approvals, requests and receipts remain archived. This starts a new local administration record, not deployment or project enablement.',
+                         identity=identifier or str(home)):
+            raise OperationPaused('New operation declined; original operation retained.')
+        identifier = None
+    elif previous and not verified:
+        ui.message('Resuming exact operation ' + identifier + '\nSaved phase: ' + previous['step'] +
+                   '\nState: ' + previous['state'] + '\nOriginal approvals and request receipts are retained; no effect is automatically replaced.')
+        previous_mode = previous['answers'].get('selection', {}).get('mode') or previous['parameters'].get('mode')
+        if args.mode and previous_mode and args.mode != previous_mode:
+            raise SetupPending('Requested mode differs from this unfinished operation. Resume its original mode; use Back only for safe unsubmitted choices.')
+    return present(ui, home, operation_id=identifier, mode=args.mode)
 
 
 def _run(args, home):
@@ -536,7 +571,14 @@ def _run(args, home):
         private_directory(home / 'runtime')
         private_directory(home / 'runtime' / 'setup')
         with setup_lock(home / 'runtime' / 'setup'):
-            return Wizard(home, args.project_root).run()
+            wizard = Wizard(home)
+            requested = getattr(args, 'mode', None)
+            if requested and wizard.state.get('mode') not in (None, requested):
+                raise SetupPending('Requested mode differs from the original legacy setup; resume its saved mode.')
+            if requested and not wizard.state.get('mode'):
+                wizard.state['mode'] = requested
+                wizard.save()
+            return wizard.run()
     except (OperationPaused, EOFError, KeyboardInterrupt):
         paused = True
         message('Setup paused at a safe boundary; readiness was not declared.')
@@ -552,8 +594,6 @@ def _run(args, home):
     except (OSError, ValueError, KeyError, TypeError, ProjectError):
         message('Setup pending: invalid or unavailable local settings/artifacts/project. Preserve existing files, check their paths and private permissions, and resume. No readiness was declared.')
     resume = [str(Path(sys.executable).parent / 'maven-setup'), '--home', str(home)]
-    if args.project_root is not None:
-        resume.extend(['--project-root', str(args.project_root)])
     message('Resume: ' + shlex.join(resume))
     message('Preserved setup artifacts: ' + str(home / 'runtime' / 'setup'))
     if paused:
