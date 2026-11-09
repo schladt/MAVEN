@@ -503,9 +503,12 @@ def main(argv=None):
     parser.add_argument('--operation', help='Resume the exact persisted administration operation UUID')
     parser.add_argument('--mode', choices=('existing', 'new'), help='Connect an existing instance or review new provisioning')
     parser.add_argument('--fresh-operation', action='store_true', help='Review a new administration operation after verified completion; unresolved operations are never discarded')
+    parser.add_argument('--restart-operation', help='Review abandonment of this unfinished setup UUID and start over without deleting cloud resources')
     args = parser.parse_args(argv)
     if args.operation and args.fresh_operation:
         parser.error('--operation resumes exact evidence and cannot be combined with --fresh-operation')
+    if args.restart_operation and (args.operation or args.fresh_operation or args.mode):
+        parser.error('--restart-operation starts with fresh choices; it cannot be combined with --operation, --fresh-operation or --mode')
     home = args.home.expanduser().absolute()
     os.environ['MAVEN_HOME'] = str(home)
     from tools.tui import run_workflow
@@ -518,6 +521,31 @@ def main(argv=None):
 def _present(ui, args, home):
     from tools.tui.administration import present
     from tools.administration import AdminOperations
+    if getattr(args, 'restart_operation', None):
+        from tools.setup_restart import review_restart, restart
+        from tools.administration import _digest
+        try:
+            review = review_restart(home, args.restart_operation)
+            digest = _digest(review)
+            ui.set_context('Abandon setup • Local configuration reset only • Cloud resources and sign-ins remain')
+            approved = ui.review('Abandon unfinished setup and start over?',
+                f'Home: {home}\nOperation: {review["operation_id"]}\nSaved step: {review["saved_step"]}\n\n' +
+                review['effect'] + '\n\n' + review['retained'] + '\n\n' + review['warning'] +
+                '\n\nStop any harness sessions using this home first. The old operation becomes read-only; its exact evidence remains archived.',
+                details=json.dumps(review, indent=2), identity=review['operation_id'],
+                destructive=True, accept='Abandon and start over')
+            if not approved:
+                raise OperationPaused('Restart declined; the existing setup was not abandoned.')
+            result = restart(home, args.restart_operation, confirm_review=digest,
+                source={'origin': 'owner MAVEN setup TUI',
+                        'excerpt': 'Owner selected Abandon and start over for operation ' +
+                                   args.restart_operation + ' / review ' + digest})
+        except (SetupPending, ValueError, OSError) as error:
+            ui.review('Setup restart needs attention', str(error) +
+                      '\nPreserve the restart archive and original receipts. Resume this exact restart after resolving the blocker.',
+                      accept='Pause')
+            return 1
+        return present(ui, home, operation_id=result['operation_id'])
     identifier = args.operation
     state_path = home / 'runtime' / 'setup' / 'state.json'
     if identifier is None and state_path.exists():

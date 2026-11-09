@@ -48,6 +48,53 @@ def _connection_config(values):
     return config
 
 
+def _discover_stacks(values):
+    """Read all stack pages using only confirmed maintenance access."""
+    from botocore.config import Config
+    from botocore.exceptions import ClientError
+    from tools.memory.bootstrap import _outputs
+    from tools.memory.client import MemoryClientError
+    from tools.memory.environment import selected_aws_session, transport_ca_bundle
+    from tools.setup_common import expected_account
+    region, account = values['MAVEN_AWS_REGION'], expected_account(values)
+    session = selected_aws_session(values, deploy=True, region=region)
+    cloud = session.client('cloudformation', verify=transport_ca_bundle(), config=Config(
+        connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
+    found = []
+    try:
+        for page in cloud.get_paginator('describe_stacks').paginate():
+            for stack in page['Stacks']:
+                if stack.get('StackStatus') not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE'):
+                    continue
+                if not stack.get('StackId', '').startswith(f'arn:aws:cloudformation:{region}:{account}:stack/'):
+                    continue
+                try:
+                    config = _outputs(stack)
+                except MemoryClientError as error:
+                    if error.code not in ('invalid_stack_outputs', 'invalid_configuration'):
+                        raise
+                    continue
+                if config['client_role_arn'].split(':')[4] != account:
+                    continue
+                found.append({'stack_id': stack['StackId'], 'name': stack['StackName'],
+                              'instance_id': config['instance_id'], 'status': stack['StackStatus']})
+    except ClientError as error:
+        code = error.response.get('Error', {}).get('Code', 'AWS error')
+        denied = code in ('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation')
+        raise SetupPending(
+            ('Missing maintenance access: allow cloudformation:DescribeStacks to enumerate stacks '
+             'in this account/region, then resume the same operation.' if denied else
+             'CloudFormation discovery could not complete. Check the selected maintenance login '
+             'and service availability, then resume the same operation. No stack was selected.')) from None
+    finally:
+        cloud.close()
+    if not found:
+        raise SetupPending(f'No ready MAVEN stacks found in account {account}, region {region}. '
+                           'Check the account/region and deployment status. Discovery requires valid MAVEN '
+                           'outputs and CREATE_COMPLETE or UPDATE_COMPLETE. Nothing was deployed or selected.')
+    return sorted(found, key=lambda item: (item['name'], item['stack_id']))
+
+
 class AdminOperations:
     """Explicit, restartable setup/install/project/removal/recovery operations."""
 
@@ -125,7 +172,7 @@ class AdminOperations:
             if result['removal']['status'] == 'completed':
                 result['state'] = 'completed'
         result['next_actions'] = (['respond'] if result['pending_interaction'] else
-                                  [] if result['state'] in ('completed', 'cancelled') else ['advance'])
+                                  [] if result['state'] in ('completed', 'cancelled', 'abandoned') else ['advance'])
         if self._back_checkpoint(state) is not None:
             result['next_actions'].append('back')
         return result
@@ -214,7 +261,7 @@ class AdminOperations:
         return self.status(operation_id)
 
     def _back_checkpoint(self, state):
-        if state['state'] in ('working', 'uncertain', 'completed', 'cancelled'):
+        if state['state'] in ('working', 'uncertain', 'completed', 'cancelled', 'abandoned'):
             return None
         current = (state.get('pending_interaction') or {}).get('interaction_id')
         for checkpoint in reversed(state.get('choice_checkpoints', [])):
@@ -330,7 +377,7 @@ class AdminOperations:
                     raise SetupPending('Legacy project effects may be submitted or unresolved. Reconcile their original receipts separately; installer setup cannot rewind or retry them.')
                 state.setdefault('retired_interactions', []).append(state['pending_interaction'])
                 state.update(pending_interaction=None, step='verify', state='pending')
-            if state['pending_interaction'] or state['state'] in ('completed', 'cancelled'):
+            if state['pending_interaction'] or state['state'] in ('completed', 'cancelled', 'abandoned'):
                 return self.status(operation_id)
             state.update(state='working', live_state_checked=False)
             state.pop('error', None)
@@ -427,7 +474,7 @@ class AdminOperations:
             step, answers = state['step'], state['answers']
             from tools.setup_common import expected_account
             deploy = (step.startswith('deploy_identity') or
-                      step in ('provision', 'prepare', 'plan', 'apply_review', 'apply', 'migration_stack') or
+                      step in ('discover', 'discovery_select', 'provision', 'prepare', 'plan', 'apply_review', 'apply', 'migration_stack') or
                       (step == 'connect_review' and not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID')))
             prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
             actual = state.get(('deploy_identity' if deploy else 'identity') + '_actual', {})
@@ -445,21 +492,30 @@ class AdminOperations:
             if (state.get('new_instance_id') and wizard.values.get('MAVEN_MEMORY_INSTANCE_ID')
                     and wizard.values['MAVEN_MEMORY_INSTANCE_ID'] != state['new_instance_id']):
                 raise SetupPending('Current connection differs from the original prepared instance; no initialization or starter request was dispatched.')
+            has_target = bool(wizard.values.get('MAVEN_MEMORY_INSTANCE_ID') or
+                              wizard.values.get('MAVEN_STACK_NAME'))
+            if step == 'connect_review' and not has_target:
+                # Resume old blank-target failures through confirmed discovery,
+                # never by guessing a stack or discarding prior receipts.
+                state.update(step='deploy_identity', identity_return_step='discover')
+                return
             if step == 'start':
                 mode = state['parameters'].get('mode')
                 fields = [] if mode else [
                     Field('mode', 'Instance', 'existing', kind='select',
                           choices=(('Connect existing', 'existing'), ('Provision new', 'new')))]
                 if mode != 'new':
-                    fields.append(Field('connection', 'Private .env path or exact stack name (blank uses saved settings)',
-                        required=False, help='Import an existing private connection or discover the selected stack; existing mode never deploys or initializes.'))
+                    fields.append(Field('connection', 'Connection override (optional): .env path or stack name',
+                        required=False,
+                        help=('Blank reuses this installation’s saved connection.' if has_target else
+                              'Leave blank to sign in with maintenance access and search AWS for MAVEN stacks. You will choose the instance; nothing is automatically deployed.')))
                 fields.append(Field('region', 'AWS region', wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'),
                     help='The reviewed infrastructure supports us-east-1. This pins the target region, not credentials.'))
                 title = 'Provision new memory' if mode == 'new' else 'Connect existing memory' if mode else 'Choose instance setup'
                 state['presentation']['title'] = title
                 self._question(state, 'selection', title, fields, 'selection',
                     description=('Selected task: ' + (mode or 'choose existing or new') +
-                        '. Confirm the target connection and region; no external changes occur here.'))
+                        '. Confirm the region and any optional connection override; no external changes occur here.'))
             elif step == 'selection':
                 selection = answers['selection']
                 if selection['region'] != 'us-east-1':
@@ -494,7 +550,11 @@ class AdminOperations:
                 elif review['connection']:
                     updates['MAVEN_STACK_NAME'] = review['connection']
                 wizard.settings(updates)
-                state['step'] = 'identity'
+                if answers['selection']['mode'] == 'existing' and not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'):
+                    state.update(step='deploy_identity', identity_return_step=(
+                        'identity' if wizard.values.get('MAVEN_STACK_NAME') else 'discover'))
+                else:
+                    state['step'] = 'identity'
             elif step in ('identity', 'deploy_identity'):
                 deploy = step == 'deploy_identity'
                 prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
@@ -567,10 +627,38 @@ class AdminOperations:
                 state['effect_sequence'] = state.get('effect_sequence', 0) + 1
                 if deploy and state.get('identity_return_step'):
                     state['step'] = state.pop('identity_return_step')
-                elif not deploy and (answers['selection']['mode'] == 'new' or not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID')):
+                    if state['step'] in ('discover', 'identity'):
+                        state['connection_maintenance_confirmed'] = True
+                elif not deploy and (answers['selection']['mode'] == 'new' or
+                        (not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID') and
+                         not state.get('connection_maintenance_confirmed'))):
                     state['step'] = 'deploy_identity'
                 else:
                     state['step'] = 'provision' if answers['selection']['mode'] == 'new' else 'connect_review'
+            elif step == 'discover':
+                candidates = _discover_stacks(wizard.values)
+                state['discovered_stacks'] = candidates
+                state['live_state_checked'] = True
+                self._question(state, 'discovered_stack', 'Choose MAVEN memory found in AWS', [
+                    Field('stack_id', 'MAVEN CloudFormation stack', kind='select',
+                          choices=tuple((f'{item["name"]} — instance {item["instance_id"]} — {item["status"]}',
+                                         item['stack_id']) for item in candidates),
+                          help='Choose explicitly, even if only one instance was found. Only ready stacks with valid MAVEN outputs are listed.')],
+                    'discovery_select',
+                    description=f'Account: {expected_account(wizard.values)} | Region: {wizard.values["MAVEN_AWS_REGION"]}. '
+                                'Read-only discovery is complete. Continue saves the selected stack locator locally, '
+                                'then asks for daily-use access. Complete connection details require review before binding memory. '
+                                'No deployment, database initialization or authority replacement is authorized.',
+                    details=json.dumps(candidates, indent=2))
+            elif step == 'discovery_select':
+                selected = next(item for item in state['discovered_stacks']
+                                if item['stack_id'] == answers['discovered_stack']['stack_id'])
+                # Pin the ARN, not a reusable name. Connection review and binding
+                # both re-read this exact stack using confirmed maintenance access.
+                wizard.settings({'MAVEN_STACK_NAME': selected['stack_id']})
+                state['effect_sequence'] = state.get('effect_sequence', 0) + 1
+                self._receipt(state, step, selected)
+                state['step'] = 'identity'
             elif step == 'connect_review':
                 if wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'):
                     config = _connection_config(wizard.values)

@@ -169,6 +169,24 @@ def main(argv=None) -> int:
             while True:
                 _options(args)
                 home = args.home.expanduser().absolute()
+                if args.uninstall:
+                    handoff.update(home=home, uninstall=True)
+                    ui.close_when_finished()
+                    return 0
+                if args.restart_operation:
+                    if not (home / 'venv/bin/python').is_file():
+                        # A prior local uninstall may have retained setup receipts.
+                        # Restore tools only after the normal local-install review.
+                        args.local_only = True
+                        try:
+                            result = _install(args)
+                        except BackToOptions:
+                            continue
+                        if result:
+                            return result
+                    handoff.update(home=home, restart_operation=args.restart_operation)
+                    ui.close_when_finished()
+                    return 0
                 if args.check_existing and (home / 'venv/bin/python').is_file():
                     review = ui.review('Check or repair this connection',
                                        'Use the installed Python runtime to inspect this saved connection.\n'
@@ -197,19 +215,24 @@ def main(argv=None) -> int:
                 ui.close_when_finished()
                 return 0
 
-        result = run_workflow('Set up MAVEN', [
-            'Choose a task', 'Installation folder', 'Review installation', 'Install tools',
-            'Connect cloud memory',
-        ], operation)
+        result = run_workflow('MAVEN installation and removal', ['Choose a task'], operation)
         if result or not handoff:
             return result
         # The first app is closed before the installed setup app owns the terminal.
         home = handoff['home']
         from tools.tui.bootstrap import run_terminal
-        command = [str(home / 'venv/bin/python'), '-m', 'tools.setup', '--home', str(home),
-                   '--mode', handoff['mode']]
-        if handoff.get('operation'):
-            command.extend(['--operation', handoff['operation']])
+        if handoff.get('uninstall'):
+            python = home / 'venv/bin/python'
+            command = [str(python) if python.is_file() else sys.executable, '-m', 'tools.uninstall']
+        elif handoff.get('restart_operation'):
+            python = home / 'venv/bin/python'
+            command = [str(python) if python.is_file() else sys.executable, '-m', 'tools.setup',
+                       '--home', str(home), '--restart-operation', handoff['restart_operation']]
+        else:
+            command = [str(home / 'venv/bin/python'), '-m', 'tools.setup', '--home', str(home),
+                       '--mode', handoff['mode']]
+            if handoff.get('operation'):
+                command.extend(['--operation', handoff['operation']])
         return run_terminal(
             command, cwd=Path(__file__).resolve().parent,
             env=dict(os.environ, MAVEN_HOME=str(home), PYTHONPATH=str(Path(__file__).resolve().parent)),
@@ -312,6 +335,8 @@ def _advanced_options(args):
 
 def _options(args):
     ui = require()
+    args.uninstall = False
+    args.restart_operation = None
     while True:
         stage('Choose a task')
         home = (args.home or Path(os.environ.get('MAVEN_HOME', '~/.maven'))).expanduser().absolute()
@@ -323,18 +348,32 @@ def _options(args):
             task = ui.choose('Your existing MAVEN installation', [
                 ('Resume unfinished setup — keep the original requests and approvals' if pending else
                  'Check or repair this connection — verify the saved instance; no automatic redeployment', 'existing'),
+                *([('Abandon unfinished setup and start over — preserve receipts and cloud resources', 'restart')]
+                  if pending else []),
                 ('Update local MAVEN software — preserve cloud settings; no AWS login or cloud changes', 'update'),
                 ('Set up a separate instance — choose another private installation folder', 'separate'),
+                ('Uninstall — find an installation and choose what to remove', 'uninstall'),
                 ('Advanced options — software-only installation and custom local settings', 'advanced'),
             ], description=summary)
         else:
             task = ui.choose('What would you like to do?', [
                 ('Connect to existing MAVEN — install software and connect to existing cloud memory', 'existing'),
                 ('Create a new MAVEN instance — review and provision billable AWS infrastructure', 'new'),
+                ('Uninstall — find an installation and choose what to remove', 'uninstall'),
                 ('Advanced options — install software without connecting to cloud memory', 'advanced'),
             ], description='Choose your goal. The wizard explains each step before asking you to decide.\n'
                            'Maintenance access manages infrastructure; daily-use access operates memory.\n'
                            'They may be separate identities in the same AWS account. Neither is assumed yet.')
+        if task == 'restart':
+            args.home, args.restart_operation = home, pending
+            return
+        if task == 'uninstall':
+            from tools.tui.installations import choose_removal_home
+            selected = choose_removal_home(ui, extra=(home,))
+            if selected is None:
+                continue
+            args.home, args.uninstall = selected, True
+            return
         separate = task == 'separate'
         if separate:
             task = ui.choose('Set up a separate installation', [

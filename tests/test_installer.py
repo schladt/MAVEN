@@ -122,6 +122,56 @@ class InstallerTests(unittest.TestCase):
             self.assertIsNone(args.setup_operation)
             self.assertFalse(unused.exists())
 
+    def test_uninstall_discovery_lists_known_homes_without_scanning_unrelated_folders(self):
+        from tools.tui.installations import choose_removal_home
+        from tools.uninstall.common import save_private
+        from tools.uninstall.local import REGISTRY
+        with tempfile.TemporaryDirectory() as directory:
+            user = Path(directory)
+            default, environment, registered, removed, unrelated = [
+                user / name for name in ('.maven', 'environment', 'custom', 'removed', 'unrelated')]
+            for home in (default, environment, registered, removed, unrelated):
+                home.mkdir(mode=0o700)
+            save_private(removed / 'installation.json', {'active': False})
+            save_private(user / REGISTRY, {'schema': 1, 'homes': [str(registered), str(removed)]})
+            keep = unrelated / 'owner-file'
+            keep.write_text('preserve')
+            ui = Mock()
+            def choose(title, choices, **kwargs):
+                detected = {label: value for label, value in choices if value.isdigit()}
+                self.assertEqual(set(detected), {str(default), str(environment), str(registered)})
+                return detected[str(registered)]
+            ui.choose.side_effect = choose
+            ui.review.return_value = True
+            with patch.object(Path, 'home', return_value=user), \
+                    patch.dict(os.environ, {'MAVEN_HOME': str(environment)}):
+                selected = choose_removal_home(ui)
+            self.assertEqual(selected, registered)
+            self.assertEqual(keep.read_text(), 'preserve')
+            self.assertTrue(all(home.is_dir() for home in (default, environment, registered, removed)))
+
+    def test_advanced_uninstall_browser_rejects_root_files_and_symlink_paths(self):
+        from tools.tui.installations import choose_removal_home
+        with tempfile.TemporaryDirectory() as directory:
+            user = Path(directory)
+            home = user / 'custom'
+            home.mkdir(mode=0o700)
+            keep = home / 'owner-file'
+            keep.write_text('preserve')
+            link = user / 'link'
+            link.symlink_to(home, target_is_directory=True)
+            ui = Mock()
+            ui.choose.side_effect = ['advanced', 'path', 'path', 'path', 'path', 'select']
+            ui.form.side_effect = [{'path': '/'}, {'path': str(keep)}, {'path': str(link)},
+                                   {'path': str(home)}]
+            ui.review.return_value = True
+            with patch.object(Path, 'home', return_value=user), \
+                    patch.dict(os.environ, {'MAVEN_HOME': str(user / 'absent')}):
+                selected = choose_removal_home(ui)
+            self.assertEqual(selected, home)
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(keep.read_text(), 'preserve')
+
     def test_failed_package_command_cannot_leak_its_output_into_terminal(self):
         script = """
 import sys

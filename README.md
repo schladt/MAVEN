@@ -51,8 +51,8 @@ Alternatively, download and extract this repository's source archive, open a ter
 in the extracted folder, and run `python3 install.py`. You do **not** need an existing
 virtual environment, private `.env`, or project `.maven` directory.
 
-The full-screen Textual installer starts with a task: connect existing memory or
-create a new instance. For an existing installation it shows saved, **unverified**
+The full-screen Textual installer starts with a task: connect existing memory,
+create a new instance, or **Uninstall**. For an existing installation it shows saved, **unverified**
 account/instance settings and offers check/repair, local software update, or a
 separate installation. Software-only installation and optional Google/certificate
 settings live under **Advanced options**. The private home defaults to `~/.maven`.
@@ -73,11 +73,12 @@ retain complete artifacts and review digests. Destructive confirmations remain s
 
 The wizard offers two paths:
 
-- **Connect an existing MAVEN instance:** choose **Import settings from another
-  installation’s `.env` file** (usually `~/.maven/.env`), or **Find the existing
-  deployment in AWS** using its CloudFormation stack—the named group of AWS
-  resources for that instance. Confirm the actual instance and routine AWS principal.
-  This path does not redeploy, initialize the database, or replace active authority.
+- **Connect an existing MAVEN instance:** leave the connection override blank.
+  Saved connections are reused; otherwise confirm maintenance AWS access and choose
+  from MAVEN stacks discovered in that account/region. Then select daily-use access
+  and review the exact connection. An explicit stack name or configured installation's
+  `.env` path remains an optional override. This path never redeploys, initializes
+  the database, or replaces active authority.
 - **Create a new MAVEN instance:** confirm the account discovered after sign-in,
   then provide the stack/instance name, notification email and two availability zones.
   Select maintenance access separately. Review costs and generated artifacts, then
@@ -145,17 +146,26 @@ and resume with:
 maven-setup
 ```
 
-Reruns preserve configuration and pending review/request identities. An unknown cloud
-outcome must be reconciled using the same artifacts, not bypassed by starting a new
-installation. Instance readiness requires verified cloud access and complete
-applicable authority. Project enablement remains a separate harness task; a local
-package installation alone is not readiness.
+Reruns preserve configuration and pending review/request identities. To start over,
+choose **Abandon unfinished setup and start over** in `python3 install.py`. After exact
+confirmation, it archives the old operation and settings, clears the active connection,
+and opens fresh choices. Software, sign-in caches and cloud resources remain.
+**This does not cancel AWS work or stop charges.** Unknown outcomes still require
+reconciliation; do not duplicate an unresolved deployment. See
+[setup recovery](docs/getting-started.md#resume-instance-setup) for restart receipts.
+Instance readiness still requires verified cloud access and complete applicable
+authority; project enablement remains a separate harness task.
 
 ## Uninstall selected scopes
 
-Run `maven-uninstall` for the full-screen operation dashboard, or
-`python3 -m tools.uninstall` from this checkout using an interpreter with the `[ui]`
-dependencies. Inspect or resume a saved operation, or start a new guided plan.
+Run `python3 install.py` and choose **Uninstall**. It checks `~/.maven`, `MAVEN_HOME`,
+the selected `--home`, and registered installations. Choose **Advanced — browse or
+enter an installation path** for custom locations. Discovery is local and read-only;
+the chosen home is carried into the protected removal dashboard with no scope preselected.
+
+The standalone `maven-uninstall` and `python3 -m tools.uninstall` entrypoints remain
+available for recovery with the `[ui]` dependencies. Inspect/resume a saved operation
+or start a new guided plan; existing plans retain their original targets.
 **Project, machine, and cloud removal are independent choices**; selecting one
 never implicitly selects the others.
 

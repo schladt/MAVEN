@@ -13,8 +13,9 @@ _STAGE_NAMES = {
     'start': 'Choose setup', 'selection': 'Choose setup',
     'identity': 'Choose everyday AWS access', 'identity_inspect': 'Check everyday AWS identity',
     'identity_accept': 'Confirm everyday AWS identity',
-    'deploy_identity': 'Choose deployment access', 'deploy_identity_inspect': 'Check deployment identity',
-    'deploy_identity_accept': 'Confirm deployment identity',
+    'deploy_identity': 'Choose maintenance access', 'deploy_identity_inspect': 'Check maintenance identity',
+    'deploy_identity_accept': 'Confirm maintenance identity',
+    'discover': 'Find MAVEN stacks in AWS', 'discovery_select': 'Select discovered instance',
     'connect_review': 'Review existing instance', 'connect': 'Connect existing instance',
     'provision': 'Choose new instance settings', 'prepare': 'Prepare deployment review',
     'plan': 'Prepare change set', 'apply_review': 'Review billable deployment', 'apply': 'Deploy approved changes',
@@ -175,7 +176,7 @@ def present(ui, home, *, operation_id=None, mode=None):
                         continue
                     response['confirmations'] = values
             result = controller.respond(identifier, question['interaction_id'], question['revision'], response)
-        elif result['state'] in ('completed', 'cancelled'):
+        elif result['state'] in ('completed', 'cancelled', 'abandoned'):
             outcome = result.get('outcome', result['state'])
             ui.message(_text(outcome))
             if result['state'] == 'completed' and result.get('kind') == 'setup':

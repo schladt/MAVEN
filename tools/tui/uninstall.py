@@ -52,7 +52,8 @@ def _wizard(ui):
          'Reactivation is reversible and cannot accompany machine/cloud removal. '
          'Offline detachment preserves unresolved cloud evidence.'),
         ('Machine', [
-            _optional('home', 'Installation homes (one per line; blank uses default or all-homes discovery)', multiline=True),
+            _optional('home', 'Installation homes (one per line; blank uses default or all-homes discovery)',
+                      cli._default_home(), multiline=True),
             _boolean('all_homes', 'Include all discovered current-user homes'),
             _boolean('adopt_legacy', 'Inventory recognized legacy installations without ownership receipts')],
          'Home selection also supplies the default installation for project/cloud work. '
@@ -295,6 +296,8 @@ def _execute(ui, path, plan, arguments):
 def _dashboard(ui):
     while True:
         ui.stage('Dashboard')
+        ui.set_context('Removal and recovery • Selected installation: ' + cli._default_home() +
+                       '\nProject, machine and cloud scopes are independent. No removal is authorized by opening this dashboard.')
         paths = sorted((Path.home() / '.maven-uninstall').glob('*/plan.json'))
         summaries = []
         choices = [('New removal / reactivation plan', 'new'),
@@ -311,7 +314,8 @@ def _dashboard(ui):
             choices.append((label, str(index)))
         choices.append(('Exit', 'exit'))
         selected = ui.choose('Local removal dashboard', tuple(choices),
-                             description='Stored receipts only; no live cloud checks.\n' + _json(summaries))
+                             description='Selected installation: ' + cli._default_home() +
+                                         '\nStored receipts only; no live cloud checks. Existing plans retain their original targets.\n' + _json(summaries))
         if selected == 'exit':
             ui.close_when_finished()
             return 0

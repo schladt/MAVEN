@@ -224,7 +224,7 @@ def apply(values, package, review_path, environment_path, *, confirm_review, bud
         raise MemoryClientError('installation_package_changed')
     cloud = _cloud(values)
     expected = review['change_set']
-    if expected['StackName'] != values['MAVEN_STACK_NAME']:
+    if values['MAVEN_STACK_NAME'] not in (expected['StackName'], expected['StackId']):
         raise MemoryClientError('review_target_mismatch')
     change = _describe_changes(cloud, expected['ChangeSetId'], expected['StackId'])
     if _review_fields(change) != expected:

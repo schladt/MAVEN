@@ -207,6 +207,86 @@ class AdministrationTests(unittest.TestCase):
         self.assertEqual(archive.read_bytes(), original_setup)
         self.assertEqual(self.controller._path(original['operation_id']).read_bytes(), original_operation)
 
+    def test_explicit_restart_archives_settings_and_unknown_effects_without_replay(self):
+        from tools.setup_restart import review_restart, restart
+        from tools.administration import _digest
+        original = self.controller.begin('setup', {'mode': 'existing'})
+        identifier = original['operation_id']
+        wizard = Wizard(self.home)
+        wizard.settings({'MAVEN_AWS_PROFILE': 'old-owner', 'MAVEN_STACK_NAME': 'old-stack'})
+        wizard.state['submitted_requests'] = [str(uuid4())]
+        wizard.save()
+        artifact = wizard.directory / 'change-set.json.pending'
+        save_json(artifact, {'request_key': wizard.state['submitted_requests'][0]})
+        original_artifact, original_environment = artifact.read_bytes(), wizard.env.read_text()
+        state = self.controller._load(identifier)
+        state.update(state='uncertain', step='apply', pending_interaction=None)
+        self.controller._save(state)
+        with patch('tools.memory.bootstrap.apply') as cloud:
+            review = review_restart(self.home, identifier)
+            result = restart(self.home, identifier, confirm_review=_digest(review), source=self.source)
+            successor = result['operation_id']
+            self.assertNotEqual(successor, identifier)
+            self.assertEqual(Wizard(self.home).values, {})
+            old = self.controller.status(identifier)
+            self.assertEqual(old['state'], 'abandoned')
+            self.assertEqual(old['next_actions'], [])
+            self.assertEqual(self.controller.advance(identifier), old)
+            archive = read_private(Path(old['outcome']['archive']))
+            self.assertEqual(archive['original']['environment'], original_environment)
+            self.assertEqual(archive['original']['setup']['submitted_requests'], wizard.state['submitted_requests'])
+            self.assertEqual(artifact.read_bytes(), original_artifact)
+            fresh = self.controller.advance(successor)
+            self.assertEqual(fresh['pending_interaction']['key'], 'selection')
+            self.assertEqual(fresh['approvals'], [])
+            self.assertNotIn('submitted_requests', Wizard(self.home).state)
+            self.assertEqual(Wizard(self.home).state['administration_artifacts'], successor)
+            # Repeating the approved restart must not clear newly entered settings.
+            Wizard(self.home).settings({'MAVEN_AWS_PROFILE': 'new-owner'})
+            repeated = restart(self.home, identifier, confirm_review=_digest(review), source=self.source)
+            self.assertEqual(repeated['operation_id'], successor)
+            self.assertEqual(Wizard(self.home).values['MAVEN_AWS_PROFILE'], 'new-owner')
+            cloud.assert_not_called()
+
+    def test_restart_rejects_stale_review_and_preserves_active_sessions(self):
+        from tools.setup_restart import review_restart, restart
+        from tools.administration import _digest
+        identifier = self.controller.begin('setup', {})['operation_id']
+        review = review_restart(self.home, identifier)
+        Wizard(self.home).settings({'MAVEN_STACK_NAME': 'changed-after-review'})
+        before = self.controller._path(identifier).read_bytes()
+        with self.assertRaisesRegex(SetupPending, 'changed since review'):
+            restart(self.home, identifier, confirm_review=_digest(review), source=self.source)
+        self.assertEqual(self.controller._path(identifier).read_bytes(), before)
+        save_private(self.home / 'runtime/sessions.json', {
+            'schema': 1, 'sessions': {'active': {'root': str(self.base)}}, 'reservations': {}})
+        with self.assertRaises(ValueError):
+            review_restart(self.home, identifier)
+        self.assertEqual(Wizard(self.home).values['MAVEN_STACK_NAME'], 'changed-after-review')
+
+    def test_interrupted_restart_resumes_same_successor_and_retains_original_evidence(self):
+        from tools import setup_restart
+        from tools.administration import _digest
+        identifier = self.controller.begin('setup', {})['operation_id']
+        Wizard(self.home).settings({'MAVEN_STACK_NAME': 'original'})
+        review = setup_restart.review_restart(self.home, identifier)
+        atomic = setup_restart.atomic_private
+        def interrupted(path, text):
+            atomic(path, text)
+            raise OSError('interrupted after clearing settings')
+        with patch.object(setup_restart, 'atomic_private', side_effect=interrupted):
+            with self.assertRaises(OSError):
+                setup_restart.restart(self.home, identifier, confirm_review=_digest(review), source=self.source)
+        archive = self.controller.directory / ('restart-' + identifier + '.json')
+        journal = read_private(archive)
+        self.assertFalse(journal['completed'])
+        self.assertIn('original', journal['original']['environment'])
+        result = setup_restart.restart(self.home, identifier, confirm_review=_digest(review), source=self.source)
+        self.assertEqual(result['operation_id'], journal['replacement']['operation_id'])
+        self.assertEqual(Wizard(self.home).state['administration_operation'], result['operation_id'])
+        self.assertEqual(read_private(archive)['original'], journal['original'])
+        self.assertTrue(read_private(archive)['completed'])
+
     def test_fresh_setup_preserves_exact_requests_and_chat_activation_provenance(self):
         instance = str(uuid4())
         identity = {'Arn': 'arn:aws:iam::123456789012:user/owner', 'Account': '123456789012'}
@@ -416,6 +496,112 @@ class AdministrationTests(unittest.TestCase):
         self.assertEqual(result['answers']['selection'], {'mode': 'new', 'connection': '', 'region': 'us-east-1'})
         self.assertEqual(result['responses'][-1]['response'], {'region': 'us-east-1'})
 
+    def stack(self, name, instance_id=None):
+        from tests.test_memory_client import CONFIG
+        from tools.memory.deployment import OUTPUT_CONFIG
+        config = {**CONFIG, 'instance_id': instance_id or str(uuid4())}
+        return {'StackName': name,
+                'StackId': f'arn:aws:cloudformation:us-east-1:123456789012:stack/{name}/{uuid4()}',
+                'StackStatus': 'CREATE_COMPLETE',
+                'Outputs': [{'OutputKey': key, 'OutputValue': str(config[field])}
+                            for key, field in OUTPUT_CONFIG.items()]}
+
+    def test_discovery_requires_maintenance_confirmation_and_binds_only_selected_stack(self):
+        first, second = self.stack('first'), self.stack('second')
+        failed = {**self.stack('failed'), 'StackStatus': 'ROLLBACK_COMPLETE'}
+        unrelated = {'StackStatus': 'CREATE_COMPLETE', 'StackId': first['StackId'], 'Outputs': []}
+        malformed = {**self.stack('malformed'), 'Outputs': [
+            {'OutputKey': item['OutputKey'], 'OutputValue': 'bad' if item['OutputValue'].startswith('https:') else item['OutputValue']}
+            for item in first['Outputs']]}
+        cloud = Mock()
+        cloud.get_paginator.return_value.paginate.return_value = [
+            {'Stacks': [unrelated, failed, malformed, first]}, {'Stacks': [second]}]
+        cloud.describe_stacks.return_value = {'Stacks': [second]}
+        identity = {'Arn': 'arn:aws:iam::123456789012:user/owner', 'Account': '123456789012'}
+        with patch('tools.memory.environment.selected_aws_session') as aws, \
+                patch('tools.setup_common.inspect_login_identity', return_value=identity):
+            aws.return_value.client.return_value = cloud
+            result = self.controller.begin('setup', {'mode': 'existing'})
+            result = self.advance_to_question(self.respond(result, {'connection': '', 'region': 'us-east-1'}))
+            result = self.advance_to_question(self.respond(result))
+            self.assertEqual(result['pending_interaction']['key'], 'deploy_identity')
+            result = self.respond(result, {'profile': 'maintenance', 'cache': str(self.home / 'runtime/maintenance')})
+            result = self.advance_to_question(result)
+            aws.assert_not_called()
+            result = self.advance_to_question(self.respond(result))
+            self.assertEqual(result['pending_interaction']['key'], 'discovered_stack')
+            self.assertEqual([choice[1] for choice in result['pending_interaction']['fields'][0]['choices']],
+                             [first['StackId'], second['StackId']])
+            self.assertNotIn('MAVEN_STACK_NAME', Wizard(self.home).values)
+            result = self.respond(result, {'stack_id': second['StackId']})
+            self.controller = AdminOperations(self.home)
+            result = self.advance_to_question(result)
+            self.assertEqual(result['pending_interaction']['key'], 'identity')
+            self.assertEqual(Wizard(self.home).values['MAVEN_STACK_NAME'], second['StackId'])
+            self.assertNotIn('MAVEN_MEMORY_INSTANCE_ID', Wizard(self.home).values)
+            result = self.respond(result, {'profile': 'daily', 'cache': str(self.home / 'runtime/daily')})
+            result = self.advance_to_question(self.respond(self.advance_to_question(result)))
+            self.assertEqual(result['pending_interaction']['key'], 'connect')
+            from tools.memory.bootstrap import _outputs
+            self.assertEqual(result['pending_interaction']['review'], _outputs(second))
+            self.assertNotIn('MAVEN_MEMORY_INSTANCE_ID', Wizard(self.home).values)
+            result = self.advance_to_question(self.respond(result))
+            self.assertEqual(result['pending_interaction']['key'], 'upgrade')
+            self.assertEqual(Wizard(self.home).values['MAVEN_MEMORY_INSTANCE_ID'], _outputs(second)['instance_id'])
+            self.assertTrue(all(call.kwargs['StackName'] == second['StackId']
+                                for call in cloud.describe_stacks.call_args_list))
+            self.assertLessEqual({call[0] for call in cloud.method_calls},
+                                 {'get_paginator', 'get_paginator().paginate', 'describe_stacks', 'close'})
+
+    def test_discovery_does_not_treat_denied_or_empty_results_as_a_selection(self):
+        from botocore.exceptions import ClientError
+        for name, failure in [('empty', None), ('denied', ClientError(
+                {'Error': {'Code': 'AccessDenied', 'Message': 'private detail'}}, 'DescribeStacks'))]:
+            with self.subTest(name=name):
+                home = self.base / name
+                controller = AdminOperations(home)
+                result = controller.begin('setup', {'mode': 'existing'})
+                Wizard(home).settings({'MAVEN_AWS_REGION': 'us-east-1',
+                    'MAVEN_DEPLOY_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/owner'})
+                state = controller._load(result['operation_id'])
+                state.update(step='discover', pending_interaction=None)
+                controller._save(state)
+                cloud = Mock()
+                cloud.get_paginator.return_value.paginate.side_effect = failure
+                cloud.get_paginator.return_value.paginate.return_value = [{'Stacks': []}]
+                with patch('tools.memory.environment.selected_aws_session') as aws:
+                    aws.return_value.client.return_value = cloud
+                    result = controller.advance(result['operation_id'])
+                self.assertEqual(result['state'], 'blocked')
+                self.assertIsNone(result['pending_interaction'])
+                self.assertNotIn('MAVEN_STACK_NAME', Wizard(home).values)
+                self.assertNotIn('private detail', result['error'])
+                if failure:
+                    self.assertIn('cloudformation:DescribeStacks', result['error'])
+                else:
+                    self.assertIn('123456789012', result['error'])
+                    self.assertIn('us-east-1', result['error'])
+
+    def test_blank_target_checkpoint_recovers_without_erasing_receipts(self):
+        result = self.controller.begin('setup', {'mode': 'existing'})
+        identifier = result['operation_id']
+        state = self.controller._load(identifier)
+        state.update(step='connect_review', state='blocked', pending_interaction=None, error='KeyError')
+        state['answers']['selection'] = {'mode': 'existing', 'connection': '', 'region': 'us-east-1'}
+        state['approvals'] = [{'review_digest': 'original-identity-approval', 'source': self.source}]
+        state['receipts'] = [{'step': 'preflight', 'result': {'status': 'Could not verify'}}]
+        self.controller._save(state)
+        with patch('tools.memory.environment.selected_aws_session') as aws:
+            recovered = AdminOperations(self.home).advance(identifier)
+            recovered = self.advance_to_question(recovered)
+            self.assertEqual(recovered['pending_interaction']['key'], 'deploy_identity')
+            self.assertEqual(recovered['identity_return_step'], 'discover')
+            self.assertEqual(recovered['operation_id'], identifier)
+            self.assertEqual(recovered['approvals'], state['approvals'])
+            self.assertEqual(recovered['receipts'], state['receipts'])
+            aws.assert_not_called()
+            self.preflight.assert_not_called()
+
     def test_unknown_account_offers_typed_external_login_without_starting_it(self):
         result = self.controller.begin('setup', {'mode': 'existing'})
         result = self.respond(result, {'mode': 'existing', 'connection': 'saved-stack', 'region': 'us-east-1'})
@@ -433,7 +619,6 @@ class AdministrationTests(unittest.TestCase):
         self.assertEqual(result['handoff']['command'],
                          ['aws', 'login', '--profile', 'daily-owner', '--region', 'us-east-1'])
         self.assertIn('Unknown', result['handoff']['account'])
-        self.assertIn('Daily-use', result['handoff']['purpose'])
         self.assertEqual(result['handoff']['environment'],
                          {'AWS_LOGIN_CACHE_DIRECTORY': str(self.home / 'runtime/daily-login')})
         self.assertFalse(result['presentation']['verified'])

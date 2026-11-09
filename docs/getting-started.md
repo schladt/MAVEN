@@ -19,8 +19,8 @@ From the cloned or extracted source folder:
 python3 install.py
 ```
 
-The full-screen Textual interface starts with your goal: **connect existing memory**
-or **create a new instance**. An existing installation shows its saved, unverified
+The full-screen Textual interface starts with your goal: **connect existing memory**,
+**create a new instance**, or **Uninstall**. An existing installation shows its saved, unverified
 instance/account/region/profiles and offers **check or repair**, **update local
 software**, or **set up a separate instance**. Check/repair does not reinstall packages
 or automatically redeploy. A separate instance requires an unused private home.
@@ -58,13 +58,28 @@ PATH; it is **not** the private `.env`. Never source `.env`.
 
 ### Pick the connection path
 
-**Existing instance:** choose one of these connection methods:
+**Existing instance:** leave the connection override blank for the guided path.
+If this private home already has a connection, setup reuses it. Otherwise:
 
-1. **Import settings from another installation’s `.env` file**, usually
-   `~/.maven/.env`. This imports private connection settings, not credentials.
-2. **Find the existing deployment in AWS**, using its CloudFormation stack—the
-   named group of resources for that instance—and a separately selected identity
-   permitted to read its details.
+1. Select maintenance access, sign in if needed, and confirm the actual AWS account
+   and principal.
+2. MAVEN searches CloudFormation in the selected region, reading all result pages.
+   Choose the intended stack explicitly, even if only one was found. The list shows
+   stack names, instance IDs and status; only ready stacks with valid MAVEN outputs
+   from the selected account are offered.
+3. Select daily-use access, then review the complete connection before binding memory.
+
+Discovery is read-only and requires `cloudformation:DescribeStacks` permission to
+enumerate stacks in the selected account/region. Missing access or no eligible stacks
+produces a recoverable blocker, never automatic deployment or selection. Check the
+account, region, permissions and deployment status, then resume the same operation.
+The chosen stack ARN is saved as the locator to avoid silently selecting a replacement
+with the same name; connection review and binding re-read that exact stack.
+
+You can still supply an exact stack name or an absolute path to another configured
+installation's `.env` as an optional override. Importing settings does not import
+credentials. If MAVEN has not been deployed, choose **Create a new MAVEN instance**
+using a separate unused private home.
 
 The wizard derives locators from the imported file or actual stack outputs and asks
 you to confirm instance and principal identities. Neither method redeploys,
@@ -150,11 +165,43 @@ and reports its saved phase. Back only revises safe, unsubmitted choices.
 Unknown outcomes must be reconciled before retrying mutations; existing infrastructure
 must never be reinitialized to recover onboarding.
 
+Older installers could stop with `KeyError` after signing in when an existing-instance
+connection was left blank without saved settings. Pause with Ctrl+Q and restart
+the updated installer, then choose **Resume unfinished setup**. The same operation
+now reconfirms maintenance access and searches AWS for the missing target, followed
+by explicit stack selection and connection review. Historical approvals and receipts
+remain intact. Do not delete settings or receipts to recover.
+
 `maven-setup` opens the same setup screens and reads existing receipts. Guided
 installation continues directly into cloud setup; if paused, activate that home and
 run `maven-setup` when ready. `--mode existing|new` selects the task without asking
 again. After verified completion, a separately reviewed check/repair can start a
 new operation; `--fresh-operation` never discards an unfinished or unverified one.
+
+To abandon the current unfinished setup, rerun `python3 install.py` and choose
+**Abandon unfinished setup and start over**. Review the exact operation and type its
+displayed confirmation prefix. Declining leaves it unchanged. Approved abandonment:
+
+- Preserves the original operation, setup state and private `.env` contents in
+  `runtime/administration/restart-<original-operation-UUID>.json`.
+- Leaves original request artifacts, approvals, receipts, installed software, AWS
+  login caches and cloud resources intact. The old operation becomes read-only.
+- Clears active connection settings and starts a distinct setup with fresh choices,
+  approvals and an isolated artifact directory. Projects using this home need a new
+  completed connection before memory works again.
+
+Stop/recover registered MAVEN sessions and release reservations first. Setup locks
+prevent abandoning a currently running local setup. If local tools were removed,
+the installer offers its normal reviewed software-only restoration before restart.
+An interrupted restart resumes its journaled replacement operation; it never resets
+new settings again after a completed restart.
+
+**Abandonment is not cloud rollback:** submitted AWS work may continue and resources
+may still incur charges. Unknown effects remain unresolved. Reconnect to existing
+resources or manage them separately; do not duplicate an unresolved deployment.
+The recovery CLI is `maven-setup --home PATH --restart-operation UUID`, using the
+actual home and original operation ID. Unlike `--fresh-operation`, this is an explicit
+reviewed abandonment; it cannot be combined with `--mode` or `--operation`.
 
 Instance completion requires verified daily-use cloud access and complete applicable
 authority. Project enablement is separate. For an interrupted project operation,
@@ -175,8 +222,9 @@ owner source evidence, not invented TUI approval provenance.
 For a later reviewed configuration or migration, the assistant can begin a new
 `maven_admin` setup operation after the previous setup completed with verified
 instance readiness. The old wizard state and receipts are preserved, and new
-preparation artifacts are isolated. Unresolved, cancelled, or unverifiable previous
-operations must be reconciled through their original identities, not replaced.
+preparation artifacts are isolated. Ordinary new operations cannot take over unresolved,
+cancelled or unverifiable setup. Use original receipts for recovery, or explicitly
+review abandonment through the installer; abandonment does not resolve cloud effects.
 External-prerequisite screens show the command, required environment and exact resume
 command inside the review modal. Decline to pause safely while completing the handoff.
 
@@ -468,17 +516,32 @@ Approve each selected scope separately. Login, secure input, stopped-harness att
 and self-removal can require a protected terminal/browser continuation. The process
 being removed must not replace the pinned recovery worker with in-process deletion.
 
-The installed `maven-uninstall` opens a full-screen operation dashboard. From this
-checkout, `python3 -m tools.uninstall` opens the same interface when run with the
-installed `[ui]` dependencies. Dashboard discovery and inspection use local receipts,
-not live AWS queries. Choose a listed operation or open a custom `plan.json` path;
-start a new plan to select independent scopes and review their exact inventories.
+Run `python3 install.py` and choose **Uninstall** from either the first-time or
+existing-installation menu. Local discovery checks `~/.maven`, `MAVEN_HOME`, the
+installer-selected `--home`, and `~/.maven-installations/installations.json`.
+It does not recursively search the disk or contact AWS. Listed paths are candidates;
+ownership and exact inventories are checked separately before removal.
 
-The TUI never downloads dependencies during uninstall. Activate the installed
-environment first. For an older manual installation, install this checkout's `[ui]`
-extra into that existing virtual environment before using the TUI. The noninteractive
-`plan`, `apply`, `resume`, and `status` interfaces remain dependency-free for local
-removal with Python 3.11+; cloud operations still need AWS packages and selected logins.
+For a custom location, choose **Advanced — browse or enter an installation path**.
+Browse folders (including hidden directories), move to a parent, or enter an exact
+path. Files, symlink paths and filesystem root cannot be selected as removal homes.
+Back returns without changes. Confirm the chosen home to open the existing protected
+removal dashboard; this does not install/update MAVEN or approve any removal scope.
+New plans prefill that home. Existing recovery plans retain their original targets.
+
+The standalone `maven-uninstall` and `python3 -m tools.uninstall` commands still open
+the same dashboard with installed `[ui]` dependencies. Choose a listed operation or
+open a custom `plan.json`; start a new plan to select independent scopes and review
+their exact inventories. Dashboard discovery and inspection read local receipts,
+not live AWS state.
+
+The protected uninstaller stages existing dependencies offline; it does not download
+packages. The unified installer's initial UI bootstrap may separately request consent
+to download missing UI dependencies before task selection. When available, the selected
+installation's Python supplies its existing dependencies for the protected dashboard.
+Otherwise the current UI interpreter is used. Cloud operations still require AWS
+packages and explicitly selected logins. Noninteractive `plan`, `apply`, `resume`,
+and `status` remain dependency-free for local removal with Python 3.11+.
 
 ### Select independent scopes
 

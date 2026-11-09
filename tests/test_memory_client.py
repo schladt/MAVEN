@@ -802,13 +802,19 @@ class EnvironmentAndDisplayBoundaries(unittest.TestCase):
 
 class InstallationBoundaries(unittest.TestCase):
     def test_exact_review_plan_apply_and_connect_use_real_command_path_without_credentials_export(self):
+        for target in ('unit-stack', 'arn:aws:cloudformation:us-east-1:123456789012:stack/unit-stack/exact-id'):
+            with self.subTest(target=target):
+                self._reviewed_stack_connection(target)
+
+    def _reviewed_stack_connection(self, target):
         from tools.memory import bootstrap
         from tools.memory.deployment import OUTPUT_CONFIG
         from tools.memory.environment import load_environment
         template = '{"Resources":{}}'
         manifest = {'capabilities_required': ['CAPABILITY_IAM'], 'deployment_inputs': {
             'InstanceId': CONFIG['instance_id'], 'RecoveryEpoch': CONFIG['recovery_epoch']}}
-        change = {'ChangeSetId': 'reviewed-change', 'StackId': 'reviewed-stack', 'StackName': 'unit-stack',
+        change = {'ChangeSetId': 'reviewed-change',
+                  'StackId': 'arn:aws:cloudformation:us-east-1:123456789012:stack/unit-stack/exact-id', 'StackName': 'unit-stack',
                   'ChangeSetName': 'change', 'Status': 'CREATE_COMPLETE', 'ExecutionStatus': 'AVAILABLE',
                   'Changes': [{'Type': 'Resource', 'ResourceChange': {'Action': 'Add', 'LogicalResourceId': 'Memory'}}],
                   'Parameters': [], 'Capabilities': ['CAPABILITY_IAM']}
@@ -818,10 +824,10 @@ class InstallationBoundaries(unittest.TestCase):
         cloud.get_template.return_value = {'TemplateBody': json.loads(template)}
         cloud.describe_stacks.return_value = {'Stacks': [{'StackStatus': 'CREATE_COMPLETE',
             'Outputs': [{'OutputKey': key, 'OutputValue': str(CONFIG[field])} for key, field in OUTPUT_CONFIG.items()]}]}
-        values = {'MAVEN_STACK_NAME': 'unit-stack'}
+        values = {'MAVEN_STACK_NAME': target}
         with tempfile.TemporaryDirectory() as root:
             env_path, review_path = Path(root) / '.env', Path(root) / 'review.json'
-            env_path.write_text('MAVEN_STACK_NAME=unit-stack\n')
+            env_path.write_text('MAVEN_STACK_NAME=' + json.dumps(target) + '\n')
             env_path.chmod(0o600)
             with patch.object(bootstrap, '_cloud', return_value=cloud), \
                  patch.object(bootstrap, '_package', return_value=(manifest, template, [])):
@@ -830,6 +836,9 @@ class InstallationBoundaries(unittest.TestCase):
                 self.assertEqual(repeated, planned)
                 cloud.create_change_set.assert_called_once()
                 cloud.execute_change_set.assert_not_called()
+                with self.assertRaisesRegex(MemoryClientError, 'review_target_mismatch'):
+                    bootstrap.apply({'MAVEN_STACK_NAME': 'another-stack'}, root, review_path, env_path,
+                                    confirm_review=planned['review_sha256'])
                 result = bootstrap.apply(values, root, review_path, env_path,
                                          confirm_review=planned['review_sha256'])
             self.assertEqual(result['status'], 'connected')
