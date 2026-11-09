@@ -1,6 +1,7 @@
 """Explicit-profile, authenticated cloud memory client."""
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import hashlib
 import json
 import logging
@@ -14,10 +15,12 @@ import boto3
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.config import Config
+from botocore.credentials import RefreshableCredentials
 from botocore.exceptions import BotoCoreError, ClientError
+from botocore.session import Session as BotocoreSession
 import requests
 
-from .validation import MUTATION_ROUTES, ROUTES
+from .validation import CLIENT_PROTOCOL, MUTATION_ROUTES, ROUTES, SCHEMA_VERSION
 
 REGION = 'us-east-1'
 MAX_RESPONSE = 256 * 1024
@@ -25,6 +28,11 @@ CONFIG_KEYS = {'cluster_arn', 'app_secret_arn', 'admin_secret_arn', 'database',
                'journal_bucket', 'instance_id', 'recovery_epoch', 'region',
                'client_role_arn', 'admin_role_arn', 'approval_role_arn', 'endpoint', 'schema_version'}
 OPTIONAL_CONFIG_KEYS = {'skill_bucket'}
+DEFINITIVE_MUTATION_ERRORS = frozenset({
+    'revision_conflict', 'invalid_request', 'not_authorized', 'claim_conflict',
+    'project_archived', 'idempotency_conflict', 'setting_conflict',
+    'reference_unavailable', 'session_unavailable',
+})
 
 
 class MemoryClientError(Exception):
@@ -63,7 +71,7 @@ def validate_config(config: dict) -> dict:
         if (not CONFIG_KEYS <= config.keys() or config.keys() - CONFIG_KEYS - OPTIONAL_CONFIG_KEYS
                 or config['region'] != REGION or config['database'] != 'maven'):
             raise ValueError('keys')
-        if type(config['schema_version']) is not int or config['schema_version'] != 1:
+        if type(config['schema_version']) is not int or config['schema_version'] != SCHEMA_VERSION:
             raise ValueError('version')
         for key in ['instance_id', 'recovery_epoch']:
             if str(uuid.UUID(config[key])) != config[key]:
@@ -94,26 +102,57 @@ def validate_config(config: dict) -> dict:
     return dict(config)
 
 
+def _credential_time():
+    return datetime.now(timezone.utc)
+
+
 def selected_session(config: dict, *, admin: bool = False, approval: bool = False, environment: dict | None = None):
-    """Reuse the existing human login without fetching SSM or displaying credentials."""
+    """Assume only the selected role, renewing through the same verified human login."""
     if admin and approval:
         raise MemoryClientError('invalid_role_selection')
     for name in ('boto3', 'botocore', 'urllib3'):
         logging.getLogger(name).setLevel(logging.WARNING)
     try:
         from .environment import load_environment, selected_aws_session, transport_ca_bundle
-        values = load_environment() if environment is None else environment
-        source = selected_aws_session(values, region=config['region'])
-        sdk_config = Config(connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1})
-        sts = source.client('sts', config=sdk_config, verify=transport_ca_bundle())
+        values = dict(load_environment() if environment is None else environment)
+        region = config['region']
         purpose = 'admin' if admin else 'approval' if approval else 'client'
         role = config[f'{purpose}_role_arn']
-        temporary = sts.assume_role(RoleArn=role, RoleSessionName=f'maven-memory-{purpose}',
-                                    DurationSeconds=3600)['Credentials']
-        return boto3.Session(aws_access_key_id=temporary['AccessKeyId'],
-                             aws_secret_access_key=temporary['SecretAccessKey'],
-                             aws_session_token=temporary['SessionToken'], region_name=REGION)
-    except (BotoCoreError, ClientError, KeyError, OSError):
+        sdk_config = Config(connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1})
+
+        def refresh():
+            try:
+                source = selected_aws_session(values, region=region)
+                sts = source.client('sts', config=sdk_config, verify=transport_ca_bundle())
+                try:
+                    temporary = sts.assume_role(RoleArn=role, RoleSessionName=f'maven-memory-{purpose}',
+                                                DurationSeconds=3600)['Credentials']
+                finally:
+                    sts.close()
+                expiration = temporary['Expiration']
+                if (not isinstance(expiration, datetime) or expiration.tzinfo is None
+                        or expiration <= _credential_time()):
+                    raise ValueError('expiration')
+                metadata = {'access_key': temporary['AccessKeyId'],
+                            'secret_key': temporary['SecretAccessKey'],
+                            'token': temporary['SessionToken'], 'expiry_time': expiration.isoformat()}
+                if any(not isinstance(value, str) or not value for value in metadata.values()):
+                    raise ValueError('credentials')
+                return metadata
+            except (BotoCoreError, ClientError, KeyError, OSError, TypeError, ValueError, AttributeError):
+                raise MemoryClientError('selected_login_or_role_unavailable') from None
+
+        initial = refresh()
+        credentials = RefreshableCredentials(
+            access_key=initial['access_key'], secret_key=initial['secret_key'], token=initial['token'],
+            expiry_time=datetime.fromisoformat(initial['expiry_time']), refresh_using=refresh,
+            method='assume-role', time_fetcher=_credential_time,
+            # Identity or login failure must fail closed even during early renewal.
+            advisory_timeout=900, mandatory_timeout=900)
+        sdk_session = BotocoreSession()
+        sdk_session._credentials = credentials
+        return boto3.Session(botocore_session=sdk_session, region_name=region)
+    except (BotoCoreError, ClientError, KeyError, OSError, TypeError, ValueError):
         raise MemoryClientError('selected_login_or_role_unavailable') from None
 
 
@@ -136,7 +175,7 @@ class MemoryClient:
         try:
             credentials = self.session.get_credentials().get_frozen_credentials()
             request = AWSRequest(method='POST', url=url, data=raw,
-                                 headers={'Content-Type': 'application/json', 'x-maven-memory-protocol': '2'})
+                                 headers={'Content-Type': 'application/json', 'x-maven-memory-protocol': str(CLIENT_PROTOCOL)})
             SigV4Auth(credentials, 'execute-api', REGION).add_auth(request)
             timeout = max(0.1, min(27.0, remaining / 2))
             with self.http.post(url, data=raw, headers=dict(request.headers), timeout=(min(3.0, timeout), timeout),
@@ -189,11 +228,11 @@ class MemoryClient:
                 if request_key and ((status >= 500 and code not in ('warming', 'context_stale')) or status == 200):
                     uncertain = True
                 elif status not in (429, 503) or code not in ('warming', 'temporarily_unavailable', 'rate_limited'):
-                    allowed = {'revision_conflict', 'idempotency_conflict', 'record_unavailable', 'operation_unavailable',
-                               'proposal_unavailable', 'page_unavailable', 'proposal_conflict', 'approval_invalid',
-                               'invalid_request', 'not_authorized', 'authentication_required', 'context_stale',
-                               'client_incompatible', 'dependency_unavailable', 'dependency_conflict',
-                               'context_incomplete', 'claim_conflict', 'project_archived'}
+                    allowed = DEFINITIVE_MUTATION_ERRORS | {
+                        'record_unavailable', 'operation_unavailable', 'proposal_unavailable',
+                        'page_unavailable', 'proposal_conflict', 'approval_invalid',
+                        'authentication_required', 'context_stale', 'client_incompatible',
+                        'dependency_unavailable', 'dependency_conflict', 'context_incomplete'}
                     raise MemoryClientError(code if code in allowed else 'service_failure', request_key=request_key)
             remaining = deadline-time.monotonic()
             if remaining > 0:
@@ -350,7 +389,7 @@ class MemoryClient:
         pages = context.get('pages')
         if (type(generation) is not int or generation < 0 or not isinstance(pages, list)
                 or len(pages) > 100 or type(context.get('minimum_client_protocol')) is not int
-                or context['minimum_client_protocol'] not in (1, 2)):
+                or context['minimum_client_protocol'] != CLIENT_PROTOCOL):
             raise MemoryClientError('invalid_service_response')
         catalog = {}
         for page in pages:

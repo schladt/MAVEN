@@ -11,14 +11,14 @@ import logging
 from pathlib import Path
 
 from .store import DataAPI, ROLLOUT_SCOPE, control_document, fetch_control, safe_provider_error, sdk_config
-from .validation import MemoryError, authorized_actor, canonical, uuid_string
+from .validation import MemoryError, SCHEMA_VERSION, authorized_actor, canonical, uuid_string
 
 MIGRATION_SEPARATOR = "\n-- statement\n"
 MIGRATION_FILES = ("001_foundation.sql", "002_fact_change.sql", "003_current_versions.sql",
                    "004_instructions.sql", "005_owner_instructions.sql", "006_owner_memory.sql",
                    "007_memory_instruction_guards.sql", "008_service_state_lock.sql",
                    "009_named_skill_context.sql", "010_skill_resources.sql",
-                   "011_project_lifecycle.sql")
+                   "011_project_lifecycle.sql", "012_agentic_memory.sql")
 
 
 def migrations():
@@ -44,7 +44,7 @@ def _config(config):
             _refuse()
     uuid_string(config["instance_id"])
     uuid_string(config["recovery_epoch"])
-    if config.get("schema_version") != 1 or type(config.get("schema_version")) is not int:
+    if config.get("schema_version") != SCHEMA_VERSION or type(config.get("schema_version")) is not int:
         _refuse()
     if config["region"] != "us-east-1" or config["database"] != "maven":
         _refuse()
@@ -108,6 +108,8 @@ def _identity(state, config, *, allow_legacy=False):
     expected = control_document(config, state["state"])
     if allow_legacy and state.get("data_scope") in {"synthetic", "synthetic_and_owner_instructions"}:
         expected["data_scope"] = state["data_scope"]
+    if allow_legacy and state.get("schema_version") == 1:
+        expected["schema_version"] = 1
     if any(state.get(key) != value for key, value in expected.items()):
         _refuse()
     if state.get("app_secret_arn") != config["app_secret_arn"] or not state.get("app_secret_version"):
@@ -195,10 +197,11 @@ def _install(db, config, secrets, control, *, upgrade=False):
         _grant_instructions(db, tx)
         db.execute("INSERT INTO maven.service_state(singleton, instance_id, recovery_epoch, schema_version, "
                    "data_scope, state, app_secret_arn, app_secret_version) "
-                   "VALUES (true, CAST(:instance AS uuid), CAST(:epoch AS uuid), 1, :scope, "
+                   "VALUES (true, CAST(:instance AS uuid), CAST(:epoch AS uuid), :schema, :scope, "
                    "'maintenance', :secret, :version)",
                    {"instance": config["instance_id"], "epoch": config["recovery_epoch"],
-                    "secret": config["app_secret_arn"], "version": version, "scope": ROLLOUT_SCOPE}, tx)
+                    "secret": config["app_secret_arn"], "version": version, "scope": ROLLOUT_SCOPE,
+                    "schema": SCHEMA_VERSION}, tx)
 
 
 def _verify_application(db, config):
@@ -243,7 +246,8 @@ def _run(config, session, *, upgrade=False):
         control, etag = _control(s3, config)
         if control.get("uninstall"):
             _refuse()
-        if upgrade and (control["state"] == "ready" or control["data_scope"] != ROLLOUT_SCOPE):
+        if upgrade and (control["state"] == "ready" or control["data_scope"] != ROLLOUT_SCOPE
+                        or control["schema_version"] != SCHEMA_VERSION):
             _put_control(s3, config, "maintenance", etag=etag)
             control, _ = fetch_control(s3, config, allow_maintenance=True)
             if control["state"] != "maintenance":
@@ -263,7 +267,7 @@ def _run(config, session, *, upgrade=False):
         if verified != control_document(config, "ready"):
             _refuse()
         return {"status": "ready", "instance_id": config["instance_id"],
-                "recovery_epoch": config["recovery_epoch"], "schema_version": 1,
+                "recovery_epoch": config["recovery_epoch"], "schema_version": SCHEMA_VERSION,
                 "data_scope": ROLLOUT_SCOPE}
     except MemoryError:
         raise

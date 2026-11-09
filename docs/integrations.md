@@ -1,4 +1,120 @@
-# Secrets, workspace and optional Google
+# Harness and optional service integrations
+
+## Harness capability matrix
+
+The baseline is a client-launched local **stdio** MCP process, using the installed
+`maven-mcp` executable and explicit `MAVEN_HOME`. Prefer an absolute executable path
+so client PATH differences cannot select another installation. Do not put credentials
+in MCP configuration. Preserve unrelated entries and use the selected profile/custom
+destination. No public endpoint, listening port or mandatory OMP plugin is needed.
+
+The matrix records **documented support**. Runtime verification is limited to the
+specific local proof below; it is not a claim of interoperability with every client,
+version, enterprise policy, or optional feature.
+
+| Client | Documented stdio configuration and environment | Startup, decisions and trust | Semantic maintenance baseline |
+| --- | --- | --- | --- |
+| [OMP](https://omp.sh/docs/mcp) | `.omp/mcp.json`, `~/.omp/agent/mcp.json`, or named-profile MCP config; `command`, `args`, `env`, optional `cwd`; review precedence | Native `AGENTS.md` guidance; visible chat readiness fallback. Review executable config; discovery is not enablement | Use available native background tasks only when exposed and responsive; otherwise foreground |
+| [Claude Code](https://code.claude.com/docs/en/mcp) | `mcpServers` in selected local/user configuration or project `.mcp.json`; stdio command/args/env | `CLAUDE.md` guidance; [SessionStart hooks](https://code.claude.com/docs/en/hooks) documented but not required by MAVEN. Project MCP approval/workspace trust can block loading | [Native subagents](https://code.claude.com/docs/en/sub-agents) documented, including background configuration; confirm worker tool access/permissions, else foreground |
+| [Codex](https://developers.openai.com/codex/mcp) | `[mcp_servers.<name>]` in selected `config.toml`; command/args/env and supported environment controls | `AGENTS.md` guidance; client trust/tool approval remains separate from MAVEN exact reviews | Foreground is portable baseline; use native agents only if the installed version exposes verified background execution |
+| [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers) | `~/.copilot/mcp-config.json`, `mcpServers`, local/stdio command/args/env; PATH inherited, other needed variables explicitly configured | Native `copilot-instructions.md` guidance. Project-level MCP has folder-trust requirements; use user configuration for non-Git projects | Foreground fallback; do not infer nonblocking background execution from tool discovery or custom-agent support |
+| [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/) | `settings.json` `mcpServers`: command/args/env/cwd; sensitive inherited variables may be filtered | `GEMINI.md` guidance; keep tool confirmations enabled (`trust: true` bypasses them). Client policy does not replace MAVEN review | Foreground fallback unless installed native background capabilities are actually available and verified |
+
+Gemini's official documentation currently notes its transition to Antigravity CLI
+for some account tiers. A legacy skill destination is not proof of Antigravity MCP
+compatibility; confirm the actual product/version before choosing an integration.
+
+### Recorded local verification
+
+Local verification on 2026-11-09 ran in separate stages:
+
+| Run | Checks run | Result |
+| --- | --- | --- |
+| Initial focused integration run | 147 | 132 passed; 15 fixture errors |
+| Failed-check rerun after fixture corrections | 15 | Passed |
+| Targeted rerun after the final receipt-identity guard | 4 | Passed |
+| Post-review bug-fix regression run | 147 | Passed |
+
+The receipt-identity guard rerun covered receipt isolation, partial revision-conflict
+reconciliation, delegated task/checkpoint accounting, and the real stdio entry point
+through Python MCP SDK 2.3.0. At that stage the complete focused set was not rerun;
+those three initial stages did not represent a fresh 148-check run.
+
+The subsequent post-review run covered `test_maven_google`, `test_mcp`,
+`test_workflow`, `test_maintenance`, `test_memory_client`, `test_memory_contracts`,
+`test_administration` and `test_tui`. It exercised exact-content Gmail sending through
+simulated transport, credential renewal with mocked STS/controlled time, real stdio
+MCP, isolated Git subprocess input, session/assignment recovery, setup ownership and
+the actual Textual prerequisite modal. This was a targeted run, not the full suite.
+
+OMP 18.18.2 was exercised with native project MCP configuration, the packaged startup
+guidance, and simulated storage in a disposable non-Git directory. It visibly
+initialized, dispatched a real native reasoning subagent, answered a second scripted
+user turn while that worker's storage write was deliberately held, then delivered
+the result and an explicit universal/project/pending summary. The worker retrieved
+and reconciled an existing plan, preserving its owner and scope; revision 2 was
+verified. The harness and stdio process shut down successfully.
+
+Claude Code, Codex, Copilot CLI and Gemini CLI were not runtime-exercised. No AWS
+resources or separate Python environment were created. SQL migration execution was
+not tested: no local `psql` facility was available. Live service/schema rollout,
+installed harness configuration, and active cloud instructions were not changed.
+
+
+### Optional capabilities and honest fallbacks
+
+| Capability | Required portable behavior | Optional enhancement / limitation |
+| --- | --- | --- |
+| Startup | Native guidance requests initialization on the first eligible turn; print initializing then ready/blocked based on actual results | A hook may trigger earlier; MCP connection alone cannot. If guidance is not loaded/executed, disclose the gap and explicitly initialize |
+| Session identity | Preserve returned MAVEN binding in accessible session context/private evidence | Associate a native harness ID only when reliably exposed; never infer from PID, cwd or newest receipt |
+| Background reasoning | Foreground agent reads, reasons and reconciles bounded assignments | Native subagent may work while another user turn proceeds; must receive scoped context and access to MAVEN tools. MCP cannot launch it |
+| Catch-up | Resume from accessible paused discussion and disclose missing portions | Harness transcript APIs are optional, not a standard MCP facility; resume fresh avoids backfill |
+| Progress / notifications | Visible chat for initialization, explicit saves/checkpoints, mode changes and meaningful blockers | Native progress/status delivery where supported; routine successful updates stay quiet |
+| Owner decisions | Present full persisted review and bind the actual response to its identity/revision | Native dialogs/elicitation are optional; never forge consent or treat tool permission as exact target approval |
+| Shutdown | Journal effects before mutation and preserve uncertain outcomes | EOF/cancellation/process termination offers no guaranteed grace period or background completion; resume original evidence |
+
+The [MCP transport specification](https://modelcontextprotocol.io/specification/latest/basic/transports)
+defines client-launched stdio and transport-independent protocol semantics, not
+subagents, startup policy, a permanent model runtime or uniform approval APIs.
+Instructions and current context still come from the selected AWS instance.
+
+Native standing-context references:
+[OMP context files](https://omp.sh/docs/context-files),
+[Claude memory files](https://code.claude.com/docs/en/memory),
+[Codex AGENTS.md](https://developers.openai.com/codex/guides/agents-md),
+[Copilot custom instructions](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-custom-instructions),
+and [Gemini GEMINI.md](https://geminicli.com/docs/cli/gemini-md/).
+MAVEN installs first-eligible-turn guidance, not an executable startup hook or a
+guarantee that a model has initialized before accepting any user turn.
+
+### Installation and update boundaries
+
+The normal local installation includes the official Python SDK (`mcp>=2.3,<3`) on
+Python 3.11+; CLI/TUI recovery remains independent. Installer-owned MCP entries,
+the `maven` and `maven-maintenance` skills,
+and delimited native guidance are tracked for safe removal. Stage/review conflicts
+instead of replacing unrelated configuration. Close affected harnesses before applying
+integration changes; the current chat cannot certify its own shutdown.
+
+Use `--stage-harnesses PATH` to inspect a staged home layout without changing live
+configuration. Custom profiles use paired `--harness-config NAME=ABSOLUTE_FILE` and
+`--harness-context NAME=ABSOLUTE_FILE`, plus `--skill-dir PATH`. Actual writes require
+the existing stopped-harness approval. Supported native targets are OMP, Claude Code,
+Codex, Copilot CLI and Gemini CLI, not every client accepting a similar skill format.
+
+Codex integration uses an existing nonempty `AGENTS.override.md` when present,
+otherwise `AGENTS.md`. If Gemini's custom `context.fileName` excludes `GEMINI.md`,
+select the context path explicitly. Identical preexisting integration entries are
+referenced, not adopted as installer-owned. Selective removal preserves unrelated
+content. Legacy CLI skills are retired only when their bytes match the prior
+installer inventory and ownership is unshared; modified, unowned or shared copies
+block cutover and require separate review rather than deletion.
+
+First-time project enablement is explicit. Startup guidance does not authorize
+unrelated capture and is not active cloud authority. Follow [getting started](getting-started.md)
+for existing-instance schema rollout and separately approved policy activation.
+
+## Optional AWS, workspace and Google services
 
 These integrations use the selected instance's private `.env`, not the installed
 source directory. Configure `MAVEN_AWS_PROFILE`, its expected AWS identity and
@@ -95,8 +211,8 @@ Other actions accept these request fields:
 
 Review status readership manually; identifier warnings and secret-pattern scans are
 not proof that content is safe to publish. Mutations serialize the selected session's
-pending cloud journal, register as session writers and block during conflicting
-checkpoint reservations.
+pending cloud journal and retain registered-writer safeguards where applicable.
+Optional Git publication reservations must not be confused with memory-checkpoint cutoffs.
 
 ## Optional Google
 
@@ -137,6 +253,8 @@ a private `.eml` file or exact draft ID, a matching From identity and the exact 
 `--recipient` list (repeat for To/Cc/Bcc). Creating a draft is not sending. Ambiguous
 sends retain a local reservation; inspect Sent before any new attempt. Never delete a
 reservation just to retry.
+Draft sending supplies the validated MIME snapshot with the exact draft ID, so
+concurrent autosave or another client cannot replace the approved recipients/content.
 
 `tools.google.services` supplies Python functions for exact-target Drive, Docs,
 Sheets, Slides and Calendar operations; these are library APIs, not extra CLI

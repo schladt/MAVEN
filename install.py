@@ -16,6 +16,7 @@ import subprocess
 import sys
 
 from tools.interaction import Field, OperationPaused, checkpoint, current, message, require, stage
+from tools.harness import HARNESS_PATHS as INTEGRATIONS, SKILLS, apply_integration, integration_plan
 
 
 def _notify(text, *, file=None):
@@ -24,25 +25,7 @@ def _notify(text, *, file=None):
     else:
         message(text)
 
-# Primary discovery documentation:
-# https://developers.openai.com/codex/skills
-# https://code.claude.com/docs/en/skills
-# https://github.com/can1357/oh-my-pi/blob/main/docs/skills.md
-# https://docs.github.com/en/copilot/concepts/customizations/agent-skills
-# https://geminicli.com/docs/cli/skills/
-# https://antigravity.google/docs/skills
-HARNESS_PATHS = {
-    'codex': Path('.agents/skills'),
-    'claude': Path('.claude/skills'),
-    'omp': Path('.omp/agent/skills'),
-    'copilot': Path('.copilot/skills'),
-    'gemini': Path('.gemini/skills'),
-    'antigravity': Path('.gemini/config/skills'),
-}
-SKILLS = (
-    'maven-setup', 'maven-connect', 'maven-skill-use',
-    'maven-start-work', 'maven-checkpoint', 'maven-stop-work',
-)
+HARNESS_PATHS = {name: Path(paths[2]) for name, paths in INTEGRATIONS.items()}
 
 
 def _private_directory(path: Path) -> None:
@@ -76,6 +59,33 @@ def _skill_plan(source: Path, roots: list[Path]) -> list[tuple[Path, bytes]]:
                     raise ValueError(f'existing nonempty skill directory preserved: {target.parent}')
                 plan.append((target, body))
     return plan
+
+
+def _retired_skill_plan(home: Path, roots: list[Path]):
+    """Retire only exact installer-owned CLI-ritual skills during cutover."""
+    from tools.uninstall.common import read_private
+    from tools.uninstall.local import MANIFEST, _shared_skills, inventory
+    receipt = home / MANIFEST
+    prior = read_private(receipt) if receipt.exists() else {}
+    if prior and (prior.get('schema') != 1 or prior.get('home') != str(home)):
+        raise ValueError('Installer ownership receipt does not match this home.')
+    retired = ('maven-setup', 'maven-connect', 'maven-skill-use',
+               'maven-start-work', 'maven-checkpoint', 'maven-stop-work')
+    candidates = [root / name / 'SKILL.md' for root in dict.fromkeys(roots) for name in retired]
+    existing = [path for path in candidates if path.exists() or path.is_symlink()]
+    if not existing:
+        return []
+    shared, unknown = _shared_skills(home, [])
+    result = []
+    for path in existing:
+        _no_symlink_parents(path)
+        expected = prior.get('owned', {}).get(str(path))
+        if (not expected or str(path) not in prior.get('skill_references', [])
+                or str(path) in shared or unknown or inventory(path) != expected):
+            raise ValueError(f'Legacy skill is modified, shared or unowned; preserved: {path}. '
+                             'Review its removal separately or use an inactive staging home.')
+        result.append((path, expected))
+    return result
 
 
 
@@ -161,11 +171,17 @@ def main(argv=None) -> int:
     parser.add_argument('--home', type=Path, help='Private instance home (default MAVEN_HOME or ~/.maven)')
     parser.add_argument('--google', action='store_true', help='Include optional Google client dependencies')
     parser.add_argument('--harness', choices=tuple(HARNESS_PATHS), action='append', default=[],
-                        help='Install skills at a documented default user root; repeatable')
+                        help='Install documented stdio MCP configuration, startup guidance and skills; repeatable')
     parser.add_argument('--skill-dir', type=Path, action='append', default=[],
                         help='Explicit alternate skill root for a custom profile or inactive staging directory')
+    parser.add_argument('--stage-harnesses', type=Path,
+                        help='Write integrations under an inactive staging home instead of user configuration')
+    parser.add_argument('--harness-config', action='append', default=[], metavar='NAME=PATH',
+                        help='Explicit custom-profile MCP config file; pair with --harness-context and --skill-dir')
+    parser.add_argument('--harness-context', action='append', default=[], metavar='NAME=PATH',
+                        help='Explicit custom-profile startup context file')
     parser.add_argument('--harness-stopped', action='store_true',
-                        help='Confirm selected harnesses are closed before installing their skills')
+                        help='Confirm affected harnesses are closed before changing live integration files')
     parser.add_argument('--ca-bundle', type=Path, help='Explicit trusted PEM CA bundle, e.g. supplied by corporate IT')
     parser.add_argument('--local-only', action='store_true',
                         help='Install local tools only; no prompts, login, cloud setup, or project initialization')
@@ -230,11 +246,13 @@ def _options(args):
         Field('ca', 'Optional trusted PEM CA bundle', str(args.ca_bundle or ''), required=False),
         Field('skill_dirs', 'Custom skill roots (one absolute path per line)',
               '\n'.join(map(str, args.skill_dir)), kind='multiline', required=False),
+        Field('stage_harnesses', 'Optional inactive staging home (leaves live harness config unchanged)',
+              str(getattr(args, 'stage_harnesses', None) or ''), required=False),
     ]
-    fields.extend(Field(name, f'Install {name} skills at {Path.home() / root}',
+    fields.extend(Field(name, f'Install {name} MCP, startup guidance and skills',
                         name in args.harness, kind='bool') for name, root in HARNESS_PATHS.items())
     selected = require().form('Local installation options', fields,
-                              description='No shell profile or existing differing skill will be replaced. Google dependencies do not authorize account access. Never enter credentials.')
+                              description='Unrelated configuration and differing MAVEN entries are preserved. Live integration changes require stopped harnesses; staging does not. Never enter credentials.')
     if selected is None:
         raise OperationPaused('Installation options paused.')
     args.home = Path(selected['home'])
@@ -243,6 +261,7 @@ def _options(args):
     args.ca_bundle = Path(selected['ca']) if selected['ca'] else None
     args.harness = [name for name in HARNESS_PATHS if selected[name]]
     args.skill_dir = [Path(line.strip()) for line in selected['skill_dirs'].splitlines() if line.strip()]
+    args.stage_harnesses = Path(selected['stage_harnesses']) if selected['stage_harnesses'] else None
 
 
 def _install_command(command):
@@ -269,41 +288,81 @@ def _install(args, handoff=None):
         _no_symlink_parents(home)
         ca_bundle = _configure_ca(args.ca_bundle)
         source = Path(__file__).resolve().parent
-        if 'claude' in args.harness and os.environ.get('CLAUDE_CONFIG_DIR'):
-            raise ValueError('CLAUDE_CONFIG_DIR is set; use --skill-dir with its skills directory instead of --harness claude.')
-        if 'omp' in args.harness and any(os.environ.get(key) for key in (
-            'OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR',
-        )):
-            raise ValueError('OMP profile/directory override is set; use --skill-dir for the chosen profile instead of --harness omp.')
-        roots = [Path.home() / HARNESS_PATHS[name] for name in args.harness]
+        staging = getattr(args, 'stage_harnesses', None)
+        integration_home = staging.expanduser().absolute() if staging else Path.home()
+        if staging and (integration_home == Path.home()
+                        or any((integration_home / paths[0]).resolve() ==
+                               (Path.home() / paths[0]).resolve() for paths in INTEGRATIONS.values())):
+            raise ValueError('Staging must use an inactive directory, not the live user home.')
+        def custom_paths(values):
+            result = {}
+            for value in values:
+                name, separator, location = value.partition('=')
+                if not separator or name not in args.harness or not Path(location).expanduser().is_absolute():
+                    raise ValueError('Custom integration paths require a selected NAME=ABSOLUTE_PATH.')
+                if name in result:
+                    raise ValueError(f'Duplicate custom integration selection: {name}')
+                result[name] = Path(location).expanduser().absolute()
+            return result
+        configs = custom_paths(getattr(args, 'harness_config', []))
+        contexts = custom_paths(getattr(args, 'harness_context', []))
+        if configs.keys() != contexts.keys() or (configs and not args.skill_dir):
+            raise ValueError('Custom profiles require paired --harness-config/--harness-context and explicit --skill-dir.')
+        if staging and configs:
+            raise ValueError('Stage under the inactive home first; custom live paths require --harness-stopped.')
+        custom = {name: (path, contexts[name]) for name, path in configs.items()}
+        overrides = {
+            'claude': ('CLAUDE_CONFIG_DIR',),
+            'omp': ('OMP_PROFILE', 'PI_PROFILE', 'PI_CONFIG_DIR', 'PI_CODING_AGENT_DIR'),
+            'codex': ('CODEX_HOME',),
+            'copilot': ('COPILOT_HOME',),
+            'gemini': ('GEMINI_CLI_HOME',),
+        }
+        if not staging:
+            for name in args.harness:
+                if name not in custom and any(os.environ.get(key) for key in overrides[name]):
+                    raise ValueError(f'{name} configuration override is set; select its explicit '
+                                     '--harness-config, --harness-context and --skill-dir, or stage first.')
+        roots = [integration_home / HARNESS_PATHS[name] for name in args.harness if name not in custom]
         roots.extend(path.expanduser().absolute() for path in args.skill_dir)
+        selected_harnesses = list(args.harness)
         deferred = False
-        if roots and not args.harness_stopped:
+        if roots and not args.harness_stopped and not (staging and not args.skill_dir):
             if current() is None:
-                raise ValueError('Close the selected harnesses, then add --harness-stopped. No skills were changed.')
-            if not require().confirm('Are all harnesses using these skill folders closed?'):
-                deferred, roots = True, []
+                raise ValueError('Close affected harnesses and add --harness-stopped, or use '
+                                 '--stage-harnesses with an inactive directory. No integration changed.')
+            if not require().confirm('Are all harnesses using these integration files closed?'):
+                deferred, roots, selected_harnesses = True, [], []
                 _notify('Harness integration deferred; active harness files will not be changed.')
         try:
             plan = _skill_plan(source, roots)
+            integrations = integration_plan(home, selected_harnesses,
+                                            user_home=integration_home, ca_bundle=ca_bundle, paths=custom)
+            retired_skills = _retired_skill_plan(home, roots)
         except ValueError as exc:
             if current() is None:
                 raise
             message(str(exc))
-            if not require().confirm('Continue without changing any harness skills?'):
-                raise OperationPaused('Skill conflict preserved; installation paused.')
-            deferred, roots, plan = True, [], []
+            if not require().confirm('Continue without changing any harness integration?'):
+                raise OperationPaused('Integration conflict preserved; installation paused.')
+            deferred, roots, plan, integrations, retired_skills = True, [], [], [], []
         if current() is not None:
             stage('Review installation')
             body = '\n'.join([
                 f'Private home: {home}', f'Runtime: {home / "venv"}',
                 f'Settings: {home / ".env"} (existing settings preserved)',
-                f'Package source: {source}', f'Extras: ui{", google" if args.google else ""}',
+                f'Package source: {source}', f'Extras: ui, mcp{", google" if args.google else ""}',
                 f'Trusted CA: {ca_bundle or "current TLS configuration"}',
                 f'Next: {"local tools only; no AWS/project setup" if args.local_only else "installed maven-setup for explicit cloud selection"}',
                 'Shell profiles: unchanged',
                 'Skill roots:\n' + ('\n'.join(map(str, roots)) or '(none)'),
                 'New skill files:\n' + ('\n'.join(str(target) for target, _ in plan) or '(none; existing identical skills preserved)'),
+                'Exact owned legacy skills to retire:\n' + ('\n'.join(
+                    str(path) for path, _ in retired_skills) or '(none)'),
+                f'Integration mode: {"inactive staging" if staging else "live, harnesses stopped"}',
+                'Exact MAVEN integration content (unrelated configuration preserved):\n' + ('\n'.join(
+                    f'{change.path}\n{change.receipt["value"]}' for change in integrations
+                    if change.receipt is not None) or '(none)'),
             ])
             if not require().review('Approve exact local installation', body):
                 raise OperationPaused('Installation declined before local mutation.')
@@ -347,7 +406,7 @@ def _install(args, handoff=None):
         pip_ready = subprocess.run([str(python), '-m', 'pip', '--version'], capture_output=True, text=True)
         if pip_ready.returncode:
             _install_command([str(python), '-m', 'ensurepip', '--upgrade'])
-        package = str(source) + ('[ui,google]' if args.google else '[ui]')
+        package = str(source) + ('[ui,mcp,google]' if args.google else '[ui,mcp]')
         _install_command([str(python), '-m', 'pip', 'install', '--upgrade', package])
         if not environment.exists():
             body = (source / 'maven_resources' / 'templates' / 'environment.example').read_bytes()
@@ -368,6 +427,18 @@ def _install(args, handoff=None):
         record_installation(home, source, owned_paths,
                             [root / name / 'SKILL.md' for root in roots for name in SKILLS],
                             cache_roots=new_caches)
+        # Journal exact ownership before mutation: interruption leaves either an
+        # absent entry or a safely removable exact entry, never an orphan.
+        for change in integrations:
+            if change.receipt is not None:
+                record_installation(home, source, [], [], integrations=[change.receipt])
+            apply_integration(change)
+        from tools.uninstall.local import inventory
+        for path, expected in retired_skills:
+            _no_symlink_parents(path)
+            if inventory(path) != expected:
+                raise ValueError(f'Legacy skill changed since review; preserved: {path}')
+            path.unlink()
         finish_reinstallation(home, completed_marker)
         installation_locks.close()
         if current() is not None:
@@ -377,12 +448,17 @@ def _install(args, handoff=None):
         for command in activation:
             _notify(f'  {command}')
         if roots:
-            _notify('Bootstrap and lifecycle skills installed/preserved. Start a new harness session to discover them.')
+            _notify('MAVEN front-door and maintenance skills installed/preserved.')
+            if staging:
+                _notify(f'Inactive integration staged under {integration_home}; live harness configuration unchanged. '
+                        'Review and install against the selected profile after affected harnesses stop.')
+            else:
+                _notify('Start a new harness session to load startup guidance. MCP connection alone is not project readiness.')
         elif deferred:
-            _notify('Harness integration is still pending. After closing the harness, rerun this installer '
-                  'with --local-only and the desired --harness/--skill-dir plus --harness-stopped.')
+            _notify('Harness integration is pending. Stage with --stage-harnesses, or rerun after closing '
+                    'affected harnesses with --harness-stopped.')
         else:
-            _notify('No harness was modified; native skill installation remains optional.')
+            _notify('No harness configuration was modified.')
         checkpoint()
         if args.local_only:
             _notify('\nLocal-only installation complete; AWS and project setup have NOT been performed.')

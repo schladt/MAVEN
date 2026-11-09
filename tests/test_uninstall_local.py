@@ -258,6 +258,66 @@ class LocalUninstallTests(unittest.TestCase):
         self.assertTrue(other.exists())
         self.assertTrue(all(not item.get('token_revocation_claimed', False) for item in results))
 
+    def integration(self):
+        import json
+        target = self.base / 'harness.json'
+        value = {'command': str(self.home / 'venv/bin/maven-mcp')}
+        target.write_text(json.dumps({'mcpServers': {'maven': value, 'other': {'command': 'keep'}}}))
+        target.chmod(0o600)
+        receipt = {'path': str(target), 'format': 'json-entry', 'key': 'maven',
+                   'value': value, 'created': False, 'created_container': False}
+        local.record_installation(self.home, self.source, [], [], integrations=[receipt])
+        return target, receipt
+
+    def test_integration_removal_preserves_unrelated_configuration_and_resumes(self):
+        import json
+        target, receipt = self.integration()
+        fragment = local.plan_machine(self.home, offline=True)
+        barrier = next(item for item in fragment['actions'] if item['kind'] == 'local_barrier')
+        action = next(item for item in fragment['actions'] if item['kind'] == 'local_integration')
+        local.execute(barrier, {}, lambda: None)
+        progress = {}
+        result = local.execute(action, progress, lambda: None)
+        self.assertEqual(result['status'], 'removed')
+        self.assertEqual(json.loads(target.read_text()), {'mcpServers': {'other': {'command': 'keep'}}})
+        self.assertEqual(local.execute(action, progress, lambda: None)['status'], 'removed')
+        self.assertEqual(read_private(self.home / local.MANIFEST)['integrations'], [receipt])
+
+    def test_integration_changed_after_review_is_not_removed(self):
+        import json
+        target, _ = self.integration()
+        fragment = local.plan_machine(self.home, offline=True)
+        barrier = next(item for item in fragment['actions'] if item['kind'] == 'local_barrier')
+        action = next(item for item in fragment['actions'] if item['kind'] == 'local_integration')
+        local.execute(barrier, {}, lambda: None)
+        document = json.loads(target.read_text())
+        document['new_owner_setting'] = True
+        target.write_text(json.dumps(document))
+        with self.assertRaisesRegex(UninstallError, 'changed after review'):
+            local.execute(action, {}, lambda: None)
+        self.assertEqual(json.loads(target.read_text()), document)
+
+    def test_shared_integration_is_retained_for_unselected_installation(self):
+        target, receipt = self.integration()
+        other = self.base / 'other-home'
+        other.mkdir(mode=0o700)
+        local.record_installation(other, self.source, [], [], integrations=[receipt])
+        fragment = local.plan_machine(self.home, offline=True)
+        self.assertFalse(any(item['kind'] == 'local_integration' for item in fragment['actions']))
+        self.assertTrue(any(item['path'] == str(target) for item in fragment['retained']))
+
+    def test_identical_reference_receipt_does_not_adopt_or_lose_existing_ownership(self):
+        target, receipt = self.integration()
+        reference = {**receipt, 'owned': False}
+        local.record_installation(self.home, self.source, [], [], integrations=[reference])
+        self.assertEqual(read_private(self.home / local.MANIFEST)['integrations'], [receipt])
+        other = self.base / 'reference-only'
+        other.mkdir(mode=0o700)
+        local.record_installation(other, self.source, [], [], integrations=[reference])
+        fragment = local.plan_machine(other, offline=True)
+        self.assertFalse(any(item['kind'] == 'local_integration' for item in fragment['actions']))
+        self.assertTrue(target.exists())
+
 
 if __name__ == '__main__':
     unittest.main()

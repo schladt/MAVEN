@@ -7,7 +7,7 @@ import hashlib
 import json
 import time
 
-from .validation import MemoryError, MUTATION_ROUTES, canonical, decode_json, digest, fields, uuid_string
+from .validation import MemoryError, MUTATION_ROUTES, SCHEMA_VERSION, canonical, decode_json, digest, fields, uuid_string
 
 CONTROL_KEYS = {"instance_id", "recovery_epoch", "schema_version", "state", "data_scope"}
 ROLLOUT_SCOPE = "owner_memory"
@@ -65,7 +65,7 @@ def safe_provider_error(error):
 
 def control_document(config, state):
     return {"instance_id": config["instance_id"], "recovery_epoch": config["recovery_epoch"],
-            "schema_version": 1, "state": state, "data_scope": ROLLOUT_SCOPE}
+            "schema_version": SCHEMA_VERSION, "state": state, "data_scope": ROLLOUT_SCOPE}
 
 
 def parse_control(raw, config, *, allow_maintenance=False, allow_legacy=False):
@@ -83,6 +83,8 @@ def parse_control(raw, config, *, allow_maintenance=False, allow_legacy=False):
             expected["uninstall"] = marker
         if allow_legacy and document["data_scope"] in {"synthetic", "synthetic_and_owner_instructions"}:
             expected["data_scope"] = document["data_scope"]
+        if allow_legacy and document["schema_version"] == 1:
+            expected["schema_version"] = 1
         if document != expected or type(document["schema_version"]) is not int:
             raise ValueError
         if document["state"] not in {"ready", "maintenance"}:

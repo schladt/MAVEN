@@ -378,6 +378,44 @@ class GoogleBoundaryTests(unittest.TestCase):
                          [google.GMAIL_DRAFTS, google.GMAIL_DRAFTS + "/draft1",
                           google.GMAIL_DRAFTS + "/send"])
 
+    def test_draft_send_uses_validated_mime_after_concurrent_replacement(self):
+        approved = (b"From: personal@example.com\r\nTo: target@example.com\r\n"
+                    b"Subject: approved\r\n\r\napproved body")
+        replacement = (b"From: personal@example.com\r\nTo: other@example.com\r\n"
+                       b"Subject: replaced\r\n\r\nunapproved body")
+        drafts = {"draft1": approved}
+        sent = []
+
+        def fake_get(_credentials, url, *, params=None):
+            if url == google.GMAIL_DRAFTS + "/draft1":
+                snapshot = drafts["draft1"]
+                drafts["draft1"] = replacement
+                return {"id": "draft1", "message": {
+                    "raw": base64.urlsafe_b64encode(snapshot).decode("ascii")}}
+            self.assertEqual(url, google.GMAIL_MESSAGES + "/message2")
+            return {"id": "message2", "threadId": "thread1", "labelIds": ["SENT"]}
+
+        def fake_write(_credentials, method, url, body, **kwargs):
+            self.assertEqual((method, url), ("POST", google.GMAIL_DRAFTS + "/send"))
+            self.assertEqual(body["id"], "draft1")
+            self.assertEqual(drafts["draft1"], replacement)
+            encoded = body.get("message", {}).get("raw")
+            if encoded is not None:
+                drafts[body["id"]] = base64.urlsafe_b64decode(encoded)
+            sent.append(drafts.pop(body["id"]))
+            return {"id": "message2", "threadId": "thread1"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(google, "_credentials", return_value=(object(), "personal@example.com")), \
+                 patch.object(google, "_lock", return_value=nullcontext()), \
+                 patch.object(google, "LOCKS", Path(directory)), \
+                 patch.object(google, "_gmail_write", side_effect=fake_write), \
+                 patch.object(google, "_gmail_get", side_effect=fake_get):
+                self.assertEqual(
+                    google.gmail_draft_send("personal", "draft1", ["target@example.com"]),
+                    {"id": "message2", "thread_id": "thread1"})
+        self.assertEqual(sent, [approved])
+
     def test_label_modification_and_trash_are_distinct_exact_operations(self):
         calls = []
 

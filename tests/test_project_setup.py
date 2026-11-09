@@ -20,7 +20,7 @@ class ProjectSetupTests(unittest.TestCase):
         values = dict(root=root, env=env, non_interactive=True, create=True, project_id=None,
                       name='Owner project', source_origin='Owner chat approval',
                       source_excerpt='Create this project with memory-only lifecycle.',
-                      no_git=True, remote=None, accepted_url=None, branch=None, check=[])
+                      remote=None, accepted_url=None, branch=None, check=[])
         values.update(changes)
         return argparse.Namespace(**values)
 
@@ -99,7 +99,7 @@ class ProjectSetupTests(unittest.TestCase):
             client, _ = self.cloud(stack)
             cases = [self.args(Path('/'), root / '.env'),
                      self.args(root, root / '.env', create=False),
-                     self.args(root, root / '.env', no_git=False),
+                     self.args(root, root / '.env', remote='origin'),
                      self.args(root, root / '.env', source_excerpt=None)]
             for args in cases:
                 with self.subTest(args=args), self.assertRaises(ProjectError):
@@ -121,7 +121,7 @@ class ProjectSetupTests(unittest.TestCase):
             args = self.args(root, home / '.env')
             legacy = {key: value for key, value in vars(args).items()
                       if key not in ('env', 'non_interactive')}
-            legacy.update(root=str(root), project_id=str(uuid4()), request_key=str(uuid4()), existing=False)
+            legacy.update(root=str(root), project_id=str(uuid4()), request_key=str(uuid4()), existing=False, no_git=True)
             state_path = home / 'runtime' / 'setup' / 'state.json'
             save_json(state_path, {'schema': 1, 'instance_id': config['instance_id'],
                                    'project': legacy, 'submitted_requests': [legacy['request_key']]})
@@ -147,7 +147,7 @@ class ProjectSetupTests(unittest.TestCase):
             args = self.args(root, root / '.env', non_interactive=False)
             ui = Mock()
             ui.form.side_effect = [
-                {'mode': 'create', 'lifecycle': 'no-git'},
+                {'mode': 'create'},
                 {'name': 'Actual owner project', 'source_origin': 'Owner setup review',
                  'source_excerpt': 'Track the explicitly selected project.', 'checks': '["python", "-V"]'},
             ]
@@ -162,6 +162,41 @@ class ProjectSetupTests(unittest.TestCase):
             self.assertEqual(selected['check'], ['["python", "-V"]'])
             self.assertFalse((root / '.maven').exists())
 
+
+    def test_optional_git_can_be_enabled_later_without_rebinding_memory(self):
+        from tools.project import configure_git
+        from tools.memory.boundary import save_private
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory).resolve()
+            self.cloud(stack)
+            env = root / 'home' / '.env'
+            original = setup_project(self.args(root, env))['project']
+            self.assertFalse(original['git_enabled'])
+            url = 'git@example.org:owner/project.git'
+            def git(_root, *args):
+                return {('rev-parse', '--show-toplevel'): str(root),
+                        ('remote', 'get-url', '--push', 'origin'): url,
+                        ('check-ref-format', '--branch', 'main'): 'main',
+                        ('symbolic-ref', '--short', 'HEAD'): 'main'}[args]
+            with patch('tools.project._git', side_effect=git):
+                configured = configure_git(root, remote='origin', accepted_url=url, branch='main', env=env)
+                self.assertEqual(configured['project']['project_id'], original['project_id'])
+                self.assertTrue(load_project(root)['git_enabled'])
+                before = (root / '.maven/project.json').read_bytes()
+                save_private(root, f'.maven/runtime/sessions/{uuid4()}/approval.json', {'status': 'unsynchronized'})
+                with self.assertRaises(ProjectError):
+                    configure_git(root, remote='origin', accepted_url=url, branch='main', env=env)
+                self.assertEqual((root / '.maven/project.json').read_bytes(), before)
+
+    def test_reviewed_environment_change_is_refused_before_effects(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory).resolve()
+            client, _ = self.cloud(stack)
+            args = self.args(root, root / 'home' / '.env', reviewed_environment={'MAVEN_AWS_PROFILE': 'reviewed'})
+            with self.assertRaises(SetupPending):
+                setup_project(args)
+            client.invoke.assert_not_called()
+            self.assertFalse((root / '.maven').exists())
 
 if __name__ == '__main__':
     unittest.main()

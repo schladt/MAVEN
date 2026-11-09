@@ -744,7 +744,7 @@ def gmail_send(account: str, source: str | Path, recipients: list[str]) -> dict:
 
 
 def gmail_draft_send(account: str, draft_id: str, recipients: list[str]) -> dict:
-    """Send an exact existing draft once, after checking its current raw MIME."""
+    """Send the validated MIME snapshot of an existing draft at most once."""
     identifier = _gmail_id(draft_id, "draft")
     credentials, expected = _credentials(account)
     draft = _gmail_get(credentials, f"{GMAIL_DRAFTS}/{identifier}",
@@ -762,4 +762,5 @@ def gmail_draft_send(account: str, draft_id: str, recipients: list[str]) -> dict
     _mime_recipients(raw, expected, recipients)
     return _send_once(account, "draft:" + identifier,
                       lambda: _sent_message(credentials, _gmail_write(
-                          credentials, "POST", f"{GMAIL_DRAFTS}/send", {"id": identifier})))
+                          credentials, "POST", f"{GMAIL_DRAFTS}/send",
+                          {"id": identifier, **_raw_body(raw)})))

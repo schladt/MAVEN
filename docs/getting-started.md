@@ -1,9 +1,9 @@
 # Getting started
 
-Install/connect the cloud instance once, optionally defer project setup, then open
-OMP in the intended project and invoke `/skill:maven-start-work`. First use guides
-your choices in chat; later sessions reuse that project's selection and load cloud
-memory. You do not need to generate new UUIDs or assemble lifecycle commands.
+Install/connect the selected instance once, optionally defer project setup, then ask
+your assistant to enable MAVEN for an explicitly chosen folder. Subsequent supported
+sessions initialize visibly through native guidance and stdio MCP. No manually
+assembled UUIDs, JSON requests or lifecycle commands are needed for ordinary work.
 
 Start with the [README prerequisites](../README.md#before-you-start). A source
 checkout does not supply a configured virtual environment, private `.env`, or your
@@ -92,19 +92,17 @@ The actual returned principal is verified before any subsequent cloud action.
 ### Optional project setup
 
 After verified instance access and complete approved authority, the wizard offers
-an optional project step; you can defer it and configure the project in OMP later.
+an optional project step; you can defer it and enable the project in your assistant later.
 Instance readiness and project readiness are distinct. To set up now, select and
 confirm the **project folder** separately. Filesystem `/` is not permitted; an
 ambiguous/subdirectory root needs an explicit choice rather than silent rebinding.
 The MAVEN source checkout is a development project only if you explicitly choose it.
 
 Choose an existing cloud project or authorize a named new one with genuine source
-evidence. Confirm the detected Git checkout root, remote, actual push URL and current
-branch, or explicitly choose no-Git. Setup creates `.maven/project.json`, runtime
-directories and ignore rules without committing, pushing, pulling or switching
-branches. New project/request UUIDs are generated and durably journaled for you
-before mutation. Private project state is mode `0700`/`0600` and ignored before
-personal configuration is written.
+evidence. Memory works without Git configuration or an explicit no-Git choice.
+Optional Git assistance separately confirms the remote, push URL and current branch.
+Setup creates private selection/runtime state without committing, pushing, pulling
+or switching branches. New project/request identities are journaled before mutation.
 
 ### Resume instance setup
 
@@ -139,44 +137,44 @@ reconciles the original IDs before an explicitly resumed mutation. Legacy
 instance-wizard pending/saved project requests retain their original IDs and receipts;
 do not discard them or create a second project to get past an uncertain response.
 
-### First use and everyday work in OMP
+Conversational setup preserves a durable operation identity. The agent records a
+response, then advances one explicit phase; recording consent alone does not execute
+the next external action. `maven-setup --operation UUID` resumes that exact saved
+operation (use its actual returned identity). Reviews retain the full digest and real
+owner source evidence, not invented TUI approval provenance.
 
-Make the selected home's installed commands available to OMP, install/discover the
-generic skills safely as described below, and open OMP in the actual project folder:
+For a later reviewed configuration or migration, the assistant can begin a new
+`maven_admin` setup operation after the previous setup completed with verified
+instance readiness. The old wizard state and receipts are preserved, and new
+preparation artifacts are isolated. Unresolved, cancelled, or unverifiable previous
+operations must be reconciled through their original identities, not replaced.
+External-prerequisite screens show the command, required environment and exact resume
+command inside the review modal. Decline to pause safely while completing the handoff.
 
-```text
-/skill:maven-start-work
-```
+### First use and everyday work
 
-On first use, the assistant confirms the root and asks whether to select an existing
-cloud project or create a named one, and whether to use the confirmed Git destination
-or no-Git. It obtains real owner source evidence for creation, then uses the
-noninteractive project setup interface with those choices. It does not guess answers
-or ask you to invent new UUIDs. For a configured project it preserves and validates
-the existing selection, reads complete cloud instructions/dependencies and project
-handover/tasks/blockers, and starts this session. Missing authority blocks work;
-having no previous handover is normal for a new project.
+Configure the selected harness to launch the installed `maven-mcp` stdio entrypoint
+and load its thin startup/intent guidance. See the [capability matrix](integrations.md#harness-capability-matrix)
+for configuration formats and limitations; availability is not permission to capture.
 
-Each new OMP session has its own MAVEN session UUID, including parallel sessions in
-one checkout. The assistant retains that root/project/MAVEN binding across cwd
-changes. Repeating start in the same chat checks/refreshes its existing binding
-rather than creating another session. Resuming a prior session is explicit, never
-inferred from the newest file or another transcript. OMP's own session ID is only an
-optional association when reliably exposed; the assistant omits it otherwise and
-never invents one. Cloud memory, not OMP history, preserves work between sessions.
+Ask **“Enable MAVEN for this project.”** Confirm the root, instance, project and
+authorized scope. Later sessions reuse that project selection, establish a distinct
+work-session binding and load complete current authority, handover, tasks and blockers.
+The visible initializing/ready/blocked messages report actual readiness, not merely
+server startup. Where startup guidance cannot run reliably, ask **“Initialize MAVEN.”**
 
-Use `/skill:maven-checkpoint` to preserve progress and `/skill:maven-stop-work` to
-close only the current session. These coordinate writers, save truthful summaries
-and references, and require explicit approval of the exact publication candidate.
-Invoking a skill is not blanket commit/push approval. No-Git projects get memory-only
-closure, and credentials shared by active peers are not logged out by one stop.
-See [Project workflow](workflow.md) for the full approval and recovery contract.
+Ask to save or consult memory, reconcile a plan, checkpoint, pause/resume or wrap up.
+Routine maintenance stays quiet and uses native background reasoning where available,
+otherwise foreground reconciliation. Explicit saves confirm verified cloud receipts.
+Universal/current-project retrieval is the default; other-project consultation is
+explicit. Ordinary checkpoints have a cutoff and exact revisions, not Git effects.
+“Checkpoint and wait” synchronizes; “resume” catches up from available discussion,
+while “resume fresh” does not. See [workflow](workflow.md) for these boundaries.
 
-For another project, open OMP in its explicitly chosen folder and use the same
-start skill. Do not rerun instance provisioning or use the instance wizard's first
-saved project as an additional-project pointer. An owner who prefers interactive
-terminal project setup can use `maven-project setup --root /absolute/path/to/project`;
-the normal in-harness path does not require that extra terminal step.
+Additional projects only need their own explicit enablement, not another instance
+deployment. A new/forked session gets its own identity; explicit resume preserves the
+original. Cwd changes, transport reconnection and newest receipts never select a new
+project/session implicitly. Missing access blocks dependent work, not unrelated chat.
 
 ### Installer options and harnesses
 
@@ -191,26 +189,24 @@ noninteractive `--local-only` install also requires `--harness-stopped` when sel
 harness files. Conflicting files are preserved; interactive setup can continue without
 changing them. Start a new harness afterward to discover the generic skills.
 
-The installed generic skills are maven-setup, maven-connect, maven-skill-use,
-maven-start-work, maven-checkpoint and maven-stop-work. Existing older copies are
-conflicts too; the installer does not overwrite them as an upgrade. If integration
-is deferred, stage the generic skills in a separate explicit `--skill-dir PATH`,
-review differences, and arrange an owner-controlled cutover only after affected
-harnesses stop. Never replace active instructions from within a running session.
-No MCP server, daemon or auto-start hook is needed for these lifecycle skills.
+The installed generic skills are `maven` (intent front door) and `maven-maintenance`
+(bounded semantic worker). Native startup guidance and an owned MCP configuration
+entry complement them. They are bootstrap routing, not cached cloud authority.
+Unrelated user configuration is preserved; conflicts or modified owned content require
+review rather than overwrite. Stage changes and close affected harnesses before
+applying them; a running assistant cannot truthfully attest it has stopped.
 
-| Harness | Default user skill root |
-| --- | --- |
-| Codex | `~/.agents/skills` |
-| Claude Code | `~/.claude/skills` |
-| OMP | `~/.omp/agent/skills` |
-| Copilot CLI | `~/.copilot/skills` |
-| Gemini CLI | `~/.gemini/skills` |
-| Antigravity | `~/.gemini/config/skills` |
+Custom profiles need an explicit destination. Client configuration, trust, startup,
+background execution and transcript access differ; consult the
+[integration matrix](integrations.md#harness-capability-matrix). No native OMP extension
+is required. Hosted clients need separately provisioned access and are not covered by
+local stdio installation.
 
-Custom profiles need an explicit destination; these are local installation targets,
-not a guarantee of runtime behavior for every harness version. Cloud-hosted clients
-require separately provisioned skills and credentials.
+To stage selected integrations without live writes, use `--stage-harnesses PATH`.
+For custom profiles, pair `--harness-config NAME=ABSOLUTE_FILE` with
+`--harness-context NAME=ABSOLUTE_FILE` and an explicit `--skill-dir PATH`. Actual
+integration changes still require stopped-harness approval. Normal installation
+includes `ui,mcp`; optional Google dependencies remain separate.
 
 ### Optional AWS Agent Toolkit
 
@@ -252,9 +248,9 @@ an unverified certificate merely to get past an error.
 
 ## Advanced manual reference
 
-The guided installation and in-harness skills above are the normal entrypoints.
-The remaining sections document underlying commands for deliberate manual
-administration, not extra prerequisites for routine work. All shell variables below
+Conversation through MCP is the normal operating path. The remaining sections retain
+CLI/TUI administration and recovery references, not routine memory prerequisites.
+Use the installed release's help for exact argument contracts. All shell variables below
 mean actual owner-reviewed values: define them from private settings and command results.
 MAVEN provides no preconfigured account, endpoint, credentials or owner authority.
 
@@ -400,9 +396,8 @@ write outcome is unknown, reconcile the exact request key with `maven-memory loo
 ### Select the project manually
 
 Use `maven-project setup --root "$PROJECT_ROOT"` for interactive project onboarding.
-For an agent that has already obtained every owner choice, the noninteractive
-interface in [Project workflow](workflow.md#manual-project-setup-reference) generates
-new identities safely and preserves an existing selection. `maven-project init`
+For an agent that has obtained the owner choices, the shared project controller safely
+generates identities and preserves an existing selection. `maven-project init`
 remains a low-level explicit-ID API, not the ordinary first-use path. Manual starts
 also require an explicit root and complete authority; retain the returned MAVEN
 session UUID, distinct from any optional harness identity.
@@ -411,7 +406,38 @@ Review [Security and privacy](security.md) before sharing retrieved context with
 external model. Configure [optional integrations](integrations.md) only when needed;
 neither Google nor a secrets-file bucket is required to start core memory work.
 
+## Existing-instance upgrade
+
+Local code/templates do not update live AWS resources, schema or active authority.
+First inspect pending publication, setup and removal receipts. Resolve incompatible
+operations through their original supported recovery implementation; never reinterpret
+an old publication checkpoint as a new memory checkpoint or discard unknown outcomes.
+
+Separately review the matching service/schema upgrade and forward migration before
+using changed memory contracts. An incompatible deployed schema must be reported,
+not bypassed. Historical record provenance remains intact. After rollout, separately
+review proposed instruction bodies and dependencies, request exact activation
+challenges, and activate only with real owner approval. Reload active authority.
+Schema approval is not policy approval; installing templates is neither.
+
+The new contract is schema 2 / client protocol 3 with `012_agentic_memory.sql`.
+Ordinary schema-1 use is rejected. Both `maven-memory migrate --confirm-instance
+"$INSTANCE_ID"` and `maven-memory install migrate --confirm-instance "$INSTANCE_ID"`
+accept a schema-1 binding solely for the separately approved administrator migration.
+They do not rewrite it to claim runtime readiness. SQL migration alone is not service
+deployment: deploy the matching reviewed service and reconnect from actual upgraded
+stack outputs.
+See [architecture](architecture.md#rollout-and-authority) for version/cutover boundaries.
+
 ## Uninstall and retirement
+
+In conversation, ask **“Plan removal of this project's MAVEN integration only”**,
+**“Remove this local installation”**, or **“Retire this cloud instance.”** The shared
+controller presents persisted full reviews and choices, bound to interaction revisions
+and exact targets. Inspect is read-only; apply/resume can change external state.
+Approve each selected scope separately. Login, secure input, stopped-harness attestation
+and self-removal can require a protected terminal/browser continuation. The process
+being removed must not replace the pinned recovery worker with in-process deletion.
 
 The installed `maven-uninstall` opens a full-screen operation dashboard. From this
 checkout, `python3 -m tools.uninstall` opens the same interface when run with the

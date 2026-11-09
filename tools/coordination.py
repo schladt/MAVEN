@@ -109,14 +109,21 @@ class SessionRegistry:
         if marker['whole_home'] or self.key(root) in roots:
             raise CoordinationError('uninstall barrier prohibits new work; status and recovery remain available')
 
-    def register(self, root, project_id, session_id, values, *, harness=None, harness_session=None):
+    def register(self, root, project_id, session_id, values, *, harness=None, harness_session=None,
+                 memory_only=False):
         session_uuid(session_id)
         key = self.key(root)
         with self.transaction() as state:
             self._allow_work(root)
             if session_id in state['sessions']:
+                existing = state['sessions'][session_id]
+                if (memory_only and existing.get('memory_only') and existing['state'] == 'starting'
+                        and existing['root'] == key and existing['project_id'] == project_id
+                        and existing.get('harness') == harness and existing.get('harness_session') == harness_session
+                        and existing['caches'] == self.caches(values) and not existing['writers']):
+                    return  # Interrupted before the local memory binding was persisted.
                 raise CoordinationError('session is already registered; explicitly resume it')
-            if key in state['reservations']:
+            if not memory_only and key in state['reservations']:
                 raise CoordinationError('repository is reserved; new writers cannot start')
             if harness_session and any(item['root'] == key and item.get('harness') == harness
                                        and item.get('harness_session') == harness_session
@@ -124,7 +131,7 @@ class SessionRegistry:
                 raise CoordinationError('this harness context already has a session; explicitly resume it')
             state['sessions'][session_id] = {
                 'root': key, 'project_id': project_id, 'harness': harness, 'harness_session': harness_session,
-                'state': 'starting', 'writers': [], 'caches': self.caches(values)}
+                'state': 'starting', 'writers': [], 'caches': self.caches(values), 'memory_only': memory_only}
 
     def _session(self, state, root, session_id):
         item = state['sessions'].get(session_uuid(session_id))
@@ -140,12 +147,23 @@ class SessionRegistry:
         with self.transaction() as state:
             self._allow_work(root)
             item = self._session(state, root, session_id)
-            if self.key(root) in state['reservations']:
+            if not item.get('memory_only') and self.key(root) in state['reservations']:
                 raise CoordinationError('repository reservation prevents writer resume')
             if item['writers'] or self.pending(root, session_id):
                 raise CoordinationError('session has unfinished writers or cloud receipts; recover them explicitly')
             item['state'] = 'active'
             item.pop('pause_ack', None)
+
+    def use_git(self, root, session_id):
+        """Enroll this existing memory session in explicit Git writer coordination."""
+        with self.transaction() as state:
+            self._allow_work(root)
+            item = self._session(state, root, session_id)
+            reservation = state['reservations'].get(self.key(root))
+            if item['writers'] or self.pending(root, session_id) or (
+                    reservation and reservation['session_id'] != session_id):
+                raise CoordinationError('resolve in-flight writes or the other Git reservation before optional publication')
+            item['memory_only'] = False
 
     def peers(self, root, session_id):
         with self.transaction() as state:
@@ -190,7 +208,7 @@ class SessionRegistry:
                     reservation_id is not None and reservation_id != current['reservation_id']):
                 raise CoordinationError('an exact requester-owned repository reservation is required')
             waiting = [identifier for identifier, item in state['sessions'].items()
-                       if item['root'] == self.key(root) and (item['writers'] or item['state'] != 'paused'
+                       if item['root'] == self.key(root) and not item.get('memory_only') and (item['writers'] or item['state'] != 'paused'
                            or item.get('pause_ack') != current['reservation_id']
                            or self.pending(root, identifier))]
             if waiting:
@@ -225,6 +243,34 @@ class SessionRegistry:
             with self.transaction() as state:
                 item = self._session(state, root, session_id)
                 item['writers'].remove(token)
+
+    @contextlib.contextmanager
+    def memory_writer(self, root, session_id):
+        """Memory writes share the session journal, never a repository reservation."""
+        token = str(uuid.uuid4())
+        with self.transaction() as state:
+            self._allow_work(root)
+            item = self._session(state, root, session_id)
+            if item['state'] not in ('active', 'paused') or self.pending(root, session_id):
+                raise CoordinationError('memory session is unavailable or has an unresolved cloud request')
+            item['writers'].append(token)
+        try:
+            yield token
+        finally:
+            with self.transaction() as state:
+                self._session(state, root, session_id)['writers'].remove(token)
+
+    def finish_memory(self, root, session_id):
+        """Release only the session registration; never log out shared credentials."""
+        with self.transaction() as state:
+            if session_id not in state['sessions']:
+                return
+            item = self._session(state, root, session_id)
+            reservation = state['reservations'].get(self.key(root))
+            if item['writers'] or self.pending(root, session_id) or (
+                    reservation and reservation['session_id'] == session_id):
+                raise CoordinationError('session still has unresolved writes or Git publication')
+            del state['sessions'][session_id]
 
     def recover_writers(self, root, session_id, tokens):
         """Owner attests these exact interrupted operations have stopped; never guess."""

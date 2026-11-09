@@ -19,7 +19,7 @@ CHOICES = ('create', 'project_id', 'name', 'source_origin', 'source_excerpt',
 
 
 def _selection(args, root):
-    from tools.project import ProjectError, _git, _uuid, validate_accepted_url
+    from tools.project import ProjectError, _uuid, validate_accepted_url
     selected = {key: getattr(args, key, None) for key in CHOICES}
     selected['check'] = selected['check'] or []
     if not args.non_interactive:
@@ -27,13 +27,10 @@ def _selection(args, root):
         choices = require().form('Project selection', [
             Field('mode', 'Cloud project', 'create' if selected['create'] else 'existing', kind='select',
                   choices=(('Select an existing project', 'existing'), ('Create a new project', 'create'))),
-            Field('lifecycle', 'Project lifecycle', 'no-git' if selected['no_git'] else 'git', kind='select',
-                  choices=(('Git checkout', 'git'), ('Memory only (no Git)', 'no-git'))),
         ], description=f'Exact project root: {root}. No commit, push, pull or branch switch.')
         if choices is None:
             raise SetupPending('Project selection paused.')
         selected['create'] = choices['mode'] == 'create'
-        selected['no_git'] = choices['lifecycle'] == 'no-git'
         fields = ([Field('name', 'Truthful project name', selected['name'] or ''),
                    Field('source_origin', 'Owner approval origin', selected['source_origin'] or 'owner MAVEN setup TUI'),
                    Field('source_excerpt', 'Owner request / project purpose', selected['source_excerpt'] or '', kind='multiline')]
@@ -49,22 +46,6 @@ def _selection(args, root):
             selected['project_id'] = None
         else:
             selected.update(name=None, source_origin=None, source_excerpt=None)
-        selected.update(remote=None, accepted_url=None, branch=None)
-        if not selected['no_git']:
-            top = Path(_git(root, 'rev-parse', '--show-toplevel')).resolve()
-            if top != root:
-                raise SetupPending(f'Selected directory is within Git root {top}. Rerun with that explicit --root if intended; no binding was changed.')
-            remotes = _git(root, 'remote').splitlines()
-            selected['remote'] = ask('Existing Git remote', remotes[0] if len(remotes) == 1 else None)
-            url = validate_accepted_url(_git(root, 'remote', 'get-url', '--push', selected['remote']))
-            destination = require().form('Review Git destination', [
-                Field('accepted_url', 'Accepted push URL (no credentials)', url),
-                Field('branch', 'Accepted current branch', _git(root, 'symbolic-ref', '--short', 'HEAD')),
-            ], description=f'Root: {root}\nRemote: {selected["remote"]}\nNo Git mutation will run.')
-            if destination is None:
-                raise SetupPending('Git destination selection paused.')
-            selected.update(destination)
-            validate_accepted_url(selected['accepted_url'])
     if bool(selected['create']) == bool(selected['project_id']):
         raise ProjectError('Choose --create --name NAME or --project-id UUID, not both.')
     if selected['create']:
@@ -78,11 +59,11 @@ def _selection(args, root):
             raise ProjectError('Creation provenance and name require --create.')
         selected['request_key'] = None
     destinations = [selected[key] for key in ('remote', 'accepted_url', 'branch')]
-    if selected['no_git']:
-        if any(destinations):
-            raise ProjectError('--no-git cannot specify a Git destination.')
-    elif not all(destinations):
-        raise ProjectError('Choose --no-git or all of --remote, --accepted-url and --branch.')
+    if any(destinations) and not all(destinations):
+        raise ProjectError('Optional Git setup requires all of --remote, --accepted-url and --branch.')
+    if all(destinations):
+        validate_accepted_url(selected['accepted_url'])
+    selected['no_git'] = not any(destinations)
     selected.update(root=str(root), existing=False)
     if not args.non_interactive:
         approve('Approve this exact project selection and provenance.', selected['project_id'],
@@ -156,6 +137,8 @@ def setup_project(args):
     pending = state_path.exists() or state_path.is_symlink()
     selected = None
     values = load_environment(args.env)
+    if getattr(args, 'reviewed_environment', None) is not None and values != args.reviewed_environment:
+        raise SetupPending('Project connection changed after owner review; review the current environment before any effects.')
     config = memory_config(values)
     identity = {key: config[key] for key in ('instance_id', 'recovery_epoch', 'endpoint', 'region')}
     legacy = None if pending else _legacy(args.env, root, identity, args.non_interactive)
@@ -238,7 +221,7 @@ def setup_project(args):
         checkpoint()
         return {'status': 'ready', 'project': project, 'authority_generation': generation,
                 'verification': f'maven-project show --root {root}',
-                'next': 'Open this project in OMP and invoke /skill:maven-start-work.'}
+                'next': 'Initialize MAVEN in this enabled project through your harness or maven-start-work.'}
 
 
 def interactive_project(args):

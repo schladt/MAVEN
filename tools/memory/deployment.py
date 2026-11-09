@@ -254,9 +254,9 @@ def build(
         "instructions": [
             "Do not use this instruction file as a client configuration: no stack outputs exist yet.",
             "After separate owner deployment approval, capture the reviewed stack's Outputs array without fetching secret values.",
-            "Map exactly output_to_config, convert schema_version to integer 1, and write a fresh private client/admin/approval configuration from reviewed outputs; never silently update an existing runtime configuration.",
+            "Map exactly output_to_config, convert schema_version to integer 2, and write a fresh private client/admin/approval configuration from reviewed outputs; never silently update an existing runtime configuration.",
             "Explicitly select the human credential profile; assume ClientRoleArn for ordinary calls, ApprovalRoleArn only for owner challenge/activation or activation lookup, and AdminRoleArn only for approved bootstrap/migration.",
-            "Bootstrap or migrate the bundled SQL through the separately approved administrative consumer before ordinary use. Deploy this runtime and migration 010 before publishing any candidate with bundle metadata.",
+            "Bootstrap or migrate the bundled SQL through the separately approved administrative consumer before ordinary use. Deploy this runtime and migration 012 together before memory-native checkpoints or scoped retrieval. Schema-1 clients must finish pending publication recovery before cutover.",
         ],
     }
     artifacts = {

@@ -7,7 +7,7 @@ import os
 import time
 
 from .store import Store, safe_provider_error, sdk_config
-from .validation import (APPROVAL_ROUTES, MemoryError, ROUTES, authorized_actor,
+from .validation import (APPROVAL_ROUTES, CLIENT_PROTOCOL, MemoryError, ROUTES, authorized_actor,
                          decode_json, request_limit, uuid_string, validate)
 
 
@@ -93,7 +93,7 @@ def handler(event, context):
         request = validate(path, decode_json(body))
         headers = event.get("headers") or {}
         protocol = headers.get("x-maven-memory-protocol", "1")
-        if not isinstance(protocol, str) or protocol not in {"1", "2"}:
+        if not isinstance(protocol, str) or protocol != str(CLIENT_PROTOCOL):
             raise MemoryError("client_incompatible", 409)
         request_key = request.get("request_key")
         remaining = context.get_remaining_time_in_millis() / 1000 if context is not None else 25

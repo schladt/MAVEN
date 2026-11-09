@@ -46,7 +46,7 @@ def private_directory(path):
         raise SetupPending(f'Select a path without symlink components: {path}')
 
 
-def read_private(path):
+def read_private(path, *, maximum=4 * 1024 * 1024):
     from tools.memory.client import MemoryClientError, read_json
     fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
     try:
@@ -56,7 +56,7 @@ def read_private(path):
             raise MemoryClientError('setup_artifact_must_be_owner_private')
     finally:
         os.close(fd)
-    return read_json(path, maximum=4 * 1024 * 1024)
+    return read_json(path, maximum=maximum)
 
 
 def atomic_private(path, text):
@@ -122,3 +122,37 @@ def verify_authority(env, project_id=None, *, values=None):
         return context['data']['authority_generation']
     finally:
         client.close()
+
+
+def inspect_login_identity(values, *, deploy=False):
+    """Inspect only the explicitly selected login profile; never initiate login."""
+    import boto3
+    from botocore.config import Config
+    from tools.memory.environment import transport_ca_bundle
+    prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
+    previous = os.environ.get('AWS_LOGIN_CACHE_DIRECTORY')
+    os.environ['AWS_LOGIN_CACHE_DIRECTORY'] = values[prefix + 'LOGIN_CACHE']
+    try:
+        session = boto3.Session(profile_name=values[prefix + 'PROFILE'],
+                                region_name=values['MAVEN_AWS_REGION'])
+        credentials = session.get_credentials()
+        if credentials is None or credentials.method != 'login':
+            raise SetupPending('Use the explicitly selected AWS login-only profile, not static credentials.')
+        client = session.client('sts', verify=transport_ca_bundle(), config=Config(
+            connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
+        try:
+            result = client.get_caller_identity()
+        finally:
+            client.close()
+        identity = {key: result[key] for key in ('Arn', 'Account', 'UserId') if key in result}
+        if not deploy and identity['Arn'].endswith(':root'):
+            raise SetupPending('Root cannot be the routine identity.')
+        expected = values.get(prefix + 'EXPECTED_PRINCIPAL')
+        if expected and identity['Arn'] != expected:
+            raise SetupPending('Selected login differs from the preserved expected principal.')
+        return identity
+    finally:
+        if previous is None:
+            os.environ.pop('AWS_LOGIN_CACHE_DIRECTORY', None)
+        else:
+            os.environ['AWS_LOGIN_CACHE_DIRECTORY'] = previous

@@ -208,7 +208,7 @@ class Wizard:
                 config = bootstrap._outputs(result[0])
                 approve(f'Bind existing stack {stack} without deployment or initialization?', config['instance_id'],
                         body=json.dumps({'stack': stack, 'connection': config}, indent=2))
-                bootstrap.connect(self.values, self.env, confirm_instance=config['instance_id'], cloud=cloud)
+                bootstrap.connect(self.values, self.env, confirm_instance=config['instance_id'], cloud=cloud, reviewed_config=config)
                 self.values = load_environment(self.env)
             finally:
                 cloud.close()
@@ -472,7 +472,7 @@ class Wizard:
         checkpoint()
         generation = self.verify_authority()
         root = None
-        if confirm('Configure a project now? (No: instance ready; choose the actual project later in OMP)'):
+        if confirm('Configure a project now? (No: instance ready; select the actual project later in your harness)'):
             root, generation = self.project()
             stage('Verify readiness')
             self.state['ready_project'] = str(root)
@@ -490,7 +490,7 @@ class Wizard:
         if (self.home / 'activate').exists():
             message('Or load the installer environment, including any explicitly selected CA:')
             message('source ' + shlex.quote(str(self.home / 'activate')))
-        message('Open the actual project directory in OMP and invoke /skill:maven-start-work.')
+        message('Open the actual enabled project in your configured harness and ask MAVEN to initialize.')
         if root:
             message('Verify selection: maven-project show --root ' + shlex.quote(str(root)))
         checkpoint()
@@ -501,6 +501,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, default=Path(os.environ.get('MAVEN_HOME', str(Path.home() / '.maven'))))
     parser.add_argument('--project-root', type=Path, help='Explicit project suggestion; still requires confirmation')
+    parser.add_argument('--operation', help='Resume the exact persisted administration operation UUID')
     args = parser.parse_args(argv)
     home = args.home.expanduser().absolute()
     os.environ['MAVEN_HOME'] = str(home)
@@ -508,7 +509,20 @@ def main(argv=None):
     return run_workflow('MAVEN instance setup', [
         'Instance selection', 'AWS identities', 'Deployment review', 'Initialize',
         'Starter authority', 'Project selection', 'Project binding', 'Verify readiness',
-    ], lambda ui: _run(args, home))
+    ], lambda ui: _present(ui, args, home))
+
+
+def _present(ui, args, home):
+    from tools.tui.administration import present
+    identifier = args.operation
+    state_path = home / 'runtime' / 'setup' / 'state.json'
+    if identifier is None and state_path.exists():
+        state = read_private(state_path)
+        identifier = state.get('administration_operation')
+        if identifier is None and any(key in state for key in ('mode', 'prepared', 'submitted_requests', 'project')):
+            # Old pending receipts retain their original controller semantics.
+            return _run(args, home)
+    return present(ui, home, operation_id=identifier, project_root=args.project_root)
 
 
 def _run(args, home):

@@ -16,6 +16,9 @@ from tools.project import (
 class ProjectPackagingTests(unittest.TestCase):
     def test_resources_are_contained(self):
         self.assertTrue(resource_path('templates/environment.example').is_file())
+        self.assertTrue(resource_path('templates/harness/startup.md').is_file())
+        self.assertTrue(resource_path('templates/skills/maven/SKILL.md').is_file())
+        self.assertTrue(resource_path('templates/skills/maven-maintenance/SKILL.md').is_file())
         for value in ('../pyproject.toml', '/etc/passwd', ''):
             with self.assertRaises(ValueError):
                 resource_path(value)
@@ -97,7 +100,7 @@ class ProjectPackagingTests(unittest.TestCase):
         source = Path(install.__file__).parent
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            target = root / 'maven-setup/SKILL.md'
+            target = root / 'maven/SKILL.md'
             target.parent.mkdir()
             target.write_text('existing owner instructions')
             with self.assertRaises(ValueError):

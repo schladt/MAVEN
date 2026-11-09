@@ -42,7 +42,7 @@
     {
       "slug": "maven-workflow",
       "page_kind": "skill",
-      "title": "Explicit multi-session project lifecycle",
+      "title": "Memory-first multi-session lifecycle and optional publication",
       "requires": [
         "maven-memory"
       ]

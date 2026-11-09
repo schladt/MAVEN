@@ -42,7 +42,7 @@ class OwnerValidationTests(unittest.TestCase):
             "session": {"state": "active", "summary": "", "workflow": "work"},
             "operation": {"session_id": session, "name": "refresh", "state": "started", "summary": ""},
             "setting": {"key": "fixture.region", "value": "region", "scope": "global"},
-            "checkpoint": {"session_id": session, "candidate_digest": "a" * 64, "git_base": "b" * 40,
+            "checkpoint": {"session_id": session, "cutoff": 3,
                            "memory_refs": [{"record_id": entity, "revision": 1}], "state": "prepared"},
         }
         for kind, data in cases.items():
@@ -111,6 +111,35 @@ class OwnerValidationTests(unittest.TestCase):
         with self.assertRaises(validation.MemoryError):
             validation.validate("/v1/memory/claim", claim)
 
+
+    def test_memory_checkpoint_needs_no_git_and_has_strict_cutoff_manifest(self):
+        data = {"session_id": str(uuid4()), "cutoff": 0, "memory_refs": [], "state": "prepared"}
+        for state in ("prepared", "saved", "aborted"):
+            validation.validate("/v1/memory/write", record("checkpoint", {**data, "state": state}))
+        for change in ({"cutoff": True}, {"cutoff": -1}, {"cutoff": 1.5}, {"cutoff": 2147483648},
+                       {"state": "committed"}, {"git_base": "a" * 40}, {"final_commit": "b" * 40},
+                       {"candidate_digest": "c" * 64}, {"memory_refs": [{"record_id": str(uuid4()), "revision": 0}]}):
+            with self.subTest(change=change), self.assertRaises(validation.MemoryError):
+                validation.validate("/v1/memory/write", record("checkpoint", {**data, **change}))
+        ref = {"record_id": str(uuid4()), "revision": 1}
+        with self.assertRaises(validation.MemoryError):
+            validation.validate("/v1/memory/write", record("checkpoint", {**data, "memory_refs": [ref, ref]}))
+        git = {"session_id": data["session_id"], "candidate_digest": "a" * 64,
+               "git_base": "b" * 40, "memory_refs": [], "state": "committed", "final_commit": "c" * 40}
+        validation.validate("/v1/memory/write", record("checkpoint", git))
+
+    def test_search_requires_unambiguous_explicit_scope(self):
+        project = str(uuid4())
+        for request in ({}, {"project_id": project}, {"scope": "context"}, {"scope": "universal"},
+                        {"scope": "all"}, {"scope": "project", "project_id": project},
+                        {"scope": "context", "project_id": project}):
+            self.assertIs(validation.validate("/v1/memory/search", request), request)
+        for request in ({"scope": "project"}, {"scope": "all", "project_id": project},
+                        {"scope": "universal", "project_id": project}, {"scope": None},
+                        {"scope": []}, {"scope": "owner"}):
+            with self.subTest(request=request), self.assertRaises(validation.MemoryError):
+                validation.validate("/v1/memory/search", request)
+
     def test_named_context_root_requires_a_valid_skill_slug(self):
         request = {"skill_slug": "fixture-skill", "workflow": "different-workflow", "operation": "start-work"}
         validation.validate("/v1/memory/context", request)
@@ -141,7 +170,7 @@ class OwnerValidationTests(unittest.TestCase):
                   "approval_role_arn": "arn:aws:iam::123456789012:role/fixture-approval"}
         body = record()
         event = {"rawPath": "/v1/memory/write", "body": json.dumps(body),
-                 "headers": {"x-maven-memory-protocol": "2"},
+                 "headers": {"x-maven-memory-protocol": "3"},
                  "requestContext": {"http": {"method": "POST"}, "authorizer": {"iam": {
                      "userArn": "arn:aws:sts::123456789012:assumed-role/fixture-client/test"}}}}
         storage = Mock()
@@ -149,8 +178,8 @@ class OwnerValidationTests(unittest.TestCase):
         with patch.object(service, "configuration", return_value=config), patch.object(service, "make_store", return_value=storage):
             result = service.handler(event, None)
             self.assertEqual(result["statusCode"], 200)
-            self.assertEqual(storage.perform.call_args.kwargs, {"client_protocol": 2})
-            event["headers"]["x-maven-memory-protocol"] = "3"
+            self.assertEqual(storage.perform.call_args.kwargs, {"client_protocol": 3})
+            event["headers"]["x-maven-memory-protocol"] = "2"
             self.assertEqual(service.handler(event, None)["statusCode"], 409)
             self.assertEqual(storage.perform.call_count, 1)
 
@@ -509,15 +538,155 @@ BEGIN
  candidate:=candidate || jsonb_build_object('slug','fixture-cycle-a','requires',jsonb_build_array('fixture-cycle-b')); PERFORM pg_temp.publish(candidate);
  candidate:=candidate || jsonb_build_object('slug','fixture-cycle-b','requires',jsonb_build_array('fixture-cycle-a')); PERFORM pg_temp.publish(candidate);
  PERFORM pg_temp.assert_equal(maven.memory_context('{}')->'status','"dependency_conflict"','cycles fail closed');
- UPDATE maven.service_state SET minimum_client_protocol=2 WHERE singleton;
+ UPDATE maven.service_state SET minimum_client_protocol=3 WHERE singleton;
  PERFORM set_config('maven.client_protocol','1',true);
  PERFORM pg_temp.assert_equal(pg_temp.write(pg_temp.request('note','{"title":"Old client","body_markdown":"blocked","category":"fixture"}'))->'status','"client_incompatible"','obsolete writer refused');
- PERFORM set_config('maven.client_protocol','2',true);
+ PERFORM set_config('maven.client_protocol','3',true);
  PERFORM pg_temp.assert_equal(pg_temp.write(pg_temp.request('note','{"title":"New client","body_markdown":"accepted","category":"fixture"}'))->'revision','1','current writer accepted');
 END $$;
 SET CONSTRAINTS ALL IMMEDIATE;
 """
 
+
+SQL_NATIVE_CHECKPOINTS = r"""
+DO $$
+DECLARE
+ project uuid; other_project uuid; session_request jsonb; universal_request jsonb;
+ local_request jsonb; other_request jsonb; checkpoint_request jsonb;
+ revised jsonb; result jsonb; refs jsonb; task_request jsonb; selected jsonb;
+BEGIN
+ result:=pg_temp.write(pg_temp.request('entity','{"entity_type":"project","name":"Current fixture","aliases":[]}'));
+ project:=(result->>'record_id')::uuid;
+ result:=pg_temp.write(pg_temp.request('entity','{"entity_type":"project","name":"Other fixture","aliases":[]}'));
+ other_project:=(result->>'record_id')::uuid;
+ session_request:=pg_temp.request('session','{"state":"active","summary":"Memory-only session"}')
+   || jsonb_build_object('project_id',project);
+ PERFORM pg_temp.assert_equal(pg_temp.write(session_request)->'revision','1','project session');
+ universal_request:=pg_temp.request('note','{"title":"Universal","body_markdown":"General lesson","category":"reference"}');
+ local_request:=pg_temp.request('note','{"title":"Local","body_markdown":"Project choice","category":"reference"}')
+   || jsonb_build_object('project_id',project);
+ other_request:=pg_temp.request('note','{"title":"Other","body_markdown":"Other project choice","category":"reference"}')
+   || jsonb_build_object('project_id',other_project);
+ PERFORM pg_temp.write(universal_request); PERFORM pg_temp.write(local_request); PERFORM pg_temp.write(other_request);
+ selected:=jsonb_build_object('kind','note','scope','context','project_id',project);
+ result:=maven.memory_search(selected);
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(result->'records')),'2','context includes universal and current only');
+ IF EXISTS (SELECT 1 FROM jsonb_array_elements(result->'records') r WHERE r->'record_id'=other_request->'record_id') THEN
+   RAISE EXCEPTION 'context leaks unrelated project';
+ END IF;
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(maven.memory_search('{"kind":"note","scope":"universal"}')->'records')),'1','universal only');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(maven.memory_search(selected || '{"scope":"project"}')->'records')),'1','project only');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(maven.memory_search('{"kind":"note","scope":"all"}')->'records')),'3','explicit owner-wide consultation');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(maven.memory_search('{"kind":"note"}')->'records')),'3','legacy discovery stays available');
+ PERFORM pg_temp.assert_equal(maven.memory_search(selected || jsonb_build_object('scope','project','project_id',other_project))->'records'->0->'record_id',
+   other_request->'record_id','explicit other project retains identity');
+ refs:=jsonb_build_array(jsonb_build_object('record_id',universal_request->'record_id','revision',1),
+                        jsonb_build_object('record_id',local_request->'record_id','revision',1));
+ checkpoint_request:=pg_temp.request('checkpoint',jsonb_build_object('session_id',session_request->'record_id',
+   'cutoff',7,'memory_refs',refs,'state','prepared','summary','Exact handover at cutoff'))
+   || jsonb_build_object('project_id',project);
+ PERFORM pg_temp.assert_equal(pg_temp.write(checkpoint_request)->'revision','1','memory checkpoint prepares without Git');
+ PERFORM pg_temp.assert_equal(pg_temp.write(checkpoint_request)->'replayed','true','prepared request reconciles exactly');
+ PERFORM pg_temp.assert_equal(maven.memory_lookup((checkpoint_request->>'request_key')::uuid)->'revision','1','prepared request lookup');
+ revised:=checkpoint_request || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',1,
+   'data',checkpoint_request->'data' || '{"state":"saved"}');
+ FOR result IN SELECT value FROM jsonb_array_elements('[{"cutoff":8},{"summary":"Changed"},{"memory_refs":[]},{"state":"committed"}]') LOOP
+   IF COALESCE(pg_temp.write(revised || jsonb_build_object('data',revised->'data' || result))->>'status','')
+      NOT IN ('revision_conflict','invalid_request') THEN RAISE EXCEPTION 'mutable checkpoint contents'; END IF;
+ END LOOP;
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised || '{"tags":["different"]}')->'status','"revision_conflict"','checkpoint tags immutable');
+ PERFORM pg_temp.write(local_request || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',1,
+   'data',local_request->'data' || '{"body_markdown":"Later discussion"}'));
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised)->'revision','2','prepared checkpoint saves after later discussion');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised)->'replayed','true','saved outcome reconciles exactly');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',checkpoint_request->'record_id'))->'data'->'memory_refs',
+   refs,'saved refs do not follow latest');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',checkpoint_request->'record_id','revision',1))->'data'->'state',
+   '"prepared"','checkpoint preparation history intact');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',2))->'status',
+   '"revision_conflict"','saved checkpoint terminal');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised || jsonb_build_object('data',revised->'data' || '{"cutoff":8}'))->'status',
+   '"idempotency_conflict"','reconciliation cannot change original request');
+ PERFORM pg_temp.assert_equal(pg_temp.write(checkpoint_request || jsonb_build_object('request_key',gen_random_uuid(),'record_id',gen_random_uuid(),
+   'data',checkpoint_request->'data' || '{"state":"saved"}'))->'status','"invalid_request"','cannot skip prepared');
+ checkpoint_request:=checkpoint_request || jsonb_build_object('request_key',gen_random_uuid(),'record_id',gen_random_uuid());
+ PERFORM pg_temp.assert_equal(pg_temp.write(checkpoint_request || jsonb_build_object('data',checkpoint_request->'data' ||
+   jsonb_build_object('memory_refs',jsonb_build_array(jsonb_build_object('record_id',other_request->'record_id','revision',1)))))->'status',
+   '"reference_unavailable"','foreign-project checkpoint reference refused');
+ PERFORM pg_temp.assert_equal(pg_temp.write(checkpoint_request || jsonb_build_object('data',checkpoint_request->'data' ||
+   jsonb_build_object('memory_refs',jsonb_build_array(jsonb_build_object('record_id',local_request->'record_id','revision',99)))))->'status',
+   '"reference_unavailable"','nonexistent exact revision refused');
+ PERFORM pg_temp.assert_equal(pg_temp.write(checkpoint_request)->'revision','1','second checkpoint prepares');
+ revised:=checkpoint_request || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',1,
+   'data',checkpoint_request->'data' || '{"state":"aborted"}');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised)->'revision','2','checkpoint aborts without Git');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',2,
+   'data',revised->'data' || '{"state":"saved"}'))->'status','"revision_conflict"','aborted checkpoint terminal');
+ revised:=universal_request || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',1,'tags',jsonb_build_array('maven-scope-superseded'));
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised)->'revision','2','scope representation superseded');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(maven.memory_search(selected)->'records')),'1','superseded representation omitted from context search');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(maven.memory_search('{"kind":"note","scope":"all"}')->'records')),'2','superseded representation omitted from all search');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',universal_request->'record_id','revision',1))->'data',
+   universal_request->'data','original universal source remains readable');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',universal_request->'record_id'))->'revision',
+   '2','superseded exact read remains available');
+ PERFORM pg_temp.assert_equal(pg_temp.write(local_request || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',2,'project_id',other_project))->'status',
+   '"revision_conflict"','ordinary write cannot move project binding');
+ task_request:=pg_temp.request('task','{"title":"Hidden task representation","description":"","state":"open"}')
+   || jsonb_build_object('tags',jsonb_build_array('maven-scope-superseded'));
+ PERFORM pg_temp.write(task_request);
+ PERFORM pg_temp.assert_equal(maven.memory_context(jsonb_build_object('project_id',project))->'tasks','[]','superseded task omitted from startup context');
+ PERFORM pg_temp.assert_equal(maven.memory_context(jsonb_build_object('project_id',project))->'pages','[]','universal knowledge never becomes active authority');
+ task_request:=pg_temp.request('task','{"title":"Universal task","description":"Exact facts","state":"open"}')
+   || '{"tags":["retain-origin"]}';
+ PERFORM pg_temp.assert_equal(pg_temp.write(task_request)->'revision','1','universal task created');
+ revised:=jsonb_build_object('request_key',gen_random_uuid(),'record_id',task_request->'record_id','expected_revision',1,
+   'session_id',session_request->'record_id','action','claim','lease_seconds',30,'source',task_request->'source','change_reason','Claim universal task');
+ result:=pg_temp.write(revised,'claim');
+ PERFORM pg_temp.assert_equal(result->'revision','2','project session claims universal task');
+ PERFORM pg_temp.assert_equal(result->'fence','1','universal claim fence');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised,'claim')->'replayed','true','universal claim exact replay');
+ PERFORM pg_temp.assert_equal(pg_temp.write(task_request || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',2,
+   'data',task_request->'data' || '{"state":"in_progress"}','tags',jsonb_build_array('retain-origin','maven-scope-superseded')))->'status',
+   '"claim_conflict"','cannot retire active universal claim');
+ revised:=(revised-'lease_seconds') || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',2,'action','release','fence',1);
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised,'claim')->'revision','3','project session releases universal task');
+ revised:=(revised-'fence') || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',3,'action','claim','lease_seconds',30);
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised,'claim')->'fence','2','universal reclaim increments fence');
+ revised:=(revised-'lease_seconds') || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',4,'action','complete','fence',1);
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised,'claim')->'status','"claim_conflict"','stale universal fence refused');
+ revised:=revised || jsonb_build_object('request_key',gen_random_uuid(),'fence',2);
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised,'claim')->'revision','5','project session completes universal task');
+ revised:=task_request || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',5,
+   'data',task_request->'data' || '{"state":"completed"}','tags',jsonb_build_array('retain-origin','maven-scope-superseded'));
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised || jsonb_build_object('data',revised->'data' || '{"description":"Altered facts"}'))->'status',
+   '"claim_conflict"','retirement cannot alter task facts');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised || '{"tags":["maven-scope-superseded"]}')->'status',
+   '"claim_conflict"','retirement cannot discard provenance tags');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised)->'revision','6','completed task retirement only');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',task_request->'record_id'))->'data',
+   revised->'data','retirement preserves completed facts');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',6,
+   'data',revised->'data' || '{"state":"open"}'))->'status','"claim_conflict"','retirement cannot reopen terminal task');
+ task_request:=pg_temp.request('task','{"title":"Foreign task","description":"","state":"open"}')
+   || jsonb_build_object('project_id',other_project);
+ PERFORM pg_temp.write(task_request);
+ revised:=jsonb_build_object('request_key',gen_random_uuid(),'record_id',task_request->'record_id','expected_revision',1,
+   'session_id',session_request->'record_id','action','claim','lease_seconds',30,'source',task_request->'source','change_reason','Foreign claim');
+ PERFORM pg_temp.assert_equal(pg_temp.write(revised,'claim')->'status','"session_unavailable"','project task still requires matching session');
+ task_request:=pg_temp.request('task','{"title":"Archived session universal task","description":"","state":"open"}');
+ PERFORM pg_temp.write(task_request);
+ INSERT INTO maven.project_lifecycle(project_id,archived,generation,action_key,actor_id)
+   VALUES(project,true,1,repeat('a',64),'fixture-owner');
+ revised:=revised || jsonb_build_object('request_key',gen_random_uuid(),'record_id',task_request->'record_id');
+ BEGIN
+   PERFORM pg_temp.write(revised,'claim');
+   RAISE EXCEPTION 'archived project session claimed universal task';
+ EXCEPTION WHEN SQLSTATE '55000' THEN
+   IF SQLERRM<>'project_archived' THEN RAISE; END IF;
+ END;
+END $$;
+"""
 SQL_TRANSPORT_ASSERTIONS = r"""
 DO $$
 DECLARE reconstructed bytea; expected jsonb;
@@ -578,7 +747,9 @@ class OwnerPostgreSQLTests(unittest.TestCase):
                            "(SELECT id FROM maven.memory_items WHERE data->>'title'='Corrected'),'revision',1))")
         once_expression = "jsonb_build_object('sequence',nextval('fixture_evaluation'),'body',repeat('x',70000))"
         statements.extend([
-            "SELECT set_config('maven.client_protocol','2',true);", SQL_HELPERS,
+            "SELECT set_config('maven.client_protocol','3',true);", SQL_HELPERS,
+            "SAVEPOINT native_checkpoints;", SQL_NATIVE_CHECKPOINTS,
+            "ROLLBACK TO SAVEPOINT native_checkpoints; RELEASE SAVEPOINT native_checkpoints;",
             "SAVEPOINT skill_bundles;", SQL_SKILL_BUNDLES,
             "ROLLBACK TO SAVEPOINT skill_bundles; RELEASE SAVEPOINT skill_bundles;",
             "SAVEPOINT named_skill_context;", SQL_NAMED_SKILL_CONTEXT,

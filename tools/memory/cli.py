@@ -5,9 +5,10 @@ import argparse
 import json
 from pathlib import Path
 import sys
+import uuid
 
 from .client import MemoryClient, MemoryClientError, read_json, selected_session
-from .environment import DEFAULT_ENV, load_environment, memory_config
+from .environment import DEFAULT_ENV, load_environment, memory_config, migration_config
 
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(description='MAVEN cloud memory; infrastructure changes and owner-data imports require scoped approval.')
@@ -100,8 +101,8 @@ def parser() -> argparse.ArgumentParser:
     records = record.add_subparsers(dest='record_action', required=True)
     put = records.add_parser('put')
     put.add_argument('input', type=Path)
-    put.add_argument('--root', type=Path)
-    put.add_argument('--session')
+    put.add_argument('--root', type=Path, required=True)
+    put.add_argument('--session', required=True)
     get = records.add_parser('get')
     get.add_argument('--record-id', required=True)
     get.add_argument('--revision', type=int)
@@ -109,21 +110,11 @@ def parser() -> argparse.ArgumentParser:
     for key in ('kind', 'project-id', 'query', 'tag', 'subject-id', 'state', 'after-id'):
         listing.add_argument('--' + key)
     listing.add_argument('--limit', type=int)
+    listing.add_argument('--scope', choices=('context', 'project', 'universal', 'all'), default='context')
     claim = actions.add_parser('claim', help='Claim/release/complete a task using an explicit fenced request')
     claim.add_argument('input', type=Path)
     claim.add_argument('--root', type=Path, required=True)
     claim.add_argument('--session', required=True)
-    session = actions.add_parser('session', help='Record an unscoped session; project lifecycle uses maven-start-work and maven-stop-work')
-    session.add_argument('state', choices=('active', 'closed', 'abandoned'))
-    session.add_argument('--record-id', required=True)
-    session.add_argument('--request-key', required=True)
-    session.add_argument('--expected-revision', type=int, required=True)
-    session.add_argument('--summary', required=True)
-    session.add_argument('--source-origin', required=True)
-    session.add_argument('--source-excerpt', default='')
-    session.add_argument('--change-reason', required=True)
-    for key in ('project-id', 'workflow', 'operation'):
-        session.add_argument('--' + key)
     install = actions.add_parser('install', help='Explicit owner-selected build, review, exact deployment and initialization')
     steps = install.add_subparsers(dest='install_action', required=True)
     prepare = steps.add_parser('prepare', help='Build private review artifacts offline')
@@ -144,9 +135,9 @@ def parser() -> argparse.ArgumentParser:
     return command
 
 
-def _connection(args):
+def _connection(args, *, upgrade=False):
     values = load_environment(args.env)
-    return values, memory_config(values)
+    return values, migration_config(values) if upgrade else memory_config(values)
 
 
 def _scope(args):
@@ -172,51 +163,44 @@ def _memory_action(args):
                 route = '/v1/memory/read'
             else:
                 body = {key: getattr(args, key) for key in
-                        ('kind', 'project_id', 'query', 'tag', 'subject_id', 'state', 'after_id', 'limit')
+                        ('kind', 'project_id', 'scope', 'query', 'tag', 'subject_id', 'state', 'after_id', 'limit')
                         if getattr(args, key) is not None}
                 route = '/v1/memory/search'
         elif args.action == 'claim':
             body = read_json(args.input, maximum=16384)
             route = '/v1/memory/claim'
-        else:
-            scope = _scope(args)
-            body = {'request_key': args.request_key, 'record_id': args.record_id,
-                    'expected_revision': args.expected_revision, 'kind': 'session',
-                    'classification': 'Sensitive', 'data_scope': 'owner',
-                    'data': {'state': args.state, 'summary': args.summary,
-                             **{key: value for key, value in scope.items() if key != 'project_id'}},
-                    'source': {'origin': args.source_origin, 'excerpt': args.source_excerpt},
-                    'change_reason': args.change_reason}
-            if 'project_id' in scope:
-                body['project_id'] = scope['project_id']
-            route = '/v1/memory/write'
         if route in ('/v1/memory/write', '/v1/memory/claim'):
             from .validation import validate
             validate(route, body)
             root = getattr(args, 'root', None)
             session_id = getattr(args, 'session', None)
-            project_bound = 'project_id' in body or route == '/v1/memory/claim'
-            if project_bound or root is not None or session_id is not None:
-                if body.get('kind') in ('session', 'checkpoint'):
-                    raise MemoryClientError('lifecycle_command_required')
-                if root is None or session_id is None:
-                    raise MemoryClientError('explicit_project_and_session_required')
-                from tools.project import load_project
-                from tools.coordination import SessionRegistry, session_lock
-                from .boundary import MemoryBoundary
-                project = load_project(root)
-                project_id = project['project_id']
-                if route == '/v1/memory/write' and body.get('project_id') != project_id:
-                    raise MemoryClientError('project_scope_mismatch')
-                if route == '/v1/memory/claim' and body['session_id'] != session_id:
-                    raise MemoryClientError('session_scope_mismatch')
-                if body.get('kind') == 'operation' and body['data']['session_id'] != session_id:
-                    raise MemoryClientError('session_scope_mismatch')
-                with session_lock(Path(project['root']), session_id), \
-                        SessionRegistry().writer(Path(project['root']), session_id):
-                    boundary = MemoryBoundary(client, Path(project['root']), project_id, session_id)
-                    boundary.session()
-                    return boundary.submit(route, body)
+            if body.get('kind') in ('session', 'checkpoint'):
+                raise MemoryClientError('lifecycle_command_required')
+            if root is None or session_id is None:
+                raise MemoryClientError('explicit_project_and_session_required')
+            from .lifecycle import SessionService
+            from .maintenance import Maintenance
+            service = SessionService(root, session_id, env=args.env, client=client)
+            maintenance = Maintenance(service)
+            project_id = service.project_id
+            if route == '/v1/memory/write' and body.get('project_id') not in (None, project_id):
+                raise MemoryClientError('project_scope_mismatch')
+            if route == '/v1/memory/claim' and body['session_id'] != session_id:
+                raise MemoryClientError('session_scope_mismatch')
+            if body.get('kind') == 'operation' and body['data']['session_id'] != session_id:
+                raise MemoryClientError('session_scope_mismatch')
+            if route == '/v1/memory/claim':
+                fields = {key: body[key] for key in ('record_id', 'action', 'expected_revision', 'source',
+                                                    'request_key', 'lease_seconds', 'fence') if key in body}
+                fields['operation_id'] = str(uuid.uuid5(uuid.UUID(session_id), 'raw-claim:' + body['request_key']))
+                fields['reason'] = body['change_reason']
+                return maintenance.claim_task(**fields)
+            return maintenance.save(
+                body['kind'], body['data'], source=body['source'],
+                record_id=body['record_id'], expected_revision=body['expected_revision'],
+                scope='universal' if body.get('project_id') is None else 'project',
+                tags=body.get('tags', []), reason=body['change_reason'], request_key=body['request_key'],
+                operation_id=str(uuid.uuid5(uuid.UUID(session_id), 'raw-write:' + body['request_key'])))
         return client.invoke(route, body)
     finally:
         client.close()
@@ -326,11 +310,11 @@ def main(argv: list[str] | None = None) -> int:
             result = _install(args)
         elif args.action == 'skill':
             result = _skill_action(args)
-        elif args.action in ('record', 'context', 'session', 'claim'):
+        elif args.action in ('record', 'context', 'claim'):
             result = _memory_action(args)
         elif args.action in ('bootstrap', 'migrate'):
             from .admin import bootstrap, migrate
-            values, config = _connection(args)
+            values, config = _connection(args, upgrade=args.action == 'migrate')
             if args.confirm_instance != config['instance_id']:
                 raise MemoryClientError('instance_confirmation_mismatch')
             operation = bootstrap if args.action == 'bootstrap' else migrate

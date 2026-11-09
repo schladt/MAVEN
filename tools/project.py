@@ -198,6 +198,36 @@ def validate_git(root: Path, project: dict) -> None:
         raise ProjectError('--branch must select the current branch')
 
 
+def configure_git(root, *, remote, accepted_url, branch, env=None) -> dict:
+    """Opt into exact Git publication separately from memory project enablement."""
+    from tools.coordination import SessionRegistry
+    from tools.memory.boundary import private_path, read_private, save_private
+    root = Path(root).expanduser().resolve(strict=True)
+    registry = SessionRegistry(Path(env if env is not None else default_environment()).expanduser().resolve().parent)
+    with registry.transaction() as state:
+        registry._allow_work(root)
+        if str(root) in state['reservations']:
+            raise ProjectError('resolve the active Git reservation before changing its destination')
+        sessions = private_path(root, '.maven/runtime/sessions')
+        if sessions.exists():
+            for session in sessions.iterdir():
+                approval = private_path(root, str(session.relative_to(root) / 'approval.json'))
+                if approval.exists() and read_private(root, str(approval.relative_to(root))).get('status') not in (
+                        'closed', 'checkpointed', 'cancelled', 'approval_cancelled'):
+                    raise ProjectError('recover or cancel pending Git publication before changing its destination')
+        existing = load_project(root)
+        project = _validate(dict(existing, git_enabled=True, remote=remote,
+                                 accepted_url=accepted_url, branch=branch), root)
+        validate_git(root, project)
+        if project == existing:
+            return {'status': 'unchanged', 'project': project}
+        payload = (json.dumps(project, sort_keys=True, indent=2) + '\n').encode()
+        _record_integration(root, payload, _ensure_ignore(root))
+        save_private(root, '.maven/project.json', project)
+        return {'status': 'configured', 'project': project,
+                'next': 'Use maven-git explicitly for reviewed Git publication; memory remains independent.'}
+
+
 def _initialize(args) -> dict:
     # Serialize binding with uninstall's persistent local removal marker.
     from tools.coordination import SessionRegistry, private_lock
@@ -220,7 +250,7 @@ def _initialize_bound(args) -> dict:
     project = _validate({
         'schema': 1, 'project_id': args.project_id, 'root': str(root),
         'remote': args.remote, 'accepted_url': args.accepted_url, 'branch': args.branch,
-        'git_enabled': not args.no_git, 'checks': checks,
+        'git_enabled': any((args.remote, args.accepted_url, args.branch)), 'checks': checks,
     }, root)
     validate_git(root, project)
     directory = root / '.maven'
@@ -276,7 +306,6 @@ def main(argv=None) -> int:
     initialize.add_argument('--root', type=Path, required=True)
     initialize.add_argument('--project-id', required=True)
     initialize.add_argument('--env', type=Path, default=default_environment())
-    initialize.add_argument('--no-git', action='store_true', help='Select memory-only lifecycle')
     initialize.add_argument('--remote')
     initialize.add_argument('--accepted-url')
     initialize.add_argument('--branch')
@@ -297,12 +326,18 @@ def main(argv=None) -> int:
     setup.add_argument('--name')
     setup.add_argument('--source-origin')
     setup.add_argument('--source-excerpt')
-    setup.add_argument('--no-git', action='store_true')
     setup.add_argument('--remote')
     setup.add_argument('--accepted-url')
     setup.add_argument('--branch')
     setup.add_argument('--check', action='append', default=[], metavar='JSON_ARGV')
     setup.add_argument('--json', action='store_true')
+    git_setup = commands.add_parser('git', help='Explicitly configure optional Git publication for an enabled memory project')
+    git_setup.add_argument('--root', type=Path, required=True)
+    git_setup.add_argument('--env', type=Path, default=default_environment())
+    git_setup.add_argument('--remote', required=True)
+    git_setup.add_argument('--accepted-url', required=True)
+    git_setup.add_argument('--branch', required=True)
+    git_setup.add_argument('--json', action='store_true')
     show = commands.add_parser('show', help='Show the explicit local project, without cloud access')
     show.add_argument('--root', type=Path, required=True)
     show.add_argument('--json', action='store_true')
@@ -318,6 +353,9 @@ def main(argv=None) -> int:
                     'Project selection', 'Project binding',
                 ], lambda ui: interactive_project(args))
             result = setup_project(args)
+        elif args.command == 'git':
+            result = configure_git(args.root, remote=args.remote, accepted_url=args.accepted_url,
+                                   branch=args.branch, env=args.env)
         else:
             result = _initialize(args) if args.command == 'init' else load_project(args.root)
         print(json.dumps(result, indent=2))

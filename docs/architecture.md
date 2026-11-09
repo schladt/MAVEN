@@ -1,41 +1,102 @@
 # Architecture and storage
 
-MAVEN separates installed code, private local operating state, and authoritative
-cloud records. It is a CLI/client system, not a daemon or model provider.
+MAVEN is an agent-operated memory system, not a model provider. A configured harness
+launches the installed Python MCP process over standard **stdio** and owns its
+connection lifetime. No manual server startup, custom launcher, listening port or
+permanent service is needed. OMP is optional. A future Streamable HTTP adapter can
+reuse domain contracts; a public endpoint or mobile application is not included.
+
+## Layers
+
+1. **Harness guidance:** intent routing, visible initialization, context handoff,
+   decisions and native background subagents where available; foreground fallback.
+2. **MCP adapter:** official Python SDK transport/discovery, typed tools, sanitized
+   results and cancellation. Stdout is protocol-only; diagnostics go to stderr.
+3. **Shared controllers:** explicit selection, resumable interactions, maintenance
+   assignments, cutoffs, per-effect progress and verified receipts.
+4. **Domain services:** the existing cloud client, validation, authority, memory
+   lifecycle, optional Git publication, setup and pinned uninstall recovery.
+5. **AWS durable records and private local evidence:** one authoritative memory store,
+   not an alternative local database of instructions.
+
+MCP does not provide a model loop, spawn subagents or guarantee startup hooks,
+transcripts, notifications or approval dialogs. Those are harness capabilities.
+Deterministic code handles I/O, identity, revision checks, coordination and recovery;
+the harness agent interprets and reconciles semantic changes. No MAVEN-owned model
+runtime, model credential or immortal worker conversation is required.
+
+## Storage and identity
 
 | Location | Purpose | Authority |
 | --- | --- | --- |
-| Instance `venv/` and installed `maven_resources` | Executables, policy, infrastructure, generic starter proposals and bootstrap skills | Code and reviewed defaults; not active owner instructions |
-| Instance `.env` | Literal private endpoint, named profile, identity and integration settings | Connection configuration, not durable project memory |
-| Project `.maven/project.json` | Explicit cloud project UUID, canonical root and accepted Git destination/checks | Local project selection |
-| Project `.maven/runtime/sessions/<UUID>/` | Session-specific receipts and reconciliation evidence | Local evidence, not an alternate handover store |
-| Instance/project runtime coordination files | Locks, registered writers and durable reservations | Local concurrency control; no timeout takeover |
-| Project `.maven/sensitive/` | Owner-approved preserved originals | Private artifacts, never automatically operative instructions |
-| Owner-selected cloud service | Versioned instructions, projects, tasks, blockers, sessions and handovers | Durable MAVEN authority |
+| Instance `venv/`, installed resources | Executables, bootstrap guidance and proposed authority | Code, never live owner policy |
+| Instance `.env` | Explicit endpoint, named profiles, identity and integration settings | Private connection settings, not credentials or memory |
+| Project `.maven/project.json` | Canonical root/cloud project and optional Git configuration | Explicit local selection |
+| Private project/session runtime | Assignment generations, cutoff manifests, journals and receipts | Pending-work/recovery evidence, not cloud-saved memory |
+| Private administration runtime | Persisted reviews, interactions and recovery references | Exact operation evidence, not blanket approval |
+| Project `.maven/sensitive/` | Approved preserved originals | Private artifacts, not instructions |
+| Selected AWS service | Versioned records, instructions, projects, tasks, sessions and handovers | Durable MAVEN memory |
 
-The default instance is `~/.maven`. `MAVEN_HOME` explicitly selects another instance;
-installation with `--home` and subsequent use must select the same location. Code
-never uses its own installed directory as a project root. There is no global current
-project. Lifecycle commands require an explicit root, and later actions bind to the
-returned MAVEN session UUID. A harness name/session ID is optional additional identity,
-not a replacement for the MAVEN UUID.
+`MAVEN_HOME` selects the installation (default `~/.maven`). Every operation resolves
+home/instance, project where applicable, and work session explicitly. No global
+current-project/session pointer, newest-receipt inference or cwd rebinding is allowed.
+Transport identity is distinct from durable session identity. New/forked sessions get
+new identities; explicit resume retains the original. Workers inherit scoped work
+from the originating session with distinct operation/writer identity.
 
-The cloud service enforces scoped access, instruction approval, revision guards and
-request-key reconciliation. Instructions have distinct proposal and active states.
-An index discovers a page; its complete current body and dependency closure are
-required before use. The packaged authority catalog is a dependency-complete proposal
-set authored for a new owner. It contains no live owner credentials or permissions.
+## Scope, concurrency and completion
 
-The workflow coordinates cooperating writers sharing a checkout. A checkpoint obtains
-one repository reservation, requires peer quiescence, snapshots an exact candidate and
-revalidates before mutation. Different sessions keep separate receipts. No automatic
-file-to-session ownership is inferred. An arbitrary editor can still change files;
-revalidation detects candidate changes but is not an operating-system write sandbox.
+Default retrieval combines universal and current-project records. Explicit universal,
+project and owner-wide consultation remain available. Project scopes organize the
+owner's knowledge; actual AWS/instance identity controls access. Scope promotion uses
+source-linked representations retaining original project/revision and caveats. Scope
+correction changes default visibility without erasing history. Neither makes reference
+knowledge into an active instruction.
 
-Cloud authority remains authoritative when local processes end. Local originals and
-receipts may be necessary to recover a partial operation, so do not remove `.maven`
-or the instance runtime directory to clear an unexplained failure. A lost cloud
-connection is not permission to continue from a stale transcript or cached instruction.
+A bounded maintenance assignment records source evidence, allowed scope, uncertainty,
+generation and intended work. Conflicting work is serialized, stale generations are
+rejected, and cloud expected revisions/task fences protect against concurrent writers.
+The session's pending-request journal must not be overwritten by another worker.
+Multi-record results retain verified per-effect progress and a completion manifest;
+partial effects are not an atomic transaction claim.
 
-Optional Google modules are imported only by Google callers. Core project, memory,
-secrets, workspace and workflow commands do not require Google consent or packages.
+Memory checkpoints record the session, explicit accepted-work cutoff, exact
+record/revision manifest and truthful handover. Included work must finish before saved
+completion. New work stays outside that immutable boundary. Memory does not reserve
+or publish source files. Optional Git publication separately retains repository
+reservations, exact-candidate approval and recovery; arbitrary external writers remain
+outside its local coordination.
+
+Operation results distinguish pending/working, awaiting decision, paused, blocked,
+uncertain, completed and definitive failure/cancellation. They retain operation identity,
+selection, review revisions/digests, safe next actions and verified record receipts as
+applicable. Local acceptance is not cloud completion. Inspection is separate from
+reconciliation that may replay an external write. Cancellation is not rollback.
+
+## Rollout and authority
+
+Local package installation does not deploy service/schema changes or activate policy.
+Before live cutover, separately review and apply the matching cloud service/schema
+upgrade; incompatible deployed schemas must block rather than bypass validation.
+Historical Git checkpoints retain their shape/provenance. Recover incompatible pending
+publication/setup/removal operations through their original supported implementation
+before cutover; never reinterpret old receipts.
+
+The memory-native contract uses schema version **2**, transport/minimum client
+protocol **3**, and forward migration `012_agentic_memory.sql`. Ordinary clients
+reject schema 1. A separately reviewed upgrade accepts the old schema only for that
+upgrade path; SQL migration alone does not deploy the matching service. Reconnect
+using actual reviewed schema-2 stack outputs afterward; no installed configuration
+is silently rewritten. New checkpoints use `prepared` → `saved` or `aborted`,
+with immutable cutoff, exact references and summary; historical optional-Git shapes
+remain distinct.
+
+Then separately review proposed instruction bodies, dependencies and exact activation
+challenges. Activate through the existing owner-approval process and reload complete
+current authority. Packaged templates and catalog changes never auto-update active
+cloud instructions. Schema rollout approval is not instruction activation approval.
+
+Local implementation or simulated-cloud checks are not live AWS/SQL/harness proof.
+See [integration capabilities](integrations.md#harness-capability-matrix) and
+[workflow](workflow.md) for the user-visible contract. Core recovery remains independent
+of MCP/UI/model dependencies; Google remains optional.

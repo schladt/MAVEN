@@ -95,6 +95,16 @@ def memory_config(values: dict[str, str]) -> dict:
     return validate_config(config)
 
 
+def migration_config(values: dict[str, str]) -> dict:
+    """Accept a legacy binding only for its explicitly confirmed schema upgrade."""
+    from .validation import SCHEMA_VERSION
+    if values.get('MAVEN_MEMORY_SCHEMA_VERSION') == '1':
+        values = {**values, 'MAVEN_MEMORY_SCHEMA_VERSION': str(SCHEMA_VERSION)}
+    # Persistence still requires reconnecting reviewed upgraded stack outputs;
+    # successful SQL migration alone does not prove the service was deployed.
+    return memory_config(values)
+
+
 def selected_aws_session(values: dict[str, str], *, deploy: bool = False, region: str = 'us-east-1'):
     """Use only a named existing login and verify its principal; never elevate or login."""
     prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'

@@ -62,7 +62,7 @@ def stage(name):
 def require():
     interaction = current()
     if interaction is None:
-        raise OperationPaused("Interactive choices require the MAVEN TUI; use explicit noninteractive options otherwise.")
+        raise OperationPaused("A presenter is required for this synchronous interaction; use AdminOperations for resumable conversation or the MAVEN TUI.")
     return interaction
 
 

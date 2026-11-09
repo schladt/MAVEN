@@ -1,5 +1,6 @@
 """Consumer-visible configuration and uncertain-write behavior, no AWS calls."""
 from contextlib import redirect_stdout
+from datetime import datetime, timedelta, timezone
 import hashlib
 import io
 import json
@@ -13,7 +14,7 @@ from tools.memory import cli
 
 
 CONFIG = {
-    'region': 'us-east-1', 'database': 'maven', 'schema_version': 1,
+    'region': 'us-east-1', 'database': 'maven', 'schema_version': 2,
     'instance_id': '00000000-0000-4000-8000-000000000001',
     'recovery_epoch': '00000000-0000-4000-8000-000000000002',
     'endpoint': 'https://example123.execute-api.us-east-1.amazonaws.com',
@@ -108,6 +109,119 @@ class MemoryClientBoundaries(unittest.TestCase):
                 client.invoke('/v1/records/query', {'record_id': KEY})
         self.assertEqual(str(failure.exception), 'service_failure')
 
+    def test_definitive_memory_rejections_preserve_the_request_key_without_retry(self):
+        client = MemoryClient(CONFIG, None)
+        self.addCleanup(client.close)
+        for status in ('setting_conflict', 'reference_unavailable', 'session_unavailable'):
+            with self.subTest(status=status), \
+                    patch.object(client, '_post', return_value=(409, {'status': status})) as post:
+                with self.assertRaises(MemoryClientError) as failure:
+                    client.invoke('/v1/memory/write', {'request_key': KEY})
+                self.assertEqual((failure.exception.code, failure.exception.request_key), (status, KEY))
+                post.assert_called_once()
+
+
+class RefreshableSessionBoundaries(unittest.TestCase):
+    def setUp(self):
+        import boto3
+        self.real_session = boto3.Session
+        self.clock = datetime(2030, 1, 1, tzinfo=timezone.utc)
+        clock = patch('tools.memory.client._credential_time', side_effect=lambda: self.clock)
+        clock.start()
+        self.addCleanup(clock.stop)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.values = {
+            'MAVEN_AWS_PROFILE': 'selected-profile',
+            'MAVEN_AWS_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/selected',
+            'MAVEN_AWS_LOGIN_CACHE': self.directory.name,
+        }
+        self.source = MagicMock()
+        self.sts = self.source.client.return_value
+        self.sts.get_caller_identity.return_value = {'Arn': self.values['MAVEN_AWS_EXPECTED_PRINCIPAL']}
+        self.sts.assume_role.side_effect = lambda **kwargs: self.temporary(
+            f'synthetic-{self.sts.assume_role.call_count}', self.clock + timedelta(hours=1))
+        factory = patch('tools.memory.environment.boto3.Session', side_effect=self.session_factory)
+        self.factory = factory.start()
+        self.addCleanup(factory.stop)
+
+    @staticmethod
+    def temporary(key, expiration):
+        return {'Credentials': {'AccessKeyId': key, 'SecretAccessKey': 'synthetic-secret',
+                                'SessionToken': 'synthetic-token', 'Expiration': expiration}}
+
+    def session_factory(self, **kwargs):
+        if 'botocore_session' in kwargs:
+            return self.real_session(**kwargs)
+        self.assertEqual(kwargs, {'profile_name': 'selected-profile', 'region_name': CONFIG['region']})
+        return self.source
+
+    def test_expiring_credentials_refresh_through_the_original_selected_identity_and_role(self):
+        for purpose in ('client', 'admin', 'approval'):
+            with self.subTest(purpose=purpose):
+                config, values = dict(CONFIG), dict(self.values)
+                session = selected_session(config, admin=purpose == 'admin',
+                                           approval=purpose == 'approval', environment=values)
+                credentials = session.get_credentials()
+                first = credentials.get_frozen_credentials().access_key
+                config[purpose + '_role_arn'] = 'arn:aws:iam::999999999999:role/changed'
+                values.update(MAVEN_AWS_PROFILE='changed', MAVEN_AWS_EXPECTED_PRINCIPAL='changed')
+                validations = self.sts.get_caller_identity.call_count
+                assumptions = self.sts.assume_role.call_count
+                closes = self.sts.close.call_count
+                self.clock += timedelta(minutes=46)
+                renewed = credentials.get_frozen_credentials().access_key
+                self.assertNotEqual(first, renewed)
+                self.assertEqual(self.sts.get_caller_identity.call_count, validations + 1)
+                self.assertEqual(self.sts.assume_role.call_count, assumptions + 1)
+                self.assertEqual(self.sts.close.call_count, closes + 2)
+                self.sts.assume_role.assert_called_with(
+                    RoleArn=CONFIG[purpose + '_role_arn'],
+                    RoleSessionName='maven-memory-' + purpose, DurationSeconds=3600)
+                self.clock += timedelta(minutes=16)
+                self.assertEqual(credentials.get_frozen_credentials().access_key, renewed)
+                self.assertEqual(self.sts.assume_role.call_count, assumptions + 1)
+
+    def test_identity_change_rejects_early_refresh_and_never_signs_with_expired_credentials(self):
+        session = selected_session(CONFIG, environment=self.values)
+        credentials = session.get_credentials()
+        self.assertEqual(credentials.get_frozen_credentials().access_key, 'synthetic-1')
+        self.sts.get_caller_identity.return_value = {'Arn': 'arn:aws:iam::123456789012:root'}
+        self.clock += timedelta(minutes=46)
+        with self.assertRaisesRegex(MemoryClientError, '^unexpected_login_identity$'):
+            credentials.get_frozen_credentials()
+        self.clock += timedelta(minutes=16)
+        client = MemoryClient(CONFIG, session)
+        self.addCleanup(client.close)
+        with patch.object(client.http, 'post') as post:
+            with self.assertRaisesRegex(MemoryClientError, '^unexpected_login_identity$'):
+                client._post('/v1/context/load', {}, 10)
+            post.assert_not_called()
+        self.assertEqual(self.sts.assume_role.call_count, 1)
+        self.assertEqual(self.sts.close.call_count, 4)
+
+    def test_failed_or_expired_sts_refresh_is_sanitized_and_closed_without_sending(self):
+        from botocore.exceptions import ClientError
+        for mode in ('denied', 'expired'):
+            with self.subTest(mode=mode):
+                self.sts.assume_role.side_effect = None
+                self.sts.assume_role.return_value = self.temporary('original', self.clock + timedelta(hours=1))
+                session = selected_session(CONFIG, environment=self.values)
+                client = MemoryClient(CONFIG, session)
+                self.addCleanup(client.close)
+                self.clock += timedelta(hours=2)
+                if mode == 'denied':
+                    self.sts.assume_role.side_effect = ClientError(
+                        {'Error': {'Code': 'AccessDenied', 'Message': 'PRIVATE PROVIDER DETAILS'}}, 'AssumeRole')
+                else:
+                    self.sts.assume_role.return_value = self.temporary('expired', self.clock - timedelta(seconds=1))
+                closes = self.sts.close.call_count
+                with patch.object(client.http, 'post') as post:
+                    with self.assertRaisesRegex(MemoryClientError, '^selected_login_or_role_unavailable$'):
+                        client._post('/v1/context/load', {}, 10)
+                    post.assert_not_called()
+                self.assertEqual(self.sts.close.call_count, closes + 2)
+
 
 class InstructionClientBoundaries(unittest.TestCase):
     def setUp(self):
@@ -146,7 +260,8 @@ class InstructionClientBoundaries(unittest.TestCase):
         source = MagicMock()
         sts = source.client.return_value
         sts.assume_role.return_value = {'Credentials': {'AccessKeyId': 'synthetic', 'SecretAccessKey': 'synthetic',
-                                                       'SessionToken': 'synthetic'}}
+                                                       'SessionToken': 'synthetic',
+                                                       'Expiration': datetime.now(timezone.utc) + timedelta(hours=1)}}
         with patch('tools.memory.environment.selected_aws_session', return_value=source), patch('tools.memory.client.boto3.Session'):
             selected_session(CONFIG, approval=True, environment={})
         sts.assume_role.assert_called_once_with(RoleArn=CONFIG['approval_role_arn'],
@@ -242,7 +357,7 @@ class InstructionClientBoundaries(unittest.TestCase):
     @staticmethod
     def context(*pages, generation=1):
         keys = ('page_id', 'slug', 'page_kind', 'title', 'scope', 'revision', 'content_hash', 'data_scope', 'requires', 'bundle')
-        return {'status': 'ready', 'data': {'authority_generation': generation, 'minimum_client_protocol': 2,
+        return {'status': 'ready', 'data': {'authority_generation': generation, 'minimum_client_protocol': 3,
                 'pages': [{key: page['data'][key] for key in keys if key in page['data']} for page in pages],
                 'tasks': [], 'next_task_after_id': None}}
 
@@ -384,7 +499,7 @@ class InstructionClientBoundaries(unittest.TestCase):
             post.return_value.__enter__.return_value = response
             self.client._post('/v1/memory/context', {}, 5)
         headers = post.call_args.kwargs['headers']
-        self.assertEqual(headers['x-maven-memory-protocol'], '2')
+        self.assertEqual(headers['x-maven-memory-protocol'], '3')
         self.assertIn('x-maven-memory-protocol', headers['Authorization'])
         self.assertFalse(post.call_args.kwargs['allow_redirects'])
 
@@ -479,6 +594,81 @@ class InstructionCliBoundaries(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertEqual(result['status'], 'instance_confirmation_mismatch')
             login.assert_not_called()
+            migrate.assert_not_called()
+
+    def test_both_migration_commands_accept_legacy_binding_without_rewriting_reviewed_configuration(self):
+        from tools.memory.environment import load_environment, memory_config
+        from tools.memory import bootstrap
+        for command in (['migrate'], ['install', 'migrate']):
+            for version in (1, 2):
+                with self.subTest(command=command, version=version), tempfile.TemporaryDirectory() as root:
+                    path = Path(root) / '.env'
+                    values = {'MAVEN_MEMORY_' + key.upper(): str(value) for key, value in CONFIG.items()}
+                    values['MAVEN_MEMORY_SCHEMA_VERSION'] = str(version)
+                    original = ''.join(key + '=' + json.dumps(value) + '\n' for key, value in values.items())
+                    path.write_text(original)
+                    path.chmod(0o600)
+                    session = MagicMock()
+                    with patch('tools.memory.admin.migrate', return_value={
+                            'status': 'ready', 'schema_version': 2, 'instance_id': CONFIG['instance_id']}) as migrate, \
+                            patch.object(cli, 'selected_session', return_value=session) as direct_select, \
+                            patch.object(bootstrap, 'selected_session', return_value=session) as install_select, \
+                            patch.object(bootstrap, 'MemoryClient') as factory:
+                        factory.return_value.load_context.return_value = {
+                            'data': {'authority_generation': 3, 'minimum_client_protocol': 3}}
+                        code, result = self.run_cli(
+                            ['--env', str(path), *command, '--confirm-instance', CONFIG['instance_id']])
+                    self.assertEqual((code, result['status'], result['schema_version']), (0, 'ready', 2))
+                    migrate.assert_called_once_with(CONFIG, session)
+                    selection = install_select if command[0] == 'install' else direct_select
+                    self.assertTrue(selection.call_args_list[0].kwargs['admin'])
+                    self.assertEqual(path.read_text(), original)
+                    self.assertEqual(load_environment(path), values)
+                    if version == 1:
+                        with self.assertRaisesRegex(MemoryClientError, '^invalid_configuration$'):
+                            memory_config(values)
+                    else:
+                        self.assertEqual(memory_config(values), CONFIG)
+
+    def test_migration_failure_or_mismatched_confirmation_never_rewrites_legacy_binding(self):
+        from tools.memory import bootstrap
+        for command in (['migrate'], ['install', 'migrate']):
+            for confirmed in (KEY, CONFIG['instance_id']):
+                with self.subTest(command=command, confirmed=confirmed), tempfile.TemporaryDirectory() as root:
+                    path = Path(root) / '.env'
+                    values = {'MAVEN_MEMORY_' + key.upper(): str(value) for key, value in CONFIG.items()}
+                    values['MAVEN_MEMORY_SCHEMA_VERSION'] = '1'
+                    original = ''.join(key + '=' + json.dumps(value) + '\n' for key, value in values.items())
+                    path.write_text(original)
+                    path.chmod(0o600)
+                    with patch('tools.memory.admin.migrate', side_effect=MemoryClientError('migration_refused')) as migrate, \
+                            patch.object(cli, 'selected_session') as direct_select, \
+                            patch.object(bootstrap, 'selected_session') as install_select, \
+                            patch.object(bootstrap, 'MemoryClient') as factory:
+                        code, result = self.run_cli(
+                            ['--env', str(path), *command, '--confirm-instance', confirmed])
+                    self.assertEqual(code, 2)
+                    self.assertEqual(path.read_text(), original)
+                    factory.assert_not_called()
+                    if confirmed == KEY:
+                        self.assertEqual(result['status'], 'instance_confirmation_mismatch')
+                        direct_select.assert_not_called()
+                        install_select.assert_not_called()
+                        migrate.assert_not_called()
+                    else:
+                        self.assertEqual(result['status'], 'migration_refused')
+                        migrate.assert_called_once()
+
+    def test_migration_does_not_relax_other_configuration_guards(self):
+        for changed in ({'schema_version': 3}, {'endpoint': 'https://example.invalid'}):
+            values = {'MAVEN_MEMORY_' + key.upper(): str(value)
+                      for key, value in {**CONFIG, 'schema_version': 1, **changed}.items()}
+            with self.subTest(changed=changed), patch.object(cli, 'load_environment', return_value=values), \
+                    patch.object(cli, 'selected_session') as select, \
+                    patch('tools.memory.admin.migrate') as migrate:
+                code, result = self.run_cli(['migrate', '--confirm-instance', CONFIG['instance_id']])
+            self.assertEqual((code, result), (2, {'status': 'invalid_configuration'}))
+            select.assert_not_called()
             migrate.assert_not_called()
 
     def test_load_dispatches_only_named_skill_and_explicit_test_mode(self):
@@ -591,31 +781,20 @@ class EnvironmentAndDisplayBoundaries(unittest.TestCase):
             factory.return_value.close.assert_called_once()
             self.assertEqual(json.loads(output.getvalue())['format'], 'maven-lossless-tree-v1')
 
-    def test_session_cli_records_actual_state_with_provenance_and_stable_key(self):
-        with patch('tools.memory.cli._connection', return_value=({}, CONFIG)), \
-             patch('tools.memory.cli.selected_session'), patch('tools.memory.cli.MemoryClient') as factory:
-            factory.return_value.invoke.return_value = {'status': 'ready', 'data': {'revision': 1}}
-            with redirect_stdout(io.StringIO()):
-                code = cli.main(['session', 'active', '--record-id', KEY, '--request-key', KEY,
-                                 '--expected-revision', '0', '--summary', 'Started actual work',
-                                 '--source-origin', 'owner work request', '--change-reason', 'Begin session'])
-            self.assertEqual(code, 0)
-            route, body = factory.return_value.invoke.call_args.args
-            self.assertEqual(route, '/v1/memory/write')
-            self.assertEqual(body['data'], {'state': 'active', 'summary': 'Started actual work'})
-            self.assertEqual(body['source'], {'origin': 'owner work request', 'excerpt': ''})
-            self.assertNotIn('project_id', body)
-            self.assertEqual(body['request_key'], KEY)
-
-    def test_project_session_cannot_bypass_managed_lifecycle(self):
-        with patch('tools.memory.cli._connection', return_value=({}, CONFIG)), \
-             patch('tools.memory.cli.selected_session'), patch('tools.memory.cli.MemoryClient') as factory:
+    def test_raw_record_cannot_bypass_managed_session_closure(self):
+        body = {'request_key': KEY, 'record_id': KEY, 'expected_revision': 1,
+                'kind': 'session', 'classification': 'Sensitive', 'data_scope': 'owner',
+                'project_id': KEY, 'data': {'state': 'closed', 'summary': 'Unverified closure'},
+                'source': {'origin': 'Owner conversation', 'excerpt': 'Close the session'},
+                'change_reason': 'Close the session'}
+        with tempfile.TemporaryDirectory() as directory, \
+                patch('tools.memory.cli._connection', return_value=({}, CONFIG)), \
+                patch('tools.memory.cli.selected_session'), patch('tools.memory.cli.MemoryClient') as factory:
+            path = Path(directory) / 'request.json'
+            path.write_text(json.dumps(body))
             output = io.StringIO()
             with redirect_stdout(output):
-                code = cli.main(['session', 'closed', '--project-id', KEY,
-                                 '--record-id', KEY, '--request-key', KEY,
-                                 '--expected-revision', '1', '--summary', 'Fixture close',
-                                 '--source-origin', 'fixture', '--change-reason', 'Fixture close'])
+                code = cli.main(['record', 'put', str(path), '--root', directory, '--session', KEY])
             self.assertEqual(code, 2)
             self.assertEqual(json.loads(output.getvalue())['status'], 'lifecycle_command_required')
             factory.return_value.invoke.assert_not_called()
@@ -722,7 +901,7 @@ class InstallationBoundaries(unittest.TestCase):
              patch.object(bootstrap, 'selected_session') as select, \
              patch.object(bootstrap, 'MemoryClient') as factory:
             factory.return_value.load_context.return_value = {
-                'data': {'authority_generation': 3, 'minimum_client_protocol': 2}}
+                'data': {'authority_generation': 3, 'minimum_client_protocol': 3}}
             result = bootstrap.initialize({}, confirm_instance=CONFIG['instance_id'], upgrade=True)
             migrate.assert_called_once()
             self.assertTrue(select.call_args_list[0].kwargs['admin'])

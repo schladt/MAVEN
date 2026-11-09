@@ -3,13 +3,68 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
+from uuid import uuid4
 
-from textual.widgets import Input
+from textual.widgets import Input, TextArea
 
 from tools.tui.app import ReviewScreen, WorkflowApp
+from tools.tui.administration import present
 
 
 class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_administration_handoff_is_visible_and_only_explicit_resume_advances(self):
+        for state, resume in (('blocked', False), ('uncertain', True)):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as directory:
+                home = Path(directory) / 'private home'
+                identifier = str(uuid4())
+                command = ['aws', 'login', '--profile', 'selected-owner']
+                cache = str(home / 'login cache')
+                error = 'Selected identity needs external authentication.'
+                reason = 'Authenticate privately, then return to this same operation.'
+                recovery = 'Do not replace the retained request receipt.'
+                result = {
+                    'operation_id': identifier, 'state': state, 'step': 'identity_inspect',
+                    'pending_interaction': None, 'error': error, 'recovery': recovery,
+                    'handoff': {'reason': reason, 'command': command,
+                                'environment': {'AWS_LOGIN_CACHE_DIRECTORY': cache}},
+                }
+                controller = Mock()
+                controller.status.return_value = result
+                controller.advance.return_value = {
+                    'operation_id': identifier, 'state': 'completed', 'step': 'done',
+                    'pending_interaction': None, 'outcome': 'Ready',
+                }
+                with patch('tools.tui.administration.AdminOperations', return_value=controller):
+                    app = WorkflowApp('Administration', ['identity_inspect', 'done'],
+                                      lambda ui: present(ui, home, operation_id=identifier))
+                    async with app.run_test(size=(100, 34)) as pilot:
+                        await pilot.pause()
+                        self.assertIsInstance(app.screen, ReviewScreen)
+                        body = app.screen.query_one('#review-body', TextArea)
+                        self.assertTrue(body.is_on_screen)
+                        self.assertTrue(body.read_only)
+                        # These are the actual handoff values in the active modal,
+                        # not a snapshot of incidental presenter wording.
+                        for value in (error, reason, recovery, ' '.join(command),
+                                      'AWS_LOGIN_CACHE_DIRECTORY', cache, str(home), identifier):
+                            self.assertIn(value, body.text)
+                        self.assertIn('--operation ' + identifier, body.text)
+                        self.assertIn('--home', body.text)
+                        self.assertIn('maven-setup', body.text)
+                        controller.advance.assert_not_called()
+                        await pilot.click('#accept' if resume else '#decline')
+                        await pilot.pause()
+                        if resume:
+                            controller.advance.assert_called_once_with(identifier)
+                            self.assertEqual(app.exit_code, 0)
+                        else:
+                            controller.advance.assert_not_called()
+                            self.assertEqual(app.exit_code, 130)
+                        controller.respond.assert_not_called()
+                        self.assertEqual(result['state'], state)
+                        await pilot.press('ctrl+q')
+
     async def test_destructive_action_requires_exact_six_character_or_short_identity(self):
         for identity in ('abcdef-long-target-identity', 'abc'):
             with self.subTest(identity=identity), tempfile.TemporaryDirectory() as directory:

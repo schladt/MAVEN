@@ -118,7 +118,7 @@ def _lock(path):
         os.close(fd)
 
 
-def record_installation(home, source, owned_paths, skill_references, *, cache_roots=()):
+def record_installation(home, source, owned_paths, skill_references, *, cache_roots=(), integrations=()):
     """Installer receipt; only newly created or explicitly upgraded owned paths."""
     home = checked_path(home)
     target = home / MANIFEST
@@ -137,8 +137,22 @@ def record_installation(home, source, owned_paths, skill_references, *, cache_ro
         if path not in (home / 'runtime/aws-login-cache', home / 'runtime/aws-deploy-login-cache'):
             raise UninstallError('Only installer-created dedicated cache directories can be owned')
         caches[str(path)] = _entry(path)
+    previous_integrations = prior.get('integrations', []) if prior.get('active', True) else []
+    integration_map = {(item['path'], item['format'], item['key']): item
+                       for item in previous_integrations}
+    for item in integrations:
+        key = (item['path'], item['format'], item['key'])
+        previous = integration_map.get(key)
+        if previous and previous.get('owned', True) and item.get('owned') is False:
+            left, right = previous['value'], item['value']
+            if item['format'] == 'text-block':
+                left, right = left.lstrip('\n'), right.lstrip('\n')
+            if left == right:
+                continue  # Keep the original exact ownership/removal receipt.
+        integration_map[key] = item
     save_private(target, {'schema': 1, 'home': str(home), 'source': str(source),
-                          'owned': owned, 'skill_references': references, 'cache_roots': caches, 'active': True})
+                          'owned': owned, 'skill_references': references, 'cache_roots': caches,
+                          'integrations': list(integration_map.values()), 'active': True})
     registry = _registry_path()
     with _lock(registry.with_suffix('.lock')):
         value = read_private(registry) if _exists(registry) else {'schema': 1, 'homes': []}
@@ -318,6 +332,7 @@ def plan_machine(home, *, selected_homes=(), offline=False, export=None, adopt_l
         fragment['warnings'].append('Explicit legacy adoption approves the complete reviewed dedicated MAVEN virtual-environment inventory; no other legacy artifact is claimed.')
     elif not manifest:
         fragment['warnings'].append('Legacy/unowned runtime retained. Explicit --adopt-legacy can review and remove a verified dedicated MAVEN virtual environment.')
+    _plan_integrations(fragment, home, manifest, selected_homes)
     _plan_caches(fragment, home, manifest, selected_homes)
     for child in sorted(home.iterdir()):
         if export is not None and child.name == '.env':
@@ -557,6 +572,8 @@ def execute(action, progress, save):
             raise UninstallError('Persistent local removal barrier is missing')
         if kind == 'local_machine_finalize':
             return _finalize_machine(action, progress, save)
+        if kind == 'local_integration':
+            return _remove_integration(action, progress, save)
         if kind == 'local_remove':
             if details.get('manifest') is not None and file_digest(home / MANIFEST) != details['manifest']:
                 raise UninstallError('Installer ownership changed; approval invalid')
@@ -1005,3 +1022,73 @@ def _sharing_locks(home, selected_homes):
             stack.enter_context(_lock(other / 'runtime/registry.lock'))
             stack.enter_context(_lock(other / 'runtime/setup/lock'))
         yield
+
+
+def _integration_references(home, selected_homes):
+    selected = {str(home), *(str(checked_path(item, exists=False)) for item in selected_homes)}
+    references, uncertain = set(), False
+    for candidate in discover_homes(selected):
+        if candidate in selected:
+            continue
+        try:
+            manifest = read_private(Path(candidate) / MANIFEST)
+            if manifest.get('active', True):
+                references.update(item['path'] for item in manifest.get('integrations', []))
+        except (OSError, ValueError, UninstallError):
+            uncertain = True
+    return references, uncertain
+
+
+def _plan_integrations(fragment, home, manifest, selected_homes):
+    from tools.harness import removal_content
+    shared, uncertain = _integration_references(home, selected_homes)
+    for receipt in manifest.get('integrations', []):
+        path = receipt['path']
+        if not receipt.get('owned', True):
+            fragment['retained'].append({'path': path, 'reason': 'Referenced existing integration; not owned by this installation'})
+            continue
+        try:
+            if uncertain or path in shared:
+                raise UninstallError('Integration is shared or unselected installation ownership is uncertain')
+            after = removal_content(receipt)
+            if after is None:
+                continue
+            expected = inventory(Path(path))
+        except (OSError, ValueError, UninstallError) as error:
+            fragment['retained'].append({'path': path, 'reason': str(error)})
+            continue
+        fragment['actions'].append(_action('local_integration', path, 85,
+            home=str(home), root=None, receipt=receipt, inventory=expected,
+            after_sha256=hashlib.sha256(after).hexdigest(),
+            manifest=file_digest(home / MANIFEST),
+            selected_homes=[str(checked_path(item, exists=False)) for item in selected_homes]))
+
+
+def _remove_integration(action, progress, save):
+    from tools.harness import removal_content, remove_integration
+    details = action['details']
+    home, path = Path(details['home']), Path(action['target'])
+    with _sharing_locks(home, details['selected_homes']):
+        shared, uncertain = _integration_references(home, details['selected_homes'])
+        if uncertain or str(path) in shared:
+            raise UninstallError('Integration acquired a shared dependency; preserve and re-plan')
+        if file_digest(home / MANIFEST) != details['manifest']:
+            raise UninstallError('Integration ownership changed; approval invalid')
+        current = inventory(path) if _exists(path) else {}
+        if current != details['inventory']:
+            # Reconciliation verifies the exact reviewed result, including edits
+            # performed by another selected home's identical removal action.
+            empty_owned_file = (details['receipt']['created']
+                                and details['after_sha256'] == hashlib.sha256(b'').hexdigest())
+            if ((_exists(path) and file_digest(path) == details['after_sha256'])
+                    or (not _exists(path) and empty_owned_file)):
+                return {'status': 'removed', 'unrelated_content_preserved': True,
+                        'already_at_reviewed_result': True}
+            raise UninstallError('Integration changed after review; no unrelated content removed')
+        after = removal_content(details['receipt'])
+        if after is None or hashlib.sha256(after).hexdigest() != details['after_sha256']:
+            raise UninstallError('Selective integration removal differs from reviewed content')
+        progress['intent'] = 'remove exact integration'
+        save()
+        result = remove_integration(details['receipt'])
+        return {'status': 'removed', **result}

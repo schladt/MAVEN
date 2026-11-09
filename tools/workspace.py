@@ -74,6 +74,33 @@ def copy_original(root, source, target, expected, initial):
     return target
 
 
+class WorkspaceMemory(MemoryBoundary):
+    """Keep workspace receipts inside the same maintenance cutoff as ordinary notes."""
+    def __init__(self, service):
+        from tools.memory.maintenance import Maintenance
+        super().__init__(service.client, service.root, service.project_id, service.session_id)
+        self.service = service
+        self.maintenance = Maintenance(service)
+
+    def write(self, kind, data, *, record_id=None, expected_revision=0, tags=(),
+              reason='Record managed work', source=None, scope='project', request_key=None):
+        from tools.memory.boundary import digest
+        record_id = record_id or str(uuid.uuid4())
+        source = source if source is not None else {
+            'origin': 'governed-workspace', 'excerpt': 'Explicit workspace operation: ' + reason}
+        operation_id = str(uuid.uuid5(uuid.UUID(self.session_id), 'workspace-write:' + digest({
+            'record_id': record_id, 'expected_revision': expected_revision, 'kind': kind,
+            'data': data, 'tags': list(tags), 'source': source, 'reason': reason, 'scope': scope,
+            'request_key': request_key})))
+        result = self.maintenance.save(
+            kind, data, source=source, record_id=record_id, expected_revision=expected_revision,
+            tags=tags, reason=reason, scope=scope, request_key=request_key, operation_id=operation_id)
+        refs = [ref for ref in result['assignment']['saved_refs'] if ref['record_id'] == record_id]
+        if result.get('cloud_saved') is not True or len(refs) != 1:
+            raise BoundaryError('workspace memory mutation has no exact verified receipt')
+        return self.service.read_record(record_id, revision=refs[0]['revision'], scope=scope)
+
+
 class Workspace:
     def __init__(self, memory):
         self.memory = memory
@@ -248,7 +275,7 @@ class Workspace:
         if not isinstance(fields, dict) or set(fields) != set(SECTIONS) or not all(isinstance(v, str) for v in fields.values()):
             raise BoundaryError('status requires all explicit publishable sections; internal content is never a fallback')
         rendered = '# Team Status\n\n' + '\n\n'.join('## ' + section + '\n\n' + fields[section] for section in SECTIONS) + '\n'
-        from tools.workflow import SECRET_PATTERNS
+        from tools.git_workflow import SECRET_PATTERNS
         if any(pattern.search(rendered) for _, pattern in SECRET_PATTERNS):
             raise BoundaryError('publishable status contains a possible secret; no output generated')
         warnings = []
@@ -297,8 +324,9 @@ class Workspace:
 def main(argv=None):
     from tools.memory.client import MemoryClientError, read_json
     from tools.memory.environment import configured_client
-    from tools.project import default_environment, load_project
-    from tools.coordination import SessionRegistry, session_lock
+    from tools.project import default_environment
+    from tools.coordination import SessionRegistry
+    from tools.memory.lifecycle import SessionService
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--session', required=True, help='active MAVEN session UUID')
@@ -309,9 +337,9 @@ def main(argv=None):
     client = None
     try:
         root = args.root.resolve()
-        project = load_project(root)
         client = configured_client(args.env)
-        workspace = Workspace(MemoryBoundary(client, root, project['project_id'], args.session))
+        service = SessionService(root, args.session, env=args.env, client=client)
+        workspace = Workspace(WorkspaceMemory(service))
         if args.action == 'intake-pending':
             report = workspace.pending()
         else:
@@ -321,7 +349,7 @@ def main(argv=None):
             if not args.request.is_file() or args.request.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
                 raise BoundaryError('workspace request must be an owner-private regular file')
             body = read_json(args.request)
-            with session_lock(root, args.session), SessionRegistry().writer(root, args.session), workspace_lock(root):
+            with SessionRegistry(args.env.expanduser().resolve().parent).writer(root, args.session), workspace_lock(root):
                 report = getattr(workspace, args.action.replace('-', '_'))(**body)
         print(json.dumps(report, indent=2, sort_keys=True))
         return 0 if report.get('current', True) else 2

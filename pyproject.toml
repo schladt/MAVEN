@@ -18,6 +18,7 @@ dependencies = [
 [project.optional-dependencies]
 ui = ["textual>=2.1,<3", "packaging>=24,<27"]
 google = ["google-auth-oauthlib>=1.2,<2", "google-api-python-client>=2,<3"]
+mcp = ["mcp>=2.3,<3"]
 
 [project.scripts]
 maven-setup = "tools.setup:main"
@@ -31,11 +32,13 @@ maven-checkpoint = "tools.workflow:checkpoint_main"
 maven-stop-work = "tools.workflow:stop_main"
 maven-workflow = "tools.workflow:main"
 maven-uninstall = "tools.uninstall.cli:main"
+maven-mcp = "tools.mcp.server:main"
+maven-git = "tools.git_workflow:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["tools", "tools.*", "maven_resources"]
 
 [tool.setuptools.package-data]
-maven_resources = ["config/*.json", "templates/*.example", "templates/skills/*/SKILL.md", "templates/authority/*.md", "templates/authority/*.json", "infra/memory/*.json"]
+maven_resources = ["config/*.json", "templates/*.example", "templates/skills/*/SKILL.md", "templates/harness/*.md", "templates/authority/*.md", "templates/authority/*.json", "infra/memory/*.json"]
 "tools.memory" = ["migrations/*.sql"]

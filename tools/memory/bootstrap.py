@@ -177,13 +177,15 @@ def _outputs(stack):
         raise MemoryClientError('invalid_stack_outputs') from None
 
 
-def connect(values, environment_path, *, confirm_instance, cloud=None):
+def connect(values, environment_path, *, confirm_instance, cloud=None, reviewed_config=None):
     """Bind reviewed stack outputs into the existing private config, never credentials."""
     cloud = _cloud(values) if cloud is None else cloud
     stacks = cloud.describe_stacks(StackName=values['MAVEN_STACK_NAME'])['Stacks']
     if len(stacks) != 1 or stacks[0].get('StackStatus') not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE'):
         raise MemoryClientError('stack_not_ready')
     config = _outputs(stacks[0])
+    if reviewed_config is not None and config != reviewed_config:
+        raise MemoryClientError('reviewed_connection_changed')
     if config['instance_id'] != confirm_instance:
         raise MemoryClientError('instance_confirmation_mismatch')
     for field in ('instance_id', 'recovery_epoch'):
@@ -262,8 +264,8 @@ def apply(values, package, review_path, environment_path, *, confirm_review, bud
 
 def initialize(values, *, confirm_instance, upgrade=False):
     from .admin import bootstrap, migrate
-    from .environment import memory_config
-    config = memory_config(values)
+    from .environment import memory_config, migration_config
+    config = migration_config(values) if upgrade else memory_config(values)
     if config['instance_id'] != confirm_instance:
         raise MemoryClientError('instance_confirmation_mismatch')
     operation = migrate if upgrade else bootstrap

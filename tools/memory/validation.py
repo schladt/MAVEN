@@ -19,6 +19,10 @@ MUTATION_ROUTES = {"/v1/records/change", "/v1/proposals/create", "/v1/proposals/
 ROUTES = {"/v1/records/change", "/v1/records/query", "/v1/operations/lookup",
           "/v1/proposals/create", "/v1/pages/index", "/v1/pages/read"} | APPROVAL_ROUTES | MEMORY_ROUTES
 
+# Version 2 requires migration 012 and memory-native checkpoint/scope contracts.
+SCHEMA_VERSION = 2
+CLIENT_PROTOCOL = 3
+
 
 def request_limit(route):
     if route == "/v1/memory/write":
@@ -278,8 +282,10 @@ def _memory_data(kind, data, request):
         "session": ({"state", "summary"}, {"workflow", "operation"}),
         "operation": ({"session_id", "name", "state", "summary"}, set()),
         "setting": ({"key", "value", "scope"}, {"secret_ref"}),
-        "checkpoint": ({"session_id", "candidate_digest", "git_base", "memory_refs", "state"},
-                       {"final_commit", "summary"}),
+        "checkpoint": (({"session_id", "cutoff", "memory_refs", "state"}, {"summary"})
+                       if isinstance(data, dict) and "cutoff" in data else
+                       ({"session_id", "candidate_digest", "git_base", "memory_refs", "state"},
+                        {"final_commit", "summary"})),
     }
     fields(data, *schemas[kind])
     if len(canonical(data).encode("utf-8")) > 147456:
@@ -299,7 +305,8 @@ def _memory_data(kind, data, request):
               "decision": {"proposed", "accepted", "superseded"}, "risk": {"open", "mitigated", "closed"},
               "session": {"active", "closed", "abandoned"},
               "operation": {"started", "completed", "failed", "blocked"},
-              "checkpoint": {"prepared", "committed", "aborted"}}
+              "checkpoint": ({"prepared", "saved", "aborted"} if "cutoff" in data
+                             else {"prepared", "committed", "aborted"})}
     if kind in states and (not isinstance(data["state"], str) or data["state"] not in states[kind]):
         invalid()
     if kind == "entity":
@@ -321,13 +328,16 @@ def _memory_data(kind, data, request):
             if not re.fullmatch(r"[A-Za-z0-9_./:@+=-]+", data["secret_ref"]["name"]):
                 invalid()
     if kind == "checkpoint":
-        if not isinstance(data["candidate_digest"], str) or not re.fullmatch(r"[0-9a-f]{64}", data["candidate_digest"]):
-            invalid()
-        for key in ("git_base", "final_commit"):
-            if key in data and (not isinstance(data[key], str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", data[key])):
+        if "cutoff" in data:
+            nonnegative_integer(data["cutoff"])
+        else:
+            if not isinstance(data["candidate_digest"], str) or not re.fullmatch(r"[0-9a-f]{64}", data["candidate_digest"]):
                 invalid()
-        if (data["state"] == "committed") != ("final_commit" in data):
-            invalid()
+            for key in ("git_base", "final_commit"):
+                if key in data and (not isinstance(data[key], str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", data[key])):
+                    invalid()
+            if (data["state"] == "committed") != ("final_commit" in data):
+                invalid()
         refs = data["memory_refs"]
         if not isinstance(refs, list) or len(refs) > 100:
             invalid()
@@ -364,7 +374,14 @@ def _memory(route, value):
         if "revision" in value:
             revision(value["revision"])
     elif action == "search":
-        fields(value, (), {"kind", "project_id", "query", "tag", "subject_id", "state", "after_id", "limit"})
+        fields(value, (), {"kind", "project_id", "scope", "query", "tag", "subject_id", "state", "after_id", "limit"})
+        if "scope" in value:
+            if value["scope"] not in ("project", "universal", "context", "all"):
+                invalid()
+            if value["scope"] == "project" and "project_id" not in value:
+                invalid()
+            if value["scope"] in ("universal", "all") and "project_id" in value:
+                invalid()
         if "kind" in value and (not isinstance(value["kind"], str) or value["kind"] not in MEMORY_KINDS):
             invalid()
         for key in ("project_id", "subject_id", "after_id"):

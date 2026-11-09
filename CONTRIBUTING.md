@@ -8,11 +8,10 @@ publication, durable records or concurrency before changing their contracts.
 
 For first-time use, follow the [guided installer](README.md#install-and-set-up):
 `python3 install.py` creates its own private environment and offers instance setup.
-The project step is optional: open OMP in an explicitly chosen project and invoke
-`/skill:maven-start-work` to obtain first-use project choices in chat. Configured
-projects retain their selection; new harness sessions get distinct MAVEN sessions.
-Use `/skill:maven-checkpoint` and `/skill:maven-stop-work` for exact approval and
-peer-aware closure, not a required out-of-harness terminal ritual.
+The project step is optional: enable an explicitly chosen folder in your supported
+assistant. Configured projects retain their selection; new work sessions get distinct
+MAVEN identities. Conversation through stdio MCP is the normal path; CLI/TUI remain
+recovery surfaces. Memory checkpoints and closure never implicitly publish source.
 
 No preexisting `.venv` or project `.maven` directory is required. The MAVEN source
 checkout is not automatically a development project: explicitly choose/approve that
@@ -20,15 +19,12 @@ root before registration. Filesystem `/` is never valid. For local package
 installation without the cloud wizard, use `python3 install.py --local-only`.
 The development environment below is a separate, optional contributor workflow.
 
-Use a virtual environment with Python 3.11 or newer:
+Use the existing Python 3.11+ environment with the required optional extras. Install
+`.[mcp,ui]` for MCP/UI development, and select focused existing tests for the affected
+behavior. Do not create a separate test environment or deploy cloud resources merely
+to verify changes. Core recovery must not import MCP, UI or model dependencies.
 
-```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -e '.[ui]'
-.venv/bin/python -m unittest discover -s tests
-```
-
-Install `-e '.[ui,google]'` instead to exercise the optional Google tests. Those tests
+Include the `google` extra only to exercise optional Google behavior. Those tests
 use synthetic accounts and mocked services; no live Google access is required.
 Keep a separate private `MAVEN_HOME` for any explicitly authorized manual work.
 The repository must not contain your environment file, credentials, runtime state,
@@ -68,9 +64,14 @@ work using system Python without importing Textual or AWS packages.
 ## Change requirements
 
 - Preserve explicit project/session selection and complete cloud-authority loading.
-- Keep packaged lifecycle skills thin wrappers over the existing CLI. Bind the
-  absolute root and returned MAVEN UUID to one harness session across cwd changes;
-  no global current-session file, guessed OMP identity or implicit resume.
+- Keep bootstrap guidance intent-based and thin over shared controllers via MCP.
+  Bind root and returned MAVEN identity to the work session across cwd changes;
+  no global current-session file, guessed harness identity or implicit resume.
+- Preserve non-Git memory, explicit scope selection, source-linked promotion,
+  assignment supersession, checkpoint cutoffs and both resume modes. Native background
+  reasoning is a harness capability, not an MCP or deterministic-worker feature.
+- Keep service/schema rollout and exact active-policy approval separate from local
+  implementation. Preserve historical checkpoints and pending recovery implementations.
 - Keep instance setup separate from additional-project setup. Noninteractive
   creation needs explicit owner choices and genuine source evidence, and generated
   IDs must be journaled before mutation. Preserve legacy pending-request identities.
@@ -91,6 +92,12 @@ work using system Python without importing Textual or AWS packages.
 - Use only invented fixtures and reserved example domains. Do not paste private
   instructions, source histories, customer data, real resource IDs or token-shaped
   values into issues, tests, logs or documentation.
+
+For MCP changes, use the real stdio adapter/SDK client with simulated storage and the
+existing environment. Verify discovery, representative calls and shutdown without
+printing non-protocol text to stdout. Record exact harness/runtime combinations
+actually exercised; documented configuration is not a runtime interoperability test.
+SQL migration runtime validation and live-cloud deployment are separate evidence.
 
 Describe the behavior changed, checks actually run, and any untested external
 assumptions in your contribution. Do not claim a successful deployment or workflow

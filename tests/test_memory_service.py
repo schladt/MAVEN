@@ -23,7 +23,7 @@ CONFIG = {"cluster_arn": "arn:aws:rds:us-east-1:123456789012:cluster:synthetic",
           "instance_id": INSTANCE, "recovery_epoch": EPOCH, "client_role_arn": ROLE,
           "admin_role_arn": "arn:aws:iam::123456789012:role/memory-admin",
           "approval_role_arn": APPROVAL_ROLE,
-          "region": "us-east-1", "endpoint": "https://example.invalid", "schema_version": 1}
+          "region": "us-east-1", "endpoint": "https://example.invalid", "schema_version": 2}
 
 
 def change():
@@ -52,6 +52,7 @@ def resolution():
 
 def event(body=None, path="/v1/records/change"):
     return {"rawPath": path, "rawQueryString": "", "body": json.dumps(change() if body is None else body),
+            "headers": {"x-maven-memory-protocol": "3"},
             "requestContext": {"http": {"method": "POST"},
                                "authorizer": {"iam": {"userArn": ACTOR}}}}
 
@@ -277,7 +278,7 @@ class HandlerTests(unittest.TestCase):
         body = proposal()
         body["data_scope"] = "owner"
         self.assertEqual(service.handler(event(body, "/v1/proposals/create"), None)["statusCode"], 200)
-        self.factory.return_value.perform.assert_called_once_with("/v1/proposals/create", body, ACTOR, client_protocol=1)
+        self.factory.return_value.perform.assert_called_once_with("/v1/proposals/create", body, ACTOR, client_protocol=3)
         self.factory.reset_mock()
         body = change()
         body["data_scope"] = "owner"
@@ -315,7 +316,7 @@ class HandlerTests(unittest.TestCase):
             request = event(body, path)
             request["requestContext"]["authorizer"]["iam"]["userArn"] = APPROVAL_ACTOR
             self.assertEqual(service.handler(request, None)["statusCode"], 200)
-            self.factory.return_value.perform.assert_called_with(path, body, APPROVAL_ACTOR, client_protocol=1)
+            self.factory.return_value.perform.assert_called_with(path, body, APPROVAL_ACTOR, client_protocol=3)
 
     def test_lookup_allows_either_role_but_ordinary_routes_require_client(self):
         self.factory.return_value.perform.return_value = {}
@@ -351,7 +352,7 @@ class HandlerTests(unittest.TestCase):
                 request["body"] = base64.b64encode(request["body"].encode()).decode()
                 request["isBase64Encoded"] = True
             self.assertEqual(service.handler(request, None)["statusCode"], 200)
-            self.factory.return_value.perform.assert_called_with("/v1/proposals/create", body, ACTOR, client_protocol=1)
+            self.factory.return_value.perform.assert_called_with("/v1/proposals/create", body, ACTOR, client_protocol=3)
 
     def test_raw_request_size_and_encoding_fail_closed(self):
         for path, maximum in [("/v1/records/change", 8192),
@@ -494,7 +495,7 @@ class AdminContractTests(unittest.TestCase):
         db.transaction.return_value.__exit__ = Mock(return_value=False)
         bundle = admin.migrations()
         installed = {name: sha for name, sha, _ in bundle[:4]}
-        state = {**store.control_document(CONFIG, "ready"), "data_scope": "synthetic",
+        state = {**store.control_document(CONFIG, "ready"), "data_scope": "synthetic", "schema_version": 1,
                  "app_secret_arn": CONFIG["app_secret_arn"], "app_secret_version": "v1"}
         db.scalar.side_effect = [True, True, json.dumps(installed), json.dumps(state)]
         secrets = Mock()
