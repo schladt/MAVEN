@@ -246,19 +246,12 @@ class Wizard:
             package = self.directory / 'package'
             has_package = package.exists()
             updates = {'MAVEN_ACCOUNT_ID': account, 'MAVEN_CALLER_PRINCIPAL_ARN': caller}
-            specifications = (
-                ('MAVEN_STACK_NAME', 'New CloudFormation stack name', ''),
-                ('MAVEN_INSTANCE_NAME', 'Instance name (2–32 lowercase letters/digits/hyphens)', ''),
-                ('MAVEN_NOTIFICATION_EMAIL', 'Notification email', ''),
-                ('MAVEN_AVAILABILITY_ZONES', 'Two distinct reviewed us-east-1 AZs, comma-separated', ''),
-                ('MAVEN_ENGINE_VERSION', 'Reviewed Aurora PostgreSQL 18 patch >=18.3', '18.6'),
-            )
+            from tools.setup_common import provision_fields
+            fields = provision_fields(self.values)
             stage('Deployment review')
             if has_package:
-                updates.update({key: self.values.get(key) for key, _, _ in specifications})
+                updates.update({field.name: self.values.get(field.name) for field in fields})
             else:
-                fields = [Field(key, label, self.values.get(key) or default)
-                          for key, label, default in specifications]
                 selected = require().form('New instance provisioning', fields,
                                           description='Select actual account/region-supported AZs and engine patch. Confirm the notification subscription when it arrives.')
                 if selected is None:
@@ -361,7 +354,8 @@ class Wizard:
         from tools.memory import onboarding
         stage('Starter authority')
         from tools.memory.environment import configured_client
-        from tools.memory.validation import digest, validate_create, validate_resolve
+        from tools.memory.validation import digest, validate_resolve
+        from tools.setup_starter import collection, prepare, summary
         self.preflight('routine')
         self.preflight('authority')
         directory = self.directory / 'starter'
@@ -373,31 +367,38 @@ class Wizard:
             approve(f'Offline starter preparation was interrupted before submission. Preserve {directory} as {archived} and prepare a fresh, unsubmitted review set?', 'REBUILD OFFLINE')
             directory.rename(archived)
         if not directory.exists():
-            if not confirm('Prepare generic starter authority for this new instance (offline, not yet active)?'):
-                raise SetupPending('Fresh-instance starter authority remains unconfigured.')
-            onboarding.prepare(directory, source_origin='owner terminal setup',
-                               source_excerpt='Owner requested the generic starter proposals for the newly deployed instance.')
-        manifest = read_private(directory / 'manifest.json')
+            prepare(directory)
+        review = collection(directory, self.values)
         completed = self.state.setdefault('starter_completed', [])
-        if all(page['slug'] in completed for page in manifest['pages']):
+        slugs = [page['candidate']['slug'] for page in review['pages']]
+        if completed != slugs[:len(completed)]:
+            raise SetupPending('Saved starter progress differs from the ordered collection; preserve the original receipts.')
+        if len(completed) == len(slugs):
             return
-        if not confirm('This is the newly deployed instance and no active harness is using it. Continue reviewing its starter authority?'):
-            raise SetupPending('Starter activation paused; no active harness authority is changed.')
-        for page in manifest['pages']:
-            slug = page['slug']
-            if not re.fullmatch(r'[a-z0-9][a-z0-9-]*', slug) or page['file'] != slug + '.json':
-                raise SetupPending('Invalid starter artifact path; preserve the package for inspection.')
-            draft_path = directory / page['file']
-            draft = validate_create(read_private(draft_path))
+        approved = self.state.get('starter_collection_approval')
+        if approved is None:
+            if not require().review('Install all starter instructions — one approval',
+                                    summary(review, len(completed)),
+                                    details=json.dumps(review, ensure_ascii=False, indent=2),
+                                    identity=digest(review), identity_label='Collection digest'):
+                raise SetupPending('Starter collection approval declined; no remaining instructions were activated.')
+            approved = {'review_digest': digest(review), 'source': {
+                'origin': 'owner MAVEN setup TUI',
+                'excerpt': 'Owner approved uploading and activating the complete starter collection / digest ' + digest(review)}}
+            self.state['starter_collection_approval'] = approved
+            self.save()
+        if approved['review_digest'] != digest(review):
+            raise SetupPending('Starter contents or connection changed; the saved collection approval cannot be reused.')
+        for draft in review['pages']:
+            checkpoint()
+            if digest(collection(directory, self.values)) != approved['review_digest']:
+                raise SetupPending('Starter collection changed during execution; preserve its original approval and requests.')
+            slug = draft['candidate']['slug']
+            draft_path = directory / (slug + '.json')
             candidate_hash = digest(draft['candidate'])
-            if (candidate_hash != page['candidate_hash'] or draft['proposal_id'] != page['proposal_id']
-                    or draft['page_id'] != page['page_id'] or draft['request_key'] != page['request_key']):
-                raise SetupPending('Starter candidate changed; refusing to submit or activate it.')
             if slug in completed:
                 continue
-            candidate_body = json.dumps(draft, ensure_ascii=False, indent=2)
-            approve('Propose this exact starter candidate (not activation). Review its complete body, scope and dependencies.',
-                    candidate_hash, body=candidate_body)
+            stage(f'Install starter instructions — {len(completed) + 1}/{len(slugs)}: ' + draft['candidate']['title'])
             self.state['starter_submitted'] = True
             self.save()
             client = configured_client(self.env, values=self.values)
@@ -409,8 +410,6 @@ class Wizard:
                     raise SetupPending('Cloud proposal does not match the reviewed candidate.')
             finally:
                 client.close()
-            approve('Activate this exact candidate through the separate approval role? Its instructions become operative in this new instance.',
-                    candidate_hash, body=candidate_body)
             selection = self.state.setdefault('starter_approvals', {})
             name = selection.get(slug, slug + '.approval.json')
             if Path(name).name != name:
@@ -425,8 +424,8 @@ class Wizard:
                         challenge_path = approval_path.with_suffix('.challenge.json')
                         save_json(challenge_path, challenge)
                         onboarding.approval(draft_path, challenge_path, approval_path,
-                                            approval_origin='owner MAVEN setup TUI',
-                                            approval_excerpt='Owner approved activation using the review button after viewing the complete candidate, scope and dependencies. Candidate SHA256: ' + candidate_hash)
+                                            approval_origin=approved['source']['origin'],
+                                            approval_excerpt=approved['source']['excerpt'])
                     selection[slug] = approval_path.name
                     self.save()
                     request = validate_resolve(read_private(approval_path))
@@ -440,7 +439,6 @@ class Wizard:
                     except MemoryClientError as exc:
                         if exc.code != 'approval_invalid' or attempt:
                             raise
-                        approve('The service definitively rejected this approval (for example, an expired challenge). Preserve it and authorize a new challenge for the SAME exact candidate? Unknown outcomes are never renewed.', 'RENEW ' + candidate_hash)
                         approval_path = directory / (slug + '.approval.' + str(uuid4()) + '.json')
                         # Save the next artifact name before creating it; never lose an approval request.
                         selection[slug] = approval_path.name
@@ -559,9 +557,10 @@ def _present(ui, args, home):
                 from tools.tui.harness import finish_setup
                 wizard = Wizard(home)
                 return finish_setup(ui, home, {'home': str(home), 'account': expected_account(wizard.values),
-                    'region': wizard.values.get('MAVEN_AWS_REGION'), 'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
+                    'region': wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'), 'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
                     'profile': wizard.values.get('MAVEN_AWS_PROFILE'), 'instance_ready': True,
-                    'authority_generation': wizard.state['authority_generation'], 'project_configured': False})
+                    'authority_generation': wizard.state['authority_generation'], 'project_configured': False,
+                    'binding': dict(wizard.values)})
             return result
     previous = AdminOperations(home).status(identifier) if identifier else None
     if previous and previous['kind'] != 'setup':
@@ -571,7 +570,14 @@ def _present(ui, args, home):
         for receipt in previous['receipts'])
     if args.fresh_operation and previous and not verified:
         raise SetupPending('Cannot start fresh while the saved operation is unfinished or unverified. Resume its exact UUID; original requests and receipts are retained.')
-    if args.fresh_operation or verified:
+    if verified and not args.fresh_operation:
+        from tools.tui.harness import completed_setup_outcome, finish_setup
+        try:
+            outcome = completed_setup_outcome(home, previous)
+        except ValueError as error:
+            raise SetupPending(str(error)) from error
+        return finish_setup(ui, home, outcome)
+    if args.fresh_operation:
         if not ui.review('Start a new instance check/repair operation?',
                          'Home: ' + str(home) + '\nPrevious operation: ' + str(identifier or 'None') +
                          '\nMode: ' + (args.mode or 'existing') +

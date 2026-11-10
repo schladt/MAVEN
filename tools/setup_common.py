@@ -14,6 +14,25 @@ class SetupPending(Exception):
     """A safe stop, not a successful setup."""
 
 
+def provision_fields(values=None):
+    """Editable deployment suggestions; none assert live AWS availability."""
+    from dataclasses import replace
+    fields = [
+        Field('MAVEN_STACK_NAME', 'New CloudFormation stack name',
+              help='AWS uses this name to manage the deployment as one group of resources.'),
+        Field('MAVEN_INSTANCE_NAME', 'MAVEN instance name',
+              default_from='MAVEN_STACK_NAME', pattern=r'[a-z][a-z0-9-]{0,30}[a-z0-9]',
+              help='Defaults to the stack name when compatible; edit to override. Use 2–32 lowercase letters, digits or hyphens; start with a letter and end with a letter or digit. If the stack name does not fit, enter a separate instance name.'),
+        Field('MAVEN_NOTIFICATION_EMAIL', 'Notification email'),
+        Field('MAVEN_AVAILABILITY_ZONES', 'Two distinct us-east-1 zones, comma-separated',
+              'us-east-1a, us-east-1b',
+              help='Suggested zones, not verified for your account. Confirm availability and edit if needed; spaces after commas are accepted.'),
+        Field('MAVEN_ENGINE_VERSION', 'Aurora PostgreSQL version', '18.6',
+              help='Suggested version, not verified as available in AWS. Confirm regional availability and Data API/auto-pause support. MAVEN requires PostgreSQL 18 patch >=18.3.'),
+    ]
+    return [replace(field, default=(values or {}).get(field.name) or field.default) for field in fields]
+
+
 def ask(prompt, default=None):
     values = require().form(prompt, [Field('value', prompt, default or '')])
     if values is None:

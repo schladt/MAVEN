@@ -16,6 +16,7 @@ import install
 from tools.interaction import OperationPaused, using
 from tools.harness import (
     HARNESS_PATHS, apply_integration, integration_plan, removal_content, remove_integration, retired_skill_plan,
+    _read, launcher_permission_plan, repair_launcher_permissions,
 )
 
 
@@ -49,6 +50,24 @@ class InstallerTests(unittest.TestCase):
             self.assertEqual(result, 1)
             self.assertEqual({key: os.environ.get(key) for key in keys}, before)
             self.assertFalse(home.exists())
+
+    def test_live_harness_stop_is_confirmed_in_the_only_local_change_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            user = Path(directory)
+            home = user / 'not-created'
+            args = argparse.Namespace(home=home, google=False, harness=['omp'], skill_dir=[],
+                                      ca_bundle=None, local_only=True, harness_stopped=False)
+            ui = Mock()
+            ui.review.return_value = False
+            ui.confirm.side_effect = AssertionError('redundant confirmation')
+            with using(ui), patch.object(Path, 'home', return_value=user), \
+                    patch.dict(os.environ, {}, clear=True), patch.object(install, '_prerequisites'):
+                with self.assertRaises(OperationPaused):
+                    install._install(args)
+            ui.review.assert_called_once()
+            self.assertIn('Harnesses stopped', ui.review.call_args.kwargs['accept'])
+            self.assertFalse(home.exists())
+            self.assertFalse((user / '.omp').exists())
 
     def test_declined_local_review_creates_no_installation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -193,6 +212,50 @@ with using(object()):
         self.assertNotIn('private-output', result.stdout + result.stderr)
         self.assertNotIn('private-error', result.stdout + result.stderr)
 
+    def test_staged_install_records_safe_launcher_and_skills_under_group_writable_umask(self):
+        from tools.uninstall.common import read_private
+        from tools.uninstall.local import inventory, MANIFEST
+        with tempfile.TemporaryDirectory() as directory:
+            user = Path(directory)
+            home, staged = user / 'instance', user / 'inactive'
+            def create_runtime(path):
+                (path / 'bin').mkdir(parents=True)
+                (path / 'pyvenv.cfg').write_text('test runtime; never executed\n')
+                (path / 'bin/python').write_text('test interpreter; never executed\n')
+            def install_package(command):
+                launcher = home / 'venv/bin/maven-mcp'
+                launcher.write_text('#!/test-only/python\n')
+                launcher.chmod(0o775)
+            mask = os.umask(0o002)
+            try:
+                with patch.object(Path, 'home', return_value=user), patch.dict(os.environ, {}, clear=True), \
+                        patch.object(install, '_prerequisites'), \
+                        patch('venv.EnvBuilder.create', side_effect=create_runtime), \
+                        patch.object(install.subprocess, 'run', return_value=Mock(returncode=0)), \
+                        patch.object(install, '_install_command', side_effect=install_package), \
+                        redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    result = install.main(['--local-only', '--home', str(home), '--harness', 'omp',
+                                           '--stage-harnesses', str(staged)])
+            finally:
+                os.umask(mask)
+            self.assertEqual(result, 0)
+            launcher = home / 'venv/bin/maven-mcp'
+            self.assertEqual(launcher.stat().st_mode & 0o7777, 0o755)
+            self.assertIsNotNone(_read(launcher))
+            receipt = read_private(home / MANIFEST)
+            self.assertEqual(receipt['owned'][str(home / 'venv')], inventory(home / 'venv'))
+            self.assertFalse((user / '.omp').exists())
+            config = staged / HARNESS_PATHS['omp'][0]
+            self.assertEqual(json.loads(_read(config))['mcpServers']['maven']['command'], str(launcher))
+            for name in ('maven', 'maven-maintenance'):
+                skill = staged / HARNESS_PATHS['omp'][2] / name / 'SKILL.md'
+                self.assertEqual(skill.stat().st_mode & 0o777, 0o600)
+                self.assertIsNotNone(_read(skill))
+                self.assertEqual(receipt['owned'][str(skill)], inventory(skill))
+            for item in receipt['integrations']:
+                remove_integration(item)
+                self.assertFalse(Path(item['path']).exists())
+
     def test_harness_install_and_selective_removal_preserve_unrelated_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -336,6 +399,256 @@ with using(object()):
             selected = integration_plan(root / 'instance', ['gemini'], user_home=root,
                                         paths={'gemini': (settings, settings.parent / 'CUSTOM.md')})
             self.assertEqual(selected[1].path.name, 'CUSTOM.md')
+
+
+class HarnessFinishTests(unittest.TestCase):
+    def setUp(self):
+        from tools.uninstall.local import record_installation
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.user = Path(self.temporary.name)
+        self.home = self.user / 'instance'
+        self.home.mkdir(mode=0o700)
+        self.launcher = self.home / 'venv/bin/maven-mcp'
+        self.launcher.parent.mkdir(parents=True)
+        self.launcher.write_text('#!/test-only/python\nprint("launcher")\n')
+        self.launcher.chmod(0o775)
+        self.user_patch = patch.object(Path, 'home', return_value=self.user)
+        self.user_patch.start()
+        self.addCleanup(self.user_patch.stop)
+        self.environment = patch.dict(os.environ, {}, clear=True)
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+        record_installation(self.home, Path(install.__file__).parent, [self.home / 'venv'], [])
+
+    def ui(self):
+        ui = Mock()
+        ui.form.return_value = {name: name == 'omp' for name in HARNESS_PATHS}
+        ui.review.return_value = True
+        ui.choose.return_value = 'skip'
+        return ui
+
+    def test_exact_launcher_repair_preserves_bytes_and_other_files(self):
+        from tools.tui.harness import configure_harnesses
+        from tools.uninstall.common import read_private
+        from tools.uninstall.local import inventory, MANIFEST
+        before = self.launcher.read_bytes()
+        unrelated = self.home / 'venv/owner-added'
+        unrelated.write_text('not adopted')
+        unrelated.chmod(0o664)
+        ui = self.ui()
+        result = configure_harnesses(ui, self.home)
+        self.assertEqual(result['status'], 'written')
+        self.assertEqual(self.launcher.stat().st_mode & 0o7777, 0o755)
+        self.assertEqual(self.launcher.read_bytes(), before)
+        self.assertEqual(unrelated.stat().st_mode & 0o777, 0o664)
+        receipt = read_private(self.home / MANIFEST)
+        owned = receipt['owned'][str(self.home / 'venv')]
+        self.assertEqual(owned['bin/maven-mcp'], inventory(self.launcher)[''])
+        self.assertNotIn('owner-added', owned)
+        ui.review.assert_called_once()
+        ui.choose.assert_not_called()
+        self.assertIn('0775 → 0755', ui.review.call_args.args[1])
+        self.assertIn('Harnesses stopped', ui.review.call_args.kwargs['accept'])
+        original_integrations = receipt['integrations']
+        retry_ui = self.ui()
+        retry = configure_harnesses(retry_ui, self.home)
+        retry_ui.review.assert_not_called()
+        self.assertEqual(retry['status'], 'unchanged')
+        self.assertEqual(read_private(self.home / MANIFEST)['integrations'], original_integrations)
+        for item in original_integrations:
+            remove_integration(item)
+            self.assertFalse(Path(item['path']).exists())
+
+    def test_manually_repaired_launcher_refreshes_only_exact_stale_receipt(self):
+        from tools.tui.harness import configure_harnesses
+        from tools.uninstall.common import read_private
+        from tools.uninstall.local import inventory, MANIFEST
+        self.launcher.chmod(0o755)
+        before = self.launcher.stat()
+        ui = self.ui()
+        with patch('tools.tui.harness.repair_launcher_permissions') as chmod:
+            result = configure_harnesses(ui, self.home)
+        chmod.assert_not_called()
+        self.assertEqual(result['status'], 'written')
+        self.assertEqual(self.launcher.stat().st_ctime_ns, before.st_ctime_ns)
+        self.assertIn('Launcher already 0755', ui.review.call_args.args[1])
+        receipt = read_private(self.home / MANIFEST)
+        self.assertEqual(receipt['owned'][str(self.home / 'venv')]['bin/maven-mcp'],
+                         inventory(self.launcher)[''])
+
+    def test_declined_repair_does_not_change_launcher_receipt_or_harness(self):
+        from tools.tui.harness import configure_harnesses
+        from tools.uninstall.local import MANIFEST
+        receipt = (self.home / MANIFEST).read_bytes()
+        ui = self.ui()
+        ui.review.return_value = False
+        result = configure_harnesses(ui, self.home)
+        self.assertEqual(result['status'], 'skipped')
+        self.assertEqual(self.launcher.stat().st_mode & 0o777, 0o775)
+        self.assertEqual((self.home / MANIFEST).read_bytes(), receipt)
+        self.assertFalse((self.user / '.omp').exists())
+
+    def test_interrupted_repair_journal_retries_without_adopting_runtime(self):
+        from tools.tui.harness import configure_harnesses
+        from tools.uninstall.common import read_private
+        from tools.uninstall.local import MANIFEST
+        with patch('tools.tui.harness.repair_launcher_permissions', side_effect=OSError('interrupted')):
+            result = configure_harnesses(self.ui(), self.home)
+        self.assertEqual(result['status'], 'conflict')
+        self.assertEqual(self.launcher.stat().st_mode & 0o777, 0o775)
+        self.assertEqual(read_private(self.home / MANIFEST)['owned'][str(self.home / 'venv')]['bin/maven-mcp']['mode'], 0o755)
+        result = configure_harnesses(self.ui(), self.home)
+        self.assertEqual(result['status'], 'written')
+        self.assertEqual(self.launcher.stat().st_mode & 0o777, 0o755)
+
+    def test_launcher_symlink_hardlink_wrong_owner_and_other_modes_are_preserved(self):
+        original = self.launcher.read_bytes()
+        owner = self.launcher.with_name('owner')
+        self.launcher.rename(owner)
+        self.launcher.symlink_to(owner)
+        with self.assertRaises(ValueError):
+            launcher_permission_plan(self.home)
+        self.launcher.unlink()
+        os.link(owner, self.launcher)
+        with self.assertRaises(ValueError):
+            launcher_permission_plan(self.home)
+        self.launcher.unlink()
+        owner.rename(self.launcher)
+        with patch('tools.harness.os.getuid', return_value=os.getuid() + 1):
+            with self.assertRaises(ValueError):
+                launcher_permission_plan(self.home)
+        for mode in (0o777, 0o6755, 0o644):
+            self.launcher.chmod(mode)
+            with self.assertRaises(ValueError):
+                launcher_permission_plan(self.home)
+            self.assertEqual(self.launcher.stat().st_mode & 0o7777, mode)
+        self.assertEqual(self.launcher.read_bytes(), original)
+
+    def test_changed_launcher_refuses_repair_and_unowned_launcher_is_not_adopted(self):
+        from tools.tui.harness import configure_harnesses
+        expected = launcher_permission_plan(self.home)
+        self.launcher.write_text('# owner changed the launcher\n')
+        with self.assertRaises(ValueError):
+            repair_launcher_permissions(self.home, expected)
+        result = configure_harnesses(self.ui(), self.home)
+        self.assertEqual(result['status'], 'conflict')
+        self.assertIn('ownership receipt', result['reason'])
+        self.assertEqual(self.launcher.stat().st_mode & 0o777, 0o775)
+        self.assertFalse((self.user / '.omp').exists())
+
+    def test_conflict_retry_stays_in_local_harness_workflow(self):
+        from tools.tui.harness import configure_harnesses
+        ui = self.ui()
+        ui.choose.return_value = 'retry'
+        from tools.harness import integration_plan as real_plan
+        calls = []
+        def planning(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 1:
+                raise ValueError('local conflict corrected before retry')
+            return real_plan(*args, **kwargs)
+        with patch('tools.tui.harness.integration_plan', side_effect=planning):
+            result = configure_harnesses(ui, self.home)
+        self.assertEqual(result['status'], 'written')
+        ui.choose.assert_called_once()
+        ui.review.assert_called_once()
+
+    def completed(self, *, legacy=False):
+        from tools.uninstall.common import save_private
+        from uuid import uuid4
+        values = {'MAVEN_MEMORY_INSTANCE_ID': str(uuid4()), 'MAVEN_ACCOUNT_ID': '123456789012',
+                  'MAVEN_AWS_REGION': 'us-east-1', 'MAVEN_AWS_PROFILE': 'owner',
+                  'MAVEN_MEMORY_ENDPOINT': 'https://original.example',
+                  'MAVEN_MEMORY_RECOVERY_EPOCH': str(uuid4()),
+                  'MAVEN_AWS_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/owner'}
+        environment = self.home / '.env'
+        environment.write_text(''.join(key + '=' + json.dumps(value) + '\n' for key, value in values.items()))
+        environment.chmod(0o600)
+        identifier = str(uuid4())
+        outcome = {'home': str(self.home), 'instance_ready': True,
+                   'instance_id': values['MAVEN_MEMORY_INSTANCE_ID'], 'account': values['MAVEN_ACCOUNT_ID'],
+                   'region': values['MAVEN_AWS_REGION'], 'profile': values['MAVEN_AWS_PROFILE'],
+                   'authority_generation': 3, 'project_configured': False}
+        previous = {'kind': 'setup', 'state': 'completed', 'operation_id': identifier,
+                    'step': 'verify', 'pending_interaction': None, 'outcome': outcome,
+                    'receipts': [{'step': 'verify', 'result': {'instance_ready': True}}]}
+        if legacy:
+            previous['starter_binding'] = values
+        else:
+            outcome['binding'] = values
+        save_private(self.home / 'runtime/setup/state.json', {'administration_operation': identifier})
+        save_private(self.home / 'runtime/administration' / (identifier + '.json'), previous)
+        return previous
+
+    def test_completed_default_and_explicit_resume_reuse_bound_readiness_offline(self):
+        from tools.setup import _present
+        for legacy in (False, True):
+            previous = self.completed(legacy=legacy)
+            for explicit in (False, True):
+                with self.subTest(legacy=legacy, explicit=explicit):
+                    ui, controller = Mock(), Mock()
+                    controller.status.return_value = previous
+                    args = argparse.Namespace(operation=previous['operation_id'] if explicit else None,
+                                              fresh_operation=False, mode=None)
+                    receipt_path = self.home / 'runtime/administration' / (previous['operation_id'] + '.json')
+                    before = receipt_path.read_bytes()
+                    with patch('tools.administration.AdminOperations', return_value=controller), \
+                            patch('tools.tui.administration.present') as present, \
+                            patch('tools.tui.harness.finish_setup', return_value={'status': 'skipped'}) as finish, \
+                            patch('tools.memory.environment.selected_aws_session', side_effect=AssertionError('AWS forbidden')):
+                        self.assertEqual(_present(ui, args, self.home), {'status': 'skipped'})
+                    present.assert_not_called()
+                    controller.begin.assert_not_called()
+                    controller.advance.assert_not_called()
+                    ui.review.assert_not_called()
+                    finish.assert_called_once()
+                    self.assertEqual(finish.call_args.args[2]['binding'],
+                                     previous.get('starter_binding') or previous['outcome']['binding'])
+                    self.assertEqual(receipt_path.read_bytes(), before)
+
+    def test_changed_targets_or_missing_binding_cannot_reuse_completed_readiness(self):
+        from tools.setup import _present
+        from tools.setup_common import SetupPending
+        from tools.tui.harness import completed_setup_outcome
+        previous = self.completed()
+        for key in ('MAVEN_MEMORY_ENDPOINT', 'MAVEN_MEMORY_RECOVERY_EPOCH',
+                    'MAVEN_MEMORY_INSTANCE_ID', 'MAVEN_AWS_PROFILE', 'MAVEN_AWS_EXPECTED_PRINCIPAL'):
+            with self.subTest(key=key):
+                changed = dict(previous['outcome']['binding'], **{key: 'changed'})
+                (self.home / '.env').write_text(''.join(k + '=' + json.dumps(v) + '\n' for k, v in changed.items()))
+                controller = Mock()
+                controller.status.return_value = previous
+                with patch('tools.administration.AdminOperations', return_value=controller), \
+                        patch('tools.tui.administration.present') as present, \
+                        patch('tools.tui.harness.finish_setup') as finish:
+                    with self.assertRaises(SetupPending):
+                        _present(Mock(), argparse.Namespace(operation=previous['operation_id'],
+                                 fresh_operation=False, mode=None), self.home)
+                present.assert_not_called()
+                finish.assert_not_called()
+        previous = self.completed()
+        previous['outcome'].pop('binding')
+        with self.assertRaises(ValueError):
+            completed_setup_outcome(self.home, previous)
+
+    def test_ready_installer_menu_routes_harness_and_explicit_fresh_check_separately(self):
+        self.completed()
+        args, ui = argparse.Namespace(home=self.home), Mock()
+        ui.choose.return_value = 'harness'
+        with using(ui):
+            install._options(args)
+        self.assertTrue(args.check_existing)
+        self.assertFalse(args.setup_fresh)
+        self.assertFalse(args.local_only)
+        ui.form.assert_not_called()
+        self.assertIn('harness', [value for _, value in ui.choose.call_args.args[1]])
+        ui.choose.return_value = 'existing'
+        ui.form.return_value = {'home': str(self.home)}
+        with using(ui):
+            install._options(args)
+        self.assertTrue(args.setup_fresh)
+        self.assertIsNone(args.setup_operation)
 
 
 if __name__ == '__main__':

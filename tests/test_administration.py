@@ -85,6 +85,119 @@ class AdministrationTests(unittest.TestCase):
             self.assertEqual(args.source_excerpt, self.source['excerpt'])
         self.assertEqual((self.controller.directory / (result['operation_id'] + '.json')).stat().st_mode & 0o777, 0o600)
 
+    def starter_review(self):
+        result = self.controller.begin('setup', {'mode': 'new'})
+        state = self.controller._load(result['operation_id'])
+        state.update(step='starter_prepare_review', pending_interaction=None, state='pending',
+                     starter_binding=dict(Wizard(self.home).values))
+        self.controller._save(state)
+        return self.controller.advance(result['operation_id'])
+
+    def starter_client(self, pages):
+        from tools.memory.validation import digest
+        by_id = {page['proposal_id']: page for page in pages}
+        active, uploaded = [], []
+
+        def invoke(route, body):
+            if route == '/v1/proposals/create':
+                uploaded.append(body['proposal_id'])
+                return {'status': 'ready'}
+            if route == '/v1/operations/lookup':
+                return {'status': 'ready'}
+            draft = by_id[body['proposal_id']]
+            if route == '/v1/proposals/challenge':
+                return {'status': 'ready', 'data': {
+                    'proposal_id': draft['proposal_id'], 'page_id': draft['page_id'],
+                    'expected_revision': 0, 'candidate_hash': digest(draft['candidate']),
+                    'challenge_id': str(uuid4()),
+                    'expires_at': (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()}}
+            if route == '/v1/proposals/resolve':
+                self.assertEqual(body['candidate_hash'], digest(draft['candidate']))
+                active.append(body)
+                return {'status': 'active', 'data': {'page_id': draft['page_id'], 'revision': 1}}
+            self.fail('Unexpected route: ' + route)
+
+        client = Mock(invoke=Mock(side_effect=invoke))
+        client.read_full.side_effect = lambda target: {'data': {
+            'content_hash': digest(by_id[target['proposal_id']]['candidate'])}}
+        return client, uploaded, active
+
+    def test_one_collection_approval_installs_nine_pages_and_survives_resume(self):
+        result = self.starter_review()
+        question = result['pending_interaction']
+        pages = question['review']['pages']
+        self.assertEqual(len(pages), 9)
+        self.assertEqual(question['key'], 'starter_collection')
+        client, uploaded, active = self.starter_client(pages)
+        with patch('tools.memory.environment.configured_client', return_value=client):
+            paused = self.controller.respond(result['operation_id'], question['interaction_id'],
+                question['revision'], {'approved': False, 'review_digest': question['review_digest']})
+            client.invoke.assert_not_called()
+            result = self.respond(paused)
+            for _ in range(60):
+                if result['step'] == 'verify':
+                    break
+                self.assertIsNone(result['pending_interaction'])
+                self.controller = AdminOperations(self.home)
+                result = self.controller.advance(result['operation_id'])
+                self.assertNotIn(result['state'], ('blocked', 'uncertain'), result.get('error'))
+        self.assertEqual(result['step'], 'verify')
+        self.assertEqual(uploaded, [page['proposal_id'] for page in pages])
+        self.assertEqual([item['proposal_id'] for item in active], uploaded)
+        self.assertTrue(all(item['approval_source'] == self.source for item in active))
+        self.assertEqual(len(result['approvals']), 1)
+        self.assertEqual(result['starter_progress']['completed'], 9)
+
+    def test_collection_approval_rejects_changes_to_a_later_page_before_any_submission(self):
+        from tools.memory.validation import digest
+        result = self.respond(self.starter_review())
+        wizard = self.controller._wizard(self.controller._load(result['operation_id']))
+        directory = wizard.directory / 'starter'
+        manifest = read_private(directory / 'manifest.json')
+        page = manifest['pages'][-1]
+        path = directory / page['file']
+        changed = read_private(path)
+        changed['candidate']['body_markdown'] += '\\nChanged after review.'
+        page['candidate_hash'] = digest(changed['candidate'])
+        save_json(path, changed)
+        save_json(directory / 'manifest.json', manifest)
+        with patch('tools.memory.environment.configured_client') as client:
+            result = self.controller.advance(result['operation_id'])
+        client.assert_not_called()
+        self.assertEqual(result['state'], 'blocked')
+        self.assertIn('Reviewed candidate changed', result['error'])
+
+    def test_old_individual_review_becomes_one_remaining_collection_review_without_replaying_pages(self):
+        result = self.starter_review()
+        pages = result['pending_interaction']['review']['pages']
+        state = self.controller._load(result['operation_id'])
+        state.update(step='starter_review', starter_index=5)
+        self.controller._review(state, 'starter_submit', 'Old individual review', pages[5], 'starter_submit')
+        self.controller._save(state)
+        old = state['pending_interaction']
+        before = dict(pages[5])
+        with self.assertRaises(ValueError):
+            self.controller.respond(result['operation_id'], old['interaction_id'], old['revision'],
+                {'approved': True, 'review_digest': old['review_digest'], 'source': self.source})
+        self.assertIn('advance', self.controller.status(result['operation_id'])['next_actions'])
+        result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['pending_interaction']['key'], 'starter_collection')
+        self.assertEqual(result['pending_interaction']['review']['pages'][5], before)
+        result = self.respond(result)
+        client, uploaded, active = self.starter_client(pages)
+        with patch('tools.memory.environment.configured_client', return_value=client):
+            for _ in range(30):
+                if result['step'] == 'verify':
+                    break
+                self.assertIsNone(result['pending_interaction'])
+                result = self.controller.advance(result['operation_id'])
+                self.assertNotIn(result['state'], ('blocked', 'uncertain'), result.get('error'))
+        self.assertEqual(result['step'], 'verify')
+        self.assertEqual(uploaded, [page['proposal_id'] for page in pages[5:]])
+        self.assertEqual(len(active), 4)
+        self.assertEqual(len(result['approvals']), 1)
+
+
     def test_existing_setup_reaches_verified_readiness_without_provisioning(self):
         wizard = Wizard(self.home)
         instance = str(uuid4())
@@ -507,6 +620,7 @@ class AdministrationTests(unittest.TestCase):
                             for key, field in OUTPUT_CONFIG.items()]}
 
     def test_discovery_requires_maintenance_confirmation_and_binds_only_selected_stack(self):
+        from tools.memory import bootstrap
         first, second = self.stack('first'), self.stack('second')
         failed = {**self.stack('failed'), 'StackStatus': 'ROLLBACK_COMPLETE'}
         unrelated = {'StackStatus': 'CREATE_COMPLETE', 'StackId': first['StackId'], 'Outputs': []}
@@ -519,6 +633,7 @@ class AdministrationTests(unittest.TestCase):
         cloud.describe_stacks.return_value = {'Stacks': [second]}
         identity = {'Arn': 'arn:aws:iam::123456789012:user/owner', 'Account': '123456789012'}
         with patch('tools.memory.environment.selected_aws_session') as aws, \
+                patch.object(bootstrap, 'selected_aws_session', aws), \
                 patch('tools.setup_common.inspect_login_identity', return_value=identity):
             aws.return_value.client.return_value = cloud
             result = self.controller.begin('setup', {'mode': 'existing'})
@@ -732,7 +847,7 @@ class AdministrationTests(unittest.TestCase):
             self.controller._preflight(state, {}, 'infrastructure')
         self.assertEqual(state['receipts'][-1]['result']['status'], 'Missing access')
 
-    def test_revising_unsubmitted_package_preserves_old_artifacts_and_requires_new_review(self):
+    def test_revising_unsubmitted_package_preserves_old_artifacts_before_preview(self):
         result = self.controller.begin('setup', {'mode': 'new'})
         state = self.controller._load(result['operation_id'])
         identity = {'Account': '123456789012', 'Arn': 'arn:aws:iam::123456789012:user/owner'}
@@ -755,19 +870,18 @@ class AdministrationTests(unittest.TestCase):
                 patch('tools.memory.bootstrap._package', return_value=(
                     {'deployment_inputs': {'InstanceId': instance}, 'artifact_sha256': {}}, '{}', [])), \
                 patch('tools.memory.bootstrap.plan') as plan:
-            result = self.advance_to_question(self.respond(result, chosen))
-            first_review = result['pending_interaction']['review_digest']
+            result = self.controller.advance(self.respond(result, chosen)['operation_id'])
+            first_candidate = result['prepared_plan']
             original = prepared[0].read_bytes()
-            result = self.respond(result)
             result = self.controller.back(result['operation_id'])
-            result = self.advance_to_question(self.respond(result, {**chosen, 'MAVEN_STACK_NAME': 'revised-stack'}))
+            result = self.controller.advance(self.respond(result, {**chosen, 'MAVEN_STACK_NAME': 'revised-stack'})['operation_id'])
         plan.assert_not_called()
-        self.assertEqual(result['pending_interaction']['key'], 'plan')
-        self.assertNotEqual(result['pending_interaction']['review_digest'], first_review)
+        self.assertEqual(result['step'], 'plan')
+        self.assertNotEqual(result['prepared_plan'], first_candidate)
         self.assertEqual(prepared[0].read_bytes(), original)
         self.assertEqual(len(prepared), 2)
         self.assertNotEqual(prepared[0].parent, prepared[1].parent)
-        self.assertEqual(len(result['approvals']), 1)
+        self.assertEqual(result['approvals'], [])
 
     def test_cloud_removal_uses_maintenance_handoff_before_planning(self):
         wizard = Wizard(self.home)
@@ -784,16 +898,27 @@ class AdministrationTests(unittest.TestCase):
         self.assertIn('Maintenance', result['handoff']['purpose'])
         self.assertEqual(result['handoff']['account'], '123456789012')
 
-    def test_completed_explicit_operation_starts_only_after_new_operation_review(self):
+    def test_completed_explicit_operation_resumes_harness_and_fresh_check_is_opt_in(self):
         from tools.interaction import OperationPaused
         result = self.controller.begin('setup', {'mode': 'existing'})
+        wizard = Wizard(self.home)
+        wizard.settings({'MAVEN_AWS_REGION': 'us-east-1', 'MAVEN_MEMORY_INSTANCE_ID': str(uuid4()),
+                         'MAVEN_AWS_PROFILE': 'owner', 'MAVEN_ACCOUNT_ID': '123456789012'})
         state = self.controller._load(result['operation_id'])
-        state.update(state='completed', pending_interaction=None)
+        self.controller._complete_setup(state, wizard, 9)
         state['receipts'].append({'step': 'verify', 'result': {'instance_ready': True}})
         self.controller._save(state)
-        args = Namespace(operation=result['operation_id'], fresh_operation=False, mode='existing')
+        before = self.controller._path(result['operation_id']).read_bytes()
+        args = Namespace(operation=result['operation_id'], fresh_operation=False, mode=None)
         ui = Mock(review=Mock(return_value=False))
-        with patch('tools.tui.administration.present') as present:
+        with patch('tools.tui.administration.present') as present, \
+                patch('tools.tui.harness.finish_setup') as finish:
+            _present(ui, args, self.home)
+            finish.assert_called_once()
+            present.assert_not_called()
+            ui.review.assert_not_called()
+            self.assertEqual(self.controller._path(result['operation_id']).read_bytes(), before)
+            args.operation, args.fresh_operation = None, True
             with self.assertRaises(OperationPaused):
                 _present(ui, args, self.home)
             present.assert_not_called()

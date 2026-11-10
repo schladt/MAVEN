@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import signal
 import subprocess
 import threading
@@ -24,17 +25,21 @@ class DialogScreen(ModalScreen):
         self.set_class(self.app.size.width < 90, "compact")
         yield Header()
         yield Static("", id="dialog-size-warning", markup=False)
-        yield Static(self.app.context_text, id="dialog-context", classes="context-banner", markup=False)
         yield Footer()
         with Horizontal(id="dialog-workspace"):
             yield Static(steps, id="dialog-steps", markup=False)
             yield from self.dialog()
+        yield Static(self.app.activity_text, id="dialog-status", classes="activity-status", markup=False)
 
     def on_resize(self, event):
         self.set_class(event.size.width < 90, "compact")
         for warning in self.query("#dialog-size-warning"):
             warning.update("Enlarge the terminal to 80 × 24; Ctrl+Q still pauses safely."
                            if event.size.width < 80 or event.size.height < 24 else "")
+
+    def context_banner(self):
+        with VerticalScroll(classes="context-scroll"):
+            yield Static(self.app.context_text, id="dialog-context", classes="context-banner", markup=False)
 
     def technical_details(self, details):
         if details:
@@ -50,9 +55,12 @@ class FormScreen(DialogScreen):
         self.heading, self.fields = title, fields
         self.description, self.submit_label, self.allow_back = description, submit, back
         self.details = details
+        self._suggestions = {}
+        self._overrides = set()
 
     def dialog(self) -> ComposeResult:
         with Vertical(id="dialog"):
+            yield from self.context_banner()
             yield Label(self.heading, classes="heading", markup=False)
             with VerticalScroll(id="form-fields"):
                 if self.description:
@@ -83,6 +91,15 @@ class FormScreen(DialogScreen):
     def on_mount(self):
         for error in self.query(".field-error"):
             error.display = False
+        for index, field in enumerate(self.fields):
+            if field.default_from:
+                suggestion = self._suggestion(field)
+                self._suggestions[field.name] = suggestion
+                control = self.query_one(f"#field-{index}", Input)
+                if not control.value:
+                    control.value = suggestion
+                elif control.value != suggestion:
+                    self._overrides.add(field.name)
         controls = self.query("Input, Select, Checkbox, TextArea")
         if controls:
             controls.first().focus()
@@ -104,6 +121,28 @@ class FormScreen(DialogScreen):
         event.stop()
         self.submit()
 
+    def _suggestion(self, field):
+        source_index = next(index for index, source in enumerate(self.fields)
+                            if source.name == field.default_from)
+        value = self.query_one(f"#field-{source_index}", Input).value.strip()
+        return value if not field.pattern or re.fullmatch(field.pattern, value) else ""
+
+    def on_input_changed(self, event: Input.Changed):
+        for index, field in enumerate(self.fields):
+            if field.name not in self._suggestions:
+                continue
+            source_index = next(index for index, source in enumerate(self.fields)
+                                if source.name == field.default_from)
+            if event.input.id != f"field-{source_index}":
+                continue
+            control = self.query_one(f"#field-{index}", Input)
+            suggestion = self._suggestion(field)
+            if control.value != self._suggestions[field.name]:
+                self._overrides.add(field.name)
+            if field.name not in self._overrides:
+                control.value = suggestion
+            self._suggestions[field.name] = suggestion
+
     def submit(self):
         result, invalid = {}, []
         for index, field in enumerate(self.fields):
@@ -118,6 +157,8 @@ class FormScreen(DialogScreen):
                 message = "A value is required."
             elif isinstance(value, str) and any(ord(c) < 32 and c not in ("\n", "\t") for c in value):
                 message = "Control characters are not allowed."
+            elif isinstance(value, str) and value and field.pattern and not re.fullmatch(field.pattern, value):
+                message = field.help or "This value does not match the required format."
             error = self.query_one(f"#error-{index}", Static)
             error.update(message)
             error.display = bool(message)
@@ -141,6 +182,7 @@ class ChooseScreen(DialogScreen):
 
     def dialog(self) -> ComposeResult:
         with Vertical(id="dialog"):
+            yield from self.context_banner()
             yield Label(self.heading, classes="heading", markup=False)
             if self.description:
                 yield TextArea(self.description, read_only=True, soft_wrap=True, id="choice-details")
@@ -172,6 +214,7 @@ class ReviewScreen(DialogScreen):
 
     def dialog(self) -> ComposeResult:
         with Vertical(id="dialog"):
+            yield from self.context_banner()
             yield Label(self.heading, classes="heading", markup=False)
             with VerticalScroll(id="review-content"):
                 if self.description:
@@ -238,10 +281,16 @@ class Interaction:
         answer = []
 
         def completed(value):
+            self.app.show_activity("working")
             answer.append(value)
             answered.set()
 
-        self.app.call_from_thread(self.app.push_screen, screen, completed)
+        def present():
+            if not self.pause_requested.is_set():
+                self.app.show_activity("input", screen.heading)
+                self.app.push_screen(screen, completed)
+
+        self.app.call_from_thread(present)
         while not answered.wait(0.1):
             self.checkpoint()
         self.checkpoint()
@@ -278,7 +327,11 @@ class Interaction:
         # Authentication owns the terminal temporarily; its output is never retained.
         if any(key in kwargs for key in ("stdout", "stderr", "capture_output", "input")):
             raise ValueError("External authentication must use the terminal directly")
-        result = self.app.call_from_thread(self.app.external, command, kwargs)
+        self.app.call_from_thread(self.app.show_activity, "input", "External authentication")
+        try:
+            result = self.app.call_from_thread(self.app.external, command, kwargs)
+        finally:
+            self.app.call_from_thread(self.app.show_activity, "working")
         self.checkpoint()
         return result
 
@@ -297,12 +350,16 @@ class WorkflowApp(App):
     Screen { background: $surface; }
     #workspace { height: 1fr; }
     #steps { width: 25; border-right: solid $primary; padding: 1; overflow-y: auto; }
-    #activity { width: 1fr; padding: 1; }
-    #status { height: auto; padding: 1 0; text-style: bold; }
-    #events { height: 1fr; border: solid $primary; }
-    #busy { height: 1; }
+    #activity { width: 1fr; border: thick $primary; padding: 1 2; }
+    Screen.compact #activity { border: solid $primary; padding: 0 1; }
+    #events { height: 1fr; min-height: 3; background: $panel; }
+    #activity-bar { height: auto; min-height: 1; margin-top: 1; }
+    .activity-status { height: auto; width: 1fr; text-style: bold; }
+    #busy { height: 1; width: 11; margin-right: 2; }
     #size-warning { height: auto; color: $warning; }
     .context-banner { height: auto; padding: 0 1; background: $boost; }
+    .context-scroll { height: auto; max-height: 9; margin-bottom: 1; }
+    Screen.compact .context-scroll { max-height: 4; margin-bottom: 0; }
     #dialog-workspace { height: 1fr; }
     Screen.compact #steps { display: none; }
     ModalScreen { background: $surface; }
@@ -347,22 +404,27 @@ class WorkflowApp(App):
         self.exit_code = 0
         self.close_on_finish = False
         self._signals = {}
+        self.activity_state = "working"
+        self.activity_text = "Waiting… " + self.active_stage
         self._main_screen = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("", id="size-warning")
-        yield Static(self.context_text, id="context", classes="context-banner", markup=False)
         with Horizontal(id="workspace"):
             yield Static("", id="steps", markup=False)
             with Vertical(id="activity"):
-                yield Static("Starting…", id="status", markup=False)
-                yield LoadingIndicator(id="busy")
+                with VerticalScroll(classes="context-scroll"):
+                    yield Static(self.context_text, id="context", classes="context-banner", markup=False)
                 yield RichLog(id="events", wrap=True, markup=False, highlight=False, max_lines=2000)
+                with Horizontal(id="activity-bar"):
+                    yield LoadingIndicator(id="busy")
+                    yield Static(self.activity_text, id="status", classes="activity-status", markup=False)
         yield Footer()
 
     def on_mount(self):
         self._main_screen = self.screen
+        self.on_resize()
         if threading.current_thread() is threading.main_thread():
             self._signals = {number: signal.signal(number, self._signal_pause)
                              for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
@@ -390,8 +452,30 @@ class WorkflowApp(App):
         if name not in self.steps:
             self.steps.append(name)
         self._main_screen.query_one("#steps", Static).update("\n\n".join(("> " if item == name else "  ") + item for item in self.steps))
-        self._main_screen.query_one("#status", Static).update(name)
+        self.show_activity(self.activity_state)
         self.show_message(name)
+
+    def show_activity(self, state, detail=""):
+        """Update lifecycle-driven status only on Textual's UI thread."""
+        if self.interaction.pause_requested.is_set() and not self.finished:
+            state = "pause_requested"
+        self.activity_state = state
+        if state == "working":
+            text = "Waiting… " + self.active_stage
+        elif state == "input":
+            text = "Awaiting input — " + (detail or self.active_stage)
+        elif state == "pause_requested":
+            text = "Pause requested: waiting for a safe checkpoint. Submitted remote operations may continue."
+        else:
+            text = {"paused": "Paused", "failed": "Failed", "complete": "Complete"}[state]
+            if detail:
+                text += " — " + detail
+        self.activity_text = text
+        self._main_screen.query_one("#status", Static).update(text)
+        self._main_screen.query_one("#busy").display = state in ("working", "pause_requested")
+        for screen in self.screen_stack:
+            for status in screen.query("#dialog-status"):
+                status.update(text)
 
     def show_context(self, text):
         self.context_text = text
@@ -419,7 +503,7 @@ class WorkflowApp(App):
                     code = result
                 elif isinstance(result, dict):
                     self.interaction.message(json.dumps(result, indent=2, ensure_ascii=False))
-                    code = 130 if result.get("status") == "paused" else (2 if result.get("status") == "blocked" else 0)
+                    code = 130 if result.get("status") == "paused" else (2 if result.get("status") in ("blocked", "conflict") else 0)
                 if code:
                     message = "Paused; preserve the receipts and resume." if code in (3, 130) else "Not complete. Review the diagnostics and preserved recovery state."
             except OperationPaused as error:
@@ -437,8 +521,8 @@ class WorkflowApp(App):
         while len(self.screen_stack) > 1:
             self.pop_screen()
         self.finished, self.exit_code = True, code
-        self._main_screen.query_one("#busy").display = False
-        self._main_screen.query_one("#status", Static).update(message)
+        state = "paused" if code in (3, 130) else ("failed" if code else "complete")
+        self.show_activity(state, message)
         self.show_message(message)
         if self.interaction.pause_requested.is_set() or (self.close_on_finish and code == 0):
             self.exit(code)
@@ -448,6 +532,6 @@ class WorkflowApp(App):
             self.exit(self.exit_code)
             return
         self.interaction.pause_requested.set()
-        self._main_screen.query_one("#status", Static).update("Pause requested: waiting for a safe checkpoint. Submitted remote operations may continue.")
+        self.show_activity("pause_requested")
         while len(self.screen_stack) > 1:
             self.pop_screen()

@@ -801,6 +801,27 @@ class EnvironmentAndDisplayBoundaries(unittest.TestCase):
 
 
 class InstallationBoundaries(unittest.TestCase):
+    def test_prepare_accepts_zone_whitespace_without_accepting_missing_or_duplicate_zones(self):
+        from tools.memory import bootstrap
+        values = {'MAVEN_NOTIFICATION_EMAIL': 'owner@example.com', 'MAVEN_ENGINE_VERSION': '18.6',
+                  'MAVEN_INSTANCE_NAME': 'maven-test', 'MAVEN_ACCOUNT_ID': '123456789012',
+                  'MAVEN_CALLER_PRINCIPAL_ARN': 'arn:aws:iam::123456789012:user/owner',
+                  'MAVEN_AVAILABILITY_ZONES': ' us-east-1b, us-east-1c '}
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory) / 'package'
+            manifest = bootstrap.prepare(values, package)
+            parameters = json.loads((package / 'parameters.json').read_text())
+            self.assertEqual(next(item['ParameterValue'] for item in parameters
+                                  if item['ParameterKey'] == 'AvailabilityZones'), 'us-east-1b,us-east-1c')
+            self.assertEqual(manifest['deployment_inputs']['AvailabilityZones'], 'us-east-1b,us-east-1c')
+            for index, invalid in enumerate(('us-east-1b, us-east-1b', 'us-east-1b, ',
+                                             'us-east-1b, ,us-east-1c')):
+                with self.subTest(zones=invalid):
+                    target = Path(directory) / str(index)
+                    with self.assertRaises(MemoryClientError):
+                        bootstrap.prepare({**values, 'MAVEN_AVAILABILITY_ZONES': invalid}, target)
+                    self.assertFalse(target.exists())
+
     def test_exact_review_plan_apply_and_connect_use_real_command_path_without_credentials_export(self):
         for target in ('unit-stack', 'arn:aws:cloudformation:us-east-1:123456789012:stack/unit-stack/exact-id'):
             with self.subTest(target=target):

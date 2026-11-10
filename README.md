@@ -63,6 +63,10 @@ After verified cloud setup, optionally review local integration for OMP, Claude 
 Codex, Copilot or Gemini. Close affected harnesses before approving writes; conflicts
 are preserved. Files written, cloud readiness and an actual harness connection are
 reported separately. A written configuration is **not** a verified MCP connection.
+Older installer-owned MCP launchers with group-writable permissions can be repaired
+to `0755` within the local file-change review. Modified or unowned legacy skills
+are preserved and require separate resolution; restarting cloud setup does not
+fix those local conflicts. Use **Retry local harness configuration** instead.
 
 Use Tab/Shift+Tab, arrow keys, Space and Enter, or the mouse. Ctrl+Q/Ctrl+C requests
 a safe pause; it does not undo completed work or cancel an AWS operation already
@@ -70,6 +74,9 @@ submitted. AWS sign-in temporarily takes over the terminal, then returns to setu
 Back revises unsubmitted choices without undoing completed actions. Plain-language
 reviews explain purpose, changes and consequences; expandable technical details
 retain complete artifacts and review digests. Destructive confirmations remain separate.
+The active step's account, access and target details stay inside the bordered panel.
+A bottom status bar distinguishes background work, awaiting input, pause, failure
+and completion. The activity indicator is spaced apart from the status text.
 
 The wizard offers two paths:
 
@@ -81,11 +88,18 @@ The wizard offers two paths:
   the database, or replaces active authority.
 - **Create a new MAVEN instance:** confirm the account discovered after sign-in,
   then provide the stack/instance name, notification email and two availability zones.
-  Select maintenance access separately. Review costs and generated artifacts, then
-  approve the change set, its exact execution, database initialization and each starter authority
-  candidate. The current deployment template is restricted to `us-east-1` and a
-  same-account human IAM user; see [deployment limitations](docs/getting-started.md#deployment-limitations-and-costs)
-  before choosing this path. Deployment is not permission to activate instructions.
+  The instance name defaults to a compatible stack name and remains editable.
+  Suggested zones (`us-east-1a, us-east-1b`) and PostgreSQL version (`18.6`) are
+  editable, not verified AWS availability. Spaces around comma-separated zones
+  are accepted; confirm actual regional support before deployment.
+  Select maintenance access separately. **Prepare deployment review** requests a
+  change-set preview without deploying resources. Review costs and approve exact
+  billable execution, database initialization, then **one approval to upload and
+  activate all nine starter instruction pages**. Complete artifacts remain available
+  in expandable technical details. The current deployment template is restricted
+  to `us-east-1` and a same-account human IAM user; see
+  [deployment limitations](docs/getting-started.md#deployment-limitations-and-costs).
+  Deployment is not permission to activate instructions.
 
 **Daily-use access** operates memory; **maintenance access** manages infrastructure
 or reads necessary stack metadata. These are purposes, not necessarily different AWS
@@ -96,6 +110,12 @@ marks unknown values, then verifies and asks you to confirm the actual identity.
 Saved-account mismatches block progress; root is never a daily-use fallback.
 Read-only preflights report **Passed**, **Missing access**, or **Could not verify**
 with limitations and remediation. They do not grant permissions or guarantee deployment.
+
+After verified setup, **Continue / configure coding harnesses** resumes local
+configuration without repeating cloud approvals. Saved readiness must still match
+the exact local settings; AWS is not rechecked by this step. Explicit connection
+check/repair remains a separate task. Existing unfinished checks retain their own
+checkpoints and receipts.
 
 AWS sign-in may also offer AWS skills and an AWS MCP connection. These are optional
 and separate from MAVEN; see [the AWS toolkit note](docs/getting-started.md#optional-aws-agent-toolkit).

@@ -15,8 +15,160 @@ from tools.tui.administration import present
 
 
 class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_activity_tracks_work_input_and_completion_on_ui_thread(self):
+        for size in ((80, 24), (130, 45)):
+            with self.subTest(size=size):
+                release, finish = threading.Event(), threading.Event()
+                answers, update_threads = [], []
+
+                def operation(ui):
+                    ui.stage('Submitting request')
+                    if not release.wait(10):
+                        raise RuntimeError('test did not release request')
+                    answers.append(ui.form('Choose profile', [Field('profile', 'Profile', 'owner')]))
+                    ui.stage('Waiting for completion')
+                    if not finish.wait(10):
+                        raise RuntimeError('test did not finish request')
+
+                app = WorkflowApp('Activity lifecycle', ['Starting'], operation)
+                show_activity = app.show_activity
+
+                def record_activity(*args, **kwargs):
+                    update_threads.append(threading.current_thread())
+                    return show_activity(*args, **kwargs)
+
+                try:
+                    with patch.object(app, 'show_activity', side_effect=record_activity):
+                        async with app.run_test(size=size) as pilot:
+                            await pilot.pause()
+                            self.assertEqual(app.activity_state, 'working')
+                            self.assertIn('Waiting… Submitting request', app.activity_text)
+                            self.assertTrue(app.screen.query_one('#busy').display)
+                            self.assertTrue(app.screen.query_one('#status').is_on_screen)
+                            self.assertGreaterEqual(app.screen.query_one('#status').region.y,
+                                                    app.screen.query_one('#events').region.bottom)
+                            release.set()
+                            await pilot.pause()
+                            self.assertIsInstance(app.screen, FormScreen)
+                            self.assertEqual(app.activity_state, 'input')
+                            self.assertIn('Awaiting input — Choose profile',
+                                          str(app.screen.query_one('#dialog-status', Static).render()))
+                            self.assertFalse(app._main_screen.query_one('#busy').display)
+                            await pilot.click('#submit')
+                            await pilot.pause()
+                            self.assertEqual(answers, [{'profile': 'owner'}])
+                            self.assertEqual(app.activity_state, 'working')
+                            self.assertIn('Waiting for completion', app.activity_text)
+                            self.assertTrue(app.screen.query_one('#busy').display)
+                            finish.set()
+                            await pilot.pause()
+                            self.assertTrue(app.finished)
+                            self.assertEqual(app.activity_state, 'complete')
+                            self.assertFalse(app.screen.query_one('#busy').display)
+                            self.assertTrue(all(thread is threading.main_thread() for thread in update_threads))
+                            await pilot.press('ctrl+q')
+                finally:
+                    release.set()
+                    finish.set()
+
+    async def test_terminal_status_distinguishes_failure_pause_and_completion(self):
+        for result, state in ((0, 'complete'), (2, 'failed'), (3, 'paused'), (130, 'paused'),
+                              ('exception', 'failed'), ({'status': 'conflict'}, 'failed')):
+            with self.subTest(result=result):
+                def operation(ui):
+                    if result == 'exception':
+                        raise ValueError('private exception material')
+                    return result
+
+                app = WorkflowApp('Terminal status', [], operation)
+                async with app.run_test(size=(80, 24)) as pilot:
+                    await pilot.pause()
+                    self.assertTrue(app.finished)
+                    self.assertEqual(app.activity_state, state)
+                    status = app.screen.query_one('#status', Static)
+                    self.assertTrue(str(status.render()).startswith(state.capitalize()))
+                    self.assertNotIn('private exception material', str(status.render()))
+                    self.assertTrue(status.is_on_screen)
+                    self.assertFalse(app.screen.query_one('#busy').display)
+                    await pilot.pause()
+                    self.assertEqual(app.activity_state, state)
+                    await pilot.press('ctrl+q')
+
+    async def test_external_authentication_hands_off_terminal_without_busy_indicator(self):
+        result = Mock(returncode=0)
+        answers = []
+
+        def operation(ui):
+            answers.append(ui.external(['local-auth-placeholder'], check=False))
+
+        app = WorkflowApp('External authentication', ['Authenticate'], operation)
+
+        def authenticate(*args, **kwargs):
+            self.assertIs(threading.current_thread(), threading.main_thread())
+            self.assertEqual(app.activity_state, 'input')
+            self.assertIn('External authentication', app.activity_text)
+            self.assertFalse(app._main_screen.query_one('#busy').display)
+            return result
+
+        with patch.object(app, 'suspend') as suspend, patch('tools.tui.app.subprocess.run', side_effect=authenticate) as run:
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.pause()
+                suspend.assert_called_once_with()
+                run.assert_called_once_with(['local-auth-placeholder'], check=False)
+                self.assertEqual(answers, [result])
+                self.assertEqual(app.activity_state, 'complete')
+                self.assertFalse(app.screen.query_one('#busy').display)
+                await pilot.press('ctrl+q')
+
+    async def test_instance_name_default_preserves_overrides_and_rejects_incompatible_names(self):
+        from tools.setup_common import provision_fields
+        answers = []
+
+        def operation(ui):
+            answers.append(ui.form('Choose new instance settings', provision_fields()))
+            answers.append(ui.form('Revisit saved settings', provision_fields(answers[0])))
+
+        app = WorkflowApp('Instance defaults', ['New instance'], operation)
+        async with app.run_test(size=(110, 42)) as pilot:
+            await pilot.pause()
+            stack = app.screen.query_one('#field-0', Input)
+            instance = app.screen.query_one('#field-1', Input)
+            stack.value = 'my-memory'
+            await pilot.pause()
+            self.assertEqual(instance.value, 'my-memory')
+            stack.value = 'My-CloudFormation-Stack'
+            await pilot.pause()
+            self.assertEqual(instance.value, '')
+            instance.value = 'INVALID'
+            app.screen.query_one('#field-2', Input).value = 'owner@example.com'
+            await pilot.click('#submit')
+            await pilot.pause()
+            self.assertEqual(answers, [])
+            self.assertTrue(app.screen.query_one('#error-1', Static).display)
+            instance.value = 'custom-memory'
+            await pilot.pause()
+            stack.value = 'different-stack'
+            await pilot.pause()
+            self.assertEqual(instance.value, 'custom-memory')
+            stack.value = 'custom-memory'
+            await pilot.pause()
+            stack.value = 'final-stack'
+            await pilot.pause()
+            self.assertEqual(instance.value, 'custom-memory')
+            await pilot.click('#submit')
+            await pilot.pause()
+            self.assertEqual(answers[0]['MAVEN_INSTANCE_NAME'], 'custom-memory')
+            self.assertEqual(app.screen.query_one('#field-1', Input).value, 'custom-memory')
+            app.screen.query_one('#field-0', Input).value = 'another-stack'
+            await pilot.pause()
+            self.assertEqual(app.screen.query_one('#field-1', Input).value, 'custom-memory')
+            await pilot.press('ctrl+q')
+
     async def test_help_context_and_complete_details_survive_compact_navigation(self):
-        context = 'Task: Connect existing memory\nAccess purpose: Everyday memory access\nAWS account: 123456789012 | Profile: owner | not verified'
+        context = ('Task: Connect existing memory\nAccess purpose: Everyday memory access\n'
+                   'AWS account: 123456789012\nProfile: owner | not verified\n'
+                   'Principal: arn:aws:iam::123456789012:user/owner\nTarget: instance-123\n'
+                   'Checkpoint: identity inspection\nReceipts: /private/operations/receipt.json')
         artifact = '{"exact_instance": "instance-123", "complete": "' + 'retained ' * 80 + '"}'
         answers = []
 
@@ -28,15 +180,16 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 details=artifact, back=True))
             answers.append(ui.review('Review exact selection', 'No deployment is approved here.',
                                      identity='instance-123', details=artifact, back=True))
+            answers.append(ui.choose('Next action', [('Finish', 'finish')], description='Keep all receipts.'))
 
         app = WorkflowApp('Context and details', ['Choose access'], operation)
-        async with app.run_test(size=(100, 34)) as pilot:
+        async with app.run_test(size=(130, 45)) as pilot:
             await pilot.pause()
             self.assertIsInstance(app.screen, FormScreen)
             self.assertTrue(app.screen.query_one('.field-help', Static).is_on_screen)
-            banner = app.screen.query_one('#dialog-context', Static).region
-            sidebar = app.screen.query_one('#dialog-steps', Static).region
-            self.assertGreaterEqual(sidebar.y, banner.bottom)
+            panel = app.screen.query_one('#dialog')
+            self.assertEqual(str(panel.query_one('#dialog-context', Static).render()), context)
+            self.assertTrue(panel.query_one('.context-scroll').is_on_screen)
             self.assertEqual(app.screen.query_one('#technical-body', TextArea).text, artifact)
             self.assertTrue(app.screen.query_one('#technical-details', Collapsible).collapsed)
             self.assertFalse(app.screen.query_one('#technical-body', TextArea).is_on_screen)
@@ -48,6 +201,13 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(str(app.screen.query_one('#dialog-context', Static).render()), context)
             self.assertTrue(app.screen.query_one('#dialog-context', Static).is_on_screen)
+            context_scroll = app.screen.query_one('.context-scroll')
+            self.assertGreater(context_scroll.max_scroll_y, 0)
+            context_scroll.focus()
+            await pilot.press('end')
+            await pilot.pause()
+            self.assertGreater(context_scroll.scroll_y, 0)
+            self.assertTrue(app.screen.query_one('#submit').is_on_screen)
             await pilot.click('#submit')
             await pilot.pause()
             self.assertIsInstance(app.screen, ReviewScreen)
@@ -57,7 +217,16 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(app.screen.query_one('#dialog-context', Static).render()), context)
             await pilot.click('#back')
             await pilot.pause()
-            self.assertEqual(answers, [{'profile': 'owner'}, None])
+            self.assertIsInstance(app.screen, ChooseScreen)
+            self.assertEqual(str(app.screen.query_one('#dialog #dialog-context', Static).render()), context)
+            self.assertTrue(app.screen.query_one('#choices').is_on_screen)
+            self.assertIn('Awaiting input', str(app.screen.query_one('#dialog-status', Static).render()))
+            await pilot.press('enter')
+            await pilot.pause()
+            self.assertEqual(answers, [{'profile': 'owner'}, None, 'finish'])
+            self.assertEqual(str(app.screen.query_one('#activity #context', Static).render()), context)
+            self.assertGreaterEqual(app.screen.query_one('#status').region.y,
+                                    app.screen.query_one('#events').region.bottom)
             self.assertTrue(app.screen.query_one('#context', Static).is_on_screen)
             self.assertEqual(str(app.screen.query_one('#context', Static).render()), context)
             await pilot.press('ctrl+q')
@@ -449,10 +618,15 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(entered.is_set())
                     await pilot.press('ctrl+q')
                     self.assertFalse(app.finished)
+                    self.assertEqual(app.activity_state, 'pause_requested')
+                    self.assertIn('waiting for a safe checkpoint', str(app.screen.query_one('#status', Static).render()))
+                    self.assertTrue(app.screen.query_one('#busy').display)
                     release.set()
                     await pilot.pause()
                     self.assertEqual(receipt.read_text(), 'first action durably complete')
                     self.assertEqual(app.exit_code, 130)
+                    self.assertEqual(app.activity_state, 'paused')
+                    self.assertTrue(app.activity_text.startswith('Paused'))
             finally:
                 release.set()
 

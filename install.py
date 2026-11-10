@@ -21,6 +21,7 @@ from tools.interaction import Field, OperationPaused, checkpoint, current, messa
 from tools.harness import (
     HARNESS_PATHS as INTEGRATIONS, SKILLS, apply_integration, integration_plan,
     skill_plan, retired_skill_plan, retire_skills, validate_default_profiles,
+    launcher_permission_plan, repair_launcher_permissions,
 )
 
 
@@ -188,16 +189,8 @@ def main(argv=None) -> int:
                     ui.close_when_finished()
                     return 0
                 if args.check_existing and (home / 'venv/bin/python').is_file():
-                    review = ui.review('Check or repair this connection',
-                                       'Use the installed Python runtime to inspect this saved connection.\n'
-                                       'No package update or cloud changes are approved by this screen.\n'
-                                       'Sign-in and any repair that changes resources require their own review.',
-                                       details=f'Home: {home}\nSetup code: {Path(__file__).resolve().parent}',
-                                       back=True, accept='Continue to connection checks')
-                    if review is None:
-                        continue
-                    if not review:
-                        raise OperationPaused('Connection checks declined; saved settings are unchanged.')
+                    # Selection is sufficient to open the next workflow. Cloud
+                    # effects retain their own exact reviews there.
                     handoff.update(home=home)
                 else:
                     try:
@@ -211,7 +204,8 @@ def main(argv=None) -> int:
                     show_completion(ui, home, handoff['integration'])
                     handoff.clear()
                     return 0
-                handoff.update(mode=args.setup_mode, operation=args.setup_operation)
+                handoff.update(mode=args.setup_mode, operation=args.setup_operation,
+                               fresh_operation=args.setup_fresh)
                 ui.close_when_finished()
                 return 0
 
@@ -233,6 +227,8 @@ def main(argv=None) -> int:
                        '--mode', handoff['mode']]
             if handoff.get('operation'):
                 command.extend(['--operation', handoff['operation']])
+            if handoff.get('fresh_operation'):
+                command.append('--fresh-operation')
         return run_terminal(
             command, cwd=Path(__file__).resolve().parent,
             env=dict(os.environ, MAVEN_HOME=str(home), PYTHONPATH=str(Path(__file__).resolve().parent)),
@@ -247,7 +243,7 @@ def main(argv=None) -> int:
 
 def _saved_installation(home):
     """Display saved labels only; never treat this SDK-free overview as verified config."""
-    values, notice, pending = {}, '', None
+    values, notice, pending, completed = {}, '', None, False
     path = home / '.env'
     if path.exists() or path.is_symlink():
         try:
@@ -303,6 +299,9 @@ def _saved_installation(home):
                 if str(UUID(identifier)) != identifier:
                     raise ValueError('invalid operation')
                 state = read_private(home / 'runtime/administration' / (identifier + '.json'))
+                completed = state['state'] == 'completed' and any(
+                    receipt.get('step') == 'verify' and receipt.get('result', {}).get('instance_ready') is True
+                    for receipt in state.get('receipts', []))
                 if state['state'] not in ('completed', 'cancelled'):
                     pending = identifier
                     steps = ', '.join(receipt['step'] for receipt in state.get('receipts', [])) or 'None yet'
@@ -310,7 +309,7 @@ def _saved_installation(home):
                                 f'\nNext saved step: {state["step"]}\nResume retains the exact requests and approvals; nothing is rolled back.')
         except (OSError, ValueError, KeyError, TypeError):
             summary += '\nSetup receipts need inspection; do not delete them or start over to bypass an unresolved operation.'
-    return summary, pending
+    return summary, pending, completed
 
 
 def _advanced_options(args):
@@ -342,10 +341,12 @@ def _options(args):
         home = (args.home or Path(os.environ.get('MAVEN_HOME', '~/.maven'))).expanduser().absolute()
         _no_symlink_parents(home)
         existing = any((home / name).exists() for name in ('.env', 'venv', 'runtime/setup/state.json'))
-        summary, pending = _saved_installation(home) if existing else ('', None)
+        summary, pending, completed = _saved_installation(home) if existing else ('', None, False)
         ui.set_context('Local setup • No AWS identity verified yet • No cloud changes approved')
         if existing:
             task = ui.choose('Your existing MAVEN installation', [
+                *([('Continue / configure coding harnesses — reuse prior readiness; local files only', 'harness')]
+                  if completed else []),
                 ('Resume unfinished setup — keep the original requests and approvals' if pending else
                  'Check or repair this connection — verify the saved instance; no automatic redeployment', 'existing'),
                 *([('Abandon unfinished setup and start over — preserve receipts and cloud resources', 'restart')]
@@ -364,6 +365,10 @@ def _options(args):
             ], description='Choose your goal. The wizard explains each step before asking you to decide.\n'
                            'Maintenance access manages infrastructure; daily-use access operates memory.\n'
                            'They may be separate identities in the same AWS account. Neither is assumed yet.')
+        if task == 'harness':
+            args.home, args.local_only, args.check_existing = home, False, True
+            args.setup_mode, args.setup_operation, args.setup_fresh = 'existing', None, False
+            return
         if task == 'restart':
             args.home, args.restart_operation = home, pending
             return
@@ -426,15 +431,17 @@ def _options(args):
         args.check_existing = task == 'existing' and existing and chosen == home and not separate
         args.setup_mode = 'new' if task == 'new' else 'existing'
         args.setup_operation = pending if args.check_existing else None
+        args.setup_fresh = args.check_existing and completed and pending is None
         return
 
 
 def _install_command(command):
     if current() is None:
-        return subprocess.run(command, check=True)
+        return subprocess.run(command, check=True, umask=0o022)
     # Local installation is one coherent unit through its ownership receipt. Do
     # not honor a pause between pip's mutation and recording that ownership.
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            umask=0o022)
     if result.returncode:
         raise ValueError('Local dependency installation failed. Check network access and the trusted CA bundle; existing private settings and skills are preserved.')
     return result
@@ -482,13 +489,10 @@ def _install(args, handoff=None):
         roots.extend(path.expanduser().absolute() for path in args.skill_dir)
         selected_harnesses = list(args.harness)
         deferred = False
-        if roots and not args.harness_stopped and not (staging and not args.skill_dir):
-            if current() is None:
-                raise ValueError('Close affected harnesses and add --harness-stopped, or use '
-                                 '--stage-harnesses with an inactive directory. No integration changed.')
-            if not require().confirm('Are all harnesses using these integration files closed?'):
-                deferred, roots, selected_harnesses = True, [], []
-                _notify('Harness integration deferred; active harness files will not be changed.')
+        require_stopped = bool(roots and not args.harness_stopped and not (staging and not args.skill_dir))
+        if require_stopped and current() is None:
+            raise ValueError('Close affected harnesses and add --harness-stopped, or use '
+                             '--stage-harnesses with an inactive directory. No integration changed.')
         try:
             plan = skill_plan(roots)
             integrations = integration_plan(home, selected_harnesses,
@@ -498,9 +502,8 @@ def _install(args, handoff=None):
             if current() is None:
                 raise
             message(str(exc))
-            if not require().confirm('Continue without changing any harness integration?'):
-                raise OperationPaused('Integration conflict preserved; installation paused.')
             deferred, roots, plan, integrations, retired_skills = True, [], [], [], []
+            selected_harnesses, require_stopped = [], False
         if current() is not None:
             stage('Review installation')
             body = '\n'.join([
@@ -524,8 +527,14 @@ def _install(args, handoff=None):
                        'It does not log in to AWS, create cloud resources, or enable any project.\n'
                        'Existing private connection settings and unrelated harness configuration are preserved.\n'
                        'Quit after installation does not uninstall the software; rerun to continue setup.')
+            if deferred:
+                summary += '\nHarness integration has a local conflict and will be skipped; its existing files are preserved.'
+            if require_stopped:
+                summary += ('\nClose all harness sessions using the listed files before approving, including any launching '
+                            'this installer. Approval confirms they are stopped; otherwise go Back or decline.')
             review = require().review('Review local software installation', summary, details=body,
-                                      back=True, accept='Install software')
+                                      back=True, accept=('Harnesses stopped — install software'
+                                                         if require_stopped else 'Install software'))
             if review is None:
                 raise BackToOptions('Return to installation choices; no local mutation was started.')
             if not review:
@@ -572,6 +581,11 @@ def _install(args, handoff=None):
             _install_command([str(python), '-m', 'ensurepip', '--upgrade'])
         package = str(source) + ('[ui,mcp,google]' if args.google else '[ui,mcp]')
         _install_command([str(python), '-m', 'pip', 'install', '--upgrade', package])
+        # pip derives entry-point mode from its umask. Never leave 0775 launchers
+        # for the harness reader, which correctly rejects group-writable files.
+        launcher_repair = launcher_permission_plan(home)
+        if launcher_repair is not None:
+            repair_launcher_permissions(home, launcher_repair)
         if not environment.exists():
             body = (source / 'maven_resources' / 'templates' / 'environment.example').read_bytes()
             fd = os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
@@ -580,7 +594,8 @@ def _install(args, handoff=None):
         for target, body in plan:
             target.parent.mkdir(parents=True, exist_ok=True)
             _no_symlink_parents(target)
-            with target.open('xb') as stream:
+            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(descriptor, 'wb') as stream:
                 stream.write(body)
         activation = _activation(home, ca_bundle)
         owned_paths = [target for target, _ in plan]

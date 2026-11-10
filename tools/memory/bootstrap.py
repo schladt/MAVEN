@@ -62,7 +62,7 @@ def prepare(values, destination):
                      caller_principal_arn=values['MAVEN_CALLER_PRINCIPAL_ARN'],
                      instance_id=values.get('MAVEN_INSTANCE_ID', values.get('MAVEN_MEMORY_INSTANCE_ID')),
                      recovery_epoch=values.get('MAVEN_RECOVERY_EPOCH', values.get('MAVEN_MEMORY_RECOVERY_EPOCH')),
-                     availability_zones=values['MAVEN_AVAILABILITY_ZONES'].split(','))
+                     availability_zones=[zone.strip() for zone in values['MAVEN_AVAILABILITY_ZONES'].split(',')])
     except (KeyError, ValueError, OSError):
         raise MemoryClientError('installation_settings_invalid') from None
 

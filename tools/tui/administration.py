@@ -23,10 +23,10 @@ _STAGE_NAMES = {
     'migration_review': 'Review database upgrade', 'migrate': 'Apply approved database upgrade',
     'migration_reconnect': 'Reconnect upgraded instance', 'migration_stack': 'Find upgraded instance',
     'upgrade_choice': 'Choose database upgrade', 'verify': 'Verify instance readiness',
-    'starter_prepare_review': 'Review starter content preparation', 'starter_prepare': 'Prepare starter content',
-    'starter_review': 'Review starter proposal', 'starter_submit': 'Submit approved starter proposal',
-    'starter_challenge': 'Request starter approval challenge', 'starter_approve': 'Record starter approval',
-    'starter_activate': 'Activate approved starter content', 'starter_renew': 'Renew approval challenge',
+    'starter_prepare_review': 'Prepare starter instructions', 'starter_prepare': 'Prepare starter instructions',
+    'starter_review': 'Install starter instructions', 'starter_submit': 'Upload approved starter instructions',
+    'starter_challenge': 'Prepare approved activation',
+    'starter_activate': 'Activate approved starter instructions', 'starter_renew': 'Renew activation challenge',
     'done': 'Setup complete',
 }
 
@@ -50,6 +50,10 @@ def _context(result, stage):
                      str(presentation['principal']))
     if presentation.get('target'):
         lines.append('Exact target: ' + str(presentation['target']))
+    progress = result.get('starter_progress')
+    if result.get('step', '').startswith('starter') and progress:
+        lines.append(f'Starter instructions: {progress["completed"]}/{progress["total"]} completed | '
+                     f'Page {progress["position"]}: {progress["title"]}')
     lines.append('Saved: ' + stage + ' | Receipts: ' + str(len(result.get('receipts', []))) +
                  ' | Ctrl+Q pauses')
     return '\n'.join(lines)
@@ -137,7 +141,8 @@ def present(ui, home, *, operation_id=None, mode=None):
             if question['kind'] == 'form':
                 fields = [Field(**{**field, 'choices': tuple(tuple(choice) for choice in field.get('choices', ()))})
                           for field in question['fields']]
-                response = ui.form(question['title'], fields, description=description, details=details, back=can_back)
+                response = ui.form(question['title'], fields, description=description, details=details,
+                                   back=can_back, submit=question.get('submit', 'Continue'))
                 if response is None:
                     if can_back:
                         result = controller.back(identifier)
@@ -181,7 +186,7 @@ def present(ui, home, *, operation_id=None, mode=None):
             ui.message(_text(outcome))
             if result['state'] == 'completed' and result.get('kind') == 'setup':
                 from tools.tui.harness import finish_setup
-                finish_setup(ui, home, outcome)
+                return finish_setup(ui, home, outcome)
             return 0 if result['state'] == 'completed' else 1
         elif result['state'] in ('blocked', 'uncertain'):
             if result.get('handoff', {}).get('type') == 'aws_login':

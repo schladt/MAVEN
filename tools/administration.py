@@ -22,6 +22,8 @@ from uuid import UUID, uuid4
 from tools.interaction import Field
 from tools.setup_common import SetupPending, private_directory, read_private, save_json, setup_lock
 
+_LEGACY_STARTER_REVIEWS = frozenset(('starter_prepare', 'starter_submit', 'starter_activate', 'starter_renew'))
+
 
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
@@ -166,6 +168,10 @@ class AdminOperations:
                 (state.get('pending_interaction') or {}).get('key') in ('optional_project', 'project')):
             result['pending_interaction'] = None
             result['notice'] = 'This old installer project prompt is retired. Advance to verify instance readiness; no project will be enabled.'
+        if (state['kind'] == 'setup' and
+                (state.get('pending_interaction') or {}).get('key') in _LEGACY_STARTER_REVIEWS):
+            result['pending_interaction'] = None
+            result['notice'] = 'Continue to one exact starter-collection approval. Completed pages and original request artifacts remain preserved.'
         if state.get('plan_path'):
             from tools.uninstall.cli import status
             result['removal'] = status(state['plan_path'])
@@ -187,6 +193,8 @@ class AdminOperations:
                 raise ValueError('Stale interaction; inspect the current full review before responding.')
             if not isinstance(response, dict):
                 raise ValueError('A structured response is required.')
+            if state['kind'] == 'setup' and question['key'] in _LEGACY_STARTER_REVIEWS:
+                raise ValueError('This individual starter review has been replaced. Advance to the complete collection review.')
             if question['kind'] == 'review':
                 if set(response) - {'approved', 'review_digest', 'source', 'confirmations'}:
                     raise ValueError('Unsupported approval response fields.')
@@ -220,6 +228,8 @@ class AdminOperations:
                         valid = isinstance(value, str) and (not field['required'] or bool(value.strip()))
                         if field['choices']:
                             valid = valid and value in [choice[1] for choice in field['choices']]
+                        if field.get('pattern') and value:
+                            valid = valid and bool(re.fullmatch(field['pattern'], value.strip()))
                     if not valid:
                         raise ValueError('Invalid answer for ' + field['name'])
                 key = question['key']
@@ -254,6 +264,8 @@ class AdminOperations:
                 if key == 'install' and (not Path(response['source']).is_absolute()
                         or not (Path(response['source']) / 'install.py').is_file()):
                     raise ValueError('Select an absolute checkout containing install.py.')
+                if key == 'provision' and question.get('submit') == 'Prepare deployment review':
+                    state['preparation_requested'] = _digest(answer)
                 state['answers'][question['key']] = answer
             state.setdefault('responses', []).append({'interaction_id': interaction_id, 'revision': revision, 'response': response})
             state.update(step=question['next_step'], pending_interaction=None, state='pending')
@@ -298,7 +310,7 @@ class AdminOperations:
             self._save(state)
         return self.status(operation_id)
 
-    def _question(self, state, key, title, fields, next_step, *, description='', details=''):
+    def _question(self, state, key, title, fields, next_step, *, description='', details='', submit='Continue'):
         previous = state['answers'].get(key, {})
         serialized = [asdict(field) for field in fields]
         for field in serialized:
@@ -308,7 +320,7 @@ class AdminOperations:
             'interaction_id': str(uuid4()), 'revision': state['revision'] + 1,
             'kind': 'form', 'key': key, 'title': title, 'fields': serialized,
             'description': description or 'Choose the exact target and access needed for this task. No cloud changes are made by this form.',
-            'details': details, 'next_step': next_step}
+            'details': details, 'submit': submit, 'next_step': next_step}
         state.setdefault('choice_checkpoints', []).append({
             'question': deepcopy(question), 'answers': deepcopy(state['answers']),
             'step': state['step'], 'effect_sequence': state.get('effect_sequence', 0),
@@ -323,10 +335,11 @@ class AdminOperations:
             'plan': 'Create a reviewable CloudFormation change set, not the resources. The candidate describes Aurora database, networking, IAM, API, storage, notifications and logging. Execution is separately approved; Aurora capacity, retained data/snapshots, network traffic, API requests and logs can incur ongoing charges. Interruption must reconcile this same change set; no automatic execution or rollback.',
             'apply': 'Create billable Aurora database, network, IAM, API, storage, notification and logging resources. Aurora capacity, storage, snapshots, network traffic, API requests and logs incur charges. Interruption may leave an in-flight stack; resume the exact change set. Retained data can continue costing money after removal.',
             'schema': 'Run the exact SQL bundle under the existing separately assumed administration role. Initialization/migration changes database schema and may interrupt memory writers; preserve and reconcile uncertain requests. This does not approve authority activation.',
-            'starter_submit': 'Submit this exact authority proposal, not activate it.',
-            'starter_activate': 'Activate these exact instructions using the separate approval role. Active instructions change future memory behavior.',
             'removal': 'Remove only the reviewed targets. Retire retains data and ongoing storage/snapshot costs; purge can permanently destroy data. Writers/harnesses must stop where the plan requires it. Interrupted removal resumes original receipts, never a new plan.',
         }.get(key, title + '. Approve only this exact candidate; changes require a fresh review.')
+        if key == 'starter_collection':
+            from tools.setup_starter import summary as starter_summary
+            summary = starter_summary(review, state.get('starter_index', 0))
         summary += '\nAccount: ' + str(context.get('account', 'Unknown')) + '; region: ' + str(context.get('region', 'us-east-1'))
         summary += '\nTarget home: ' + state['home']
         if context.get('target'):
@@ -336,10 +349,12 @@ class AdminOperations:
                        ('instance_id', 'identity', 'selection', 'instance', 'targets',
                         'machine_homes', 'scopes', 'region', 'mode', 'connection')
                        if name in review}
-            if key.startswith('starter'):
+            if key == 'starter_collection':
+                targets = {}
+            elif key.startswith('starter'):
                 draft = review.get('candidate', review)
-                targets = {name: draft[name] for name in ('proposal_id', 'page_id', 'request_key') if name in draft}
-                targets['authority_title'] = draft.get('candidate', {}).get('title')
+                candidate = draft.get('candidate', draft)
+                targets = {'authority_title': candidate['title']} if 'title' in candidate else {}
             if targets:
                 summary += '\nTargets and scope:\n' + json.dumps(targets, indent=2)
         if state.get('preflight'):
@@ -370,6 +385,11 @@ class AdminOperations:
         self._prepare()
         with setup_lock(self.directory):
             state = self._load(operation_id)
+            if (state['kind'] == 'setup' and
+                    (state.get('pending_interaction') or {}).get('key') in _LEGACY_STARTER_REVIEWS):
+                question = state['pending_interaction']
+                state.setdefault('retired_interactions', []).append(question)
+                state.update(pending_interaction=None, step=question['next_step'], state='pending')
             if (state['kind'] == 'setup' and
                     (state.get('pending_interaction') or {}).get('key') in ('optional_project', 'project')):
                 if state['step'] == 'project_apply' or any(
@@ -460,7 +480,8 @@ class AdminOperations:
             'region': wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'),
             'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
             'profile': wizard.values.get('MAVEN_AWS_PROFILE'),
-            'instance_ready': True, 'authority_generation': generation, 'project_configured': False})
+            'instance_ready': True, 'authority_generation': generation, 'project_configured': False,
+            'binding': dict(wizard.values)})
 
 
     def _setup(self, state):
@@ -522,6 +543,10 @@ class AdminOperations:
                     raise SetupPending('The reviewed infrastructure supports us-east-1 only.')
                 if selection['mode'] == 'new' and wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'):
                     raise SetupPending('Existing connection cannot be redeployed; choose a separate home.')
+                if selection['mode'] == 'new':
+                    wizard.settings({'MAVEN_AWS_REGION': selection['region']})
+                    state['step'] = 'identity'
+                    return
                 review = dict(selection)
                 connection = selection['connection']
                 if selection['mode'] == 'existing' and connection.startswith('/'):
@@ -692,11 +717,11 @@ class AdminOperations:
                 if (routine['Account'] != deploy['Account'] or not re.fullmatch(
                         r'arn:aws:iam::' + re.escape(routine['Account']) + r':user/[A-Za-z0-9+=,.@_/-]+', routine['Arn'])):
                     raise SetupPending('Fresh provisioning requires an exact same-account IAM user routine principal and deployment identity.')
-                self._question(state, 'provision', 'Billable new instance inputs; review actual supported availability zones and prices', [
-                    Field('MAVEN_STACK_NAME', 'New stack name'), Field('MAVEN_INSTANCE_NAME', 'Instance name'),
-                    Field('MAVEN_NOTIFICATION_EMAIL', 'Notification email'),
-                    Field('MAVEN_AVAILABILITY_ZONES', 'Two distinct us-east-1 zones, comma-separated'),
-                    Field('MAVEN_ENGINE_VERSION', 'Reviewed Aurora PostgreSQL 18 patch >=18.3', '18.6')], 'prepare')
+                from tools.setup_common import provision_fields
+                self._question(state, 'provision', 'Choose new instance settings',
+                               provision_fields(), 'prepare',
+                               description='Editable suggestions for us-east-1; verify actual zone/engine availability and prices. Continue prepares local artifacts and requests a CloudFormation change-set preview. It does not deploy billable resources; deployment requires the next approval.',
+                               submit='Prepare deployment review')
             elif step == 'prepare':
                 wizard.settings({**answers['provision'], 'MAVEN_ACCOUNT_ID': state['identity_actual']['Account'],
                                  'MAVEN_CALLER_PRINCIPAL_ARN': state['identity_actual']['Arn'],
@@ -714,13 +739,21 @@ class AdminOperations:
                 review = Wizard.package_review(package, manifest, template, parameters)
                 state['presentation']['target'] = wizard.values['MAVEN_STACK_NAME'] + '; instance ' + state['new_instance_id']
                 self._preflight(state, wizard.values, 'infrastructure')
-                self._review(state, 'plan', 'Create/reconcile one CREATE change set; do not execute it', review, 'plan')
+                if state.get('preparation_requested') == _digest(answers['provision']):
+                    state['prepared_plan'] = _digest(review)
+                    state['step'] = 'plan'
+                else:
+                    self._review(state, 'plan', 'Prepare the requested deployment preview; do not deploy resources', review, 'plan')
             elif step in ('plan', 'apply_review', 'apply'):
                 package, path = wizard.directory / state.get('package_path', 'package'), wizard.directory / 'change-set.json'
                 manifest, template, parameters = bootstrap._package(package)
                 body = Wizard.package_review(package, manifest, template, parameters)
                 if step == 'plan':
-                    self._approved(state, 'plan', body)
+                    if state.get('preparation_requested') == _digest(answers.get('provision', {})):
+                        if state.get('prepared_plan') != _digest(body):
+                            raise SetupPending('Prepared package changed before preview; revise the unsubmitted inputs rather than reuse this request.')
+                    else:
+                        self._approved(state, 'plan', body)
                     result = bootstrap.plan(wizard.values, package, path, change_type='CREATE')
                     self._receipt(state, step, result)
                     state['step'] = 'apply_review'
@@ -804,50 +837,50 @@ class AdminOperations:
     def _starter(self, state, wizard):
         from tools.memory import onboarding
         from tools.memory.environment import configured_client
-        from tools.memory.validation import digest, validate_create, validate_resolve
+        from tools.memory.validation import digest, validate_resolve
+        from tools.setup_starter import collection, prepare
         step = state['step']
         directory = wizard.directory / 'starter'
         if state.get('starter_binding') != wizard.values:
             raise SetupPending('Starter connection or selected credentials differ from the original initialization; restore the exact binding before any lookup, submission, challenge or activation.')
-        if step == 'starter_prepare_review':
-            self._review(state, 'starter_prepare', 'Prepare generic starter proposals offline, not activate them',
-                         {'binding': state['starter_binding'], 'action': 'prepare starter proposals'}, 'starter_prepare')
-            return
-        if step == 'starter_prepare':
-            source = self._approved(state, 'starter_prepare',
-                                    {'binding': state['starter_binding'], 'action': 'prepare starter proposals'})
+        if step in ('starter_prepare_review', 'starter_prepare'):
             if not directory.exists():
-                onboarding.prepare(directory, source_origin=source['origin'], source_excerpt=source['excerpt'])
-            state['step'] = 'starter_review'
-            return
-        manifest = read_private(directory / 'manifest.json')
+                prepare(directory)
+            step = 'starter_review'
+            state['step'] = step
+        review = collection(directory, state['starter_binding'])
+        pages = review['pages']
         index = state.get('starter_index', 0)
-        if index == len(manifest['pages']):
+        if type(index) is not int or not 0 <= index <= len(pages):
+            raise SetupPending('Invalid saved starter progress; preserve the original receipts.')
+        if index == len(pages):
             state['step'] = 'verify'
             return
-        page = manifest['pages'][index]
-        if not re.fullmatch(r'[a-z0-9][a-z0-9-]*', page['slug']) or page['file'] != page['slug'] + '.json':
-            raise SetupPending('Invalid starter artifact path.')
-        path = directory / page['file']
-        draft = validate_create(read_private(path))
-        if (digest(draft['candidate']) != page['candidate_hash'] or
-                any(draft[key] != page[key] for key in ('proposal_id', 'page_id', 'request_key'))):
-            raise SetupPending('Starter candidate or original request identity changed.')
+        draft = pages[index]
+        candidate_hash = digest(draft['candidate'])
+        slug = draft['candidate']['slug']
+        state['starter_progress'] = {'completed': index, 'total': len(pages),
+                                     'position': index + 1, 'title': draft['candidate']['title']}
+        if 'starter_collection' not in state['answers']:
+            self._review(state, 'starter_collection', 'Install all starter instructions — one approval',
+                         review, step)
+            return
+        source = self._approved(state, 'starter_collection', review)
+        path = directory / (slug + '.json')
         round_number = state.get('starter_round', 0)
         suffix = '.chat.' + str(round_number)
-        challenge_path = directory / (page['slug'] + suffix + '.challenge.json')
-        approval_path = directory / (page['slug'] + suffix + '.approval.json')
+        challenge_path = directory / (slug + suffix + '.challenge.json')
+        approval_path = directory / (slug + suffix + '.approval.json')
         if step == 'starter_review':
             self._preflight(state, wizard.values, 'routine')
-            self._review(state, 'starter_submit', 'Propose exact candidate, not activation', draft, 'starter_submit')
+            state['step'] = 'starter_submit'
         elif step == 'starter_submit':
-            self._approved(state, 'starter_submit', draft)
             client = configured_client(wizard.env, values=wizard.values)
             try:
                 wizard.before_request(client, draft['request_key'])
                 result = client.invoke('/v1/proposals/create', draft)
                 actual = client.read_full({'proposal_id': draft['proposal_id']})['data']
-                if actual.get('content_hash') != page['candidate_hash']:
+                if actual.get('content_hash') != candidate_hash:
                     raise SetupPending('Cloud proposal does not match reviewed candidate.')
             finally:
                 client.close()
@@ -860,14 +893,9 @@ class AdminOperations:
                 challenge = client.invoke('/v1/proposals/challenge', {'proposal_id': draft['proposal_id']})
             finally:
                 client.close()
-            # A fresh challenge is not an activation request; the persisted review
-            # below must be answered before any approval artifact is generated.
             save_json(challenge_path, challenge)
-            self._review(state, 'starter_activate', 'Activate this exact candidate through the separate approval role; instructions become operative',
-                         {'candidate': draft, 'challenge': challenge}, 'starter_activate')
+            state['step'] = 'starter_activate'
         elif step == 'starter_activate':
-            review = {'candidate': draft, 'challenge': read_private(challenge_path)}
-            source = self._approved(state, 'starter_activate', review)
             if not approval_path.exists():
                 from tools.memory.client import MemoryClientError
                 try:
@@ -876,11 +904,12 @@ class AdminOperations:
                 except MemoryClientError as error:
                     if error.code != 'starter_challenge_expired_or_invalid':
                         raise
-                    self._review(state, 'starter_renew', 'Challenge expired before submission; authorize a new challenge for the SAME candidate',
-                                 {'candidate': draft, 'expired_challenge': review['challenge']}, 'starter_renew')
+                    state['step'] = 'starter_renew'
+                    if round_number:
+                        raise SetupPending('Starter approval repeatedly expired before submission. Check the local clock and service availability; Resume renews only this same approved candidate.')
                     return
             request = validate_resolve(read_private(approval_path))
-            if request['candidate_hash'] != page['candidate_hash'] or request['proposal_id'] != draft['proposal_id']:
+            if request['candidate_hash'] != candidate_hash or request['proposal_id'] != draft['proposal_id']:
                 raise SetupPending('Preserved approval differs from the reviewed candidate.')
             client = configured_client(wizard.env, approval=True, values=wizard.values)
             try:
@@ -889,13 +918,17 @@ class AdminOperations:
             except Exception as error:
                 if getattr(error, 'code', None) != 'approval_invalid':
                     raise
-                self._review(state, 'starter_renew', 'Service definitively rejected approval; preserve it and authorize a new challenge for the SAME candidate',
-                             {'candidate': draft, 'rejected_request': request}, 'starter_renew')
+                # Only a definite rejection permits a new request. Unknown outcomes
+                # keep this phase and the exact original approval file on resume.
+                state['step'] = 'starter_renew'
+                if round_number:
+                    raise SetupPending('The service repeatedly rejected starter approval. Check clock/login/service availability; Resume renews only the same approved candidate.')
                 return
             finally:
                 client.close()
             self._receipt(state, step, result)
             state['starter_index'] = index + 1
+            state['starter_progress']['completed'] = index + 1
             state['starter_round'] = 0
             state['step'] = 'starter_review'
         elif step == 'starter_renew':

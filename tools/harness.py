@@ -6,6 +6,8 @@ instructions is not an execution hook or a verified project initialization.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -116,6 +118,63 @@ def _read(path: Path) -> bytes | None:
             or info.st_nlink != 1 or info.st_mode & 0o022):
         raise ValueError(f'Unsafe integration target preserved: {path}')
     return path.read_bytes()
+
+
+@contextmanager
+def _launcher(home: Path):
+    path = home / 'venv/bin/maven-mcp'
+    for part in (path, *path.parents):
+        if part.is_symlink():
+            raise ValueError(f'Symlink launcher target preserved: {part}')
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        mode = stat.S_IMODE(info.st_mode)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_nlink != 1 or not mode & 0o100
+                or (mode != 0o775 and mode & 0o7022)):
+            raise ValueError(f'Unsafe launcher preserved: {path}; require an owner-owned, single-link executable.')
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def _launcher_entry(descriptor):
+    info = os.fstat(descriptor)
+    if info.st_uid != os.getuid() or info.st_nlink != 1:
+        raise ValueError('Launcher ownership or link count changed; preserved.')
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while block := os.read(descriptor, 65536):
+        digest.update(block)
+    after = os.fstat(descriptor)
+    if any(getattr(after, key) != getattr(info, key) for key in (
+            'st_dev', 'st_ino', 'st_mode', 'st_uid', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')):
+        raise ValueError('Launcher changed while inspecting it; preserved for review.')
+    return {'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid,
+            'dev': info.st_dev, 'ino': info.st_ino, 'type': 'file',
+            'size': info.st_size, 'sha256': digest.hexdigest()}
+
+
+def launcher_permission_plan(home: Path, *, recorded=None) -> dict | None:
+    """Plan the historical 0775 repair, including its already-repaired receipt."""
+    with _launcher(home) as descriptor:
+        entry = _launcher_entry(descriptor)
+    if entry['mode'] == 0o775 or (
+            entry['mode'] == 0o755 and recorded == {**entry, 'mode': 0o775}):
+        return entry
+    return None
+
+
+def repair_launcher_permissions(home: Path, expected: dict) -> None:
+    """Change only the reviewed inode's mode; never follow links or replace bytes."""
+    if expected.get('mode') != 0o775:
+        raise ValueError('Only an exact 0775 launcher permission repair is supported.')
+    with _launcher(home) as descriptor:
+        if _launcher_entry(descriptor) != expected:
+            raise ValueError('Launcher changed since review; preserved.')
+        os.fchmod(descriptor, 0o755)
+        os.fsync(descriptor)
 
 
 def _json(raw: bytes | None) -> dict:

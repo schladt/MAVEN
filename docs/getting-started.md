@@ -88,15 +88,43 @@ authority must already be available; missing authority is a blocker, not permiss
 to reset it.
 
 **New instance:** sign in and confirm the discovered account/principal, then provide
-the stack/instance name, notification email and two availability zones. Select
+the stack/instance name, notification email and two comma-separated availability zones
+(for example, `us-east-1b, us-east-1c`; surrounding spaces are accepted). Select
 daily-use and maintenance access explicitly. Review the limitations and costs below.
-The wizard displays the generated package and complete change-set review, asks
-permission to create a change set, and binds execution to the exact review digest.
-Database initialization and each starter authority proposal/activation have separate
-reviews. Changed candidates require fresh approval. Routine terminal approvals use
-buttons and record the actual selection; destructive confirmations remain separate.
-Read the complete artifacts and candidate bodies before approving.
-Declining any stage leaves setup pending, not complete.
+The instance name automatically follows a compatible stack name until you override
+it. Stack names that do not meet the instance's 2–32-character lowercase naming
+rules require a separate instance name. The form suggests `us-east-1a, us-east-1b`
+and Aurora PostgreSQL `18.6`; both remain editable. These are suggestions, **not
+verified account/region availability**. Confirm zone availability and engine
+support for Data API and auto-pause before approving deployment. Saved answers
+remain preserved when revisiting a checkpoint.
+**Prepare deployment review** requests local package preparation and a CloudFormation
+change-set preview; it does not deploy billable resources. The next approval binds
+billable execution to the exact generated package and change-set digest. Database
+initialization remains a separate consequential approval.
+
+Starter instructions are prepared locally without an extra confirmation. **One
+collection approval replaces the eighteen per-page submission/activation approvals**:
+it authorizes uploading and activating all nine exact instruction pages, in dependency
+order. The review explains what “authority” means, lists page titles, and provides
+complete contents under **Technical details**. Progress reports the current page
+and completed count. This is not an all-or-nothing cloud transaction: completed
+pages remain active after a pause or failure. Resume preserves the approval and
+original request identifiers; changed contents or connections cannot reuse it.
+Older individual starter prompts advance to one collection review without replaying
+already completed pages. Unknown outcomes always reconcile the original request.
+
+The default flow removes duplicate new-instance region confirmation, separate
+preview-creation approval, local starter-preparation approval and per-page approvals.
+Actual AWS identity confirmation, billable execution, SQL initialization/migration,
+the starter collection, and changed local harness files retain meaningful approvals.
+Expandable technical details provide deeper inspection without a second granular
+review mode. Destructive removal confirmations remain separate.
+
+Current-step context is inside the bordered panel; its overflow is scrollable in
+small terminals. A bottom status bar distinguishes **Waiting…**, **Awaiting input**,
+pause requested, paused, failed and complete. Declining an approval preserves
+the operation rather than claiming completion or rollback.
 
 **Daily-use access** operates memory. **Maintenance access** manages CloudFormation
 or reads required stack metadata; it is requested only when needed. These purposes
@@ -130,10 +158,17 @@ The actual returned principal is verified before any subsequent cloud action.
 ### Optional harness connection and project enablement
 
 After verified cloud access and complete approved authority, optionally configure
-OMP, Claude Code, Codex, Copilot or Gemini. Review exact local MCP, startup-guidance
-and skill changes, then confirm affected harnesses are stopped before any writes.
+OMP, Claude Code, Codex, Copilot or Gemini. Select harnesses directly, then approve
+one exact local file-change review that also confirms affected harnesses are stopped.
+Identical already-configured integrations require no repeat approval or rewrite.
 Skip leaves their files unchanged. Conflicting or modified files are preserved;
 partial completed writes remain recorded in selective-uninstall ownership receipts.
+If an older install left `venv/bin/maven-mcp` group-writable (`0775`), this same
+review can repair that exact installer-owned executable to `0755` and update only
+its ownership entry. Already manually-corrected launchers can have their stale
+ownership entry reconciled. Modified, unowned, linked or otherwise unsafe targets
+remain untouched. The conflict screen offers local retry without cloud setup.
+New installs use a safe package-install umask and record safe launcher permissions.
 
 Completion distinguishes **cloud verified**, **harness files written/skipped/conflict**,
 **restart needed**, and **harness MCP connection not yet verified**.
@@ -175,8 +210,18 @@ remain intact. Do not delete settings or receipts to recover.
 `maven-setup` opens the same setup screens and reads existing receipts. Guided
 installation continues directly into cloud setup; if paused, activate that home and
 run `maven-setup` when ready. `--mode existing|new` selects the task without asking
-again. After verified completion, a separately reviewed check/repair can start a
-new operation; `--fresh-operation` never discards an unfinished or unverified one.
+again. **Completed, verified setup resumes optional harness configuration by default**,
+including an explicit `--operation` for that completed record. No new operation or
+cloud checks are started when its exact saved settings still match. The installer
+offers **Continue / configure coding harnesses** for that state.
+
+Starting a new check/repair after completion is explicit: choose that task or use
+`--fresh-operation`. This never discards an unfinished or unverified operation.
+If an older installer already started another connection check, it remains unfinished
+and resumes its current checkpoint—not the earlier completed starter installation.
+If recorded readiness lacks a recoverable exact binding or settings changed,
+restore the original settings or explicitly request a fresh check; readiness is
+not inferred from today's settings.
 
 To abandon the current unfinished setup, rerun `python3 install.py` and choose
 **Abandon unfinished setup and start over**. Review the exact operation and type its

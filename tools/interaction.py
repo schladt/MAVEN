@@ -20,6 +20,8 @@ class Field:
     choices: tuple[tuple[str, str], ...] = ()  # (label, value)
     required: bool = True
     help: str = ""
+    default_from: str = ""  # Follow another text field until the owner edits this value.
+    pattern: str = ""  # Full-match constraint, also applied to derived defaults.
 
 
 _current: ContextVar[Any] = ContextVar("maven_interaction", default=None)
