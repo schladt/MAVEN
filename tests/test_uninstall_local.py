@@ -57,26 +57,56 @@ class LocalUninstallTests(unittest.TestCase):
         return [local.execute(action, {}, lambda: None)
                 for action in sorted(fragment['actions'], key=lambda value: value['stage'])]
 
-    def test_machine_removes_owned_symlink_tree_not_source_or_settings(self):
+    def apply_before_purge(self, fragment):
+        return self.apply({'actions': [item for item in fragment['actions'] if item['kind'] != 'local_home_purge']})
+
+    def purge(self, fragment):
+        action = next(item for item in fragment['actions'] if item['kind'] == 'local_home_purge')
+        return local.execute(action, {}, lambda: None)
+
+    def test_machine_deletes_installation_folder_but_not_source_or_external_targets(self):
         runtime, external = self.runtime()
         environment = self.home / '.env'
         environment.write_text('PRIVATE=value\n')
         environment.chmod(0o600)
         self.assertIn(str(self.home), local.discover_homes())
-        self.apply(local.plan_machine(self.home, offline=True))
-        self.assertFalse(runtime.exists())
+        fragment = local.plan_machine(self.home, offline=True)
+        self.assertTrue(any('No export directory' in warning for warning in fragment['warnings']))
+        self.assertFalse(any(item['path'] == str(environment) for item in fragment['retained']))
+        self.apply(fragment)
+        self.assertFalse(self.home.exists())
         self.assertEqual(external.read_text(), 'external interpreter must survive')
-        self.assertEqual(environment.read_text(), 'PRIVATE=value\n')
         self.assertTrue((self.source / 'source.py').exists())
-        self.assertTrue(read_private(self.home / 'runtime/uninstall.json')['whole_home'])
         self.assertNotIn(str(self.home), local.discover_homes())
-        self.assertIn(str(self.home), local.discover_homes([self.home]))
+        # A later installation into the same path starts without a removal barrier.
+        self.home.mkdir(mode=0o700)
         with local._lock(self.home / 'runtime/registry.lock'):
-            completed = local.reinstall_marker(self.home)
-            self.runtime()
-            local.finish_reinstallation(self.home, completed)
-        self.assertFalse((self.home / 'runtime/uninstall.json').exists())
-        self.assertIn(str(self.home), local.discover_homes())
+            self.assertIsNone(local.reinstall_marker(self.home))
+
+    def test_installation_folder_purge_refuses_changes_and_resumes(self):
+        self.runtime()
+        (self.home / '.env').write_text('PRIVATE=value\n')
+        fragment = local.plan_machine(self.home, offline=True)
+        self.apply_before_purge(fragment)
+        added = self.home / 'runtime/added-after-review'
+        added.write_text('keep')
+        with self.assertRaisesRegex(UninstallError, 'changed since review'):
+            self.purge(fragment)
+        self.assertTrue((self.home / '.env').exists())
+        added.unlink()
+        (self.home / '.env').unlink()  # Interrupted purge: some reviewed entries already gone.
+        self.purge(fragment)
+        self.assertFalse(self.home.exists())
+        self.purge(fragment)
+
+    def test_installation_folder_without_receipt_is_kept(self):
+        (self.home / '.env').write_text('PRIVATE=value\n')
+        fragment = local.plan_machine(self.home, offline=True)
+        self.assertFalse(any(item['kind'] == 'local_home_purge' for item in fragment['actions']))
+        self.assertTrue(any('is kept because no installer ownership receipt' in warning
+                            for warning in fragment['warnings']))
+        self.apply(fragment)
+        self.assertTrue((self.home / '.env').exists())
 
     def test_inventory_change_invalidates_approval_and_interrupted_removal_resumes(self):
         runtime, _ = self.runtime()
@@ -161,11 +191,29 @@ class LocalUninstallTests(unittest.TestCase):
         self.assertTrue(skill.exists())
         self.assertTrue(any(item['path'] == str(skill) for item in fragment['retained']))
         (other / 'runtime').mkdir(mode=0o700)
+        identifier = '00000000-0000-4000-8000-000000000009'
+        session = {'root': str(self.base / 'project'), 'state': 'paused', 'writers': []}
+        save_private(other / 'runtime/sessions.json', {'schema': 1, 'sessions': {identifier: session},
+                                                       'reservations': {}})
+        idle = local.plan_machine(other)
+        barrier = next(item for item in idle['actions'] if item['kind'] == 'local_barrier')
+        self.assertTrue(barrier['details']['detach_sessions'])
+        self.assertTrue(any('will be detached' in warning for warning in idle['warnings']))
         save_private(other / 'runtime/sessions.json', {'schema': 1, 'sessions': {
-            'session': {'root': str(self.base / 'project'), 'state': 'paused', 'writers': []}},
-            'reservations': {}})
-        with self.assertRaises(UninstallError):
+            identifier: {**session, 'writers': ['in-flight']}}, 'reservations': {}})
+        with self.assertRaisesRegex(UninstallError, 'in-flight writers'):
             local.plan_machine(other)
+        # A writer registered after review invalidates the idle detachment.
+        with self.assertRaisesRegex(UninstallError, 'in-flight writers'):
+            local.execute(barrier, {}, lambda: None)
+        save_private(other / 'runtime/sessions.json', {'schema': 1, 'sessions': {identifier: session},
+                                                       'reservations': {}})
+        self.apply_before_purge(idle)
+        self.assertEqual(read_private(other / 'runtime/sessions.json')['sessions'], {})
+        evidence = read_private(next((other / 'runtime').glob('uninstall-sessions-*.json')))
+        self.assertEqual(evidence['sessions'][identifier]['state'], 'detached')
+        self.purge(idle)
+        self.assertFalse(other.exists())
 
     def test_combined_offline_export_locks_and_multiple_roots_preserve_evidence(self):
         runtime, _ = self.runtime()
@@ -199,7 +247,7 @@ class LocalUninstallTests(unittest.TestCase):
         with local._lock(root / '.maven/runtime/sessions' / identifier / 'command.lock'):
             with self.assertRaises(UninstallError):
                 local.execute(first, {}, lambda: None)
-        self.apply(combined)
+        self.apply_before_purge(combined)
         self.assertFalse(runtime.exists())
         self.assertFalse(environment.exists())
         self.assertFalse(sensitive.exists())
@@ -213,6 +261,9 @@ class LocalUninstallTests(unittest.TestCase):
         sensitive_export = next(item for item in combined['actions'] if item['target'] == str(sensitive))
         with zipfile.ZipFile(sensitive_export['details']['destination']) as archive:
             self.assertEqual(archive.read('data/original.bin'), b'owner original')
+        self.purge(combined)
+        self.assertFalse(self.home.exists())
+        self.assertTrue(Path(sensitive_export['details']['destination']).exists())
 
     def test_explicit_legacy_adoption_validates_real_metadata_and_entrypoints(self):
         runtime = self.home / 'venv'

@@ -60,9 +60,11 @@ If UI dependencies are missing, a bootstrap prompt requests permission to downlo
 them into a temporary private runtime; system Python is never modified.
 
 After verified cloud setup, optionally review local integration for OMP, Claude Code,
-Codex, Copilot or Gemini. Close affected harnesses before approving writes; conflicts
-are preserved. Files written, cloud readiness and an actual harness connection are
-reported separately. A written configuration is **not** a verified MCP connection.
+Codex, Copilot or Gemini. Running harnesses do not block the review; restart them
+afterward and confirm MAVEN is listed, since a harness that saves its own configuration
+while running can overwrite the entry. Conflicts are preserved. Files written, cloud
+readiness and an actual harness connection are reported separately. A written
+configuration is **not** a verified MCP connection.
 Older installer-owned MCP launchers with group-writable permissions can be repaired
 to `0755` within the local file-change review. Modified or unowned legacy skills
 are preserved and require separate resolution; restarting cloud setup does not
@@ -128,8 +130,9 @@ Git assistance is separate. The installation checkout is never automatically bou
 ## Work with your assistant
 
 The configured client launches the installed `maven-mcp` process with the selected
-private home, not embedded credentials. Installed `maven` front-door guidance and
-`maven-maintenance` worker guidance route intent without CLI rituals.
+private home, not embedded credentials. Installed `maven` front-door guidance,
+`maven-maintenance` worker guidance and `maven-update` self-update guidance route
+intent without CLI rituals.
 
 Ask **“Enable MAVEN for this project.”** Confirm scope and selection. Subsequent
 supported sessions visibly initialize, then report ready only after binding and
@@ -194,14 +197,17 @@ independent scopes and retained resources. The running harness cannot attest tha
 it is stopped: affected integration/self-removal requires a protected external
 continuation using the pinned recovery implementation.
 
-Project memory and protected local artifacts are retained by default. Cloud removal
+Project memory and protected project artifacts are retained by default. Machine removal
+deletes the whole installation folder, including settings, after archiving them if you
+give an archive directory; it keeps the folder only when it cannot be proven MAVEN's. Cloud removal
 defaults to recoverable retirement; permanent purge requires separate approval.
 Every operation has an exact reviewed plan and an external recovery directory.
 The TUI stays available through self-removal using an offline private runtime copy.
 Noninteractive `plan`, `apply`, `resume`, and `status` remain available; local offline
 detachment and recovery require neither Textual nor AWS packages or login.
 
-Close affected harnesses and writers before applying removal. See
+Stop affected MAVEN writers before applying removal; running harnesses only produce a
+warning. Idle registered sessions are detached with retained evidence. See
 [Uninstall and retirement](docs/getting-started.md#uninstall-and-retirement) for
 scope selection, legacy installations, export, retained charges, and recovery.
 
@@ -231,14 +237,26 @@ scope selection, legacy installations, export, retained charges, and recovery.
   context with an external model is a separate disclosure subject to that provider's
   policies; MAVEN does not promise private inference.
 
-## Upgrade boundaries
+## Update MAVEN
 
-Local installation is not live rollout. Existing instances need a separately reviewed
-matching service/schema upgrade before changed memory contracts can be used. Recover
-incompatible pending operations through their original path first. Then review and
-activate changed cloud instructions separately; templates are proposals and never
-replace active policy automatically. Documentation is not proof of runtime coverage
-of all five clients, live migration, deployment or activation.
+Ask your assistant to **"Update MAVEN"** (the `maven-update` skill), or run
+`python3 install.py` and choose **Update MAVEN**. One resumable operation brings an
+installation to its checkout's version, reviewing each part only where it differs:
+
+1. **Local software and harness skills** — the installer runs in a separate terminal
+   because it replaces the running software; restart harnesses afterward. Skills you
+   edited, or that another installation shares, are preserved.
+2. **Database schema** — pending ordered migrations, under maintenance mode.
+3. **Service stack** — a CloudFormation change set built from the live stack's own
+   deployment inputs. A change that would remove or replace the database, a secret,
+   a bucket or a key is refused before review.
+4. **Instructions** — bundled pages that are new or differ from the active ones, with
+   exact differences; updating replaces your edits to those pages, so it is optional.
+
+To get the newest published MAVEN, update the checkout first (`git pull --ff-only`).
+Local installation alone is not live rollout, and templates never replace active
+policy without approval. Documentation is not proof of runtime coverage of all five
+clients, live migration, deployment or activation.
 
 For detailed installation, recovery and manual commands, see [Getting started](docs/getting-started.md).
 Also see [Architecture](docs/architecture.md), [Security](docs/security.md),

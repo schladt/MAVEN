@@ -112,6 +112,18 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(value['status'], 'ready')
         return value['binding']
 
+    async def test_project_enablement_rejections_name_the_problem(self):
+        _, begun = await self.call('maven_project', {'parameters': {'root': str(self.root)}})
+        question = begun['pending_interaction']
+        identity = {'action': 'respond', 'kind': 'project', 'operation_id': begun['operation_id'],
+                    'interaction_id': question['interaction_id'], 'revision': question['revision']}
+        _, rejected = await self.call('maven_admin', {**identity, 'response': {'root': str(self.root)}})
+        self.assertEqual(rejected['error'], 'invalid_request')
+        self.assertIn('mode, name, project_id, root', rejected['message'])
+        _, extra = await self.call('maven_project', {'parameters': {'root': str(self.root), 'action': 'respond'}})
+        self.assertEqual(extra['error'], 'invalid_request')
+        self.assertIn('Unsupported administration kind or parameters', extra['message'])
+
     async def test_failed_initialization_never_becomes_ready_by_context_only(self):
         self.cloud.lose_next = True
         first, value = await self.call('maven_initialize', {'root': str(self.root)})

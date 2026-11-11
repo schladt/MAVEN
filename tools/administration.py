@@ -25,17 +25,30 @@ from tools.setup_common import SetupPending, private_directory, read_private, sa
 _LEGACY_STARTER_REVIEWS = frozenset(('starter_prepare', 'starter_submit', 'starter_activate', 'starter_renew'))
 
 
+class AdminInputError(ValueError):
+    """Invalid caller input; the message is MAVEN-authored and safe to return to the caller."""
+
+
 def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
                                     ensure_ascii=False, allow_nan=False).encode()).hexdigest()
 
 
+def _error_code(error):
+    """Bounded safe code: client errors use .code, service MemoryError uses .status."""
+    for name in ('code', 'status'):
+        value = getattr(error, name, None)
+        if isinstance(value, str) and value:
+            return value
+    return type(error).__name__
+
+
 def _source(value):
     if (not isinstance(value, dict) or set(value) != {'origin', 'excerpt'}
             or any(not isinstance(value[key], str) or not value[key].strip() for key in value)):
-        raise ValueError('Supply actual owner provenance as source.origin and source.excerpt; never credentials.')
+        raise AdminInputError('Supply actual owner provenance as source.origin and source.excerpt; never credentials.')
     if len(value['origin']) > 160 or len(value['excerpt']) > 2000:
-        raise ValueError('Approval origin/excerpt exceed the cloud provenance limits (160/2000 characters).')
+        raise AdminInputError('Approval origin/excerpt exceed the cloud provenance limits (160/2000 characters).')
     return value
 
 
@@ -48,6 +61,17 @@ def _connection_config(values):
     if legacy:
         config['schema_version'] = 1
     return config
+
+
+def _installation_source(home):
+    """The checkout the installer recorded for this home."""
+    from tools.uninstall.local import MANIFEST
+    path = Path(home) / MANIFEST
+    source = read_private(path).get('source') if path.exists() else None
+    if not source:
+        raise SetupPending('No installer receipt names the MAVEN checkout for this home. Begin the update with '
+                           'an explicit absolute checkout path.')
+    return source
 
 
 def _discover_stacks(values):
@@ -110,7 +134,7 @@ class AdminOperations:
 
     def _path(self, identifier):
         if str(UUID(identifier)) != identifier:
-            raise ValueError('Select the exact administration operation UUID.')
+            raise AdminInputError('Select the exact administration operation UUID.')
         return self.directory / (identifier + '.json')
 
     def _load(self, identifier):
@@ -128,7 +152,7 @@ class AdminOperations:
 
     def begin(self, kind, parameters):
         allowed = {
-            'setup': {'mode', 'source'},
+            'setup': {'mode', 'source', 'checkout'},
             'project': {'root'},
             'install': {'source', 'harness', 'profile'},
             'uninstall': {'project', 'reactivate_project', 'project_home', 'home', 'machine',
@@ -138,12 +162,16 @@ class AdminOperations:
             'recovery': {'operation_id', 'root', 'session_id', 'action'},
         }
         if kind not in allowed or not isinstance(parameters, dict) or set(parameters) - allowed[kind]:
-            raise ValueError('Unsupported administration kind or parameters.')
-        if kind == 'setup' and parameters.get('mode') not in (None, 'existing', 'new'):
-            raise ValueError('Setup mode must be existing or new.')
+            raise AdminInputError('Unsupported administration kind or parameters.')
+        if kind == 'setup' and parameters.get('mode') not in (None, 'existing', 'new', 'update'):
+            raise AdminInputError('Setup mode must be existing, new or update.')
+        if kind == 'setup' and 'checkout' in parameters and (
+                parameters.get('mode') != 'update' or not isinstance(parameters['checkout'], str)
+                or not Path(parameters['checkout']).expanduser().is_absolute()):
+            raise AdminInputError('checkout applies only to mode update and must be an absolute MAVEN checkout path.')
         if kind == 'install' and (not isinstance(parameters.get('harness', []), list)
                 or any(not isinstance(item, str) for item in parameters.get('harness', []))):
-            raise ValueError('Install harness must be an explicit list of names.')
+            raise AdminInputError('Install harness must be an explicit list of names.')
         if 'source' in parameters and kind == 'setup':
             _source(parameters['source'])
         self._prepare()
@@ -190,18 +218,21 @@ class AdminOperations:
             question = state['pending_interaction']
             if (not question or question['interaction_id'] != interaction_id
                     or question['revision'] != revision):
-                raise ValueError('Stale interaction; inspect the current full review before responding.')
+                raise AdminInputError('Stale interaction; inspect the current full review before responding.')
             if not isinstance(response, dict):
-                raise ValueError('A structured response is required.')
+                raise AdminInputError('A structured response is required.')
             if state['kind'] == 'setup' and question['key'] in _LEGACY_STARTER_REVIEWS:
-                raise ValueError('This individual starter review has been replaced. Advance to the complete collection review.')
+                raise AdminInputError('This individual starter review has been replaced. Advance to the complete collection review.')
             if question['kind'] == 'review':
                 if set(response) - {'approved', 'review_digest', 'source', 'confirmations'}:
-                    raise ValueError('Unsupported approval response fields.')
+                    raise AdminInputError('Unsupported approval response fields: '
+                                          + ', '.join(sorted(set(response) - {'approved', 'review_digest', 'source', 'confirmations'}))
+                                          + '. A review response is {approved, review_digest, source: {origin, excerpt}, '
+                                          'confirmations}.')
                 if response.get('review_digest') != question['review_digest']:
-                    raise ValueError('Approval must name the complete current review digest.')
+                    raise AdminInputError('Approval must name the complete current review digest.')
                 if type(response.get('approved')) is not bool:
-                    raise ValueError('Approval must be explicitly true or false.')
+                    raise AdminInputError('Approval must be explicitly true or false.')
                 if not response['approved']:
                     question = {**question, 'interaction_id': str(uuid4()), 'revision': state['revision'] + 1}
                     state.update(state='paused', pending_interaction=question)
@@ -210,7 +241,7 @@ class AdminOperations:
                     return self.status(operation_id)
                 _source(response.get('source'))
                 if response.get('confirmations', {}) != question.get('confirmations', {}):
-                    raise ValueError('Separate purge/abandon confirmations must match the exact reviewed instances.')
+                    raise AdminInputError('Separate purge/abandon confirmations must match the exact reviewed instances.')
                 state['approvals'].append({'interaction_id': interaction_id, 'revision': revision,
                                            'review_digest': question['review_digest'], 'source': response['source'],
                                            'review': question['review'],
@@ -219,7 +250,8 @@ class AdminOperations:
             else:
                 names = {field['name'] for field in question['fields']}
                 if set(response) != names:
-                    raise ValueError('Answer exactly the displayed fields; never send credentials.')
+                    raise AdminInputError('Answer exactly the displayed fields (' + ', '.join(sorted(names))
+                                          + '); never send credentials.')
                 for field in question['fields']:
                     value = response[field['name']]
                     if field['kind'] == 'bool':
@@ -231,39 +263,39 @@ class AdminOperations:
                         if field.get('pattern') and value:
                             valid = valid and bool(re.fullmatch(field['pattern'], value.strip()))
                     if not valid:
-                        raise ValueError('Invalid answer for ' + field['name'])
+                        raise AdminInputError('Invalid answer for ' + field['name'])
                 key = question['key']
                 if key in ('identity', 'deploy_identity', 'removal_identity'):
                     if not re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', response['profile']) or not Path(response['cache']).expanduser().is_absolute():
-                        raise ValueError('Select a named profile and an absolute private login-cache directory.')
+                        raise AdminInputError('Select a named profile and an absolute private login-cache directory.')
                 answer = response
                 if key == 'selection':
                     fixed_mode = state['parameters'].get('mode')
                     if fixed_mode and response.get('mode', fixed_mode) != fixed_mode:
-                        raise ValueError('This operation retains its explicitly selected setup mode.')
+                        raise AdminInputError('This operation retains its explicitly selected setup mode.')
                     answer = {'connection': '', **response}
                     if fixed_mode:
                         answer['mode'] = fixed_mode
                     if answer['region'] != 'us-east-1':
-                        raise ValueError('The reviewed deployment supports us-east-1 only.')
+                        raise AdminInputError('The reviewed deployment supports us-east-1 only.')
                     if answer['mode'] == 'new' and answer['connection']:
-                        raise ValueError('New provisioning cannot select an existing connection.')
+                        raise AdminInputError('New provisioning cannot select an existing connection.')
                     if answer['connection'].startswith('/'):
                         from tools.memory.environment import load_environment
                         _connection_config(load_environment(Path(answer['connection'])))
                 if key == 'project':
                     if not Path(response['root']).is_absolute() or not Path(response['root']).is_dir():
-                        raise ValueError('Select an absolute existing project directory.')
+                        raise AdminInputError('Select an absolute existing project directory.')
                     if response['mode'] == 'create':
                         if not response['name'].strip() or response['project_id']:
-                            raise ValueError('Creation requires a name and no existing project UUID.')
+                            raise AdminInputError('Creation requires a name and no existing project UUID.')
                     elif str(UUID(response['project_id'])) != response['project_id'] or response['name']:
-                        raise ValueError('Select an exact existing project UUID without a new name.')
+                        raise AdminInputError('Select an exact existing project UUID without a new name.')
                 if key == 'optional_project':
                     raise SetupPending('Installer project enablement has been removed. Advance this operation to finish instance readiness without changing a project.')
                 if key == 'install' and (not Path(response['source']).is_absolute()
                         or not (Path(response['source']) / 'install.py').is_file()):
-                    raise ValueError('Select an absolute checkout containing install.py.')
+                    raise AdminInputError('Select an absolute checkout containing install.py.')
                 if key == 'provision' and question.get('submit') == 'Prepare deployment review':
                     state['preparation_requested'] = _digest(answer)
                 state['answers'][question['key']] = answer
@@ -336,6 +368,10 @@ class AdminOperations:
             'apply': 'Create billable Aurora database, network, IAM, API, storage, notification and logging resources. Aurora capacity, storage, snapshots, network traffic, API requests and logs incur charges. Interruption may leave an in-flight stack; resume the exact change set. Retained data can continue costing money after removal.',
             'schema': 'Run the exact SQL bundle under the existing separately assumed administration role. Initialization/migration changes database schema and may interrupt memory writers; preserve and reconcile uncertain requests. This does not approve authority activation.',
             'removal': 'Remove only the reviewed targets. Retire retains data and ongoing storage/snapshot costs; purge can permanently destroy data. Writers/harnesses must stop where the plan requires it. Interrupted removal resumes original receipts, never a new plan.',
+            'service_update': 'Execute this exact CloudFormation change set on the existing MAVEN service stack. '
+                              'Listed resources are modified in place; no resource that holds memory data or '
+                              'credentials is removed or replaced (that is refused before review). The service may '
+                              'briefly return errors while the update runs; interruption resumes this same change set.',
         }.get(key, title + '. Approve only this exact candidate; changes require a fresh review.')
         if key == 'starter_collection':
             from tools.setup_starter import summary as starter_summary
@@ -404,7 +440,7 @@ class AdminOperations:
             state.pop('handoff', None)
             if state['step'] in ('connection', 'plan', 'apply', 'initialize', 'migrate',
                                   'migration_bind', 'starter_submit', 'starter_activate',
-                                  'project_apply', 'removal_apply', 'recover'):
+                                  'update_service_apply', 'project_apply', 'removal_apply', 'recover'):
                 state['effect_sequence'] = state.get('effect_sequence', 0) + 1
             self._save(state)  # Persist the phase before any potentially uncertain effect.
             try:
@@ -412,7 +448,7 @@ class AdminOperations:
                     getattr(self, '_' + state['kind'])(state)
             except Exception as error:
                 # SDK and subprocess messages can contain credentials. Preserve safe codes only.
-                code = getattr(error, 'code', type(error).__name__)
+                code = _error_code(error)
                 state['state'] = 'uncertain' if any(word in code for word in ('unknown', 'uncertain', 'unavailable', 'timeout')) else 'blocked'
                 state['error'] = str(error) if isinstance(error, SetupPending) else code
                 state['recovery'] = 'Inspect status, correct the prerequisite, then advance this same operation. Original request artifacts are retained.'
@@ -434,7 +470,8 @@ class AdminOperations:
                 if (previous.get('operation_id') != owner or previous.get('kind') != 'setup'
                         or previous.get('state') != 'completed'
                         or previous.get('pending_interaction') or not verified):
-                    raise SetupPending('Existing setup ownership is unresolved. Resume its exact administration UUID; cancellation alone does not resolve its effects.')
+                    raise SetupPending('Existing setup operation ' + owner + ' is unresolved. Resume that exact '
+                                       'administration UUID; cancellation alone does not resolve its effects.')
                 # Archive before replacing the shared owner pointer. A crash between
                 # these writes may retry the identical archive, never overwrite it.
                 archive = self.directory / ('setup-' + owner + '.json')
@@ -495,11 +532,12 @@ class AdminOperations:
             step, answers = state['step'], state['answers']
             from tools.setup_common import expected_account
             deploy = (step.startswith('deploy_identity') or
-                      step in ('discover', 'discovery_select', 'provision', 'prepare', 'plan', 'apply_review', 'apply', 'migration_stack') or
+                      step in ('discover', 'discovery_select', 'provision', 'prepare', 'plan', 'apply_review', 'apply',
+                               'migration_stack', 'update_service') or
                       (step == 'connect_review' and not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID')))
             prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
             actual = state.get(('deploy_identity' if deploy else 'identity') + '_actual', {})
-            state['presentation'] = {'title': 'MAVEN instance setup',
+            state['presentation'] = {'title': 'Update MAVEN' if state['parameters'].get('mode') == 'update' else 'MAVEN instance setup',
                 'purpose': ('Maintenance access — CloudFormation create/update or necessary metadata discovery'
                             if deploy else 'Daily-use access — connect to memory; SQL/authority require separate approvals'),
                 'account': actual.get('Account') or expected_account(wizard.values),
@@ -519,6 +557,15 @@ class AdminOperations:
                 # Resume old blank-target failures through confirmed discovery,
                 # never by guessing a stack or discarding prior receipts.
                 state.update(step='deploy_identity', identity_return_step='discover')
+                return
+            if state['parameters'].get('mode') == 'update' and step.startswith('update_'):
+                self._update(state, wizard, step, answers)
+                return
+            if step == 'start' and state['parameters'].get('mode') == 'update':
+                if not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID') or not wizard.values.get('MAVEN_STACK_NAME'):
+                    raise SetupPending('This installation is not connected to a MAVEN instance. Run setup to connect '
+                                       'or create one first; update only changes an existing installation.')
+                state['step'] = 'update_local'
                 return
             if step == 'start':
                 mode = state['parameters'].get('mode')
@@ -654,6 +701,8 @@ class AdminOperations:
                     state['step'] = state.pop('identity_return_step')
                     if state['step'] in ('discover', 'identity'):
                         state['connection_maintenance_confirmed'] = True
+                elif not deploy and state['parameters'].get('mode') == 'update':
+                    state['step'] = 'update_schema'
                 elif not deploy and (answers['selection']['mode'] == 'new' or
                         (not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID') and
                          not state.get('connection_maintenance_confirmed'))):
@@ -783,7 +832,9 @@ class AdminOperations:
                     self._receipt(state, step, result)
                     if not upgrade:
                         state['starter_binding'] = dict(wizard.values)
-                    if upgrade and wizard.values.get('MAVEN_MEMORY_SCHEMA_VERSION') == '1':
+                    if upgrade and state.get('update_return_step'):
+                        state['step'] = state.pop('update_return_step')
+                    elif upgrade and wizard.values.get('MAVEN_MEMORY_SCHEMA_VERSION') == '1':
                         state['step'] = 'migration_reconnect'
                     else:
                         state['step'] = 'verify' if upgrade else 'starter_prepare_review'
@@ -820,7 +871,7 @@ class AdminOperations:
                 if _connection_config(load_environment(wizard.env)) != config:
                     raise SetupPending('Upgraded stack outputs changed after review.')
                 self._receipt(state, step, result)
-                state['step'] = 'verify'
+                state['step'] = state.pop('update_return_step', 'verify')
             elif step.startswith('starter'):
                 self._starter(state, wizard)
             elif step == 'verify':
@@ -834,13 +885,181 @@ class AdminOperations:
             else:
                 raise SetupPending('Unknown setup phase; retain evidence and use the matching implementation.')
 
+    def _update(self, state, wizard, step, answers):
+        """Bring an existing installation to its checkout: local software, schema, service, instructions."""
+        from tools import update
+        from tools.memory import bootstrap
+        from tools.memory.environment import configured_client, load_environment
+        if step in ('update_local', 'update_local_wait'):
+            checkout = state['parameters'].get('checkout') or _installation_source(self.home)
+            report = update.local_report(self.home, Path(checkout).expanduser())
+            state['update_report'] = {**state.get('update_report', {}), 'local': report}
+            if not report['current'] and step == 'update_local':
+                software = report['software']
+                lines = [f'Checkout: {report["checkout"]}',
+                         f'Software files changed/added/removed: {len(software["changed"])}/'
+                         f'{len(software["added"])}/{len(software["removed"])}',
+                         f'Harness skills to update/add: {len(report["skills"]["stale"])}/{len(report["skills"]["missing"])}',
+                         'Harnesses: ' + (', '.join(report['harnesses']) or 'none configured')]
+                git = report['git']
+                if git.get('repository') and git.get('behind'):
+                    lines.append(f'The checkout is {git["behind"]} commit(s) behind {git["upstream"]} as of the last '
+                                 'fetch; update the checkout first if you want those changes.')
+                self._question(state, 'local_update', 'Update local MAVEN software', [
+                    Field('skip', 'Continue without updating local software (cloud steps use the installed version)',
+                          False, kind='bool')], 'update_local_choice',
+                    description='\n'.join(lines) + '\n\nContinue to get the exact installer command. It runs in a '
+                                'separate terminal because it replaces the software this process is using.',
+                    details=json.dumps(report, indent=2))
+                return
+            if not report['current']:
+                command = update.install_command(self.home, Path(report['checkout']), report['harnesses'])
+                self._handoff(state, 'Run this installer in a separate terminal and choose "Update local MAVEN '
+                              'software". Then restart this harness (or rerun maven-setup) so it loads the new '
+                              'software, and advance this same operation. Its Review screen lists every change.',
+                              command)
+                state['handoff']['type'] = 'local_update'
+                return
+            if update.running_software_stale():
+                raise SetupPending('MAVEN was updated after this process started, so it is still running the old '
+                                   'software. Restart the harness (or rerun maven-setup), then advance this same operation.')
+            self._receipt(state, 'update_local', {'current': True, 'checkout': report['checkout']})
+            state['step'] = 'identity'
+        elif step == 'update_local_choice':
+            if answers['local_update']['skip']:
+                self._receipt(state, step, {'local_update': 'skipped by owner'})
+                state['step'] = 'identity'
+            else:
+                state['step'] = 'update_local_wait'
+                self._update(state, wizard, 'update_local_wait', answers)
+        elif step == 'update_schema':
+            status = update.schema_status(wizard.values)
+            self._receipt(state, step, status)
+            if status['state'] == 'incompatible':
+                raise SetupPending('The deployed database schema is not an ordered prefix of this version\'s migrations '
+                                   '(applied: ' + ', '.join(status['applied']) + '). Nothing was changed; this '
+                                   'software cannot upgrade it. Use the MAVEN version that matches the instance.')
+            if status['state'] == 'pending':
+                state['update_return_step'] = 'update_service'
+                state['step'] = 'migration_review'
+            else:
+                state['step'] = 'update_service'
+        elif step == 'update_service':
+            if not state.get('deploy_identity_actual') or not all(
+                    wizard.values.get('MAVEN_DEPLOY_' + key) for key in ('PROFILE', 'EXPECTED_PRINCIPAL', 'LOGIN_CACHE')):
+                state.update(identity_return_step='update_service', step='deploy_identity')
+                return
+            self._preflight(state, wizard.values, 'metadata')
+            cloud = bootstrap._cloud(wizard.values)
+            try:
+                stacks = cloud.describe_stacks(StackName=wizard.values['MAVEN_STACK_NAME'])['Stacks']
+                if len(stacks) != 1 or stacks[0].get('StackStatus') not in ('CREATE_COMPLETE', 'UPDATE_COMPLETE'):
+                    raise SetupPending('The service stack is not in a completed state (' +
+                                       str(stacks[0].get('StackStatus') if stacks else 'not found') +
+                                       '). Resolve it in CloudFormation, then advance this operation.')
+                stack = stacks[0]
+                deployed = cloud.get_template(StackName=stack['StackId'], TemplateStage='Original')['TemplateBody']
+            finally:
+                cloud.close()
+            deployed = json.loads(deployed) if isinstance(deployed, str) else deployed
+            package = wizard.directory / 'service-package'
+            if not package.exists():
+                try:
+                    update.build_service_package(stack, package, wizard.values['MAVEN_MEMORY_INSTANCE_ID'])
+                except ValueError as error:
+                    raise SetupPending('Cannot rebuild the service with the stack\'s deployment inputs: ' + str(error)) from None
+            manifest, template, _ = bootstrap._package(package)
+            if any(update.stack_parameters(stack).get(key) != value
+                   for key, value in manifest['deployment_inputs'].items()):
+                raise SetupPending('The stack\'s deployment inputs changed after this update prepared its package. '
+                                   'Start a new update operation.')
+            if json.loads(template) == deployed:
+                live = bootstrap._outputs(stack)
+                self._receipt(state, step, {'service': 'current', 'stack': stack['StackId']})
+                if live != _connection_config(wizard.values):
+                    state['update_return_step'] = 'update_authority'
+                    self._review(state, 'reconnect', 'Review current service outputs to reconnect this installation',
+                                 live, 'migration_bind')
+                else:
+                    state['step'] = 'update_authority'
+                return
+            review_path = wizard.directory / 'service-change-set.json'
+            bootstrap.plan(wizard.values, package, review_path, change_type='UPDATE')
+            document = read_private(review_path)
+            risks = update.stateful_risks(document)
+            if risks:
+                raise SetupPending('The service update would remove or replace resources that hold memory data or '
+                                   'credentials: ' + ', '.join(f'{row["logical_id"]} ({row["type"]})' for row in risks) +
+                                   '. Nothing was executed. The unexecuted change set is kept for inspection; '
+                                   'this update must be redesigned before it can be applied safely.')
+            review = {'stack': stack['StackId'], 'instance_id': wizard.values['MAVEN_MEMORY_INSTANCE_ID'],
+                      'review_sha256': document['review_sha256'], 'changes': update.change_summary(document),
+                      'change_set': document['review']}
+            self._review(state, 'service_update', 'Review MAVEN service update (CloudFormation change set)',
+                         review, 'update_service_apply')
+        elif step == 'update_service_apply':
+            review = state['approvals'][-1]['review']
+            self._approved(state, 'service_update', review)
+            result = bootstrap.apply(wizard.values, wizard.directory / 'service-package',
+                                     wizard.directory / 'service-change-set.json', wizard.env,
+                                     confirm_review=review['review_sha256'])
+            wizard.values = load_environment(wizard.env)
+            self._receipt(state, step, result)
+            state['step'] = 'update_authority'
+        elif step == 'update_authority':
+            client = configured_client(wizard.env, values=wizard.values)
+            try:
+                changes = update.authority_changes(client)
+            finally:
+                client.close()
+            state['authority_changes'] = [{key: change[key] for key in ('slug', 'title', 'action', 'page_id', 'revision')}
+                                          for change in changes]
+            if not changes:
+                self._receipt(state, step, {'instructions': 'current'})
+                state['step'] = 'verify'
+                return
+            self._question(state, 'authority_update', 'Update MAVEN instructions', [
+                Field('update', 'Propose and activate these bundled instruction updates?', False, kind='bool')],
+                'update_authority_choice',
+                description='These active owner instructions differ from the versions bundled with the installed '
+                            'software:\n' + '\n'.join(f'- {change["title"]} ({change["slug"]}): {change["action"]}'
+                                                       for change in changes) +
+                            '\n\nAn update replaces the active page, including any edits you made to it; Technical '
+                            'details shows the exact difference. Leave unchecked to keep the active instructions. '
+                            'If checked, the next screen asks for one approval of the exact collection.',
+                details='\n\n'.join(f'## {change["slug"]} ({change["action"]})\n{change["diff"] or change["candidate"]["body_markdown"]}'
+                                    for change in changes))
+        elif step == 'update_authority_choice':
+            if not answers['authority_update']['update']:
+                self._receipt(state, step, {'instructions': 'kept by owner'})
+                state['step'] = 'verify'
+                return
+            directory = wizard.directory / 'authority-update'
+            if not directory.exists():
+                client = configured_client(wizard.env, values=wizard.values)
+                try:
+                    changes = update.authority_changes(client)
+                finally:
+                    client.close()
+                if [change['slug'] for change in changes] != [change['slug'] for change in state['authority_changes']]:
+                    raise SetupPending('The active instructions changed after they were shown. Start a new update operation.')
+                update.prepare_authority_update(directory, changes, {
+                    'origin': 'MAVEN update preparation',
+                    'excerpt': 'Bundled instruction updates prepared locally for owner review; '
+                               'submission and activation have not been approved.'})
+            state.update(starter_binding=dict(wizard.values), starter_directory='authority-update',
+                         starter_index=0, step='starter_review')
+        else:
+            raise SetupPending('Unknown update phase; retain evidence and use the matching implementation.')
+
     def _starter(self, state, wizard):
         from tools.memory import onboarding
         from tools.memory.environment import configured_client
         from tools.memory.validation import digest, validate_resolve
         from tools.setup_starter import collection, prepare
         step = state['step']
-        directory = wizard.directory / 'starter'
+        updating = 'starter_directory' in state
+        directory = wizard.directory / state.get('starter_directory', 'starter')
         if state.get('starter_binding') != wizard.values:
             raise SetupPending('Starter connection or selected credentials differ from the original initialization; restore the exact binding before any lookup, submission, challenge or activation.')
         if step in ('starter_prepare_review', 'starter_prepare'):
@@ -848,7 +1067,8 @@ class AdminOperations:
                 prepare(directory)
             step = 'starter_review'
             state['step'] = step
-        review = collection(directory, state['starter_binding'])
+        review = collection(directory, state['starter_binding'],
+                            action='submit_and_activate_instruction_update' if updating else None)
         pages = review['pages']
         index = state.get('starter_index', 0)
         if type(index) is not int or not 0 <= index <= len(pages):
@@ -862,7 +1082,8 @@ class AdminOperations:
         state['starter_progress'] = {'completed': index, 'total': len(pages),
                                      'position': index + 1, 'title': draft['candidate']['title']}
         if 'starter_collection' not in state['answers']:
-            self._review(state, 'starter_collection', 'Install all starter instructions — one approval',
+            self._review(state, 'starter_collection', ('Update MAVEN instructions' if updating else
+                                                        'Install all starter instructions') + ' — one approval',
                          review, step)
             return
         source = self._approved(state, 'starter_collection', review)
@@ -934,6 +1155,12 @@ class AdminOperations:
         elif step == 'starter_renew':
             state['starter_round'] = round_number + 1
             state['step'] = 'starter_challenge'
+
+    def database_status(self):
+        """Read-only database wake probe for this home's saved connection; never advances an operation."""
+        from tools.memory.environment import load_environment
+        from tools.setup_common import database_status
+        return database_status(load_environment(self.home / '.env'))
 
     def _project_binding(self):
         from tools.memory.environment import load_environment, memory_config
@@ -1155,7 +1382,7 @@ class AdminOperations:
                         getattr(self, '_' + original['kind'])(original)
                     except Exception as error:
                         original['state'] = 'blocked'
-                        original['error'] = str(error) if isinstance(error, SetupPending) else getattr(error, 'code', type(error).__name__)
+                        original['error'] = str(error) if isinstance(error, SetupPending) else _error_code(error)
                     if original['state'] == 'working':
                         original['state'] = 'pending'
                     self._save(original)

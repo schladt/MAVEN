@@ -15,12 +15,14 @@ from mcp.server import MCPServer
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
+from tools.administration import AdminInputError
 from tools.coordination import session_uuid
 from tools.memory.boundary import BoundaryError, digest, private_path, read_private, save_private
 from tools.memory.client import MemoryClientError
 from tools.memory.maintenance import Maintenance, MaintenanceError
 from tools.memory.validation import MemoryError
 from tools.project import ProjectError, instance_home
+from tools.setup_common import SetupPending
 
 
 INSTRUCTIONS = """MAVEN is owner-controlled cloud memory, independent of Git and of this harness.
@@ -269,6 +271,12 @@ def create_server(application=None):
                         'next_action': 'Inspect the exact session status and retained operation evidence.'}
             except MemoryError as error:
                 return {'status': 'blocked', 'error': error.status, 'cloud_saved': False}
+            except AdminInputError as error:
+                return {'status': 'error', 'error': 'invalid_request', 'message': str(error),
+                        'binding': app.binding, 'cloud_saved': False}
+            except SetupPending as error:
+                return {'status': 'blocked', 'error': 'setup_pending', 'message': str(error),
+                        'binding': app.binding, 'cloud_saved': False}
             except (ValueError, TypeError, KeyError, OSError):
                 return {'status': 'error', 'error': 'invalid_or_unavailable_operation',
                         'binding': app.binding, 'cloud_saved': False}
@@ -476,7 +484,11 @@ def create_server(application=None):
                      parameters: dict[str, Any] | None = None, operation_id: str | None = None,
                      interaction_id: str | None = None, revision: int | None = None,
                      response: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Drive real resumable administration. Present persisted questions/full exact reviews, capture actual owner responses, then explicitly advance. Back revises unsubmitted choices only, never rolls back external effects. Project/machine/cloud removal are independent. Login, secrets and affected-harness shutdown use secure external handoffs."""
+        """Drive real resumable administration. Present persisted questions/full exact reviews, capture actual owner responses, then explicitly advance. Back revises unsubmitted choices only, never rolls back external effects. Project/machine/cloud removal are independent. Login, secrets and affected-harness shutdown use secure external handoffs.
+
+        respond: pass the pending_interaction's interaction_id and revision. A form response is an object with exactly its field names. A review response is {approved: bool, review_digest: <the review's digest>, source: {origin, excerpt} describing the owner's actual answer, confirmations: <the review's confirmations, usually {}>}. Invalid input returns error invalid_request with a message naming the problem.
+
+        Updating an existing installation: begin kind "setup" with parameters {mode: "update"} (optional absolute "checkout"). It checks local software and harness skills, then the database schema, service stack and bundled instructions, asking for review only where something differs."""
         admin = app.admin()
         if action == 'begin':
             if kind is None:
@@ -497,7 +509,9 @@ def create_server(application=None):
     @server.tool()
     @guarded
     def maven_project(parameters: dict[str, Any]) -> dict[str, Any]:
-        """Begin explicit first-time project enablement or selection through persisted owner choices. Memory does not require Git. Never use the installation checkout as an implicit project."""
+        """Begin explicit first-time project enablement or selection through persisted owner choices; parameters is {root: absolute project folder}. Memory does not require Git. Never use the installation checkout as an implicit project.
+
+        This only begins the operation. Answer its pending_interaction and advance it with maven_admin (kind "project") using the returned operation_id."""
         return app.admin().begin('project', parameters)
 
     @server.tool()

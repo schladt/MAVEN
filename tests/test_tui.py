@@ -264,14 +264,40 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                         await pilot.press('enter')
                         await pilot.pause()
                         external.assert_called_once_with(command, {'env': {**os.environ, **environment}, 'check': False})
-                        self.assertIsInstance(app.screen, ReviewScreen)
-                        self.assertIn('not verified', app.screen.query_one('#review-body', TextArea).text)
-                        controller.advance.assert_not_called()
-                        await pilot.click('#accept')
-                        await pilot.pause()
+                        # Status 0 inspects the actual identity without an intermediate screen.
                         controller.advance.assert_called_once_with(identifier)
                         self.assertIn('actual-owner', str(app.screen.query_one('#context', Static).render()))
                         controller.respond.assert_not_called()
+                        await pilot.press('ctrl+q')
+
+    async def test_paused_database_is_awaited_then_the_same_step_retried(self):
+        for statuses, retried in ((['warming', 'warming', 'awake'], True), (['not_authorized'], False)):
+            with self.subTest(statuses=statuses), tempfile.TemporaryDirectory() as directory:
+                identifier = str(uuid4())
+                controller = Mock()
+                controller.status.return_value = {
+                    'operation_id': identifier, 'state': 'blocked', 'step': 'migrate', 'error': 'warming',
+                    'pending_interaction': None, 'next_actions': ['advance'], 'receipts': []}
+                controller.database_status.side_effect = statuses
+                controller.advance.return_value = {
+                    'operation_id': identifier, 'state': 'cancelled', 'step': 'done', 'pending_interaction': None}
+                clock = Mock(now=0.0)
+                fake_time = Mock(monotonic=lambda: clock.now)
+                fake_time.sleep.side_effect = lambda seconds: setattr(clock, 'now', clock.now + seconds)
+                with patch('tools.tui.administration.AdminOperations', return_value=controller), \
+                        patch('tools.tui.administration.time', fake_time):
+                    app = WorkflowApp('Setup', ['Setup'], lambda ui: present(ui, Path(directory), operation_id=identifier))
+                    async with app.run_test(size=(80, 24)) as pilot:
+                        await pilot.pause(0.5)
+                        self.assertEqual(controller.database_status.call_count, len(statuses))
+                        if retried:
+                            controller.advance.assert_called_once_with(identifier)
+                            self.assertNotIsInstance(app.screen, ReviewScreen)
+                            self.assertGreaterEqual(clock.now, 2 * 5)  # Checks are spaced by the wake interval.
+                        else:
+                            controller.advance.assert_not_called()
+                            self.assertIsInstance(app.screen, ReviewScreen)
+                            self.assertIn('Setup stopped', app.screen.heading)
                         await pilot.press('ctrl+q')
 
     async def test_aws_login_manual_back_and_pause_never_launch_a_command(self):

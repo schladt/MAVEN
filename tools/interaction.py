@@ -22,6 +22,7 @@ class Field:
     help: str = ""
     default_from: str = ""  # Follow another text field until the owner edits this value.
     pattern: str = ""  # Full-match constraint, also applied to derived defaults.
+    section: str = ""  # Heading rendered above this field, separating it from the fields before it.
 
 
 _current: ContextVar[Any] = ContextVar("maven_interaction", default=None)

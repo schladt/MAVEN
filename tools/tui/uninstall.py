@@ -1,6 +1,7 @@
 """Textual uninstall workflow backed by immutable plans and a pinned subprocess."""
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -15,14 +16,25 @@ from tools.uninstall.common import UninstallError
 
 STEPS = ['Dashboard', 'Scopes', 'Projects', 'Machine', 'Cloud', 'Recovery',
          'Inventory', 'Review', 'Approvals', 'Execution', 'Result']
+HARNESS_WARNING = (
+    'Removal does not require closing assistant harnesses. Running sessions keep their loaded '
+    'configuration until restarted and lose MAVEN tools once its runtime is removed.\n\n'
+    'A harness that saves its own configuration file while running can write the removed MAVEN '
+    'entry back. After closing each harness, reopen it and confirm MAVEN is no longer listed.')
+NO_ARCHIVE_WARNING = (
+    'No archive directory was given. Machine removal permanently deletes each selected installation '
+    'folder, including its private settings (.env), saved AWS sign-in caches, unfinished setup state '
+    'and session records. A folder is kept only when it cannot be proven safe to delete; the review '
+    'lists any exceptions.\n\n'
+    'Go Back to enter an archive directory and keep a copy of the settings and records.')
 
 
 def _json(value):
     return json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False)
 
 
-def _boolean(name, label, default=False):
-    return Field(name, label, default, kind='bool', required=False)
+def _boolean(name, label, default=False, *, section='', help=''):
+    return Field(name, label, default, kind='bool', required=False, section=section, help=help)
 
 
 def _optional(name, label, default='', *, multiline=False):
@@ -40,12 +52,14 @@ def _wizard(ui):
     # The Machine page always appears: its home also defaults project/cloud work.
     pages = [
         ('Scopes', None, [
-            _boolean('project_scope', 'Detach, archive, or reactivate projects'),
+            _boolean('project_scope', 'Detach, archive, or reactivate projects', section='What to remove'),
             _boolean('machine', 'Remove machine installation(s)'),
             _boolean('cloud', 'Retire or purge a cloud instance'),
-            _boolean('offline', 'Offline local work only (no cloud inventory)')],
-         'Scopes are independent. Opening this dashboard does not contact the cloud. '
-         'Inventory may contact the cloud only after you approve the selections.'),
+            _boolean('offline', 'Offline: never contact AWS', section='How to run',
+                     help='Changes how the selections above run; it removes nothing by itself. '
+                          'Cannot be combined with cloud removal, project archive or reactivation.')],
+         'Select what to remove; each item is independent. Opening this dashboard does not contact '
+         'the cloud. Inventory may contact the cloud only after you approve the selections.'),
         ('Projects', 'project_scope', [
             _optional('project', 'Project roots to detach (one absolute path per line)', multiline=True),
             _optional('reactivate_project', 'Project roots to reactivate instead (one per line)', multiline=True),
@@ -72,7 +86,8 @@ def _wizard(ui):
          'Retirement is the default. Purge and session abandonment require separate '
          'instance confirmations after full resource review. Unselected/shared resources remain.'),
         ('Recovery', None, [
-            _optional('export', 'Private artifact export directory (blank preserves in place)'),
+            _optional('export', 'Archive directory for settings and records (blank: machine removal deletes '
+                                'them with the installation folder; project files stay in place)'),
             _optional('output', 'Private plan/recovery directory (blank uses ~/.maven-uninstall/<UUID>)')],
          'Recovery and export directories must be outside every selected removal root. '
          'Keep the complete plan, journal, runner, and staged dependencies for recovery.')]
@@ -91,8 +106,7 @@ def _wizard(ui):
     while True:
         title, _, fields, description = pages[index]
         ui.stage(title)
-        fields = [Field(field.name, field.label, values.get(field.name, field.default),
-                        field.kind, field.choices, field.required) for field in fields]
+        fields = [replace(field, default=values.get(field.name, field.default)) for field in fields]
         result = ui.form(title, fields, description=description, back=True)
         if result is None:
             if index == 0:
@@ -123,11 +137,17 @@ def _wizard(ui):
         if values['project_scope'] and not (args.project or args.reactivate_project):
             error = 'Project scope requires at least one detach or reactivation root.'
         elif not (values['project_scope'] or args.machine or args.cloud):
-            error = 'Select at least one scope.'
+            error = 'Select at least one item under "What to remove". Offline only changes how they run.'
         if error:
             ui.review('Revise selections', error, accept='Edit selections')
             index = 0
             continue
+        if args.machine and not args.export:
+            approved = ui.review('Delete without an archive?', NO_ARCHIVE_WARNING,
+                                 accept='Delete without archive', back=True)
+            if not approved:
+                index = len(pages) - 1
+                continue
         ui.stage('Inventory')
         if not ui.review('Approve read-only inventory', _json(vars(args)),
                          accept='Inventory exact targets', back=True):
@@ -192,13 +212,15 @@ def _approve(ui, path, plan):
                          identity=identity, destructive=True, accept='Approve ' + name, back=True):
             return None
         arguments.extend(['--confirm-' + name, identity])
-    for requirement, prompt in (
-            ('writers-quiescent', 'Have all affected writers actually stopped?'),
-            ('harnesses-stopped', 'Are all affected assistant harnesses closed?')):
-        if requirement in plan['requires']:
-            if not ui.confirm(prompt):
-                return None
-            arguments.append('--' + requirement)
+    if 'writers-quiescent' in plan['requires']:
+        if not ui.confirm('Have all affected writers actually stopped?'):
+            return None
+        arguments.append('--writers-quiescent')
+    if 'harnesses-stopped' in plan['requires']:
+        if not ui.review('Assistant harnesses may still be running', HARNESS_WARNING,
+                         accept='Continue with removal', back=True):
+            return None
+        arguments.append('--harnesses-stopped')
     _unchanged(path, plan)
     return arguments
 

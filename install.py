@@ -20,7 +20,7 @@ from uuid import UUID
 from tools.interaction import Field, OperationPaused, checkpoint, current, message, require, stage
 from tools.harness import (
     HARNESS_PATHS as INTEGRATIONS, SKILLS, apply_integration, integration_plan,
-    skill_plan, retired_skill_plan, retire_skills, validate_default_profiles,
+    skill_plan, retired_skill_plan, retire_skills, validate_default_profiles, write_skill,
     launcher_permission_plan, repair_launcher_permissions,
 )
 
@@ -351,6 +351,8 @@ def _options(args):
                  'Check or repair this connection — verify the saved instance; no automatic redeployment', 'existing'),
                 *([('Abandon unfinished setup and start over — preserve receipts and cloud resources', 'restart')]
                   if pending else []),
+                *([('Update MAVEN — local software and harness skills, then cloud service, database schema '
+                    'and instructions, each separately reviewed', 'upgrade')] if completed and not pending else []),
                 ('Update local MAVEN software — preserve cloud settings; no AWS login or cloud changes', 'update'),
                 ('Set up a separate instance — choose another private installation folder', 'separate'),
                 ('Uninstall — find an installation and choose what to remove', 'uninstall'),
@@ -368,6 +370,19 @@ def _options(args):
         if task == 'harness':
             args.home, args.local_only, args.check_existing = home, False, True
             args.setup_mode, args.setup_operation, args.setup_fresh = 'existing', None, False
+            return
+        if task == 'upgrade':
+            from tools.update import local_report
+            from tools.uninstall.common import read_private
+            from tools.uninstall.local import MANIFEST
+            source = read_private(home / MANIFEST).get('source') if (home / MANIFEST).exists() else None
+            # The installer itself is the checkout; its harnesses are the ones this home configured.
+            report = local_report(home, Path(__file__).resolve().parent)
+            args.home, args.local_only, args.check_existing = home, False, False
+            args.harness = report['harnesses']
+            args.setup_mode, args.setup_operation, args.setup_fresh = 'update', None, False
+            if source and Path(source).resolve() != Path(__file__).resolve().parent:
+                message(f'This installation was installed from {source}; updating it from {Path(__file__).resolve().parent}.')
             return
         if task == 'restart':
             args.home, args.restart_operation = home, pending
@@ -494,7 +509,7 @@ def _install(args, handoff=None):
             raise ValueError('Close affected harnesses and add --harness-stopped, or use '
                              '--stage-harnesses with an inactive directory. No integration changed.')
         try:
-            plan = skill_plan(roots)
+            plan = skill_plan(roots, home)
             integrations = integration_plan(home, selected_harnesses,
                                             user_home=integration_home, ca_bundle=ca_bundle, paths=custom)
             retired_skills = retired_skill_plan(home, roots)
@@ -514,10 +529,12 @@ def _install(args, handoff=None):
                 f'Next: {"local tools only; no AWS/project setup" if args.local_only else "installed maven-setup for explicit cloud selection"}',
                 'Shell profiles: unchanged',
                 'Skill roots:\n' + ('\n'.join(map(str, roots)) or '(none)'),
-                'New skill files:\n' + ('\n'.join(str(target) for target, _ in plan) or '(none; existing identical skills preserved)'),
+                'Skill files to create or update:\n' + ('\n'.join(
+                    str(target) + (' (update installer-owned copy)' if expected else '')
+                    for target, _, expected in plan) or '(none; existing identical skills preserved)'),
                 'Exact owned legacy skills to retire:\n' + ('\n'.join(
                     str(path) for path, _ in retired_skills) or '(none)'),
-                f'Integration mode: {"inactive staging" if staging else "live, harnesses stopped"}',
+                f'Integration mode: {"inactive staging" if staging else "live"}',
                 'Exact MAVEN integration content (unrelated configuration preserved):\n' + ('\n'.join(
                     f'{change.path}\n{change.receipt["value"]}' for change in integrations
                     if change.receipt is not None) or '(none)'),
@@ -530,11 +547,11 @@ def _install(args, handoff=None):
             if deferred:
                 summary += '\nHarness integration has a local conflict and will be skipped; its existing files are preserved.'
             if require_stopped:
-                summary += ('\nClose all harness sessions using the listed files before approving, including any launching '
-                            'this installer. Approval confirms they are stopped; otherwise go Back or decline.')
+                summary += ('\nRunning harness sessions do not block installation; restart them to load MAVEN. '
+                            'A harness that saves its own configuration file while running can overwrite the '
+                            'MAVEN entry; after restarting it, confirm MAVEN is listed.')
             review = require().review('Review local software installation', summary, details=body,
-                                      back=True, accept=('Harnesses stopped — install software'
-                                                         if require_stopped else 'Install software'))
+                                      back=True, accept='Install software')
             if review is None:
                 raise BackToOptions('Return to installation choices; no local mutation was started.')
             if not review:
@@ -591,14 +608,11 @@ def _install(args, handoff=None):
             fd = os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
             with os.fdopen(fd, 'wb') as stream:
                 stream.write(body)
-        for target, body in plan:
-            target.parent.mkdir(parents=True, exist_ok=True)
+        for target, body, expected in plan:
             _no_symlink_parents(target)
-            descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(descriptor, 'wb') as stream:
-                stream.write(body)
+            write_skill(target, body, expected)
         activation = _activation(home, ca_bundle)
-        owned_paths = [target for target, _ in plan]
+        owned_paths = [target for target, _, _ in plan]
         if own_runtime:
             owned_paths.append(installation)
         if own_activation:
@@ -637,7 +651,7 @@ def _install(args, handoff=None):
         if handoff is not None:
             handoff['home'] = home
             handoff['activation'] = activation
-            changed = ([str(target) for target, _ in plan] +
+            changed = ([str(target) for target, _, _ in plan] +
                        [str(change.path) for change in integrations if change.before != change.after] +
                        [str(target) for target, _ in retired_skills])
             handoff['integration'] = {

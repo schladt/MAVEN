@@ -8,7 +8,7 @@ from pathlib import Path
 from maven_resources import resource_path
 from tools.harness import (
     HARNESS_PATHS, SKILLS, _read, apply_integration, integration_plan,
-    retired_skill_plan, retire_skills, skill_plan, validate_default_profiles,
+    retired_skill_plan, retire_skills, skill_plan, validate_default_profiles, write_skill,
     launcher_permission_plan, repair_launcher_permissions,
 )
 from tools.interaction import Field, OperationPaused
@@ -120,7 +120,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
             if ca_bundle is None and os.environ.get('AWS_CA_BUNDLE'):
                 ca_bundle = Path(os.environ['AWS_CA_BUNDLE']).expanduser().absolute()
             changes = integration_plan(home, selected, ca_bundle=ca_bundle)
-            skills = skill_plan(roots)
+            skills = skill_plan(roots, home)
             retired = retired_skill_plan(home, roots)
         except (OSError, ValueError, UninstallError) as exc:
             result.update(status='conflict', reason=str(exc))
@@ -153,13 +153,13 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
             visible.append(f'{action}: {change.path}')
             details.append(f'{change.path}\nExact MAVEN entry/block:\n' +
                            json.dumps(change.receipt['value'], indent=2, ensure_ascii=False))
-        for target, body in skills:
-            visible.append(f'Create shipped skill: {target}')
+        for target, body, expected in skills:
+            visible.append(('Update installer-owned skill: ' if expected else 'Create shipped skill: ') + str(target))
             details.append(f'{target}\n{body.decode()}')
         for root in roots:
             for name in SKILLS:
                 target = root / name / 'SKILL.md'
-                if not any(path == target for path, _ in skills):
+                if not any(path == target for path, _, _ in skills):
                     visible.append(f'Preserve identical skill: {target}')
         for target, expected in retired:
             visible.append(f'Remove exact installer-owned legacy skill: {target}')
@@ -167,10 +167,11 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
         visible.extend([f'Update selective uninstall ownership: {home / MANIFEST}',
                         'Update the existing local installation discovery registry.',
                         'Unrelated settings remain. No credentials, cloud changes, package reinstall or project binding.',
-                        'Close every affected harness session before approving, including any launching this installer. '
-                        'The installer cannot verify process liveness; decline or skip if any is running.'])
+                        'Running harness sessions do not block this change: they load it only after a restart. '
+                        'A harness that saves its own configuration file while running can overwrite the MAVEN entry; '
+                        'after restarting it, confirm MAVEN is listed.'])
         approved = ui.review('Review exact local harness changes', '\n'.join(visible),
-                             details='\n\n'.join(details), accept='Harnesses stopped — apply local changes', back=True)
+                             details='\n\n'.join(details), accept='Apply local changes', back=True)
         if approved is None:
             continue
         if not approved:
@@ -186,7 +187,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                 raise ValueError('This home requires explicit local reinstallation after uninstall; no harness files changed.')
             prior = _ownership(home)
             source = Path(prior['source']) if prior.get('source') else resource_path('templates').parent
-            if skill_plan(roots) != skills or retired_skill_plan(home, roots) != retired:
+            if skill_plan(roots, home) != skills or retired_skill_plan(home, roots) != retired:
                 raise ValueError('Skill files changed since review; preserved. Review again before writing.')
             for change in changes:
                 if _read(change.path) != change.before:
@@ -210,15 +211,8 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                     result['written'].append(str(home / MANIFEST))
             references = [root / name / 'SKILL.md' for root in roots for name in SKILLS]
             record_installation(home, source, [], references)
-            for target, body in skills:
-                target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-                if _read(target) is not None:
-                    raise ValueError(f'Skill appeared since review; preserved: {target}')
-                descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
-                with os.fdopen(descriptor, 'wb') as stream:
-                    stream.write(body)
-                    stream.flush()
-                    os.fsync(stream.fileno())
+            for target, body, expected in skills:
+                write_skill(target, body, expected)
                 result['written'].append(str(target))
                 record_installation(home, source, [target], references)
             for change in changes:

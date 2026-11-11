@@ -65,7 +65,6 @@ class InstallerTests(unittest.TestCase):
                 with self.assertRaises(OperationPaused):
                     install._install(args)
             ui.review.assert_called_once()
-            self.assertIn('Harnesses stopped', ui.review.call_args.kwargs['accept'])
             self.assertFalse(home.exists())
             self.assertFalse((user / '.omp').exists())
 
@@ -449,7 +448,6 @@ class HarnessFinishTests(unittest.TestCase):
         ui.review.assert_called_once()
         ui.choose.assert_not_called()
         self.assertIn('0775 → 0755', ui.review.call_args.args[1])
-        self.assertIn('Harnesses stopped', ui.review.call_args.kwargs['accept'])
         original_integrations = receipt['integrations']
         retry_ui = self.ui()
         retry = configure_harnesses(retry_ui, self.home)

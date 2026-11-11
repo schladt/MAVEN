@@ -6,7 +6,7 @@ from tools.memory.validation import digest, validate_create
 from tools.setup_common import SetupPending, read_private
 
 
-def collection(directory, binding):
+def collection(directory, binding, *, action=None):
     """Read every candidate so one approval binds the entire ordered collection."""
     directory = Path(directory)
     manifest = read_private(directory / 'manifest.json')
@@ -24,13 +24,14 @@ def collection(directory, binding):
         pages.append(draft)
     if not pages:
         raise SetupPending('The starter collection is empty; no instructions were approved.')
-    return {'action': 'submit_and_activate_starter_collection', 'binding': dict(binding), 'pages': pages}
+    return {'action': action or 'submit_and_activate_starter_collection', 'binding': dict(binding), 'pages': pages}
 
 
 def summary(review, completed=0):
     pages = review['pages']
+    updating = review['action'] == 'submit_and_activate_instruction_update'
     lines = [
-        'Install MAVEN’s starter instructions', '',
+        'Update MAVEN’s instructions to the bundled versions' if updating else 'Install MAVEN’s starter instructions', '',
         'These are the bundled instructions agents use for memory, connections, setup, workflows, '
         'skills, secrets, workspace files and optional Google operations.',
         '“Authority” means owner-approved agent instructions, not AWS permissions.', '',

@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import sys
@@ -171,7 +172,8 @@ def _action(kind, target, stage, **details):
             'stage': stage, 'details': details}
 
 
-def _quiet(home, root=None, *, allow_sessions=False):
+def _quiet(home, root=None, *, allow_sessions=False, allow_idle=False):
+    """Refuse registered sessions; allow_idle admits only sessions with no in-flight writers."""
     registry = home / 'runtime/sessions.json'
     if not _exists(registry):
         return
@@ -182,22 +184,36 @@ def _quiet(home, root=None, *, allow_sessions=False):
     for session in value['sessions'].values():
         if not isinstance(session, dict) or not isinstance(session.get('root'), str):
             raise UninstallError('Malformed local session entry; recover it before uninstall')
-        if not allow_sessions and (root is None or session['root'] == str(root)):
+        if allow_sessions or (root is not None and session['root'] != str(root)):
+            continue
+        if not allow_idle:
             raise UninstallError('Stop/recover registered local sessions before uninstall; no liveness guesses are made')
+        if session.get('writers') != []:
+            raise UninstallError('A registered local session has in-flight writers; recover it, or choose '
+                                 'Offline local work only after confirming those writers stopped')
     if not allow_sessions and any(root is None or key == str(root) for key in value['reservations']):
         raise UninstallError('Release local repository reservations before uninstall')
 
 
-def _guard(home, root=None, *, offline=False):
-    _quiet(home, root, allow_sessions=offline)
+def _guard(fragment, home, root=None, *, offline=False):
+    # Idle registrations (no in-flight writers) are detached with retained evidence
+    # instead of blocking; cooperating commands still hold command locks at execution.
+    _quiet(home, root, allow_sessions=offline, allow_idle=True)
     state = _registry_state(home)
     affected = {key: item for key, item in state['sessions'].items()
                 if root is None or item['root'] == str(root)}
-    return _action('local_barrier', home, 5, home=str(home), root=str(root) if root else None,
-                   offline=offline, registry_before=digest(state), affected_sessions=sorted(affected),
-                   registry_sessions={key: digest(item) for key, item in affected.items()},
-                   registry_reservations={key: digest(item) for key, item in state['reservations'].items()
-                                          if root is None or key == str(root)})
+    if affected and not offline:
+        fragment['warnings'].append(
+            f'{len(affected)} registered local session(s) without in-flight writers will be detached: '
+            + ', '.join(sorted(affected)) + '. A harness still running them loses MAVEN access after removal; '
+            'their exact registrations are retained as private evidence.')
+    fragment['actions'].append(_action(
+        'local_barrier', home, 5, home=str(home), root=str(root) if root else None,
+        offline=offline, detach_sessions=bool(affected), registry_before=digest(state),
+        affected_sessions=sorted(affected),
+        registry_sessions={key: digest(item) for key, item in affected.items()},
+        registry_reservations={key: digest(item) for key, item in state['reservations'].items()
+                               if root is None or key == str(root)}))
 
 
 def _export(fragment, source, destination, home, root=None, *, stage=80, move=True, exclude=()):
@@ -237,7 +253,7 @@ def plan_project(root, home, *, offline=False, archive=False, export=None):
             fragment[key].extend(cloud.get(key, []))
     else:
         fragment['warnings'].append('Offline detach does not verify cloud sessions or claim cloud closure.')
-    fragment['actions'].append(_guard(home, root, offline=offline))
+    _guard(fragment, home, root, offline=offline)
     entries = inventory(config)
     destination = config.with_name('detached-project-' + entries['']['sha256'] + '.json')
     if _exists(destination):
@@ -280,7 +296,7 @@ def _shared_skills(home, selected_homes):
 def plan_machine(home, *, selected_homes=(), offline=False, export=None, adopt_legacy=False):
     home = checked_path(home)
     fragment = _fragment()
-    fragment['actions'].append(_guard(home, offline=offline))
+    _guard(fragment, home, offline=offline)
     fragment['targets'].append({'scope': 'machine', 'home': str(home)})
     fragment['warnings'].append('Discovery covers only default, MAVEN_HOME, explicit and installer-registered homes; external shared caches are never removed.')
     if offline:
@@ -334,11 +350,14 @@ def plan_machine(home, *, selected_homes=(), offline=False, export=None, adopt_l
         fragment['warnings'].append('Legacy/unowned runtime retained. Explicit --adopt-legacy can review and remove a verified dedicated MAVEN virtual environment.')
     _plan_integrations(fragment, home, manifest, selected_homes)
     _plan_caches(fragment, home, manifest, selected_homes)
+    removed = [Path(item['target']) for item in fragment['actions'] if item['kind'] == 'local_remove']
+    blocker, entries = _purge_plan(home, manifest, selected_homes,
+                                   [str(path.relative_to(home)) for path in removed if home in path.parents])
     for child in sorted(home.iterdir()):
         if export is not None and child.name == '.env':
             _private_environment(child)
             _export(fragment, child, export, home)
-        elif str(child) not in removable:
+        elif str(child) not in removable and blocker:
             fragment['retained'].append({'path': str(child), 'reason': 'Recovery/coordination evidence, shared caches, ownership receipt, modified or unowned artifact; not exported or removed'})
     if export is not None and _exists(home / 'runtime'):
         _export(fragment, home / 'runtime', export, home, move=False,
@@ -348,7 +367,44 @@ def plan_machine(home, *, selected_homes=(), offline=False, export=None, adopt_l
         removed_targets=[item['target'] for item in fragment['actions']
                          if item['kind'] == 'local_remove'
                          or item['kind'] == 'local_export' and item['details'].get('move')]))
+    if blocker:
+        fragment['warnings'].append(f'Installation folder {home} is kept because {blocker}; '
+                                    'its remaining files are listed as retained.')
+        return fragment
+    inside = [item for item in fragment['retained'] if home in Path(item['path']).parents]
+    fragment['retained'] = [item for item in fragment['retained'] if item not in inside]
+    fragment['actions'].append(_action('local_home_purge', home, 110, home=str(home), root=None,
+                                       inventory=entries))
+    fragment['warnings'].append(
+        f'The whole installation folder {home} is permanently deleted after removal, including private '
+        'settings (.env), saved AWS sign-in caches, unfinished setup state and detached session records'
+        + (', and these files that did not match the installer receipt: ' + ', '.join(item['path'] for item in inside)
+           if inside else '') + '. '
+        + ('Settings and runtime records are archived to the export directory first; sign-in caches, '
+           'locks and detached session records are not archived.' if export is not None else
+           'No export directory was given, so nothing is archived.'))
     return fragment
+
+
+def _purge_plan(home, manifest, selected_homes, exclude):
+    """(reason the installation folder must be kept, None) or (None, inventory after earlier removals)."""
+    if not manifest:
+        return 'no installer ownership receipt proves it belongs to MAVEN', None
+    if home == Path.home().absolute():
+        return 'it is the user home directory', None
+    source = Path(manifest.get('source', '/'))
+    if source == home or home in source.parents:
+        return 'it contains the MAVEN source checkout', None
+    if any(home == Path(item['root']) or home in Path(item['root']).parents
+           for item in _registry_state(home)['sessions'].values()):
+        return 'it contains a registered project folder', None
+    references, uncertain = _cache_references(home, selected_homes)
+    if uncertain or any(home in Path(path).parents for path in references):
+        return 'another installation uses, or may use, a sign-in cache inside it', None
+    try:
+        return None, inventory(home, exclude=exclude)
+    except UninstallError as exc:
+        return f'it holds an artifact that is never deleted ({exc})', None
 
 
 def _sync(directory):
@@ -535,12 +591,58 @@ def _export_execute(action, progress, save):
             'originals_retained': not action['details'].get('move', True), 'live_restore_verified': False}
 
 
+# Files removal itself writes or rewrites inside the home between review and purge.
+_PURGE_WRITTEN = re.compile(r'runtime(/(registry\.lock|uninstall\.json|uninstall-complete\.json|setup/lock'
+                            r'|uninstall-sessions-[0-9a-f]+\.json|uninstall-completed-history-[0-9a-f]+\.json))?')
+_PURGE_REWRITTEN = {MANIFEST, 'runtime/sessions.json'}
+
+
+def _purge_home(action, progress, save):
+    """Delete the reviewed installation folder; refuse anything added or changed since review."""
+    home = Path(action['target'])
+    for running in (Path(sys.prefix), Path(sys.executable).absolute(), Path(__file__).absolute()):
+        if running == home or home in running.parents:
+            raise UninstallError('Use the external recovery runner before deleting this installation folder')
+    operation = action.get('operation_dir')
+    if operation and (Path(operation) == home or home in Path(operation).parents):
+        raise UninstallError('Recovery operation directory overlaps the installation folder')
+    if not _exists(home):
+        return {'status': 'removed', 'path': str(home), 'home_removed': True}
+    runtime = home / 'runtime'
+    with _lock(runtime / 'registry.lock') if runtime.is_dir() else contextlib.nullcontext():
+        expected = action['details']['inventory']
+        current = inventory(home)
+        changed = sorted(name for name, item in current.items()
+                         if not _PURGE_WRITTEN.fullmatch(name) and name not in _PURGE_REWRITTEN
+                         and expected.get(name) != item)
+        if changed:
+            raise UninstallError('Installation folder changed since review; preserved: '
+                                 + ', '.join(str(home / name) for name in changed[:10]))
+        for name in sorted(current, key=lambda value: (len(Path(value).parts), value), reverse=True):
+            target = home / name if name else home
+            progress['intent'] = name
+            save()
+            if current[name]['type'] == 'directory':
+                target.rmdir()
+            else:
+                target.unlink()
+            _sync(target.parent)
+    progress.pop('intent', None)
+    save()
+    return {'status': 'removed', 'path': str(home), 'home_removed': True, 'entries': len(current),
+            'token_revocation_claimed': False}
+
+
 def execute(action, progress, save):
     details = action['details']
     home = checked_path(details['home'], exists=False)
     root = details.get('root')
+    if action['kind'] == 'local_home_purge':
+        return _purge_home(action, progress, save)
     with _execution_locks(home, root):
-        _quiet(home, root, allow_sessions=action['kind'] == 'local_barrier' and details.get('offline', False))
+        barrier = action['kind'] == 'local_barrier'
+        _quiet(home, root, allow_sessions=barrier and details.get('offline', False),
+               allow_idle=barrier and details.get('detach_sessions', False))
         marker_path = home / 'runtime/uninstall.json'
         marker = read_private(marker_path) if _exists(marker_path) else {
             'schema': 1, 'whole_home': False, 'project_roots': []}
@@ -556,7 +658,7 @@ def execute(action, progress, save):
                 marker['project_roots'] = sorted(set(marker['project_roots']) | {root})
             marker.setdefault('actions', {})[digest(action)] = {'root': root}
             save_private(marker_path, marker)
-            if details.get('offline'):
+            if details.get('offline') or details.get('detach_sessions'):
                 _detach_registry(action, progress, save)
             return {'status': 'verified', 'local_writer_barrier': str(marker_path)}
         if kind == 'local_project_release':

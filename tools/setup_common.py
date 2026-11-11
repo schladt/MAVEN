@@ -173,6 +173,31 @@ def check_login_identity(values, identity, *, deploy=False):
         raise SetupPending('Root cannot be the daily-use identity.')
 
 
+def database_status(values):
+    """Read-only wake probe through the SQL administration role: 'awake', 'warming', or an error code.
+
+    The SELECT itself starts an auto-paused Aurora cluster resuming; it never changes MAVEN state.
+    """
+    from botocore.config import Config
+    from tools.memory.client import selected_session
+    from tools.memory.environment import migration_config, transport_ca_bundle
+    try:
+        config = migration_config(values)
+        session = selected_session(config, admin=True, environment=values)
+        client = session.client('rds-data', verify=transport_ca_bundle(), config=Config(
+            connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
+        try:
+            client.execute_statement(resourceArn=config['cluster_arn'], secretArn=config['admin_secret_arn'],
+                                     database=config['database'], sql='SELECT 1')
+        finally:
+            client.close()
+        return 'awake'
+    except Exception as error:
+        code = (getattr(error, 'response', {}).get('Error', {}).get('Code', '')
+                or getattr(error, 'code', '') or type(error).__name__)
+        return 'warming' if code == 'DatabaseResumingException' else code
+
+
 def permission_preflight(values, task):
     """Read/assume/simulate only. Results describe probes, not blanket permission."""
     from botocore.config import Config

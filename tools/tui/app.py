@@ -19,6 +19,14 @@ from textual.widgets.option_list import Option
 from tools.interaction import OperationPaused, confirmation_prefix, using
 
 
+class StateCheckbox(Checkbox):
+    """Draw the mark only when checked; Textual's default draws X in both states."""
+
+    @property
+    def BUTTON_INNER(self):  # noqa: N802 - overrides Textual's class constant
+        return "X" if self.value else " "
+
+
 class DialogScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         steps = "\n\n".join(("> " if item == self.app.active_stage else "  ") + item for item in self.app.steps)
@@ -67,8 +75,10 @@ class FormScreen(DialogScreen):
                     yield Static(self.description, markup=False)
                 for index, field in enumerate(self.fields):
                     identifier = f"field-{index}"
+                    if field.section:
+                        yield Label(field.section, classes="section-heading", markup=False)
                     if field.kind == "bool":
-                        yield Checkbox(Text(field.label), value=bool(field.default), id=identifier)
+                        yield StateCheckbox(Text(field.label), value=bool(field.default), id=identifier)
                     else:
                         yield Label(field.label, markup=False)
                         if field.kind == "select":
@@ -314,6 +324,10 @@ class Interaction:
     def message(self, text):
         self.app.call_from_thread(self.app.show_message, str(text))
 
+    def progress(self, text):
+        """Show live progress (for example a wait timer) in the busy status line."""
+        self.app.call_from_thread(self.app.show_activity, "working", str(text))
+
     def stage(self, name):
         self.checkpoint()
         self.app.call_from_thread(self.app.show_stage, str(name))
@@ -378,6 +392,7 @@ class WorkflowApp(App):
     .multi-input { height: 6; min-height: 3; }
     .field-error { height: auto; color: $error; }
     .field-help { height: auto; color: $text-muted; }
+    .section-heading { text-style: bold; }
     .buttons { height: auto; min-height: 3; align-horizontal: right; margin-top: 1; }
     .buttons Button { margin-left: 1; }
     .hint { height: auto; color: $text-muted; }
@@ -461,7 +476,7 @@ class WorkflowApp(App):
             state = "pause_requested"
         self.activity_state = state
         if state == "working":
-            text = "Waiting… " + self.active_stage
+            text = detail or "Waiting… " + self.active_stage
         elif state == "input":
             text = "Awaiting input — " + (detail or self.active_stage)
         elif state == "pause_requested":

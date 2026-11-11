@@ -260,6 +260,112 @@ class AdministrationTests(unittest.TestCase):
         self.assertEqual(self.controller.advance(result['operation_id'])['state'], 'completed')
         self.assertEqual(original_path.read_bytes(), original_operation)
 
+    def update_fixture(self, stack_changes):
+        """Patches for an update run: current local software, one pending migration, a changed service."""
+        wizard = Wizard(self.home)
+        instance = str(uuid4())
+        wizard.settings({'MAVEN_MEMORY_INSTANCE_ID': instance, 'MAVEN_AWS_REGION': 'us-east-1',
+                         'MAVEN_STACK_NAME': 'maven-stack-01'})
+        identity = {'Arn': 'arn:aws:iam::123456789012:user/owner', 'Account': '123456789012'}
+        cloud = Mock()
+        cloud.describe_stacks.return_value = {'Stacks': [{
+            'StackId': 'arn:aws:cloudformation:us-east-1:123456789012:stack/maven-stack-01/1',
+            'StackStatus': 'UPDATE_COMPLETE', 'Parameters': [{'ParameterKey': 'InstanceId', 'ParameterValue': instance}]}]}
+        cloud.get_template.return_value = {'TemplateBody': {'deployed': 'old'}}
+        document = {'review': {'change_set': {'Changes': [{'ResourceChange': change} for change in stack_changes]}},
+                    'review_sha256': 'f' * 64}
+        patches = [
+            patch('tools.administration._connection_config', return_value={'instance_id': instance, 'schema_version': 2}),
+            patch('tools.setup_common.inspect_login_identity', return_value=identity),
+            patch.object(Wizard, 'verify_authority', return_value=21),
+            patch('tools.update.local_report', return_value={'current': True, 'checkout': str(self.base)}),
+            patch('tools.update.running_software_stale', return_value=False),
+            patch('tools.update.schema_status', return_value={'state': 'pending', 'applied': 11,
+                                                              'pending': ['012_agentic_memory.sql']}),
+            patch('tools.update.build_service_package', side_effect=lambda stack, path, instance: path.mkdir()),
+            patch('tools.memory.bootstrap._cloud', return_value=cloud),
+            patch('tools.memory.bootstrap._package', return_value=(
+                {'deployment_inputs': {'InstanceId': instance}}, json.dumps({'deployed': 'new'}), [])),
+            patch('tools.memory.bootstrap.plan', side_effect=lambda values, package, path, change_type: save_json(path, document)),
+            patch('tools.memory.environment.configured_client'),
+            patch('tools.update.authority_changes', return_value=[]),
+        ]
+        mocks = {}
+        for item in patches:
+            mocks[item.attribute] = item.start()
+            self.addCleanup(item.stop)
+        return mocks
+
+    def run_update(self, answers, *, stop_at=None):
+        result = self.controller.begin('setup', {'mode': 'update', 'checkout': str(self.base)})
+        for _ in range(40):
+            result = self.advance_to_question(result)
+            if result['state'] in ('completed', 'blocked', 'uncertain'):
+                return result
+            key = result['pending_interaction']['key']
+            if key == stop_at:
+                return result
+            result = self.respond(result, answers.get(key))
+        self.fail('Update did not finish')
+
+    def test_update_migrates_schema_then_updates_service_with_reviews(self):
+        mocks = self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'MemoryFunction',
+                                      'ResourceType': 'AWS::Lambda::Function', 'Replacement': 'False'}])
+        answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')}}
+        with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}) as initialize, \
+                patch('tools.memory.bootstrap.apply', return_value={'status': 'connected'}) as apply:
+            result = self.run_update(answers)
+        self.assertEqual(result['state'], 'completed', result)
+        reviews = [approval['review'] for approval in result['approvals']]
+        self.assertTrue(any(review.get('upgrade') is True for review in reviews))  # schema review
+        service = next(review for review in reviews if 'changes' in review)
+        self.assertEqual(service['changes'][0]['logical_id'], 'MemoryFunction')
+        initialize.assert_called_once()
+        self.assertTrue(initialize.call_args.kwargs['upgrade'])
+        apply.assert_called_once()
+        self.assertEqual(apply.call_args.kwargs['confirm_review'], 'f' * 64)
+        mocks['plan'].assert_called_once()
+        self.assertEqual(mocks['plan'].call_args.kwargs['change_type'], 'UPDATE')
+        self.assertTrue(result['outcome']['instance_ready'])
+
+    def test_update_refuses_service_change_that_replaces_data_resources(self):
+        self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'DatabaseCluster',
+                              'ResourceType': 'AWS::RDS::DBCluster', 'Replacement': 'True'}])
+        answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')}}
+        with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}), \
+                patch('tools.memory.bootstrap.apply') as apply:
+            result = self.run_update(answers)
+        self.assertEqual(result['state'], 'blocked')
+        self.assertIn('DatabaseCluster (AWS::RDS::DBCluster)', result['error'])
+        apply.assert_not_called()
+        self.assertFalse(any('changes' in approval['review'] for approval in result['approvals']))
+
+    def test_update_offers_instruction_changes_as_one_collection_review(self):
+        from tools.memory.onboarding import catalog
+        candidate = catalog()[0][0]
+        mocks = self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'MemoryFunction',
+                                      'ResourceType': 'AWS::Lambda::Function', 'Replacement': 'False'}])
+        mocks['authority_changes'].return_value = [{
+            'slug': candidate['slug'], 'title': candidate['title'], 'action': 'update', 'page_id': str(uuid4()),
+            'revision': 3, 'candidate': candidate, 'diff': '-old\n+new\n'}]
+        answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')},
+                   'authority_update': {'update': True}}
+        with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}), \
+                patch('tools.memory.bootstrap.apply', return_value={'status': 'connected'}):
+            offered = self.run_update(answers, stop_at='authority_update')
+            self.assertIn('-old\n+new', offered['pending_interaction']['details'])
+            result = self.respond(offered, answers['authority_update'])
+            result = self.advance_to_question(result)
+        review = result['pending_interaction']
+        self.assertEqual(review['key'], 'starter_collection')
+        self.assertEqual(review['title'], 'Update MAVEN instructions — one approval')
+        page = review['review']['pages'][0]
+        self.assertEqual((page['page_id'], page['expected_revision']),
+                         (mocks['authority_changes'].return_value[0]['page_id'], 3))
+
     def test_setup_never_steals_unresolved_or_unverified_ownership(self):
         for phase in ('awaiting_decision', 'working', 'blocked', 'uncertain', 'cancelled', 'completed'):
             with self.subTest(phase=phase):

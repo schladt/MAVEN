@@ -499,7 +499,9 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, default=Path(os.environ.get('MAVEN_HOME', str(Path.home() / '.maven'))))
     parser.add_argument('--operation', help='Resume the exact persisted administration operation UUID')
-    parser.add_argument('--mode', choices=('existing', 'new'), help='Connect an existing instance or review new provisioning')
+    parser.add_argument('--mode', choices=('existing', 'new', 'update'),
+                        help='Connect an existing instance, review new provisioning, or update an existing installation '
+                             '(local software, database schema, service stack and instructions)')
     parser.add_argument('--fresh-operation', action='store_true', help='Review a new administration operation after verified completion; unresolved operations are never discarded')
     parser.add_argument('--restart-operation', help='Review abandonment of this unfinished setup UUID and start over without deleting cloud resources')
     args = parser.parse_args(argv)
@@ -570,7 +572,11 @@ def _present(ui, args, home):
         for receipt in previous['receipts'])
     if args.fresh_operation and previous and not verified:
         raise SetupPending('Cannot start fresh while the saved operation is unfinished or unverified. Resume its exact UUID; original requests and receipts are retained.')
-    if verified and not args.fresh_operation:
+    if args.mode == 'update' and not args.operation and (not previous or verified):
+        # A completed setup is archived; the update is a new reviewed operation. An unfinished
+        # operation is resumed below and must itself be an update.
+        identifier = None
+    elif verified and not args.fresh_operation:
         from tools.tui.harness import completed_setup_outcome, finish_setup
         try:
             outcome = completed_setup_outcome(home, previous)

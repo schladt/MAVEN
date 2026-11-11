@@ -24,7 +24,7 @@ HARNESS_PATHS = {
     'copilot': ('.copilot/mcp-config.json', '.copilot/copilot-instructions.md', '.copilot/skills'),
     'gemini': ('.gemini/settings.json', '.gemini/GEMINI.md', '.gemini/skills'),
 }
-SKILLS = ('maven', 'maven-maintenance')
+SKILLS = ('maven', 'maven-maintenance', 'maven-update')
 
 
 @dataclass(frozen=True)
@@ -51,10 +51,27 @@ def validate_default_profiles(harnesses) -> None:
                              '--harness-config, --harness-context and --skill-dir, or stage first.')
 
 
-def skill_plan(roots: list[Path]) -> list[tuple[Path, bytes]]:
-    """Plan only absent shipped skills, never adopting or replacing user files."""
+def skill_plan(roots: list[Path], home: Path | None = None) -> list[tuple[Path, bytes, dict | None]]:
+    """Plan absent shipped skills, plus upgrades of unmodified installer-owned skills of ``home``.
+
+    Each entry is (target, body, expected): expected is None for a new file, otherwise the exact
+    receipt inventory the existing file must still match when it is replaced. User-modified,
+    shared or unowned files are never replaced.
+    """
     bodies = {name: resource_path(f'templates/skills/{name}/SKILL.md').read_bytes()
               for name in SKILLS}
+    owned, shared, unknown = {}, set(), False
+    if home is not None:
+        from tools.uninstall.common import read_private
+        from tools.uninstall.local import MANIFEST, _shared_skills
+        receipt = home / MANIFEST
+        prior = read_private(receipt) if receipt.exists() else {}
+        if prior and (prior.get('schema') != 1 or prior.get('home') != str(home)):
+            raise ValueError('Installer ownership receipt does not match this home.')
+        references = set(prior.get('skill_references', []))
+        owned = {path: inventory for path, inventory in prior.get('owned', {}).items() if path in references}
+        if owned:
+            shared, unknown = _shared_skills(home, [])
     plan = []
     for root in dict.fromkeys(roots):
         for name, body in bodies.items():
@@ -62,13 +79,50 @@ def skill_plan(roots: list[Path]) -> list[tuple[Path, bytes]]:
             before = _read(target)
             if before is not None:
                 if before != body:
+                    expected = owned.get(str(target))
+                    if expected is not None and str(target) not in shared and not unknown:
+                        from tools.uninstall.local import inventory
+                        if inventory(target) == expected:
+                            plan.append((target, body, expected))
+                            continue
                     raise ValueError(f'Existing skill differs; preserved without changes: {target}. '
-                                     'Use --skill-dir with a separate staging directory for manual review.')
+                                     'It was modified after installation, is shared with another installation, '
+                                     'or was not installed by MAVEN. Use --skill-dir with a separate staging '
+                                     'directory for manual review.')
             else:
                 if target.parent.exists() and any(target.parent.iterdir()):
                     raise ValueError(f'Existing nonempty skill directory preserved: {target.parent}')
-                plan.append((target, body))
+                plan.append((target, body, None))
     return plan
+
+
+def write_skill(target: Path, body: bytes, expected: dict | None) -> None:
+    """Create a planned skill, or replace an owned one only while it still matches its receipt."""
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if expected is None:
+        if _read(target) is not None:
+            raise ValueError(f'Skill appeared since review; preserved: {target}')
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        return
+    from tools.uninstall.local import inventory
+    _read(target)
+    if inventory(target) != expected:
+        raise ValueError(f'Skill changed since review; preserved: {target}')
+    descriptor, temporary = tempfile.mkstemp(prefix='.maven-skill-', dir=target.parent)
+    try:
+        with os.fdopen(descriptor, 'wb') as stream:
+            stream.write(body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, target)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def retired_skill_plan(home: Path, roots: list[Path]):

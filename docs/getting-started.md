@@ -306,13 +306,18 @@ appropriate package cache, and it does not establish cloud readiness. `--home PA
 chooses another private home, `--google` installs
 optional client libraries without granting Google account access, and `--harness NAME`
 selects a harness (repeat for several). `--skill-dir PATH` explicitly selects a custom
-destination. Close affected harnesses before confirming skill installation; a
-noninteractive `--local-only` install also requires `--harness-stopped` when selecting
-harness files. Conflicting files are preserved; interactive setup can continue without
-changing them. Start a new harness afterward to discover the generic skills.
+destination. Running harnesses do not block interactive skill installation: they load
+the change after a restart, and a harness that saves its own configuration while running
+can overwrite the MAVEN entry, so confirm it is listed afterward. A noninteractive
+`--local-only` install still requires `--harness-stopped` when selecting harness files.
+Conflicting files are preserved; interactive setup can continue without changing them.
+Start a new harness afterward to discover the generic skills.
 
-The installed generic skills are `maven` (intent front door) and `maven-maintenance`
-(bounded semantic worker). Native startup guidance and an owned MCP configuration
+The installed generic skills are `maven` (intent front door), `maven-maintenance`
+(bounded semantic worker) and `maven-update` (updates MAVEN itself; see
+[Existing-instance upgrade](#existing-instance-upgrade)). An installer-owned skill
+you have not edited is upgraded when MAVEN updates; edited or shared copies are kept.
+Native startup guidance and an owned MCP configuration
 entry complement them. They are bootstrap routing, not cached cloud authority.
 Unrelated user configuration is preserved; conflicts or modified owned content require
 review rather than overwrite. Stage changes and close affected harnesses before
@@ -530,17 +535,25 @@ neither Google nor a secrets-file bucket is required to start core memory work.
 
 ## Existing-instance upgrade
 
-Local code/templates do not update live AWS resources, schema or active authority.
-First inspect pending publication, setup and removal receipts. Resolve incompatible
-operations through their original supported recovery implementation; never reinterpret
-an old publication checkpoint as a new memory checkpoint or discard unknown outcomes.
+Local code/templates do not update live AWS resources, schema or active authority by
+themselves. The guided update applies them as one resumable setup operation in mode
+`update` (`maven-setup --mode update`, **Update MAVEN** in `python3 install.py`, the
+`maven-update` skill, or `maven_admin` begin kind `setup` with `{"mode": "update"}`):
 
-Separately review the matching service/schema upgrade and forward migration before
-using changed memory contracts. An incompatible deployed schema must be reported,
-not bypassed. Historical record provenance remains intact. After rollout, separately
-review proposed instruction bodies and dependencies, request exact activation
-challenges, and activate only with real owner approval. Reload active authority.
-Schema approval is not policy approval; installing templates is neither.
+| Stage | What it compares | What it does when different |
+| --- | --- | --- |
+| Local | Installed package files (`RECORD`) and installer-owned harness skills vs the checkout | Hands off the installer command; restart harnesses, then resume. Edited or shared skills are preserved |
+| Schema | `maven.schema_migrations` vs the bundled ordered migrations (admin role, read-only) | Separately reviewed forward migration; a non-prefix history is reported, not bypassed |
+| Service | Deployed template vs the current template built from the live stack's parameters (maintenance access) | Reviewed `UPDATE` change set; removal/replacement of RDS, Secrets Manager, S3 or KMS resources is refused before review; reconnects from the updated outputs |
+| Instructions | Active page content hashes vs the bundled catalog | Optional; one collection approval proposes and activates new and changed pages at their current revisions |
+
+Each stage that is already current passes without a question. A change set is created
+only to review it; execution needs approval. First inspect pending publication, setup
+and removal receipts. Resolve incompatible operations through their original supported
+recovery implementation; never reinterpret an old publication checkpoint as a new
+memory checkpoint or discard unknown outcomes. Historical record provenance remains
+intact. Reload active authority after instruction changes. Schema approval is not
+policy approval; installing templates is neither.
 
 The new contract is schema 2 / client protocol 3 with `012_agentic_memory.sql`.
 Ordinary schema-1 use is rejected. Both `maven-memory migrate --confirm-instance
@@ -596,7 +609,7 @@ the selected targets. All paths and identifiers below mean your actual selection
 | Selection passed to `maven-uninstall plan` | Effect |
 | --- | --- |
 | `--project "$PROJECT_ROOT"` | Detach that checkout; retain cloud memory |
-| `--machine --home "$MAVEN_HOME"` | Remove attributable tools/integration for that installation; leave project bindings and cloud resources |
+| `--machine --home "$MAVEN_HOME"` | Remove attributable tools/integration, then delete that whole installation folder (settings, sign-in caches, setup and session records); leave project bindings and cloud resources |
 | `--cloud --home "$MAVEN_HOME"` | Retire the configured cloud instance; leave local installations and project files |
 
 Combine selectors to request more than one scope. Repeat `--project` or machine
@@ -635,7 +648,14 @@ In the TUI, review the complete plan, then confirm each selected destructive tar
 using only its first six characters (the full identity if shorter). The full target
 is shown, and the prefix never selects a target or substitutes for backend identity
 checks. Purge and administrative abandonment retain separate confirmations.
-Changed plans invalidate all collected approvals.
+Changed plans invalidate all collected approvals. The TUI still asks whether affected
+writers stopped; running assistant harnesses only produce a warning, because a harness
+that saves its own configuration can write a removed MAVEN entry back.
+
+Registered local sessions with no in-flight writers do not block planning: the plan
+warns, and the barrier detaches their registrations and retains the exact entries as
+private evidence. A session with in-flight writers still blocks; recover it, or use
+`--offline` after confirming those writers stopped.
 
 Ctrl+Q/Ctrl+C stops dispatching new actions at the next saved action boundary, then
 closes the UI without a persistent background worker. In-flight remote operations
@@ -646,8 +666,8 @@ Existing recovery snapshots created before the TUI worker protocol remain immuta
 the dashboard can inspect them and shows their original CLI recovery command rather
 than replacing the approved implementation.
 
-Stop affected local writers and close affected assistant harnesses before applying.
-These flags are truthful attestations, not commands that stop processes:
+For the CLI, stop affected local writers and close affected assistant harnesses before
+applying. These flags are truthful attestations, not commands that stop processes:
 
 ```sh
 maven-uninstall apply --plan "$PRIVATE_OPERATION_DIRECTORY/plan.json" \
@@ -696,11 +716,19 @@ Reactivation uses the current binding or one unambiguous, digest-verified preser
 `detached-project-*.json` binding. It restores cloud eligibility, not local attachment;
 select the project again through `maven-project setup` when ready.
 
-Local removal preserves originals, receipts, and ignore protection by default.
-`--export "$PRIVATE_EXPORT_DIRECTORY"` produces verified private ZIP archives,
+Project removal preserves originals, receipts, and ignore protection by default.
+Machine removal deletes the whole installation folder as its final step, after
+tools, caches and integrations are removed. The folder is kept, with a warning,
+only when no installer ownership receipt proves it is MAVEN's, it is your home
+directory, it contains the source checkout or a registered project, another
+installation may use a sign-in cache inside it, or it holds a `.git`, mounted or
+foreign-owned entry. Anything added or changed after review stops the deletion.
+Without `--export`, nothing is archived; the TUI asks before continuing.
+`--export "$PRIVATE_EXPORT_DIRECTORY"` produces verified private ZIP archives first,
 moving resolved originals/settings only after verification. Archives contain
-`inventory.json` and `data/` entries. Unresolved recovery evidence and a minimal
-detached project binding remain in place; the report distinguishes copies from moves.
+`inventory.json` and `data/` entries; sign-in caches, locks and detached session
+records are not archived. Project recovery evidence and a minimal detached project
+binding remain in place; the report distinguishes copies from moves.
 Credential caches are not included in recovery exports. Do not remove ignore rules
 while protected `.maven` artifacts remain.
 
