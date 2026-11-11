@@ -446,6 +446,11 @@ def _options(args):
         args.check_existing = task == 'existing' and existing and chosen == home and not separate
         args.setup_mode = 'new' if task == 'new' else 'existing'
         args.setup_operation = pending if args.check_existing else None
+        if args.setup_operation:
+            # Resume continues the unfinished operation in its own mode (e.g. an update).
+            from tools.uninstall.common import read_private
+            saved = read_private(home / 'runtime/administration' / (pending + '.json'))
+            args.setup_mode = saved.get('parameters', {}).get('mode') or args.setup_mode
         args.setup_fresh = args.check_existing and completed and pending is None
         return
 

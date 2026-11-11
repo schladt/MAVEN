@@ -7,12 +7,15 @@ import hashlib
 import json
 import time
 
-from .validation import MemoryError, MUTATION_ROUTES, SCHEMA_VERSION, canonical, decode_json, digest, fields, uuid_string
+from .validation import (MEMORY_ROUTES, MemoryError, MUTATION_ROUTES, SCHEMA_VERSION, canonical, decode_json, digest,
+                         fields, uuid_string)
 
 CONTROL_KEYS = {"instance_id", "recovery_epoch", "schema_version", "state", "data_scope"}
 ROLLOUT_SCOPE = "owner_memory"
 JSON_CHUNK_BYTES = 4096
 MAX_JSON_RESULT_BYTES = 655360
+# Reads may reuse a ready control document this long; mutations always fetch it fresh.
+CONTROL_TTL_SECONDS = 5
 
 
 def json_result_sql(expression):
@@ -177,13 +180,15 @@ class DataAPI:
             raise MemoryError("temporarily_unavailable") from None
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, *, timeouts=True):
+        """Explicit timeouts unless the application role's session defaults already bound statements."""
         self.budget()
         tx = self.client.begin_transaction(**self.base)["transactionId"]
         committed = False
         try:
-            self.execute("SELECT set_config('statement_timeout', '5s', true), "
-                         "set_config('lock_timeout', '1s', true)", transaction=tx)
+            if timeouts:
+                self.execute("SELECT set_config('statement_timeout', '5s', true), "
+                             "set_config('lock_timeout', '1s', true)", transaction=tx)
             yield tx
             self.budget()
             self.client.commit_transaction(resourceArn=self.base["resourceArn"],
@@ -236,25 +241,128 @@ WHERE o.request_key = CAST(:request_key AS uuid) AND maven.instruction_visible(o
 """
 
 
+# Ordinary memory, page and proposal routes are one maven.memory_request statement.
+DISPATCHED_ROUTES = MEMORY_ROUTES | {"/v1/proposals/create", "/v1/proposals/resolve",
+                                     "/v1/proposals/challenge", "/v1/pages/index", "/v1/pages/read"}
+WRITE_ROUTES = MUTATION_ROUTES | {"/v1/proposals/challenge"}
+ROUTE_STATUSES = {"revision_conflict", "idempotency_conflict", "record_unavailable",
+                  "proposal_unavailable", "page_unavailable", "proposal_conflict",
+                  "approval_invalid", "invalid_request", "claim_conflict", "setting_conflict",
+                  "reference_unavailable", "session_unavailable", "client_incompatible",
+                  "context_incomplete", "dependency_unavailable", "dependency_conflict", "context_stale"}
+DISPATCH = ("maven.memory_request(:route, CAST(:request AS jsonb), :request_hash, :candidate_hash, "
+            ":actor, CAST(:protocol AS integer))")
+
+
+def route_result(result):
+    """Map exact route outcomes; anything unrecognized is an ambiguous provider failure."""
+    if not isinstance(result, dict):
+        raise MemoryError("temporarily_unavailable")
+    if "status" in result:
+        code = result["status"]
+        if code not in ROUTE_STATUSES:
+            raise MemoryError("temporarily_unavailable")
+        status = 404 if code.endswith("_unavailable") else 422 if code == "invalid_request" else 409
+        raise MemoryError(code, status, **{k: v for k, v in result.items() if k == "current_revision"})
+    return result
+
+
+class ControlCache:
+    """Per-container ready control document; only reads may reuse it, briefly."""
+
+    def __init__(self, ttl=CONTROL_TTL_SECONDS, clock=time.monotonic):
+        self.ttl = ttl
+        self.clock = clock
+        self.clear()
+
+    @staticmethod
+    def _key(config):
+        return config["journal_bucket"], config["instance_id"], config["recovery_epoch"]
+
+    def get(self, config):
+        if self.document is None or self.key != self._key(config) or self.clock() - self.fetched_at > self.ttl:
+            return None
+        return dict(self.document)
+
+    def put(self, config, document):
+        self.key, self.document, self.fetched_at = self._key(config), dict(document), self.clock()
+
+    def clear(self):
+        self.key = self.document = self.fetched_at = None
+
+
 class Store:
-    def __init__(self, config, data_client, s3_client, *, deadline=None):
+    def __init__(self, config, data_client, s3_client, *, deadline=None, control_cache=None):
         self.config = config
         self.db = DataAPI(data_client, config, deadline=deadline)
         self.s3 = s3_client
+        self.cache = control_cache
 
-    def control(self):
+    def control(self, *, fresh=True):
+        if not fresh and self.cache is not None:
+            cached = self.cache.get(self.config)
+            if cached is not None:
+                return cached
         self.db.budget()
-        return fetch_control(self.s3, self.config)[0]
+        try:
+            document = fetch_control(self.s3, self.config)[0]
+        except Exception:
+            if self.cache is not None:
+                self.cache.clear()
+            raise
+        if self.cache is not None:
+            self.cache.put(self.config, document)
+        return document
 
-    def state(self, tx, expected):
-        raw = self.db.scalar("SELECT maven.lock_service_state()::text", transaction=tx)
-        if raw is None or parse_control(raw, self.config) != expected:
-            raise MemoryError("context_stale")
+    def envelope(self, raw, expected):
+        """Trust a result only under the expected locked service state; return its generation."""
+        try:
+            value = json.loads(raw) if raw is not None else None
+            if not isinstance(value, dict) or not {"service_state", "authority_generation"} <= value.keys():
+                raise ValueError
+        except ValueError:
+            raise MemoryError("temporarily_unavailable") from None
+        try:
+            if value["service_state"] is None or parse_control(canonical(value["service_state"]), self.config) != expected:
+                raise MemoryError("context_stale")
+        except MemoryError:
+            if self.cache is not None:
+                self.cache.clear()
+            raise MemoryError("context_stale") from None
+        generation = value["authority_generation"]
+        if type(generation) is not int or generation < 0:
+            raise MemoryError("temporarily_unavailable")
+        return value, generation
 
     def perform(self, route, request, actor, *, client_protocol=1):
-        expected = self.control()
+        """Return (result, authority_generation) for one validated request."""
+        mutation = route in WRITE_ROUTES
+        expected = self.control(fresh=mutation)
+        if route not in DISPATCHED_ROUTES:
+            return self._legacy(route, request, actor, expected, client_protocol, mutation)
+        values = {"route": route, "request": canonical(request),
+                  "request_hash": digest(request) if mutation else None,
+                  "candidate_hash": digest(request["candidate"]) if "candidate" in request else None,
+                  "actor": actor, "protocol": client_protocol}
+        overflow = "context_incomplete" if route == "/v1/memory/context" else "temporarily_unavailable"
+        if not mutation:
+            # One autocommitted statement; the application role's session timeouts bound it.
+            raw = self.db.json_scalar(DISPATCH, values, overflow_status=overflow)
+            value, generation = self.envelope(raw, expected)
+            return route_result(value.get("result")), generation
+        # Mutations keep an explicit transaction so a changed control document rolls them back.
+        with self.db.transaction(timeouts=False) as tx:
+            raw = self.db.json_scalar(DISPATCH, values, tx, overflow_status=overflow)
+            value, generation = self.envelope(raw, expected)
+            result = route_result(value.get("result"))
+            if self.control() != expected:
+                raise MemoryError("context_stale")
+        return result, generation
+
+    def _legacy(self, route, request, actor, expected, client_protocol, mutation):
         with self.db.transaction() as tx:
-            self.state(tx, expected)
+            _, generation = self.envelope(
+                self.db.scalar("SELECT maven.memory_service_state()::text", transaction=tx), expected)
             self.db.execute("SELECT set_config('maven.client_protocol', :protocol, true)",
                             {"protocol": str(client_protocol)}, tx)
             if not self.db.scalar("SELECT maven.memory_protocol_allowed()", transaction=tx):
@@ -267,31 +375,6 @@ class Store:
                                              "revision": request.get("revision")}, tx)
                 if raw is None:
                     raise MemoryError("record_unavailable", 404)
-            elif route in {"/v1/memory/write", "/v1/memory/claim"}:
-                raw = self.db.scalar(
-                    "SELECT maven.memory_write(:action, CAST(:request AS jsonb), :hash, :actor)::text",
-                    {"action": route.rsplit("/", 1)[1], "request": canonical(request),
-                     "hash": digest(request), "actor": actor}, tx)
-            elif route in {"/v1/memory/read", "/v1/memory/search", "/v1/memory/context"}:
-                function = {"/v1/memory/read": "memory_read", "/v1/memory/search": "memory_search",
-                            "/v1/memory/context": "memory_context"}[route]
-                raw = self.db.json_scalar(f"maven.{function}(CAST(:request AS jsonb))",
-                                          {"request": canonical(request)}, tx,
-                                          overflow_status="context_incomplete" if function == "memory_context"
-                                          else "temporarily_unavailable")
-            elif route in {"/v1/proposals/create", "/v1/proposals/resolve"}:
-                raw = self.db.scalar(
-                    "SELECT maven.instruction_write(:action, CAST(:request AS jsonb), :hash, :candidate_hash, :actor)::text",
-                    {"action": route.rsplit("/", 1)[1], "request": canonical(request),
-                     "hash": digest(request), "candidate_hash": digest(request["candidate"]) if "candidate" in request else None,
-                     "actor": actor}, tx)
-            elif route == "/v1/proposals/challenge":
-                raw = self.db.scalar("SELECT maven.instruction_challenge(CAST(:proposal AS uuid), :actor)::text",
-                                     {"proposal": request["proposal_id"], "actor": actor}, tx)
-            elif route in {"/v1/pages/index", "/v1/pages/read"}:
-                function = "instruction_index" if route == "/v1/pages/index" else "instruction_read"
-                raw = self.db.scalar(f"SELECT maven.{function}(CAST(:request AS jsonb))::text",
-                                     {"request": canonical(request)}, tx)
             else:
                 raw = self.db.scalar(LOOKUP, {"request_key": request["request_key"]}, tx)
                 if raw is None:
@@ -301,18 +384,7 @@ class Store:
                                          {"request_key": request["request_key"]}, tx)
                 if raw is None:
                     raise MemoryError("operation_unavailable", 404)
-            result = json.loads(raw)
-            if "status" in result:
-                code = result["status"]
-                if code not in {"revision_conflict", "idempotency_conflict", "record_unavailable",
-                                "proposal_unavailable", "page_unavailable", "proposal_conflict",
-                                "approval_invalid", "invalid_request", "claim_conflict", "setting_conflict",
-                                "reference_unavailable", "session_unavailable", "client_incompatible",
-                                "context_incomplete", "dependency_unavailable", "dependency_conflict"}:
-                    raise MemoryError("temporarily_unavailable")
-                status = 404 if code.endswith("_unavailable") else 422 if code == "invalid_request" else 409
-                raise MemoryError(code, status,
-                                  **{k: v for k, v in result.items() if k == "current_revision"})
-            if route in MUTATION_ROUTES | {"/v1/proposals/challenge"} and self.control() != expected:
+            result = route_result(json.loads(raw))
+            if mutation and self.control() != expected:
                 raise MemoryError("context_stale")
-        return result
+        return result, generation

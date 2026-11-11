@@ -139,6 +139,16 @@ An identity differing from saved bindings is blocked, not silently substituted.
 Choose **Sign in**, manual instructions, Back or pause; login is never launched
 without that choice. A failed login offers manual recovery, not a readiness claim.
 
+MAVEN keeps its own private AWS sign-in caches inside the installation home
+(`runtime/aws-login-cache` for daily use, `runtime/aws-deploy-login-cache` for
+maintenance). A plain `aws login --profile …` writes the AWS default cache, which MAVEN
+does not read. When a sign-in expires, use the exact command MAVEN shows (in the
+installer's **Sign in** screen, a blocked tool result, or `maven_status`), for example:
+
+```sh
+AWS_LOGIN_CACHE_DIRECTORY=~/.maven/runtime/aws-login-cache aws login --profile maven-interactive --region us-east-1
+```
+
 Read-only access preflights distinguish **Passed**, **Missing access**, and
 **Could not verify**. Missing access blocks the affected phase with remediation and
 retry of the same operation. Unknown checks remain disclosed in reviews, not relabelled
@@ -292,6 +302,19 @@ Universal/current-project retrieval is the default; other-project consultation i
 explicit. Ordinary checkpoints have a cutoff and exact revisions, not Git effects.
 “Checkpoint and wait” synchronizes; “resume” catches up from available discussion,
 while “resume fresh” does not. See [workflow](workflow.md) for these boundaries.
+
+After restarting a harness, the assistant checks `maven_status` before claiming a
+connection; an unbound process lists the active registered sessions for the folder and
+resumes only the exact one. In a folder that is not enabled, an explicit owner request
+to “use what MAVEN knows” allows a read-only universal search/read (`unbound=true`)
+without enabling the folder, creating a session or capturing discussion.
+
+**Optional keep-warm:** set `MAVEN_KEEP_WARM=1` in the private `.env` (or the MCP
+process environment) to have an initialized MCP process ping the instruction index every
+240 seconds, keeping Aurora from auto-pausing (5 minutes idle) during active sessions.
+It is off by default: each ping is a billed Lambda/Data API request, and a database kept
+awake accrues compute charges for as long as the session stays bound. Leave it off when
+cold-start latency is acceptable.
 
 Additional projects only need their own explicit enablement, not another instance
 deployment. A new/forked session gets its own identity; explicit resume preserves the

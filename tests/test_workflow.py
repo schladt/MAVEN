@@ -119,15 +119,25 @@ class ApprovalTests(unittest.TestCase):
 
 
 class SessionRecoveryTests(unittest.TestCase):
-    def test_legacy_handover_uses_recorded_time_not_random_identifier(self):
-        older = {'record_id': 'ffffffff-ffff-4fff-8fff-ffffffffffff',
-                 'recorded_at': '2026-01-01T00:00:00+00:00',
-                 'data': {'state': 'closed', 'workflow': 'maven-workflow', 'summary': '{}'}}
-        newer = {'record_id': '11111111-1111-4111-8111-111111111111',
-                 'recorded_at': '2026-02-01T00:00:00+00:00', 'data': dict(older['data'])}
-        memory = MemoryBoundary(None, Path('/project'), str(uuid.uuid4()), str(uuid.uuid4()))
-        memory.search = lambda kind, state=None, **kwargs: iter([older, newer] if kind == 'session' else [])
-        self.assertEqual(memory.project_context()['previous_handover'], newer)
+    def test_project_context_is_one_server_request_and_never_lists_self_as_peer(self):
+        session, project = str(uuid.uuid4()), str(uuid.uuid4())
+        handover = {'session_id': str(uuid.uuid4()), 'checkpoint_record_id': str(uuid.uuid4()), 'revision': 2,
+                    'recorded_at': '2026-02-01T00:00:00+00:00', 'session_state': 'active', 'summary': 'Main line'}
+        data = {'latest_handover': handover, 'active_peers': [], 'tasks': [], 'blockers': [],
+                'owner_preferences': [{'record_id': str(uuid.uuid4()), 'revision': 1, 'title': 'Style',
+                                       'body_markdown': 'Never name clients publicly.'}]}
+        client = unittest.mock.MagicMock()
+        client.invoke.return_value = {'status': 'ready', 'data': data}
+        memory = MemoryBoundary(client, Path('/project'), project, session)
+        self.assertEqual(memory.project_context(), data)
+        client.invoke.assert_called_once_with('/v1/memory/project_context',
+                                              {'project_id': project, 'session_id': session})
+        client.invoke.return_value = {'status': 'ready', 'data': dict(data, active_peers=[{'session_id': session}])}
+        with self.assertRaises(BoundaryError):
+            memory.project_context()
+        client.invoke.return_value = {'status': 'ready', 'data': dict(data, tasks=None)}
+        with self.assertRaises(BoundaryError):
+            memory.project_context()
 
     def test_identity_failure_revokes_shared_access_but_transient_failure_does_not(self):
         from tools.git_workflow import start_main
@@ -165,6 +175,10 @@ class MemoryCloud:
     def __init__(self):
         self.records, self.history, self.requests = {}, {}, {}
         self.calls = []
+        self.context_loads = 0
+        self.generation = 1
+        self.last_generation = None
+        self.sequence = {}
         self.lose_next = False
         self.closed = False
 
@@ -172,11 +186,103 @@ class MemoryCloud:
         self.closed = True
 
     def load_context(self, scope):
-        return {'status': 'ready', 'data': {'authority_generation': 1, 'instructions': [
-            {'slug': 'core', 'revision': 1, 'content_hash': 'a' * 64,
-             'page_kind': 'directive', 'body_markdown': 'Complete current governing instructions.'}]}}
+        self.context_loads += 1
+        self.last_generation = self.generation
+        return {'status': 'ready', 'authority_generation': self.generation, 'data': {
+            'authority_generation': self.generation, 'instructions': [
+                {'slug': 'core', 'revision': 1, 'content_hash': 'a' * 64,
+                 'page_kind': 'directive', 'body_markdown': 'Complete current governing instructions.'}]}}
 
     def invoke(self, route, body):
+        response = self._invoke(route, body)
+        self.last_generation = self.generation
+        return {**response, 'authority_generation': self.generation}
+
+    @staticmethod
+    def _owner(record):
+        return record.get('data_scope') == 'owner'
+
+    def _project_context(self, body):
+        import json as _json
+        project, requester = body['project_id'], body['session_id']
+        sessions = {identifier: record for identifier, record in self.records.items()
+                    if record['kind'] == 'session' and record.get('project_id') == project}
+        checkpoints = sorted((record for record in self.records.values()
+                              if record['kind'] == 'checkpoint' and record['data'].get('session_id') in sessions),
+                             key=lambda record: self.sequence.get(record['record_id'], 0))
+        latest = {}
+        for record in checkpoints:
+            latest[record['data']['session_id']] = record
+        handover = None
+        if checkpoints:
+            record = checkpoints[-1]
+            handover = {'session_id': record['data']['session_id'], 'checkpoint_record_id': record['record_id'],
+                        'revision': record['revision'], 'recorded_at': None,
+                        'session_state': sessions[record['data']['session_id']]['data']['state'],
+                        'summary': record['data'].get('summary')}
+        peers = [{'session_id': identifier,
+                  'harness': _json.loads(record['data']['summary']).get('harness'), 'started_at': None,
+                  'latest_checkpoint_at': None,
+                  'latest_summary': latest[identifier]['data'].get('summary') if identifier in latest else None}
+                 for identifier, record in sessions.items()
+                 if identifier != requester and record['data']['state'] == 'active']
+
+        def items(kind, states):
+            return [{'record_id': record['record_id'], 'revision': record['revision'],
+                     'title': record['data'].get('title'), 'state': record['data'].get('state'),
+                     'tags': record.get('tags', [])}
+                    for record in sorted(self.records.values(), key=lambda value: value['record_id'])
+                    if record['kind'] == kind and self._owner(record) and record['data'].get('state') in states
+                    and record.get('project_id') in (None, project)]
+
+        preferences = [{'record_id': record['record_id'], 'revision': record['revision'],
+                        'title': record['data']['title'], 'body_markdown': record['data']['body_markdown'][:1000]}
+                       for record in self.records.values()
+                       if record['kind'] == 'decision' and self._owner(record) and record.get('project_id') is None
+                       and record['data'].get('state') == 'accepted'][:20]
+        return {'latest_handover': handover, 'active_peers': peers,
+                'tasks': items('task', ('open', 'in_progress', 'blocked')), 'blockers': items('risk', ('open',)),
+                'owner_preferences': preferences}
+
+    def _search(self, body):
+        import copy
+        import json as _json
+        import re as _re
+        records = [record for record in self.records.values()
+                   if (body.get('kind') is None or record['kind'] == body['kind'])
+                   and (body.get('state') is None or record['data'].get('state') == body['state'])
+                   and (body.get('include_archived') or ('archived' not in record.get('tags', [])
+                                                         and record['data'].get('state') != 'archived'))]
+        scope = body.get('scope', 'project')
+        records = [record for record in records if scope == 'all'
+                   or scope == 'context' and record.get('project_id') in (None, body.get('project_id'))
+                   or scope == 'universal' and record.get('project_id') is None
+                   or scope == 'project' and record.get('project_id') == body.get('project_id')]
+        limit = body.get('limit', 20)
+        if body.get('query'):
+            ranked = []
+            for record in records:
+                title = str(record['data'].get('title') or record['data'].get('name') or '')
+                fields = (title, ' '.join(record.get('tags', [])), _json.dumps(record['data']))
+                rank = 0
+                for token in body['query'].lower().split():
+                    pattern = r'\b' + _re.escape(token) + r'\b'
+                    weights = [weight for weight, text in zip((3, 2, 1), fields) if _re.search(pattern, text.lower())]
+                    if not weights:
+                        break
+                    rank += sum(weights)
+                else:
+                    ranked.append(dict(copy.deepcopy(record), rank=rank, snippet=None))
+            ranked.sort(key=lambda record: (-record['rank'], record['record_id']))
+            offset = body.get('offset', 0)
+            page = ranked[offset:offset + limit]
+            return {'records': page, 'next_offset': offset + limit if len(ranked) > offset + limit else None}
+        records = sorted((record for record in records
+                          if record['record_id'] > body.get('after_id', '')), key=lambda record: record['record_id'])
+        page = [dict(copy.deepcopy(record), snippet=None) for record in records[:limit]]
+        return {'records': page, 'next_after_id': page[-1]['record_id'] if len(records) > len(page) else None}
+
+    def _invoke(self, route, body):
         import copy
         from tools.memory.validation import validate
         validate(route, body)
@@ -195,25 +301,21 @@ class MemoryCloud:
                 record['claim'] = None  # Real historical reads exclude mutable leases.
             return {'status': 'ready', 'data': record}
         if action == 'search':
-            records = [record for record in self.records.values()
-                       if (body.get('kind') is None or record['kind'] == body['kind'])
-                       and (body.get('state') is None or record['data'].get('state') == body['state'])]
-            scope = body.get('scope', 'project')
-            records = [record for record in records if scope == 'all'
-                       or scope == 'context' and record.get('project_id') in (None, body.get('project_id'))
-                       or scope == 'universal' and record.get('project_id') is None
-                       or scope == 'project' and record.get('project_id') == body.get('project_id')]
-            records = sorted((record for record in records
-                              if record['record_id'] > body.get('after_id', '')), key=lambda record: record['record_id'])
-            page = records[:body.get('limit', 20)]
-            return {'status': 'ready', 'data': {'records': copy.deepcopy(page),
-                    'next_after_id': page[-1]['record_id'] if len(records) > len(page) else None}}
+            return {'status': 'ready', 'data': self._search(body)}
+        if action == 'project_context':
+            return {'status': 'ready', 'data': self._project_context(body)}
+        if action == 'revisions':
+            return {'status': 'ready', 'data': {'revisions': {
+                identifier: self.records[identifier]['revision'] for identifier in body['record_ids']
+                if identifier in self.records and self._owner(self.records[identifier])}}}
         key = body['request_key']
         if key in self.requests:
             original, result = self.requests[key]
             if original != body:
                 raise MemoryClientError('invalid_request')
-            return {'status': 'ready', 'data': copy.deepcopy(result)}
+            return {'status': 'ready', 'data': dict(copy.deepcopy(result), replayed=True)}
+        if body.get('authority_generation', self.generation) != self.generation:
+            raise MemoryClientError('context_stale')
         current = self.records.get(body['record_id'])
         if (current['revision'] if current else 0) != body['expected_revision']:
             raise MemoryClientError('revision_conflict')
@@ -239,6 +341,7 @@ class MemoryCloud:
         self.records[body['record_id']] = record
         self.history[(body['record_id'], revision)] = copy.deepcopy(record)
         self.requests[key] = (copy.deepcopy(body), copy.deepcopy(result))
+        self.sequence[body['record_id']] = len(self.requests)
         if self.lose_next:
             self.lose_next = False
             raise MemoryClientError('outcome_unknown', request_key=key)
@@ -436,8 +539,10 @@ class MemoryLifecycleTests(unittest.TestCase):
         calls = len(self.cloud.calls)
         context = self.service.context()['context']
         self.assertEqual({record['record_id'] for record in context['tasks'] + context['blockers']}, owner_ids)
+        routes = [route for route, _ in self.cloud.calls[calls:]]
+        self.assertEqual(routes.count('/v1/memory/project_context'), 1)
         read_ids = {body['record_id'] for route, body in self.cloud.calls[calls:] if route == '/v1/memory/read'}
-        self.assertFalse(read_ids & synthetic_ids)
+        self.assertEqual(read_ids, {self.identifier})  # Only the session-active check; no per-record reads.
         first = self.service.search(kind='task')
         self.assertEqual(first['records'], [])
         self.assertIsNotNone(first['next_after_id'])
@@ -640,6 +745,241 @@ class MemoryLifecycleTests(unittest.TestCase):
         refs = self.cloud.records[result['checkpoint']['receipt']['record_id']]['data']['memory_refs']
         self.assertIn(MemoryBoundary.ref(setting), refs)
         self.assertIn(MemoryBoundary.ref(operation), refs)
+
+class WireCloud(MemoryCloud):
+    """Answers the real signed client at its HTTP boundary, so every service request is counted."""
+    BODY = 'Complete current governing instructions.'
+
+    def __init__(self):
+        super().__init__()
+        self.wire = []
+
+    def page(self):
+        import hashlib
+        from tools.memory.validation import digest
+        candidate = {'slug': 'core', 'page_kind': 'directive', 'title': 'Core', 'scope': {},
+                     'body_markdown': self.BODY, 'authority_state': 'active'}
+        return {'page_id': str(uuid.uuid5(uuid.NAMESPACE_URL, 'maven:core')), 'slug': 'core',
+                'page_kind': 'directive', 'title': 'Core', 'scope': {}, 'revision': 1,
+                'content_hash': digest(candidate), 'data_scope': 'owner', 'body_markdown': self.BODY,
+                'body_sha256': hashlib.sha256(self.BODY.encode()).hexdigest()}
+
+    def post(self, route, body, remaining):
+        from tools.memory.validation import CLIENT_PROTOCOL
+        self.wire.append(route)
+        if route == '/v1/memory/context':
+            return 200, {'status': 'ready', 'authority_generation': self.generation, 'data': {
+                'authority_generation': self.generation, 'minimum_client_protocol': CLIENT_PROTOCOL,
+                'pages': [self.page()], 'bodies_inline': True, 'tasks': [], 'next_task_after_id': None}}
+        try:
+            return 200, self.invoke(route, body)
+        except MemoryClientError as error:
+            return 409, {'status': error.code}
+
+
+class RequestBudgetTests(unittest.TestCase):
+    """Once initialized, authority is cached: each memory call costs only its own request."""
+    def setUp(self):
+        from tools.memory.client import MemoryClient
+        from tools.memory.lifecycle import SessionService
+        from test_memory_client import CONFIG
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name) / 'project'
+        self.root.mkdir()
+        self.identifier = str(uuid.uuid4())
+        save_private(self.root, '.maven/project.json', {
+            'schema': 1, 'project_id': str(uuid.uuid4()), 'root': str(self.root)})
+        self.cloud = WireCloud()
+        self.client = MemoryClient(CONFIG, None)
+        post = patch.object(self.client, '_post', side_effect=self.cloud.post)
+        post.start()
+        self.addCleanup(post.stop)
+        skills = patch('tools.memory.skills.SessionSkills.start', return_value={'status': 'ready', 'data': {'resources': []}})
+        skills.start()
+        self.addCleanup(skills.stop)
+        self.service = SessionService(self.root, self.identifier, env=self.root.parent / 'home' / '.env',
+                                      client=self.client)
+        self.addCleanup(self.service.close)
+        self.source = {'origin': 'Owner conversation', 'excerpt': 'Preserve this relevant finding.'}
+        self.note = {'title': 'Finding', 'body_markdown': 'Verified local behavior.', 'category': 'work'}
+        start = len(self.cloud.wire)
+        self.service.initialize()
+        # New session: session lookup, one inline context, session write, one project context.
+        self.assertEqual(self.cloud.wire[start:], ['/v1/memory/read', '/v1/memory/context',
+                                                   '/v1/memory/write', '/v1/memory/project_context'])
+
+    def requests(self, operation):
+        start = len(self.cloud.wire)
+        return operation(), self.cloud.wire[start:]
+
+    def test_initialized_search_read_and_save_each_issue_exactly_one_request(self):
+        saved, wire = self.requests(lambda: self.service.save('note', self.note, source=self.source))
+        self.assertEqual(wire, ['/v1/memory/write'])
+        self.assertEqual({key: saved[key] for key in ('kind', 'data', 'tags', 'revision')},
+                         {'kind': 'note', 'data': self.note, 'tags': [], 'revision': 1})
+        record, wire = self.requests(lambda: self.service.read_record(saved['record_id']))
+        self.assertEqual(wire, ['/v1/memory/read'])
+        self.assertEqual(record['data'], self.note)
+        found, wire = self.requests(lambda: self.service.search(query='finding'))
+        self.assertEqual(wire, ['/v1/memory/search'])
+        self.assertEqual([item['record_id'] for item in found['records']], [saved['record_id']])
+        self.assertIsNone(found['next_offset'])
+        updated, wire = self.requests(lambda: self.service.save(
+            'note', dict(self.note, body_markdown='Later finding.'), source=self.source,
+            record_id=saved['record_id'], expected_revision=1))
+        self.assertEqual(wire, ['/v1/memory/write'])
+        self.assertEqual(self.cloud.records[saved['record_id']]['data'], updated['data'])
+        self.assertEqual(self.cloud.context_loads, 0)
+        self.assertNotIn('authority_changed', found)
+
+    def test_malformed_requests_fail_locally_with_field_detail_and_no_request(self):
+        start = len(self.cloud.wire)
+        for arguments, field in (({'offset': 20}, 'offset'), ({'query': 'x', 'after_id': str(uuid.uuid4())}, 'after_id'),
+                                 ({'limit': 50}, 'limit'), ({'scope': 'all', 'project_id': str(uuid.uuid4())}, 'project_id')):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(MemoryClientError) as error:
+                    self.service.search(**arguments)
+                self.assertEqual(error.exception.code, 'invalid_request')
+                self.assertIn(field, error.exception.detail)
+        with self.assertRaises(MemoryClientError) as error:
+            self.service.save('note', {'title': 'Missing body', 'category': 'work'}, source=self.source)
+        self.assertIn('body_markdown', error.exception.detail)
+        self.assertEqual(self.cloud.wire[start:], [])
+        self.assertIsNone(self.service.status()['pending_request'])
+
+    def test_explicit_save_is_one_write_plus_its_completion_receipt(self):
+        from tools.memory.maintenance import Maintenance
+        result, wire = self.requests(lambda: Maintenance(self.service).save('note', self.note, source=self.source))
+        self.assertEqual(result['status'], 'saved')
+        self.assertEqual(wire, ['/v1/memory/write', '/v1/memory/write'])
+
+    def test_inline_context_is_a_single_request(self):
+        context, wire = self.requests(lambda: self.client.load_context({'workflow': 'maven-workflow'}))
+        self.assertEqual(wire, ['/v1/memory/context'])
+        self.assertEqual(context['data']['instructions'][0]['body_markdown'], WireCloud.BODY)
+
+    def test_checkpoint_verifies_up_to_one_hundred_refs_with_one_revisions_request(self):
+        refs = [MemoryBoundary.ref(self.service.save('note', dict(self.note, title=f'Note {index}'), source=self.source))
+                for index in range(99)]
+        checkpoint, wire = self.requests(lambda: self.service.checkpoint(
+            summary='Bounded handover', refs=refs, cutoff=0, checkpoint_id=str(uuid.uuid4())))
+        self.assertEqual(checkpoint['status'], 'checkpointed')
+        self.assertEqual(wire, ['/v1/memory/revisions', '/v1/memory/write', '/v1/memory/write'])
+        missing = [dict(refs[0], revision=2)]
+        with self.assertRaises(BoundaryError):
+            self.requests(lambda: self.service.checkpoint(summary='Unavailable version', refs=missing, cutoff=0,
+                                                           checkpoint_id=str(uuid.uuid4())))
+        self.assertEqual(self.cloud.wire[-1], '/v1/memory/revisions')
+
+    def test_generation_change_is_reported_and_authority_reloads_before_the_next_write(self):
+        self.cloud.generation = 2
+        found, wire = self.requests(lambda: self.service.search(kind='note'))
+        self.assertEqual(wire, ['/v1/memory/search'])
+        self.assertTrue(found['authority_changed'])
+        again, wire = self.requests(lambda: self.service.search(kind='note'))
+        self.assertEqual((wire, again['authority_changed']), (['/v1/memory/search'], True))
+        saved, wire = self.requests(lambda: self.service.save('note', self.note, source=self.source))
+        # Session re-check and one inline authority reload precede the governed write.
+        self.assertEqual(wire, ['/v1/memory/read', '/v1/memory/context', '/v1/memory/write'])
+        self.assertNotIn('authority_changed', saved)
+        found, wire = self.requests(lambda: self.service.search(kind='note'))
+        self.assertEqual(wire, ['/v1/memory/search'])
+        self.assertNotIn('authority_changed', found)
+
+    def test_write_under_superseded_authority_commits_nothing_and_next_write_reloads(self):
+        # Authority advanced elsewhere with no intervening response to this session.
+        self.cloud.generation = 2
+        before = dict(self.cloud.records)
+        with self.assertRaises(MemoryClientError) as error:
+            self.service.save('note', self.note, source=self.source)
+        self.assertEqual(error.exception.code, 'context_stale')
+        self.assertEqual(self.cloud.calls[-1][1]['authority_generation'], 1)
+        self.assertEqual(self.cloud.records, before)
+        self.assertIsNone(self.service.status()['pending_request'])
+        saved, wire = self.requests(lambda: self.service.save('note', self.note, source=self.source))
+        self.assertEqual(wire, ['/v1/memory/read', '/v1/memory/context', '/v1/memory/write'])
+        self.assertEqual(self.cloud.calls[-1][1]['authority_generation'], 2)
+        self.assertEqual(self.cloud.records[saved['record_id']]['data'], self.note)
+
+    def test_rejected_lookup_after_lost_write_response_keeps_the_original_request_pending(self):
+        original = self.cloud.post
+
+        def post(route, body, remaining):
+            if route == '/v1/memory/write':
+                original(route, body, remaining)  # Commits, then the response is lost.
+                raise MemoryClientError('transport_unavailable')
+            if route == '/v1/operations/lookup':
+                self.cloud.wire.append(route)
+                return 409, {'status': 'context_stale'}
+            return original(route, body, remaining)
+        with patch.object(self.client, '_post', side_effect=post), \
+                patch('tools.memory.client.time.sleep'):
+            with self.assertRaises(MemoryClientError) as error:
+                self.service.save('note', self.note, source=self.source)
+        self.assertEqual(error.exception.code, 'outcome_unknown')
+        pending = self.service.status()['pending_request']
+        self.assertIsNotNone(pending)
+        self.assertIn(self.cloud.calls[-1][1]['record_id'], self.cloud.records)
+
+    def test_instructions_list_every_applicable_active_page_and_mark_loaded_versions(self):
+        index = [dict(self.cloud.page(), body_markdown=None) | {'slug': slug, 'revision': revision, 'scope': scope}
+                 for slug, revision, scope in (('core', 1, {}), ('maven-google', 2, {}),
+                                               ('other-project', 1, {'project': str(uuid.uuid4())}))]
+        for page in index:
+            page.pop('body_markdown')
+            page.pop('body_sha256')
+        original = self.cloud.post
+
+        def post(route, body, remaining):
+            if route == '/v1/pages/index':
+                self.cloud.wire.append(route)
+                return 200, {'status': 'ready', 'authority_generation': 1, 'data': {
+                    'pages': index, 'authority_generation': 1, 'next_after_slug': None}}
+            return original(route, body, remaining)
+
+        with patch.object(self.client, '_post', side_effect=post):
+            listed, wire = self.requests(self.service.instructions)
+        self.assertEqual(wire, ['/v1/pages/index'])
+        self.assertEqual(listed['authority_generation'], 1)
+        self.assertEqual([(page['slug'], page['loaded']) for page in listed['pages']],
+                         [('core', True), ('maven-google', False)])
+
+
+class SessionLockTests(unittest.TestCase):
+    def test_reads_share_the_session_lock_and_writers_wait_then_report_busy(self):
+        from tools.coordination import SessionBusy, session_lock
+        with tempfile.TemporaryDirectory() as directory:
+            identifier = str(uuid.uuid4())
+            with session_lock(directory, identifier, shared=True), \
+                    session_lock(directory, identifier, shared=True, timeout=0.2):
+                with self.assertRaises(SessionBusy):
+                    with session_lock(directory, identifier, timeout=0.2):
+                        self.fail('exclusive lock acquired during shared reads')
+            with session_lock(directory, identifier):
+                with self.assertRaises(SessionBusy) as busy:
+                    with session_lock(directory, identifier, shared=True, timeout=0.2):
+                        self.fail('shared lock acquired during an exclusive write')
+                self.assertIsInstance(busy.exception, BoundaryError)
+            with session_lock(directory, identifier, timeout=0.2):
+                pass
+
+    def test_registered_sessions_is_a_read_only_registry_snapshot(self):
+        from tools.memory.lifecycle import registered_sessions
+        with tempfile.TemporaryDirectory() as directory:
+            home, root = Path(directory) / 'home', Path(directory) / 'project'
+            root.mkdir()
+            self.assertEqual(registered_sessions(root, home=home), [])
+            self.assertFalse((home / 'runtime' / 'sessions.json').exists())
+            registry = SessionRegistry(home)
+            first, second = str(uuid.uuid4()), str(uuid.uuid4())
+            registry.register(root, str(uuid.uuid4()), first, {}, harness='omp', memory_only=True)
+            registry.activate(root, first)
+            registry.register(Path(directory), str(uuid.uuid4()), second, {}, memory_only=True)
+            before = (home / 'runtime' / 'sessions.json').read_bytes()
+            self.assertEqual(registered_sessions(root, home=home),
+                             [{'session_id': first, 'harness': 'omp', 'state': 'active'}])
+            self.assertEqual((home / 'runtime' / 'sessions.json').read_bytes(), before)
 
 if __name__ == '__main__':
     unittest.main()

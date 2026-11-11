@@ -13,8 +13,10 @@ from unittest.mock import patch
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-from tools.coordination import private_lock
+from tools.coordination import SessionBusy, private_lock
+from tools.mcp import server as mcp_server
 from tools.mcp.server import MavenApplication, create_server, main
+from tools.memory.client import MemoryClientError
 from tools.memory.boundary import BoundaryError, read_private, save_private
 from tools.memory.lifecycle import SessionService
 from test_workflow import MemoryCloud
@@ -25,10 +27,37 @@ NOTE = {'kind': 'note', 'data': {'title': 'Finding', 'body_markdown': 'Verified 
 
 
 class MCPCloud(MemoryCloud):
+    """Answers the protocol-4 routes (search ranking fields, project_context, revisions, generations)."""
+    pages = []
+
     def invoke(self, route, body):
         if route == '/v1/pages/index':
-            return {'status': 'ready', 'data': {'pages': [], 'authority_generation': 1, 'next_after_slug': None}}
-        return super().invoke(route, body)
+            return {'status': 'ready', 'authority_generation': 1,
+                    'data': {'pages': list(self.pages), 'authority_generation': 1, 'next_after_slug': None}}
+        if route == '/v1/memory/project_context':
+            return {'status': 'ready', 'authority_generation': 1, 'data': {
+                'latest_handover': None, 'active_peers': [], 'tasks': [], 'blockers': [],
+                'owner_preferences': []}}
+        if route == '/v1/memory/revisions':
+            return {'status': 'ready', 'authority_generation': 1, 'data': {'revisions': {
+                record_id: self.records[record_id]['revision']
+                for record_id in body['record_ids'] if record_id in self.records}}}
+        if route == '/v1/memory/search':
+            listing = {key: value for key, value in body.items() if key not in ('include_archived', 'offset')}
+            result = super().invoke(route, listing)
+            records = [record for record in result['data']['records'] if body.get('include_archived')
+                       or 'archived' not in record.get('tags', []) and record['data'].get('state') != 'archived']
+            if body.get('query'):
+                terms = body['query'].lower().split()
+                records = [dict(record, rank=1, snippet=None) for record in records
+                           if all(term in json.dumps(record['data']).lower() for term in terms)]
+                return {'status': 'ready', 'authority_generation': 1,
+                        'data': {'records': records, 'next_offset': None}}
+            return {'status': 'ready', 'authority_generation': 1, 'data': {
+                'records': [dict(record, snippet=None) for record in records],
+                'next_after_id': result['data']['next_after_id']}}
+        result = super().invoke(route, body)
+        return {**result, 'authority_generation': 1} if isinstance(result, dict) else result
 
 
 class SharedMCPCloud(MCPCloud):
@@ -206,6 +235,154 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
             failed, _ = await self.call('maven_context')
         self.assertTrue(failed.is_error)
         self.assertNotIn(secret, failed.model_dump_json())
+
+    async def test_errors_distinguish_availability_from_rejections(self):
+        await self.initialize()
+        rejected = MemoryClientError('invalid_request')
+        rejected.detail = 'note requires data.body_markdown'
+        with patch.object(self.app.service, 'search', side_effect=rejected):
+            result, value = await self.call('maven_search', {'query': 'x'})
+        self.assertTrue(result.is_error)
+        self.assertEqual((value['status'], value['error']), ('error', 'invalid_request'))
+        self.assertEqual(value['detail'], 'note requires data.body_markdown')
+        self.assertNotIn('unavailable', value['message'])
+        with patch.object(self.app.service, 'search', side_effect=MemoryClientError('warming')):
+            _, value = await self.call('maven_search', {'query': 'x'})
+        self.assertEqual(value['status'], 'blocked')
+        self.assertIn('memory unavailable', value['message'])
+        with patch.object(self.app.service, 'search', side_effect=MemoryClientError('selected_login_unavailable_or_expired')):
+            _, value = await self.call('maven_search', {'query': 'x'})
+        self.assertEqual(value['status'], 'blocked')
+        with patch.object(self.app.service, 'search', side_effect=SessionBusy('secret lock path')):
+            _, value = await self.call('maven_search', {'query': 'x'})
+        self.assertEqual((value['status'], value['error']), ('error', 'session_busy'))
+        self.assertNotIn('secret lock path', json.dumps(value))
+
+    async def test_tool_descriptions_and_schemas_describe_the_record_model(self):
+        from tools.memory.validation import MEMORY_DATA_FIELDS
+        tools = {tool.name: tool for tool in await self.server.list_tools()}
+        for name in ('maven_save', 'maven_maintenance'):
+            description = tools[name].description
+            for kind, fields in MEMORY_DATA_FIELDS.items():
+                self.assertIn(f'{kind}: required', description)
+                for field in fields.get('required', []):
+                    self.assertIn(field, description)
+            self.assertIn('50 changes', description)
+            self.assertIn('100 checkpoint refs', description)
+            self.assertIn('subject_id', description)
+        search = tools['maven_search']
+        self.assertEqual(search.input_schema['properties']['limit']['maximum'], 20)
+        for parameter in ('include_archived', 'offset', 'unbound'):
+            self.assertIn(parameter, search.input_schema['properties'])
+        self.assertIn('snippet', search.description)
+        self.assertIn('detail', tools['maven_maintenance'].input_schema['properties'])
+        self.assertIn('nothing_to_record', tools['maven_resume'].input_schema['properties'])
+        self.assertIn('detail', tools['maven_admin'].input_schema['properties'])
+        self.assertTrue(tools['maven_instructions'].annotations.read_only_hint)
+
+    async def test_unbound_universal_consultation_never_binds_or_captures(self):
+        universal, project = str(uuid.uuid4()), str(uuid.uuid4())
+        for identifier, owner in ((universal, None), (project, self.project)):
+            self.cloud.records[identifier] = {
+                'record_id': identifier, 'kind': 'decision', 'revision': 1, 'project_id': owner,
+                'data': {'title': 'Never name clients publicly', 'state': 'accepted'}, 'tags': [],
+                'classification': 'Sensitive', 'data_scope': 'owner'}
+        self.cloud.pages = [{'slug': 'core', 'page_kind': 'directive', 'title': 'Core', 'revision': 2,
+                             'requires': [], 'data_scope': 'owner', 'scope': {}},
+                            {'slug': 'local', 'page_kind': 'skill', 'revision': 1, 'data_scope': 'owner',
+                             'scope': {'project': self.project}}]
+        with patch.object(self.app, 'unbound_client', return_value=self.cloud):
+            result, found = await self.call('maven_search', {'query': 'clients', 'unbound': True})
+            self.assertFalse(result.is_error, found)
+            self.assertTrue(found['unbound'])
+            self.assertEqual([item['record_id'] for item in found['records']], [universal])
+            _, implicit = await self.call('maven_search', {'scope': 'universal'})
+            self.assertTrue(implicit['unbound'])
+            _, record = await self.call('maven_read', {'record_id': universal, 'unbound': True})
+            self.assertTrue(record['unbound'])
+            denied, _ = await self.call('maven_read', {'record_id': project, 'unbound': True})
+            self.assertTrue(denied.is_error)
+            escaped, _ = await self.call('maven_search', {'scope': 'all', 'unbound': True})
+            self.assertTrue(escaped.is_error)
+            _, listed = await self.call('maven_instructions')
+        self.assertEqual([(page['slug'], page['loaded']) for page in listed['pages']], [('core', False)])
+        self.assertIsNone(self.app.service)
+        self.assertIsNone(self.app.binding)
+        self.assertFalse(any(route == '/v1/memory/write' for route, _ in self.cloud.calls))
+        bound_only, _ = await self.call('maven_search', {'scope': 'context'})
+        self.assertTrue(bound_only.is_error)
+
+    async def test_status_offers_exact_rebind_after_restart(self):
+        active = str(uuid.uuid4())
+        sessions = [{'session_id': active, 'harness': 'omp', 'state': 'active'},
+                    {'session_id': str(uuid.uuid4()), 'harness': 'omp', 'state': 'closed'}]
+        with patch('tools.memory.lifecycle.registered_sessions', return_value=sessions) as registered, \
+                patch.object(Path, 'cwd', return_value=self.root / '.maven'):
+            _, status = await self.call('maven_status')
+        registered.assert_called_once_with(self.root.resolve())
+        self.assertEqual(status['status'], 'not_initialized')
+        self.assertEqual(status['rebind_hint']['active_sessions'], [{'session_id': active, 'harness': 'omp'}])
+        self.assertIn('resume=true', status['next_action'])
+
+    async def test_expired_sign_in_returns_mavens_exact_login_command(self):
+        self.home.mkdir(mode=0o700)
+        cache = self.home / 'runtime' / 'aws-login-cache'
+        (self.home / '.env').write_text(f'MAVEN_AWS_PROFILE="daily"\nMAVEN_AWS_LOGIN_CACHE="{cache}"\n'
+                                        'MAVEN_AWS_REGION="us-east-1"\n')
+        (self.home / '.env').chmod(0o600)
+        expected = f'AWS_LOGIN_CACHE_DIRECTORY={cache} aws login --profile daily --region us-east-1'
+        with patch.object(self.app, 'unbound_client',
+                          side_effect=MemoryClientError('selected_login_unavailable_or_expired')):
+            _, blocked = await self.call('maven_search', {'query': 'firmware', 'unbound': True})
+        self.assertEqual((blocked['status'], blocked['error']), ('blocked', 'selected_login_unavailable_or_expired'))
+        self.assertEqual(blocked['sign_in']['command'], expected)
+        self.assertIn(expected, blocked['message'])
+        _, status = await self.call('maven_status')
+        self.assertEqual(status['sign_in']['command'], expected)
+
+    async def test_detail_flags_pass_through_and_admin_responses_are_summarized(self):
+        await self.initialize()
+        operation = str(uuid.uuid4())
+        with patch.object(self.app.maintenance, 'status', return_value={'state': 'saved'}) as status:
+            await self.call('maven_maintenance', {'action': 'status', 'operation_id': operation, 'detail': True})
+        status.assert_called_once_with(operation, detail=True)
+        with patch.object(self.app.maintenance, 'resume', return_value={'status': 'resumed'}) as resume:
+            await self.call('maven_resume', {'nothing_to_record': True})
+        self.assertTrue(resume.call_args.kwargs['nothing_to_record'])
+        full = {'status': 'pending', 'choice_checkpoints': [1], 'responses': {}, 'navigation': {},
+                'retired_interactions': [], 'pending_interaction': None}
+
+        class Admin:
+            def status(self, operation_id):
+                return dict(full)
+
+        self.app.admin_factory = lambda home: Admin()
+        _, summary = await self.call('maven_admin', {'action': 'status', 'operation_id': operation})
+        self.assertEqual(summary, {'status': 'pending', 'pending_interaction': None})
+        _, detailed = await self.call('maven_admin', {'action': 'status', 'operation_id': operation, 'detail': True})
+        self.assertEqual(detailed, full)
+
+    async def test_keep_warm_is_opt_in(self):
+        with patch.dict('os.environ', {'MAVEN_KEEP_WARM': ''}):
+            await self.initialize()
+        self.assertIsNone(self.app._warm_thread)
+        app = self.application()
+        pinged = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        original = self.cloud.invoke
+
+        def invoke(route, body):
+            if route == '/v1/pages/index' and body == {'limit': 1}:
+                loop.call_soon_threadsafe(pinged.set)
+            return original(route, body)
+
+        with patch.dict('os.environ', {'MAVEN_KEEP_WARM': '1'}), \
+                patch.object(mcp_server, 'KEEP_WARM_SECONDS', 0.05), \
+                patch.object(self.cloud, 'invoke', side_effect=invoke):
+            app.initialize(self.root, session_id=self.app.binding['session_id'], resume=True)
+            await asyncio.wait_for(pinged.wait(), 5)
+        app.close()
+        self.assertTrue(app._warm_stop.is_set())
 
     async def test_git_configuration_approval_is_exact_and_has_real_source(self):
         await self.initialize()

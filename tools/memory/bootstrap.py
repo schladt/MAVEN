@@ -262,7 +262,12 @@ def apply(values, package, review_path, environment_path, *, confirm_review, bud
     raise MemoryClientError('stack_execution_outcome_unknown')
 
 
-def initialize(values, *, confirm_instance, upgrade=False):
+def initialize(values, *, confirm_instance, upgrade=False, verify_service=True):
+    """Run the reviewed SQL; verify through the service unless the caller deploys it next.
+
+    An update applies the migration before the matching service code, so the old service may
+    reject the new client protocol until the service update finishes; readiness is verified then.
+    """
     from .admin import bootstrap, migrate
     from .environment import memory_config, migration_config
     config = migration_config(values) if upgrade else memory_config(values)
@@ -270,6 +275,8 @@ def initialize(values, *, confirm_instance, upgrade=False):
         raise MemoryClientError('instance_confirmation_mismatch')
     operation = migrate if upgrade else bootstrap
     result = operation(config, selected_session(config, admin=True, environment=values))
+    if not verify_service:
+        return {**result, 'service_verified': False}
     client = MemoryClient(config, selected_session(config, environment=values))
     try:
         context = client.load_context()

@@ -7,9 +7,10 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 from tools.memory.client import MemoryClient, MemoryClientError, read_json, selected_session, validate_config
+from tools.memory.validation import CLIENT_PROTOCOL
 from tools.memory import cli
 
 
@@ -119,6 +120,38 @@ class MemoryClientBoundaries(unittest.TestCase):
                     client.invoke('/v1/memory/write', {'request_key': KEY})
                 self.assertEqual((failure.exception.code, failure.exception.request_key), (status, KEY))
                 post.assert_called_once()
+
+    def test_rejection_detail_is_bounded_and_only_kept_for_known_codes(self):
+        client = MemoryClient(CONFIG, None)
+        self.addCleanup(client.close)
+        detail = 'note data requires body_markdown; does not accept body'
+        for response, expected in [
+            ({'status': 'invalid_request', 'detail': detail}, ('invalid_request', detail)),
+            ({'status': 'invalid_request', 'detail': 'x' * 201}, ('invalid_request', None)),
+            ({'status': 'invalid_request', 'detail': ['not', 'text']}, ('invalid_request', None)),
+            ({'status': 'private provider details', 'detail': 'PRIVATE'}, ('service_failure', None)),
+        ]:
+            with self.subTest(response=response), patch.object(client, '_post', return_value=(422, response)):
+                with self.assertRaises(MemoryClientError) as failure:
+                    client.invoke('/v1/memory/search', {'query': 'x'})
+                self.assertEqual((failure.exception.code, failure.exception.detail), expected)
+
+    def test_last_generation_comes_from_each_successful_response(self):
+        client = MemoryClient(CONFIG, None)
+        self.addCleanup(client.close)
+        self.assertIsNone(client.last_generation)
+        for generation, expected in ((7, 7), (8, 8), (True, None), (None, None)):
+            body = {'status': 'ready', 'data': {'records': []}}
+            if generation is not None:
+                body['authority_generation'] = generation
+            with self.subTest(generation=generation), patch.object(client, '_post', return_value=(200, body)):
+                client.invoke('/v1/memory/search', {})
+                self.assertEqual(client.last_generation, expected)
+        with patch.object(client, '_post', return_value=(409, {'status': 'revision_conflict'})):
+            client.last_generation = 9
+            with self.assertRaises(MemoryClientError):
+                client.invoke('/v1/memory/read', {'record_id': KEY})
+        self.assertEqual(client.last_generation, 9)
 
 
 class RefreshableSessionBoundaries(unittest.TestCase):
@@ -274,7 +307,7 @@ class InstructionClientBoundaries(unittest.TestCase):
                     receipt = {'status': 'ready', 'data': {'request_key': KEY, 'revision': 2}}
                     with patch.object(self.client, '_post', side_effect=[failure, (200, receipt)]) as post, \
                          patch('tools.memory.client.time.sleep'):
-                        self.assertEqual(self.client.invoke(route, {'request_key': KEY}), receipt)
+                        self.assertEqual(self.client.invoke(route, {'request_key': KEY}), {**receipt, 'reconciled': True})
                     self.assertEqual([call.args[:2] for call in post.call_args_list],
                                      [(route, {'request_key': KEY}), ('/v1/operations/lookup', {'request_key': KEY})])
 
@@ -357,7 +390,7 @@ class InstructionClientBoundaries(unittest.TestCase):
     @staticmethod
     def context(*pages, generation=1):
         keys = ('page_id', 'slug', 'page_kind', 'title', 'scope', 'revision', 'content_hash', 'data_scope', 'requires', 'bundle')
-        return {'status': 'ready', 'data': {'authority_generation': generation, 'minimum_client_protocol': 3,
+        return {'status': 'ready', 'data': {'authority_generation': generation, 'minimum_client_protocol': CLIENT_PROTOCOL,
                 'pages': [{key: page['data'][key] for key in keys if key in page['data']} for page in pages],
                 'tasks': [], 'next_task_after_id': None}}
 
@@ -450,6 +483,63 @@ class InstructionClientBoundaries(unittest.TestCase):
                 self.client.load_instruction('synthetic-skill')
             self.assertEqual(invoke.call_count, 2)
 
+    def owner_page(self, slug, body, **extra):
+        from tools.memory.validation import digest
+        candidate = {'slug': slug, 'page_kind': extra.get('page_kind', 'skill'), 'title': 'Synthetic skill',
+                     'scope': {}, 'authority_state': 'active', 'body_markdown': body}
+        candidate.update({key: extra[key] for key in ('requires', 'bundle') if key in extra})
+        return self.page(body, slug=slug, data_scope='owner', content_hash=digest(candidate), **extra)
+
+    def inline(self, *pages, generation=1):
+        context = self.context(*pages, generation=generation)
+        for metadata, page in zip(context['data']['pages'], pages):
+            metadata.update(body_markdown=page['data']['body_markdown'], body_sha256=page['data']['body_sha256'])
+        context['data']['bodies_inline'] = True
+        return context
+
+    def test_inline_context_loads_in_one_request_with_verified_bodies(self):
+        dependency = self.owner_page('dependency', 'Dependency body', page_kind='procedure')
+        root = self.owner_page('synthetic-skill', 'é root body', requires=['dependency'])
+        with patch.object(self.client, 'invoke', return_value=self.inline(root, dependency)) as invoke, \
+                patch.object(self.client, 'read_full') as read:
+            result = self.client.load_context({'workflow': 'work'})
+        invoke.assert_called_once_with('/v1/memory/context', {'workflow': 'work'}, budget=ANY)
+        read.assert_not_called()
+        instructions = result['data']['instructions']
+        self.assertEqual([page['slug'] for page in instructions], ['dependency', 'synthetic-skill'])
+        self.assertEqual(instructions[1]['body_markdown'], 'é root body')
+        self.assertTrue(all(page['operative'] is True and page['authority_state'] == 'active'
+                            and page['authority_generation'] == 1 for page in instructions))
+        self.assertFalse(any('body_markdown' in page for page in result['data']['pages']))
+
+    def test_inline_context_rejects_body_digest_or_content_hash_mismatch(self):
+        page = self.owner_page('synthetic-skill', 'approved body')
+        for changes in ({'body_markdown': 'tampered'}, {'body_sha256': '0' * 64}, {'content_hash': '0' * 64},
+                        {'body_markdown': 'tampered', 'body_sha256': hashlib.sha256(b'tampered').hexdigest()},
+                        {'body_markdown': None}, {'body_sha256': None}):
+            context = self.inline(page)
+            context['data']['pages'][0].update(changes)
+            with self.subTest(changes=changes), patch.object(self.client, 'invoke', return_value=context) as invoke:
+                with self.assertRaisesRegex(MemoryClientError, 'invalid_service_response'):
+                    self.client.load_context()
+                invoke.assert_called_once()
+        context = self.inline(page)
+        context['data']['bodies_inline'] = 'yes'
+        with patch.object(self.client, 'invoke', return_value=context):
+            with self.assertRaisesRegex(MemoryClientError, 'invalid_service_response'):
+                self.client.load_context()
+
+    def test_large_context_without_inline_bodies_keeps_pinned_chunked_reads(self):
+        page = self.owner_page('synthetic-skill', 'approved body')
+        context = self.context(page)
+        context['data']['bodies_inline'] = False
+        with patch.object(self.client, 'invoke', return_value=context) as invoke, \
+                patch.object(self.client, 'read_full', return_value=page) as read:
+            result = self.client.load_context()
+        read.assert_called_once_with({'slug': 'synthetic-skill', 'expected_revision': 1}, budget=ANY)
+        self.assertEqual(invoke.call_count, 2)  # Context plus the generation recheck.
+        self.assertEqual(result['data']['instructions'][0]['body_markdown'], 'approved body')
+
     def test_candidate_dependency_field_is_included_in_full_hash_verification(self):
         from tools.memory.validation import digest
         candidate = {'slug': 'synthetic-skill', 'page_kind': 'skill', 'title': 'Synthetic skill',
@@ -499,7 +589,7 @@ class InstructionClientBoundaries(unittest.TestCase):
             post.return_value.__enter__.return_value = response
             self.client._post('/v1/memory/context', {}, 5)
         headers = post.call_args.kwargs['headers']
-        self.assertEqual(headers['x-maven-memory-protocol'], '3')
+        self.assertEqual(headers['x-maven-memory-protocol'], str(CLIENT_PROTOCOL))
         self.assertIn('x-maven-memory-protocol', headers['Authorization'])
         self.assertFalse(post.call_args.kwargs['allow_redirects'])
 

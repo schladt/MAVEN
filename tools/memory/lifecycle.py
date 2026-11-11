@@ -1,6 +1,7 @@
 """Memory-native sessions: explicit identity, serialized journals, verified cloud receipts."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 import uuid
@@ -9,8 +10,20 @@ from tools.coordination import SessionRegistry, session_lock, session_uuid
 from tools.project import default_environment, load_project, project_values
 from .boundary import BoundaryError, MemoryBoundary, digest, private_path, read_private, save_private
 
+PROJECT_CONTEXT_KEYS = ('latest_handover', 'active_peers', 'tasks', 'blockers', 'owner_preferences')
+
+
+def registered_sessions(root, *, home=None):
+    """Local registry sessions for this root, for rebind hints; never contacts the cloud."""
+    return SessionRegistry(home).registered(Path(root).expanduser().resolve())
+
 
 class SessionService:
+    """One bound session. Approved authority and the cloud session-active check are cached
+    per process: loaded at initialize/context, reloaded before the next governed write
+    after any response reports a different authority generation, never per call. Every
+    governed write carries the cached generation; the service refuses it if authority moved."""
+
     def __init__(self, root, session_id, *, env=None, client=None, harness=None, harness_session=None):
         self.root = Path(root).expanduser().resolve(strict=True)
         self.session_id = session_uuid(session_id)
@@ -27,6 +40,16 @@ class SessionService:
         self.runtime = f'.maven/runtime/sessions/{self.session_id}'
         self.binding_path = self.runtime + '/lifecycle.json'
         self.pending_path = self.runtime + '/pending-memory.json'
+        self._authority = None
+        self._stale = False
+        self._session_checked = False
+
+    def invalidate(self, *, authority=True):
+        """Forget the cached session-active check (and, by default, authority); the next call reloads."""
+        if authority:
+            self._authority = None
+            self._stale = False
+        self._session_checked = False
 
     def _memory(self):
         if self.client is None:
@@ -73,17 +96,54 @@ class SessionService:
         if private_path(self.root, self.pending_path).exists():
             raise BoundaryError('unresolved cloud request; explicitly recover its original request before continuing')
 
-    def _require(self, *, closed=False):
+    def _guard(self, *, closed=False):
+        """Local guards run on every call; they never need the network."""
         if self._binding() is None:
             raise BoundaryError('initialize this exact session before using memory')
         self._publication_guard()
         if not closed and private_path(self.root, self.runtime + '/finish.json').exists():
             raise BoundaryError('session closure has begun; recover its original finish receipt')
-        return self._memory().session(closed=closed)
+
+    def _ready(self, memory, *, write):
+        """Use cached cloud state; load it on first use, and before a governed write after a
+        response reported a different authority generation."""
+        self._guard()
+        reload = self._authority is None or write and self._stale
+        if not self._session_checked or reload and self._stale:
+            memory.session()
+            self._session_checked = True
+        if reload:
+            self._authority = memory.context()
+            self._stale = False
+        memory.authority_generation = self._authority['authority_generation']
+
+    @contextmanager
+    def _writer(self):
+        """This session's single memory writer. A write refused because authority changed
+        (context_stale) committed nothing; the next governed call reloads authority."""
+        from .client import MemoryClientError
+        with self.registry.memory_writer(self.root, self.session_id):
+            try:
+                yield
+            except MemoryClientError as error:
+                if error.code == 'context_stale':
+                    self._stale = True
+                raise
+
+    def _observe(self, result):
+        generation = getattr(self.client, 'last_generation', None)
+        if (type(generation) is int and self._authority is not None
+                and generation != self._authority['authority_generation']):
+            self._stale = True
+        return {**result, 'authority_changed': True} if self._stale else result
 
     def _report(self, status, **fields):
         return dict(status=status, root=str(self.root), project_id=self.project_id,
                     session_id=self.session_id, **fields)
+
+    def _skills(self):
+        from .skills import SessionSkills
+        return SessionSkills(self.client, self.root, self.project_id, self.session_id).start()['data']
 
     def initialize(self, *, resume=False):
         with session_lock(self.root, self.session_id):
@@ -106,30 +166,81 @@ class SessionService:
                 registered = self.registry.inspect(self.root, self.session_id)['session']
                 if registered['project_id'] != self.project_id or registered['caches'] != self.registry.caches(values):
                     raise BoundaryError('session credentials or project selection changed')
+            self.invalidate()
             memory = self._memory()
             record = memory.restore_pointer()
             if record is None:
-                skills = memory.start(None)['skills']
+                # Start loads current authority and project context for the new session.
+                started = memory.start(None)
+                authority, skills, session = started['context'], started['skills'], started['session']
+                project = {key: started[key] for key in PROJECT_CONTEXT_KEYS}
             else:
-                memory.session()
-                from .skills import SessionSkills
-                skills = SessionSkills(self.client, self.root, self.project_id, self.session_id).start()['data']
-            # Always reload full current authority before reporting readiness.
-            context = self._context(memory, skills=skills)
+                session = memory.ref(memory.verified_session(record))
+                skills = self._skills()
+                # Always reload full current authority before reporting readiness.
+                authority = memory.context()
+                project = memory.project_context()
+            self._authority, self._session_checked = authority, True
             self.registry.activate(self.root, self.session_id)
-            return self._report('ready', context=context, session=memory.ref(memory.session()))
-
-    def _context(self, memory, *, skills=None):
-        from .skills import SessionSkills
-        authority = memory.context()
-        if skills is None:
-            skills = SessionSkills(self.client, self.root, self.project_id, self.session_id).start()['data']
-        return {**authority, **memory.project_context(), 'skills': skills}
+            return self._report('ready', context={**authority, **project, 'skills': skills}, session=session)
 
     def context(self):
-        with session_lock(self.root, self.session_id):
-            self._require()
-            return self._report('ready', context=self._context(self._memory()))
+        """Explicit reload of authority, session state and project context."""
+        with session_lock(self.root, self.session_id, shared=True):
+            self._guard()
+            memory = self._memory()
+            memory.session()
+            self._session_checked = True
+            self._authority = memory.context()
+            self._stale = False
+            context = {**self._authority, 'skills': self._skills(), **memory.project_context()}
+            return self._report('ready', context=context)
+
+    def authority_ref(self):
+        """Reference to the cached approved authority that governs delegated work."""
+        with session_lock(self.root, self.session_id, shared=True):
+            self._ready(self._memory(), write=True)
+            return {'authority_generation': self._authority['authority_generation'],
+                    'slugs': [page['slug'] for page in self._authority['instructions']]}
+
+    def instructions(self):
+        """Every active applicable instruction page; `loaded` marks the exact version in this session."""
+        from .client import MemoryClientError
+        with session_lock(self.root, self.session_id, shared=True):
+            self._ready(self._memory(), write=False)
+            loaded = {(page['slug'], page['revision']) for page in self._authority['instructions']}
+            for _ in range(3):
+                pages, after, generation = [], None, None
+                while True:
+                    request = {'limit': 10} if after is None else {'limit': 10, 'after_slug': after}
+                    response = self.client.invoke('/v1/pages/index', request)
+                    data = response.get('data') if response.get('status') == 'ready' else None
+                    if (not isinstance(data, dict) or not isinstance(data.get('pages'), list)
+                            or type(data.get('authority_generation')) is not int):
+                        raise BoundaryError('memory service returned no verified instruction index')
+                    if generation is None:
+                        generation = data['authority_generation']
+                    elif generation != data['authority_generation']:
+                        generation = None
+                        break
+                    for page in data['pages']:
+                        if not isinstance(page, dict) or not isinstance(page.get('scope', {}), dict):
+                            raise BoundaryError('memory service returned no verified instruction index')
+                        if (page.get('data_scope') != 'owner'
+                                or page.get('scope', {}).get('project', self.project_id) != self.project_id):
+                            continue
+                        pages.append({'slug': page.get('slug'), 'page_kind': page.get('page_kind'),
+                                      'title': page.get('title'), 'revision': page.get('revision'),
+                                      'requires': page.get('requires', []),
+                                      'loaded': (page.get('slug'), page.get('revision')) in loaded})
+                    after = data.get('next_after_slug')
+                    if after is None:
+                        break
+                    if not data['pages']:
+                        raise BoundaryError('memory service returned no verified instruction index')
+                if generation is not None:
+                    return self._observe({'authority_generation': generation, 'pages': pages})
+            raise MemoryClientError('context_stale')
 
     def status(self):
         # Local inspection only: no configured client, authority fetch, or replay.
@@ -151,32 +262,40 @@ class SessionService:
                             last_verified=last, finish=finish, live_checked=False)
 
     def read_record(self, record_id, *, revision=None, scope='context', project_id=None):
-        with session_lock(self.root, self.session_id):
-            self._require()
+        with session_lock(self.root, self.session_id, shared=True):
             memory = self._memory()
-            memory.context()
-            return memory.read(record_id, revision, scope=scope, project_id=project_id)
+            self._ready(memory, write=False)
+            return self._observe(memory.read(record_id, revision, scope=scope, project_id=project_id))
 
-    def search(self, *, query='', kind=None, scope='context', project_id=None, after_id=None, limit=20):
-        with session_lock(self.root, self.session_id):
-            self._require()
+    def search(self, *, query='', kind=None, scope='context', project_id=None, after_id=None, limit=20,
+               include_archived=False, offset=None):
+        # Malformed combinations (scope, offset without query, after_id with query, limit)
+        # are rejected locally by the request schema with a field-level detail.
+        body = {'scope': scope, 'limit': limit}
+        if query:
+            body['query'] = query
+        if scope in ('project', 'context'):
+            body['project_id'] = project_id or self.project_id
+        elif project_id is not None:
+            body['project_id'] = project_id
+        if kind is not None:
+            body['kind'] = kind
+        if after_id is not None:
+            body['after_id'] = after_id
+        if include_archived:
+            body['include_archived'] = True
+        if offset is not None:
+            body['offset'] = offset
+        with session_lock(self.root, self.session_id, shared=True):
             memory = self._memory()
-            memory.context()
-            if scope not in ('project', 'universal', 'context', 'all'):
-                raise BoundaryError('invalid memory search scope')
-            body = {'scope': scope, 'limit': limit}
-            if query:
-                body['query'] = query
-            if scope in ('project', 'context'):
-                body['project_id'] = project_id or self.project_id
-            elif project_id is not None:
-                raise BoundaryError('project_id requires project or context search scope')
-            if kind is not None:
-                body['kind'] = kind
-            if after_id is not None:
-                body['after_id'] = after_id
+            self._ready(memory, write=False)
             page = memory.invoke('search', body)
-            return dict(page, records=[item for item in page['records'] if item.get('data_scope') == 'owner'])
+            if not isinstance(page.get('records'), list):
+                raise BoundaryError('memory service returned no verified result')
+            return self._observe({
+                **page, 'records': [item for item in page['records']
+                                    if isinstance(item, dict) and item.get('data_scope') == 'owner'],
+                'next_after_id': page.get('next_after_id'), 'next_offset': page.get('next_offset')})
 
     def save(self, kind, data, *, source, record_id=None, expected_revision=0, scope='project',
              tags=(), reason='Record work', request_key=None):
@@ -186,31 +305,27 @@ class SessionService:
             raise BoundaryError('writes require project or universal scope')
         if kind == 'operation' and data.get('session_id') != self.session_id:
             raise BoundaryError('operation belongs to another session')
+        if record_id is None and request_key is not None:
+            record_id = str(uuid.uuid5(uuid.UUID(self.session_id), request_key))
+        if expected_revision and record_id is None:
+            raise BoundaryError('updating memory requires its exact record_id')
         with session_lock(self.root, self.session_id):
-            self._require()
-            with self.registry.memory_writer(self.root, self.session_id):
-                memory = self._memory()
-                memory.context()
-                if record_id is None and request_key is not None:
-                    record_id = str(uuid.uuid5(uuid.UUID(self.session_id), request_key))
-                if expected_revision:
-                    if record_id is None:
-                        raise BoundaryError('updating memory requires its exact record_id')
-                    # Verify historical ownership; the cloud CAS rejects stale writes while
-                    # still recognizing a replay of the original successful request key.
-                    memory.read(record_id, expected_revision, scope=scope)
+            memory = self._memory()
+            self._ready(memory, write=True)
+            with self._writer():
+                # The cloud CAS binds kind, project and data scope to the exact expected
+                # revision, and recognizes a replay of the original request key.
                 record = memory.write(kind, data, source=source, record_id=record_id,
                                       expected_revision=expected_revision, scope=scope, tags=tags,
                                       reason=reason, request_key=request_key)
-                return dict(record, scope=scope)
+                return self._observe(dict(record, scope=scope))
 
     def claim(self, record_id, *, action, expected_revision, request_key=None,
               lease_seconds=None, fence=None, source=None, scope=None, reason=None):
         with session_lock(self.root, self.session_id):
-            self._require()
-            with self.registry.memory_writer(self.root, self.session_id):
-                memory = self._memory()
-                memory.context()
+            memory = self._memory()
+            self._ready(memory, write=True)
+            with self._writer():
                 record = memory.read(record_id, expected_revision, scope='context')
                 if scope is not None and (scope not in ('project', 'universal') or
                         (scope == 'universal') != (record.get('project_id') is None)):
@@ -226,37 +341,43 @@ class SessionService:
                 if fence is not None:
                     body['fence'] = fence
                 body['request_key'] = request_key or str(uuid.uuid5(uuid.UUID(self.session_id), digest(body)))
-                _, record = memory._submit('claim', body)
-                return record
+                _, claimed = memory._submit('claim', body, target=record)
+                return self._observe(claimed)
 
     def checkpoint(self, *, summary, refs, cutoff, checkpoint_id):
         checkpoint_id = session_uuid(checkpoint_id)
         if not isinstance(summary, str) or not summary.strip() or type(cutoff) is not int or cutoff < 0:
             raise BoundaryError('checkpoint requires a substantive summary and nonnegative integer cutoff')
         with session_lock(self.root, self.session_id):
-            self._require()
-            self._no_pending()
             memory = self._memory()
-            memory.context()
+            self._ready(memory, write=True)
+            self._no_pending()
             manifest = {'session_id': self.session_id, 'cutoff': cutoff, 'memory_refs': refs, 'summary': summary}
             path = self.runtime + '/checkpoints/' + checkpoint_id + '.json'
-            if private_path(self.root, path).exists():
+            prepared_before = private_path(self.root, path).exists()
+            if prepared_before:
                 if read_private(self.root, path)['manifest'] != manifest:
                     raise BoundaryError('checkpoint manifest is immutable; original receipts were preserved')
             else:
-                # Validate each historical version, not whatever is latest after the cutoff.
                 for ref in refs:
-                    if set(ref) != {'record_id', 'revision'}:
+                    if (set(ref) != {'record_id', 'revision'} or type(ref['revision']) is not int
+                            or ref['revision'] < 1):
                         raise BoundaryError('checkpoint references require exact record_id/revision')
-                    memory.read(ref['record_id'], ref['revision'], scope='context')
+                # Each exact historical version must exist, not whatever is latest after the cutoff;
+                # the cloud checkpoint write rechecks scope and visibility of every version.
+                memory.verify_refs(refs, message='checkpoint reference is unavailable at its exact revision')
                 save_private(self.root, path, {'manifest': manifest, 'status': 'preparing'})
-            with self.registry.memory_writer(self.root, self.session_id):
+            with self._writer():
                 from .client import MemoryClientError
-                try:
-                    record = memory.read(checkpoint_id)
-                except MemoryClientError as error:
-                    if error.code != 'record_unavailable':
-                        raise
+                record = None
+                if prepared_before:
+                    # Only an earlier attempt can have written this identity.
+                    try:
+                        record = memory.read(checkpoint_id)
+                    except MemoryClientError as error:
+                        if error.code != 'record_unavailable':
+                            raise
+                if record is None:
                     record = memory.write('checkpoint', dict(manifest, state='prepared'),
                                           record_id=checkpoint_id, tags=['memory-checkpoint'])
                 if record['kind'] != 'checkpoint' or {key: value for key, value in record['data'].items()
@@ -270,18 +391,24 @@ class SessionService:
                     raise BoundaryError('checkpoint is not saved')
                 result = self._report('checkpointed', checkpoint=memory.ref(record), cutoff=cutoff, summary=summary)
                 save_private(self.root, path, {'manifest': manifest, **result})
-                return result
+                return self._observe(result)
 
     def finish(self, *, summary, checkpoint_ref):
         if not isinstance(summary, str) or not summary.strip():
             raise BoundaryError('a substantive session handover is required')
         with session_lock(self.root, self.session_id):
-            session = self._require(closed=True)
+            self._guard(closed=True)
+            memory = self._memory()
+            # Closure needs the exact current session revision for its CAS.
+            session = memory.session(closed=True)
+            self._session_checked = False
             if session['data']['state'] not in ('active', 'closed'):
                 raise BoundaryError('only an active session or its original closure can finish')
             self._no_pending()
-            memory = self._memory()
-            memory.context()
+            if self._authority is None or self._stale:
+                self._authority = memory.context()
+                self._stale = False
+            memory.authority_generation = self._authority['authority_generation']
             checkpoint = memory.read(checkpoint_ref['record_id'], checkpoint_ref['revision'])
             if (checkpoint['kind'] != 'checkpoint' or checkpoint['data'].get('session_id') != self.session_id
                     or checkpoint['data'].get('state') != 'saved' or 'cutoff' not in checkpoint['data']):
@@ -303,7 +430,7 @@ class SessionService:
                         or meta.get('phase') != 'closed' or meta.get('boundary_outcome') != 'memory-saved'):
                     raise BoundaryError('closed session differs from requested handover')
             else:
-                with self.registry.memory_writer(self.root, self.session_id):
+                with self._writer():
                     import datetime
                     meta.update(summary=summary, phase='closed', last_checkpoint=checkpoint_ref,
                                 boundary_outcome='memory-saved',
@@ -323,11 +450,16 @@ class SessionService:
                 raise BoundaryError('recover requires the original explicit session binding')
             self._publication_guard()
             memory = self._memory()
-            memory.context()
+            if self._authority is None or self._stale:
+                self._authority = memory.context()
+                self._stale = False
+            # Recovery may complete a session closure or other lifecycle write.
+            self._session_checked = False
             result = memory.recover()
             return self._report('recovered', recovery=result, next_action='Resume the original operation or initialize this session')
 
     def close(self):
+        self.invalidate()
         if self.client is not None:
             self.client.close()
             self.client = None

@@ -9,6 +9,7 @@ import contextlib
 import fcntl
 import os
 from pathlib import Path
+import time
 import uuid
 
 from tools.memory.boundary import BoundaryError, private_path, read_private, save_private
@@ -17,6 +18,13 @@ from tools.project import instance_home
 
 class CoordinationError(BoundaryError):
     pass
+
+
+class SessionBusy(CoordinationError):
+    """Another operation held this session's lock for the whole bounded wait."""
+
+
+SESSION_LOCK_TIMEOUT = 10.0
 
 
 def session_uuid(value):
@@ -30,7 +38,8 @@ def session_uuid(value):
 
 
 @contextlib.contextmanager
-def private_lock(root, relative, *, blocking=True):
+def private_lock(root, relative, *, blocking=True, shared=False, timeout=None):
+    """Owner-private flock. With a timeout, wait up to that long, then raise SessionBusy."""
     path = private_path(root, relative)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -38,17 +47,34 @@ def private_lock(root, relative, *, blocking=True):
         info = os.fstat(descriptor)
         if info.st_uid != os.getuid() or info.st_mode & 0o077:
             raise CoordinationError('coordination lock must be owner-private')
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-        except BlockingIOError:
-            raise CoordinationError('another command is using this session') from None
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        if timeout is None:
+            try:
+                fcntl.flock(descriptor, mode | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                raise CoordinationError('another command is using this session') from None
+        else:
+            deadline = time.monotonic() + timeout
+            delay = 0.005
+            while True:
+                try:
+                    fcntl.flock(descriptor, mode | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise SessionBusy('session is busy with another operation; retry shortly') from None
+                    time.sleep(min(delay, remaining))
+                    delay = min(delay * 2, 0.1)
         yield
     finally:
         os.close(descriptor)
 
 
-def session_lock(root, session_id):
-    return private_lock(root, f'.maven/runtime/sessions/{session_uuid(session_id)}/command.lock', blocking=False)
+def session_lock(root, session_id, *, shared=False, timeout=SESSION_LOCK_TIMEOUT):
+    """Read-only calls share the lock; writes are exclusive. Both wait briefly instead of failing fast."""
+    return private_lock(root, f'.maven/runtime/sessions/{session_uuid(session_id)}/command.lock',
+                        shared=shared, timeout=timeout)
 
 
 class SessionRegistry:
@@ -285,6 +311,19 @@ class SessionRegistry:
         with self.transaction() as state:
             return {'session': dict(self._session(state, root, session_id)),
                     'reservation': state['reservations'].get(self.key(root))}
+
+    def registered(self, root):
+        """Read-only snapshot of this root's sessions; never creates or rewrites the registry."""
+        if not private_path(self.home, 'runtime/sessions.json').exists():
+            return []
+        with private_lock(self.home, 'runtime/registry.lock'):
+            state = read_private(self.home, 'runtime/sessions.json')
+        sessions = state.get('sessions')
+        if state.get('schema') != 1 or not isinstance(sessions, dict):
+            raise CoordinationError('session registry is malformed; preserve it for recovery')
+        return [{'session_id': identifier, 'harness': item.get('harness'), 'state': item.get('state')}
+                for identifier, item in sessions.items()
+                if isinstance(item, dict) and item.get('root') == self.key(root)]
 
     def close(self, root, session_id, logout):
         """Remove only this session. Serialize last-user logout with registration."""

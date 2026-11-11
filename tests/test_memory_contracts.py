@@ -73,21 +73,27 @@ class CloudContractTests(unittest.TestCase):
         database.transaction.return_value.__enter__ = Mock(return_value='tx')
         database.transaction.return_value.__exit__ = Mock(return_value=False)
         bundle = admin.migrations()
-        installed = {name: digest for name, digest, _ in bundle[:-1]}
+        names = [name for name, _, _ in bundle]
+        first_new = names.index('012_agentic_memory.sql')
+        self.assertEqual(names[first_new:], ['012_agentic_memory.sql', '013_performance.sql', '014_authority_guard.sql'])
+        installed = {name: digest for name, digest, _ in bundle[:first_new]}
         old = {**store.control_document(CONFIG, 'ready'), 'schema_version': 1,
                'app_secret_arn': CONFIG['app_secret_arn'], 'app_secret_version': 'fixture-version'}
         database.scalar.side_effect = [True, True, json.dumps(installed), json.dumps(old)]
         secrets = Mock()
         admin._install(database, CONFIG, secrets, store.control_document(CONFIG, 'maintenance'), upgrade=True)
         secrets.get_secret_value.assert_not_called()
-        name, digest, statements = bundle[-1]
-        self.assertEqual(name, '012_agentic_memory.sql')
         registrations = [call for call in database.execute.call_args_list
                          if call.args[0].startswith('INSERT INTO maven.schema_migrations')]
-        self.assertEqual(len(registrations), 1)
-        self.assertEqual(registrations[0].args[1], {'name': name, 'sha': digest})
-        for statement in statements:
-            database.execute.assert_any_call(statement, transaction='tx')
+        self.assertEqual([call.args[1] for call in registrations],
+                         [{'name': name, 'sha': digest} for name, digest, _ in bundle[first_new:]])
+        for _, _, statements in bundle[first_new:]:
+            for statement in statements:
+                database.execute.assert_any_call(statement, transaction='tx')
+        executed = [call.args[0] for call in database.execute.call_args_list]
+        self.assertTrue(any('maven.memory_request(text,jsonb,text,text,text,integer) TO maven_app' in sql for sql in executed))
+        self.assertIn("ALTER ROLE maven_app SET statement_timeout = '5s'", executed)
+        self.assertIn("ALTER ROLE maven_app SET lock_timeout = '1s'", executed)
 
     def test_explicit_scope_is_transported_without_rewriting_legacy_discovery(self):
         memory = client.MemoryClient(self.config(), Mock())

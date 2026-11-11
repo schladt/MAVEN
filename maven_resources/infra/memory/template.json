@@ -707,6 +707,12 @@
                     },
                     {
                       "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/claim"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/project_context"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/revisions"
                     }
                   ]
                 },
@@ -1105,6 +1111,48 @@
         "Principal": "apigateway.amazonaws.com",
         "SourceAccount": {"Ref": "AWS::AccountId"},
         "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/claim"}
+      }
+    },
+    "MemoryProjectContextRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/project_context",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "MemoryProjectContextInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/project_context"}
+      }
+    },
+    "MemoryRevisionsRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/revisions",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "MemoryRevisionsInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/revisions"}
       }
     },
     "MemoryAdminRole": {

@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import shlex
 import ssl
 import stat
 
@@ -103,6 +104,21 @@ def migration_config(values: dict[str, str]) -> dict:
     # Persistence still requires reconnecting reviewed upgraded stack outputs;
     # successful SQL migration alone does not prove the service was deployed.
     return memory_config(values)
+
+
+def sign_in(values: dict[str, str], *, deploy: bool = False) -> dict:
+    """Exact owner sign-in for a selected profile into MAVEN's own private login cache.
+
+    A plain `aws login` writes the AWS default cache, which MAVEN never reads; only this
+    command (with AWS_LOGIN_CACHE_DIRECTORY) renews the sign-in MAVEN uses.
+    """
+    prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
+    profile = values[prefix + 'PROFILE']
+    cache = str(Path(values[prefix + 'LOGIN_CACHE']).expanduser())
+    argv = ['aws', 'login', '--profile', profile, '--region', values.get('MAVEN_AWS_REGION', 'us-east-1')]
+    return {'purpose': 'Maintenance access' if deploy else 'Daily-use access', 'profile': profile,
+            'argv': argv, 'environment': {'AWS_LOGIN_CACHE_DIRECTORY': cache},
+            'command': 'AWS_LOGIN_CACHE_DIRECTORY=' + shlex.quote(cache) + ' ' + shlex.join(argv)}
 
 
 def selected_aws_session(values: dict[str, str], *, deploy: bool = False, region: str = 'us-east-1'):

@@ -157,9 +157,9 @@ arguments. The shipped tool groups are:
 | Intent | Tools and important boundaries |
 | --- | --- |
 | Selection and current context | `maven_project`, `maven_initialize`, `maven_context`; initialize only an explicitly enabled project |
-| Inspection and consultation | `maven_status(summary=true)`, `maven_search`, `maven_read`; default `scope="context"`, explicit `project`, `universal` or `all` as intended |
+| Inspection and consultation | `maven_status(summary=true)`, `maven_instructions`, `maven_search`, `maven_read`; default `scope="context"`, explicit `project`, `universal` or `all` as intended. Search is ranked with `rank`/`snippet` (page with `offset`/`next_offset` for queries, `after_id` otherwise; `limit` ≤ 20; `include_archived` for obsolete records). `unbound=true` is a read-only universal consultation without a session, used only on explicit owner intent |
 | Mutations and scope | `maven_save`, `maven_scope`, `maven_claim`; real source origin/excerpt, expected revisions and actual task fences |
-| Semantic assignments | `maven_maintenance` actions `enqueue`, `claim`, `apply`, `revise`, `complete`, `release`, `status`; preserve operation identity and worker token |
+| Semantic assignments | `maven_maintenance` actions `enqueue`, `claim`, `apply`, `revise`, `complete`, `release`, `status`; preserve operation identity and worker token. Status/apply/revise return summaries unless `detail=true`; at most 50 changes per apply; an apply that returns `continue=true` is continued with the same token and no changes |
 | Session boundaries | `maven_checkpoint`, `maven_pause`, `maven_resume`, `maven_finish`; finish uses a verified checkpoint covering accepted work |
 | Recovery and administration | `maven_recover`, `maven_admin`; inspection does not replay mutations, recovery may |
 | Optional publication | `maven_git` actions `configure`, `inspect`, `apply`, `status`, `recover`, `cancel`, `pause`; exact reviewed candidate/owner source and actual cooperating-writer quiescence for publication |
@@ -169,6 +169,17 @@ included assignments, call it with the original `checkpoint_id` and `advance=tru
 do not create a replacement boundary. `wait=true` has the bounded wait described
 above. `maven_resume` defaults to catch-up using available `discussion`, real `source`
 and an honest `context_complete`; `fresh=true` skips look-back.
+`nothing_to_record=true` completes catch-up inline when the paused discussion held
+nothing worth saving. `maven_admin` responses omit choice checkpoints, prior responses,
+navigation and retired interactions unless `detail=true`.
+
+After a harness restart, call `maven_status` before saying connected. When the process
+is unbound it returns a `rebind_hint` listing active registered sessions for the folder;
+resume only the exact retained one. Say whether a reported memory state came from this
+conversation or was re-read from MAVEN. Client/customer engagement details stay
+project-scoped even when the default prefers universal. Offer to turn standing owner
+policies into project or universal instructions through the instruction review flow.
+Mark obsolete records with tag `archived` (or `data.state` `archived`).
 
 An interrupted closure retains its original checkpoint and finish intent. Restore
 the exact binding even if initialization reports that the session is closing or

@@ -255,13 +255,26 @@ def _block(body: str, *, toml=False) -> str:
     return start + '\n' + body.rstrip() + '\n' + end + '\n'
 
 
-def _text_change(path: Path, body: str, *, toml=False) -> Change:
+def _text_change(path: Path, body: str, *, toml=False, prior: dict | None = None) -> Change:
+    """Plan the MAVEN block; an unmodified installer-owned block is upgraded in place."""
     before = _read(path)
     text = (before or b'').decode()
     block = _block(body, toml=toml)
     if 'MAVEN BEGIN' in text or 'MAVEN END' in text:
-        if text.count(block) != 1 or text.count('MAVEN BEGIN') != 1 or text.count('MAVEN END') != 1:
+        if text.count('MAVEN BEGIN') != 1 or text.count('MAVEN END') != 1:
             raise ValueError(f'Existing MAVEN guidance differs; preserved: {path}')
+        if text.count(block) != 1:
+            owned = prior is not None and prior.get('owned', True) and prior.get('format') == 'text-block'
+            if not owned or text.count(prior['value']) != 1:
+                raise ValueError(f'Existing MAVEN guidance differs; preserved: {path}')
+            separator = prior['value'][:len(prior['value']) - len(prior['value'].lstrip('\n'))]
+            value = separator + block
+            after = text.replace(prior['value'], value).encode()
+            receipt = {'path': str(path), 'format': 'text-block', 'key': 'maven',
+                       'value': value, 'created': prior.get('created', False)}
+            if toml:
+                receipt['server'] = tomllib.loads(after.decode())['mcp_servers']['maven']
+            return Change(path, before, after, receipt)
         if toml and tomllib.loads(text).get('mcp_servers', {}).get('maven') != tomllib.loads(body)['mcp_servers']['maven']:
             raise ValueError(f'Existing MAVEN MCP table differs; preserved: {path}')
         receipt = {'path': str(path), 'format': 'text-block', 'key': 'maven',
@@ -300,6 +313,7 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
     if any('$' in value or '\n' in value or '\r' in value for value in environment.values()):
         raise ValueError('Integration paths must be literal, without environment interpolation or newlines')
     guidance = resource_path('templates/harness/startup.md').read_text()
+    receipts = _owned_text_blocks(home)
     changes = []
     for harness in dict.fromkeys(harnesses):
         config, instructions, _ = HARNESS_PATHS[harness]
@@ -319,7 +333,7 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
             body = '[mcp_servers.maven]\ncommand = ' + json.dumps(server['command'])
             body += '\nargs = []\nenv = { ' + ', '.join(
                 json.dumps(key) + ' = ' + json.dumps(value) for key, value in environment.items()) + ' }'
-            changes.append(_text_change(path, body, toml=True))
+            changes.append(_text_change(path, body, toml=True, prior=receipts.get(str(path))))
         else:
             before = _read(path)
             value = _json(before)
@@ -342,10 +356,24 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
                            'value': server, 'created': before is None,
                            'created_container': not before or 'mcpServers' not in _json(before)}
                 changes.append(Change(path, before, _encode(value), receipt))
-        changes.append(_text_change(context_path, guidance))
+        changes.append(_text_change(context_path, guidance, prior=receipts.get(str(context_path))))
     if len({change.path for change in changes}) != len(changes):
         raise ValueError('Integration targets overlap; select distinct configuration/context files')
     return changes
+
+
+def _owned_text_blocks(home: Path) -> dict[str, dict]:
+    """Installer receipts for MAVEN text blocks this home wrote (path → receipt)."""
+    from tools.uninstall.common import read_private
+    from tools.uninstall.local import MANIFEST
+    receipt = home / MANIFEST
+    if not receipt.exists():
+        return {}
+    prior = read_private(receipt)
+    if prior.get('schema') != 1 or prior.get('home') != str(home):
+        raise ValueError('Installer ownership receipt does not match this home.')
+    return {item['path']: item for item in prior.get('integrations', [])
+            if item.get('format') == 'text-block' and item.get('owned', True)}
 
 
 def _replace(path: Path, before: bytes | None, after: bytes) -> None:

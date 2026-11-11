@@ -6,7 +6,7 @@ import json
 import os
 import time
 
-from .store import Store, safe_provider_error, sdk_config
+from .store import ControlCache, Store, safe_provider_error, sdk_config
 from .validation import (APPROVAL_ROUTES, CLIENT_PROTOCOL, MemoryError, ROUTES, authorized_actor,
                          decode_json, request_limit, uuid_string, validate)
 
@@ -30,10 +30,16 @@ def configuration():
     return config
 
 
+# Lambda containers reuse SDK clients and briefly reuse the ready control document for reads.
+_CLIENTS = {}
+CONTROL_CACHE = ControlCache()
+
+
 def make_store(config, deadline):
-    import boto3
-    return Store(config, boto3.client("rds-data", config=sdk_config()),
-                 boto3.client("s3", config=sdk_config()), deadline=deadline)
+    if not _CLIENTS:
+        import boto3
+        _CLIENTS.update({name: boto3.client(name, config=sdk_config()) for name in ("rds-data", "s3")})
+    return Store(config, _CLIENTS["rds-data"], _CLIENTS["s3"], deadline=deadline, control_cache=CONTROL_CACHE)
 
 
 def response(status_code, body):
@@ -98,8 +104,8 @@ def handler(event, context):
         request_key = request.get("request_key")
         remaining = context.get_remaining_time_in_millis() / 1000 if context is not None else 25
         deadline = time.monotonic() + max(0, min(25, remaining) - 1)
-        result = make_store(config, deadline).perform(path, request, actor, client_protocol=int(protocol))
-        return response(200, {"status": "ready", "data": result})
+        result, generation = make_store(config, deadline).perform(path, request, actor, client_protocol=int(protocol))
+        return response(200, {"status": "ready", "data": result, "authority_generation": generation})
     except MemoryError as error:
         result = {"status": error.status, **error.metadata}
         if request_key is not None:

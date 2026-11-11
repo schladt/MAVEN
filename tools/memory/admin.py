@@ -18,7 +18,8 @@ MIGRATION_FILES = ("001_foundation.sql", "002_fact_change.sql", "003_current_ver
                    "004_instructions.sql", "005_owner_instructions.sql", "006_owner_memory.sql",
                    "007_memory_instruction_guards.sql", "008_service_state_lock.sql",
                    "009_named_skill_context.sql", "010_skill_resources.sql",
-                   "011_project_lifecycle.sql", "012_agentic_memory.sql")
+                   "011_project_lifecycle.sql", "012_agentic_memory.sql", "013_performance.sql",
+                   "014_authority_guard.sql")
 
 
 def migrations():
@@ -126,6 +127,12 @@ def _grant_instructions(db, tx):
                "maven.memory_write(text,jsonb,text,text), maven.memory_read(jsonb), "
                "maven.memory_search(jsonb), maven.memory_context(jsonb), "
                "maven.memory_lookup(uuid) TO maven_app", transaction=tx)
+    # Ordinary memory, page and proposal routes are one dispatcher statement with no explicit
+    # transaction for reads, so their timeouts are the application role's session defaults.
+    db.execute("GRANT EXECUTE ON FUNCTION maven.memory_service_state(), "
+               "maven.memory_request(text,jsonb,text,text,text,integer) TO maven_app", transaction=tx)
+    db.execute("ALTER ROLE maven_app SET statement_timeout = '5s'", transaction=tx)
+    db.execute("ALTER ROLE maven_app SET lock_timeout = '1s'", transaction=tx)
 
 
 def _install(db, config, secrets, control, *, upgrade=False):

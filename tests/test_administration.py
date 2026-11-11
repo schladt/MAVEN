@@ -1004,6 +1004,30 @@ class AdministrationTests(unittest.TestCase):
         self.assertIn('Maintenance', result['handoff']['purpose'])
         self.assertEqual(result['handoff']['account'], '123456789012')
 
+    def test_effect_stopped_by_expired_sign_in_offers_that_profiles_exact_sign_in(self):
+        from tools.memory.client import MemoryClientError
+        result = self.controller.begin('setup', {'mode': 'update'})
+        Wizard(self.home).settings({'MAVEN_AWS_REGION': 'us-east-1',
+            'MAVEN_AWS_PROFILE': 'daily', 'MAVEN_AWS_LOGIN_CACHE': str(self.home / 'runtime/daily'),
+            'MAVEN_DEPLOY_PROFILE': 'maintainer', 'MAVEN_DEPLOY_LOGIN_CACHE': str(self.home / 'runtime/maintenance'),
+            'MAVEN_DEPLOY_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/maintainer'})
+        state = self.controller._load(result['operation_id'])
+        state.update(step='update_service_apply', state='pending', pending_interaction=None)
+        self.controller._save(state)
+
+        def identity(values, *, deploy=False):
+            if deploy:
+                raise RuntimeError('expired')
+            return {'Account': '123456789012', 'Arn': 'arn:aws:iam::123456789012:user/daily'}
+        with patch.object(AdminOperations, '_setup', side_effect=MemoryClientError('selected_login_unavailable_or_expired')), \
+                patch('tools.setup_common.inspect_login_identity', side_effect=identity):
+            result = self.controller.advance(result['operation_id'])
+        self.assertEqual((result['state'], result['step']), ('uncertain', 'update_service_apply'))
+        self.assertEqual(result['handoff']['type'], 'aws_login')
+        self.assertEqual(result['handoff']['command'][:4], ['aws', 'login', '--profile', 'maintainer'])
+        self.assertEqual(result['handoff']['environment'],
+                         {'AWS_LOGIN_CACHE_DIRECTORY': str(self.home / 'runtime/maintenance')})
+
     def test_completed_explicit_operation_resumes_harness_and_fresh_check_is_opt_in(self):
         from tools.interaction import OperationPaused
         result = self.controller.begin('setup', {'mode': 'existing'})

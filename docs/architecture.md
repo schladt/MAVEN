@@ -60,6 +60,14 @@ The session's pending-request journal must not be overwritten by another worker.
 Multi-record results retain verified per-effect progress and a completion manifest;
 partial effects are not an atomic transaction claim.
 
+Read-only service calls take a shared session lock, so parallel searches and reads are
+fine; writes take the exclusive lock. Both wait briefly; a lock that stays held returns
+`session_busy` with retry guidance. Errors distinguish availability (warming, transport,
+rate limits, login) reported as memory unavailable, from definitive rejections carrying
+a bounded `detail` that names the offending field or kind, never its value. Ranked search
+matches every query term at word boundaries in title, tags or body and returns snippets;
+records tagged `archived` or with `data.state` `archived` are excluded unless requested.
+
 Memory checkpoints record the session, explicit accepted-work cutoff, exact
 record/revision manifest and truthful handover. Included work must finish before saved
 completion. New work stays outside that immutable boundary. Memory does not reserve

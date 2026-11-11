@@ -417,6 +417,31 @@ class AdminOperations:
         state.update(state='blocked', handoff={'reason': reason, 'command': command,
                      'environment': environment or {}, 'completion_claimed': False})
 
+    def _expired_login_handoff(self, state):
+        """A step stopped on an expired sign-in: offer the exact sign-in, with MAVEN's private
+        login cache, for whichever selected profile has expired. The step's state is kept."""
+        from tools.memory.environment import load_environment, sign_in
+        from tools.setup_common import expected_account, inspect_login_identity
+        values = load_environment(self.home / '.env')
+        for deploy, prefix in ((False, 'MAVEN_AWS_'), (True, 'MAVEN_DEPLOY_')):
+            if not values.get(prefix + 'PROFILE') or not values.get(prefix + 'LOGIN_CACHE'):
+                continue
+            try:
+                inspect_login_identity(values, deploy=deploy)
+                continue
+            except Exception:
+                pass
+            exact = sign_in(values, deploy=deploy)
+            outcome = state['state']
+            self._handoff(state, exact['purpose'] + ' sign-in is missing or expired. Choose Sign in in the terminal, '
+                          'or run this exact command externally (a plain aws login is not read by MAVEN), '
+                          'then resume this same operation.', exact['argv'], environment=exact['environment'])
+            state['handoff'].update(type='aws_login', purpose=exact['purpose'], account=expected_account(values),
+                                    profile=exact['profile'],
+                                    expected_principal=values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown'))
+            state['state'] = outcome
+            return
+
     def advance(self, operation_id):
         self._prepare()
         with setup_lock(self.directory):
@@ -452,6 +477,11 @@ class AdminOperations:
                 state['state'] = 'uncertain' if any(word in code for word in ('unknown', 'uncertain', 'unavailable', 'timeout')) else 'blocked'
                 state['error'] = str(error) if isinstance(error, SetupPending) else code
                 state['recovery'] = 'Inspect status, correct the prerequisite, then advance this same operation. Original request artifacts are retained.'
+                if state['error'] == 'selected_login_unavailable_or_expired':
+                    try:
+                        self._expired_login_handoff(state)
+                    except (OSError, ValueError, KeyError):
+                        pass  # Settings unreadable: the stopped screen still names the error.
             if state['state'] == 'working':
                 state['state'] = 'pending'
             self._save(state)
@@ -828,7 +858,9 @@ class AdminOperations:
                     self._review(state, 'schema', 'Review exact SQL ' + ('upgrade' if upgrade else 'initialization'), review, 'migrate' if upgrade else 'initialize')
                 else:
                     self._approved(state, 'schema', review)
-                    result = bootstrap.initialize(wizard.values, confirm_instance=review['instance']['instance_id'], upgrade=upgrade)
+                    # An update deploys the matching service next; verify readiness at the end instead.
+                    result = bootstrap.initialize(wizard.values, confirm_instance=review['instance']['instance_id'], upgrade=upgrade,
+                                                  verify_service=not state.get('update_return_step'))
                     self._receipt(state, step, result)
                     if not upgrade:
                         state['starter_binding'] = dict(wizard.values)

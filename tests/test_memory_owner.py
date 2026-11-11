@@ -89,7 +89,8 @@ class OwnerValidationTests(unittest.TestCase):
             with self.assertRaises(validation.MemoryError) as error:
                 validation.validate("/v1/memory/write", body)
             self.assertEqual(str(error.exception), "invalid_request")
-            self.assertEqual(error.exception.metadata, {})
+            self.assertEqual(set(error.exception.metadata), {"detail"})
+            self.assertNotIn(json.dumps(forbidden)[1:12], error.exception.metadata["detail"])
 
     def test_settings_checkpoint_and_claim_require_exact_scope_and_fence(self):
         body = record("setting", {"key": "fixture", "value": False, "scope": "project"})
@@ -170,18 +171,65 @@ class OwnerValidationTests(unittest.TestCase):
                   "approval_role_arn": "arn:aws:iam::123456789012:role/fixture-approval"}
         body = record()
         event = {"rawPath": "/v1/memory/write", "body": json.dumps(body),
-                 "headers": {"x-maven-memory-protocol": "3"},
+                 "headers": {"x-maven-memory-protocol": str(validation.CLIENT_PROTOCOL)},
                  "requestContext": {"http": {"method": "POST"}, "authorizer": {"iam": {
                      "userArn": "arn:aws:sts::123456789012:assumed-role/fixture-client/test"}}}}
         storage = Mock()
-        storage.perform.return_value = {"record_id": body["record_id"], "revision": 1}
+        storage.perform.return_value = ({"record_id": body["record_id"], "revision": 1}, 4)
         with patch.object(service, "configuration", return_value=config), patch.object(service, "make_store", return_value=storage):
             result = service.handler(event, None)
             self.assertEqual(result["statusCode"], 200)
-            self.assertEqual(storage.perform.call_args.kwargs, {"client_protocol": 3})
-            event["headers"]["x-maven-memory-protocol"] = "2"
+            self.assertEqual(json.loads(result["body"])["authority_generation"], 4)
+            self.assertEqual(storage.perform.call_args.kwargs, {"client_protocol": validation.CLIENT_PROTOCOL})
+            event["headers"]["x-maven-memory-protocol"] = str(validation.CLIENT_PROTOCOL - 1)
             self.assertEqual(service.handler(event, None)["statusCode"], 409)
             self.assertEqual(storage.perform.call_count, 1)
+
+    def test_validation_details_name_fields_and_never_values(self):
+        body = record()
+        body["data"] = {"title": "Fixture", "body": "Hidden value text", "category": "reference"}
+        with self.assertRaises(validation.MemoryError) as error:
+            validation.validate("/v1/memory/write", body)
+        detail = error.exception.metadata["detail"]
+        self.assertIn("requires body_markdown", detail)
+        self.assertIn("does not accept body", detail)
+        self.assertNotIn("Hidden value", detail)
+        self.assertLessEqual(len(detail), validation.MAX_DETAIL)
+        for request, expected in [({"limit": 50}, "limit must be an integer from 1 to 20"),
+                                  ({"offset": 1}, "offset pages ranked results and requires query"),
+                                  ({"query": "x", "offset": 1001}, "offset must be an integer from 0 to 1000"),
+                                  ({"query": "a b c d e f g h i"}, "query allows at most 8 words"),
+                                  ({"include_archived": "yes"}, "include_archived must be a boolean"),
+                                  ({"kind": "skill"}, "kind must be one of")]:
+            with self.subTest(request=request), self.assertRaises(validation.MemoryError) as error:
+                validation.validate("/v1/memory/search", request)
+            self.assertIn(expected, error.exception.metadata["detail"])
+        long_key = {"x" * 300: 1}
+        with self.assertRaises(validation.MemoryError) as error:
+            validation.validate("/v1/memory/search", long_key)
+        self.assertNotIn("x" * 50, error.exception.metadata["detail"])
+
+    def test_memory_data_fields_mirror_the_validator_table(self):
+        self.assertEqual(set(validation.MEMORY_DATA_FIELDS), validation.MEMORY_KINDS)
+        self.assertEqual(validation.MEMORY_DATA_FIELDS["note"],
+                         {"required": ["body_markdown", "category", "title"], "optional": []})
+        self.assertEqual(validation.MEMORY_DATA_FIELDS["checkpoint"]["required"],
+                         ["cutoff", "memory_refs", "session_id", "state"])
+
+    def test_ranked_search_and_new_route_contracts(self):
+        for request in ({"query": "ble firmware", "offset": 20, "limit": 20, "include_archived": True},
+                        {"include_archived": False, "after_id": str(uuid4())}):
+            self.assertIs(validation.validate("/v1/memory/search", request), request)
+        context = {"project_id": str(uuid4()), "session_id": str(uuid4())}
+        self.assertIs(validation.validate("/v1/memory/project_context", context), context)
+        for bad in ({"project_id": context["project_id"]}, {**context, "extra": 1}, {**context, "session_id": "x"}):
+            with self.subTest(bad=bad), self.assertRaises(validation.MemoryError):
+                validation.validate("/v1/memory/project_context", bad)
+        ids = [str(uuid4()) for _ in range(validation.MAX_REVISION_IDS)]
+        validation.validate("/v1/memory/revisions", {"record_ids": ids})
+        for bad in (ids + [str(uuid4())], ids[:1] * 2, ["not-a-uuid"], "x"):
+            with self.assertRaises(validation.MemoryError):
+                validation.validate("/v1/memory/revisions", {"record_ids": bad})
 
 
 class JsonResultTransportTests(unittest.TestCase):
@@ -538,10 +586,10 @@ BEGIN
  candidate:=candidate || jsonb_build_object('slug','fixture-cycle-a','requires',jsonb_build_array('fixture-cycle-b')); PERFORM pg_temp.publish(candidate);
  candidate:=candidate || jsonb_build_object('slug','fixture-cycle-b','requires',jsonb_build_array('fixture-cycle-a')); PERFORM pg_temp.publish(candidate);
  PERFORM pg_temp.assert_equal(maven.memory_context('{}')->'status','"dependency_conflict"','cycles fail closed');
- UPDATE maven.service_state SET minimum_client_protocol=3 WHERE singleton;
+ UPDATE maven.service_state SET minimum_client_protocol=4 WHERE singleton;
  PERFORM set_config('maven.client_protocol','1',true);
  PERFORM pg_temp.assert_equal(pg_temp.write(pg_temp.request('note','{"title":"Old client","body_markdown":"blocked","category":"fixture"}'))->'status','"client_incompatible"','obsolete writer refused');
- PERFORM set_config('maven.client_protocol','3',true);
+ PERFORM set_config('maven.client_protocol','4',true);
  PERFORM pg_temp.assert_equal(pg_temp.write(pg_temp.request('note','{"title":"New client","body_markdown":"accepted","category":"fixture"}'))->'revision','1','current writer accepted');
 END $$;
 SET CONSTRAINTS ALL IMMEDIATE;
@@ -703,6 +751,225 @@ BEGIN
 END $$;
 """
 
+SQL_PERFORMANCE = r"""
+DO $$
+DECLARE
+ a jsonb; b jsonb; c jsonb; d jsonb; e jsonb; f jsonb; result jsonb; page jsonb; envelope jsonb; generation_value bigint;
+ project uuid; other_project uuid; requester jsonb; old_session jsonb; main_session jsonb; odd_session jsonb;
+ checkpoint jsonb; main_checkpoint jsonb; task_open jsonb; universal_task jsonb; done_task jsonb; foreign_task jsonb;
+ risk_open jsonb; risk_done jsonb; preference jsonb; local_decision jsonb; proposed jsonb; write_request jsonb;
+BEGIN
+ a:=pg_temp.request('note','{"title":"BLE notes","body_markdown":"Firmware for radios","category":"reference"}') || '{"tags":["perf-fixture"]}';
+ b:=pg_temp.request('note','{"title":"Radio","body_markdown":"Uses BLE pairing for sensors","category":"reference"}') || '{"tags":["perf-fixture"]}';
+ c:=pg_temp.request('note','{"title":"Other","body_markdown":"Nothing relevant","category":"reference"}') || '{"tags":["perf-fixture","ble"]}';
+ d:=pg_temp.request('note','{"title":"Furniture","body_markdown":"A table is possible","category":"reference"}') || '{"tags":["perf-fixture"]}';
+ e:=pg_temp.request('note','{"title":"BLE archived","body_markdown":"Old","category":"reference"}') || '{"tags":["perf-fixture","archived"]}';
+ f:=pg_temp.request('note',jsonb_build_object('title','Long','body_markdown',repeat('x ',200) || 'BLE target' || repeat(' y',200),
+   'category','reference')) || '{"tags":["perf-fixture"]}';
+ PERFORM pg_temp.write(a); PERFORM pg_temp.write(b); PERFORM pg_temp.write(c);
+ PERFORM pg_temp.write(d); PERFORM pg_temp.write(e); PERFORM pg_temp.write(f);
+ -- Ranking: title 3, tag 2, body 1; offset pages; word boundary; archived exclusion.
+ result:=maven.memory_search('{"query":"ble","tag":"perf-fixture","limit":2}');
+ PERFORM pg_temp.assert_equal(result->'records'->0->'record_id',a->'record_id','title match ranks first');
+ PERFORM pg_temp.assert_equal(result->'records'->0->'rank','3','title rank');
+ PERFORM pg_temp.assert_equal(result->'records'->0->'snippet','null','no body match, no snippet');
+ PERFORM pg_temp.assert_equal(result->'records'->1->'record_id',c->'record_id','tag match ranks second');
+ PERFORM pg_temp.assert_equal(result->'records'->1->'rank','2','tag rank');
+ PERFORM pg_temp.assert_equal(result->'next_offset','2','ranked page cursor');
+ PERFORM pg_temp.assert_equal(result->'next_after_id','null','ranked pages use offset');
+ page:=maven.memory_search('{"query":"ble","tag":"perf-fixture","limit":2,"offset":2}');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(x->'record_id' ORDER BY x->>'record_id') FROM jsonb_array_elements(page->'records') x),
+   (SELECT jsonb_agg(v ORDER BY v#>>'{}') FROM jsonb_array_elements(jsonb_build_array(b->'record_id',f->'record_id')) v),'body matches on second page');
+ PERFORM pg_temp.assert_equal(page->'records'->0->'rank','1','body rank');
+ PERFORM pg_temp.assert_equal(page->'next_offset','null','last ranked page');
+ result:=maven.memory_search('{"query":"ble","tag":"perf-fixture"}');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(result->'records')),'4','word boundary and archive filter');
+ IF EXISTS (SELECT 1 FROM jsonb_array_elements(result->'records') x WHERE x->'record_id' IN (d->'record_id',e->'record_id')) THEN
+   RAISE EXCEPTION 'ble matched table/possible or an archived record';
+ END IF;
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(maven.memory_search('{"query":"ble","tag":"perf-fixture","include_archived":true}')->'records')),
+   '5','archived included on request');
+ result:=maven.memory_search('{"query":"BLE pairing","tag":"perf-fixture"}');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(result->'records')),'1','every token must match');
+ PERFORM pg_temp.assert_equal(result->'records'->0->'record_id',b->'record_id','multi-word match');
+ PERFORM pg_temp.assert_equal(result->'records'->0->'rank','2','rank sums tokens');
+ IF result->'records'->0->>'snippet' NOT LIKE 'Uses BLE pairing for sensors%' THEN RAISE EXCEPTION 'snippet around body match'; END IF;
+ result:=maven.memory_search('{"query":"target","tag":"perf-fixture"}');
+ IF char_length(result->'records'->0->>'snippet')>240 OR strpos(result->'records'->0->>'snippet','BLE target')=0 THEN
+   RAISE EXCEPTION 'snippet not bounded around first body match';
+ END IF;
+ PERFORM pg_temp.assert_equal(maven.memory_search('{"query":"TABLE","tag":"perf-fixture"}')->'records'->0->'record_id',d->'record_id','case-insensitive word');
+ PERFORM pg_temp.assert_equal(maven.memory_search('{"query":"firm","tag":"perf-fixture"}')->'records'->0->'record_id',a->'record_id','word-start prefix');
+ PERFORM pg_temp.assert_equal(maven.memory_search('{"query":"c++ (x) [y] .* \\","tag":"perf-fixture"}')->'records','[]','regex characters are literal');
+ result:=maven.memory_search('{"tag":"perf-fixture"}');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(result->'records')),'5','listing excludes archived');
+ IF EXISTS (SELECT 1 FROM jsonb_array_elements(result->'records') x WHERE NOT x ? 'snippet' OR x->'snippet'<>'null'::jsonb) THEN
+   RAISE EXCEPTION 'listing snippet must be null';
+ END IF;
+ PERFORM pg_temp.assert_equal(result->'next_offset','null','listing has no offset cursor');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(maven.memory_search('{"tag":"perf-fixture","include_archived":true}')->'records')),'6','listing includes archived on request');
+ -- Project startup context: latest checkpoint across closed and active sessions.
+ result:=pg_temp.write(pg_temp.request('entity','{"entity_type":"project","name":"Context fixture","aliases":[]}')); project:=(result->>'record_id')::uuid;
+ result:=pg_temp.write(pg_temp.request('entity','{"entity_type":"project","name":"Other context","aliases":[]}')); other_project:=(result->>'record_id')::uuid;
+ requester:=pg_temp.request('session',jsonb_build_object('state','active','summary',jsonb_build_object('harness','requester')::text)) || jsonb_build_object('project_id',project);
+ old_session:=pg_temp.request('session',jsonb_build_object('state','active','summary',jsonb_build_object('harness','old')::text)) || jsonb_build_object('project_id',project);
+ main_session:=pg_temp.request('session',jsonb_build_object('state','active','summary',jsonb_build_object('harness','omp')::text)) || jsonb_build_object('project_id',project);
+ odd_session:=pg_temp.request('session','{"state":"active","summary":"not json"}') || jsonb_build_object('project_id',project);
+ PERFORM pg_temp.write(requester); PERFORM pg_temp.write(old_session); PERFORM pg_temp.write(main_session); PERFORM pg_temp.write(odd_session);
+ checkpoint:=pg_temp.request('checkpoint',jsonb_build_object('session_id',old_session->'record_id','cutoff',1,'memory_refs','[]'::jsonb,
+   'state','prepared','summary','Old side handover')) || jsonb_build_object('project_id',project);
+ PERFORM pg_temp.write(checkpoint);
+ PERFORM pg_temp.assert_equal(pg_temp.write(checkpoint || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',1,
+   'data',checkpoint->'data' || '{"state":"saved"}'))->'revision','2','old checkpoint saved');
+ UPDATE maven.records SET updated_at=now()-interval '2 hours' WHERE id=(checkpoint->>'record_id')::uuid;
+ PERFORM pg_temp.write(old_session || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',1,'data',old_session->'data' || '{"state":"closed"}'));
+ UPDATE maven.records SET updated_at=now() WHERE id=(old_session->>'record_id')::uuid;
+ main_checkpoint:=pg_temp.request('checkpoint',jsonb_build_object('session_id',main_session->'record_id','cutoff',2,'memory_refs','[]'::jsonb,
+   'state','prepared','summary','Main work handover')) || jsonb_build_object('project_id',project);
+ PERFORM pg_temp.write(main_checkpoint);
+ PERFORM pg_temp.write(main_checkpoint || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',1,'data',main_checkpoint->'data' || '{"state":"saved"}'));
+ UPDATE maven.records SET updated_at=now()-interval '1 hour' WHERE id=(main_checkpoint->>'record_id')::uuid;
+ checkpoint:=pg_temp.request('checkpoint',jsonb_build_object('session_id',odd_session->'record_id','cutoff',3,'memory_refs','[]'::jsonb,
+   'state','prepared','summary','Unsaved preparation')) || jsonb_build_object('project_id',project);
+ PERFORM pg_temp.write(checkpoint);
+ task_open:=pg_temp.request('task','{"title":"Project task","description":"","state":"open"}') || jsonb_build_object('project_id',project);
+ universal_task:=pg_temp.request('task','{"title":"Universal task","description":"","state":"blocked"}');
+ done_task:=pg_temp.request('task','{"title":"Cancelled task","description":"","state":"cancelled"}') || jsonb_build_object('project_id',project);
+ foreign_task:=pg_temp.request('task','{"title":"Foreign task","description":"","state":"open"}') || jsonb_build_object('project_id',other_project);
+ risk_open:=pg_temp.request('risk','{"title":"Open risk","body_markdown":"Evidence","state":"open"}') || jsonb_build_object('project_id',project);
+ risk_done:=pg_temp.request('risk','{"title":"Mitigated risk","body_markdown":"Evidence","state":"mitigated"}') || jsonb_build_object('project_id',project);
+ preference:=pg_temp.request('decision',jsonb_build_object('title','Never name clients publicly','body_markdown',repeat('p',1500),'state','accepted'));
+ local_decision:=pg_temp.request('decision','{"title":"Local decision","body_markdown":"Local","state":"accepted"}') || jsonb_build_object('project_id',project);
+ proposed:=pg_temp.request('decision','{"title":"Proposed","body_markdown":"Maybe","state":"proposed"}');
+ PERFORM pg_temp.write(task_open); PERFORM pg_temp.write(universal_task); PERFORM pg_temp.write(done_task); PERFORM pg_temp.write(foreign_task);
+ PERFORM pg_temp.write(risk_open); PERFORM pg_temp.write(risk_done);
+ PERFORM pg_temp.write(preference); PERFORM pg_temp.write(local_decision); PERFORM pg_temp.write(proposed);
+ result:=maven.memory_project_context(jsonb_build_object('project_id',project,'session_id',requester->'record_id'));
+ PERFORM pg_temp.assert_equal(result->'latest_handover'->'checkpoint_record_id',main_checkpoint->'record_id','latest checkpoint across sessions');
+ PERFORM pg_temp.assert_equal(result->'latest_handover'->'session_id',main_session->'record_id','handover session');
+ PERFORM pg_temp.assert_equal(result->'latest_handover'->'session_state','"active"','active session handover is visible');
+ PERFORM pg_temp.assert_equal(result->'latest_handover'->'summary','"Main work handover"','handover text');
+ PERFORM pg_temp.assert_equal(result->'latest_handover'->'revision','2','saved checkpoint revision');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(p->'session_id' ORDER BY p->>'session_id') FROM jsonb_array_elements(result->'active_peers') p),
+   (SELECT jsonb_agg(v ORDER BY v#>>'{}') FROM jsonb_array_elements(jsonb_build_array(main_session->'record_id',odd_session->'record_id')) v),
+   'active peers exclude requester and closed sessions');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_object('harness',p->'harness','summary',p->'latest_summary') FROM jsonb_array_elements(result->'active_peers') p
+   WHERE p->'session_id'=main_session->'record_id'),'{"harness":"omp","summary":"Main work handover"}','peer latest checkpoint');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_object('harness',p->'harness','at',p->'latest_checkpoint_at','summary',p->'latest_summary')
+   FROM jsonb_array_elements(result->'active_peers') p WHERE p->'session_id'=odd_session->'record_id'),
+   '{"harness":null,"at":null,"summary":null}','malformed metadata and unsaved checkpoints are absent');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(t->'record_id' ORDER BY t->>'record_id') FROM jsonb_array_elements(result->'tasks') t
+   WHERE t->'record_id' IN (task_open->'record_id',universal_task->'record_id',done_task->'record_id',foreign_task->'record_id')),
+   (SELECT jsonb_agg(v ORDER BY v#>>'{}') FROM jsonb_array_elements(jsonb_build_array(task_open->'record_id',universal_task->'record_id')) v),
+   'working project and universal tasks only');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(k ORDER BY k) FROM jsonb_object_keys(result->'tasks'->0) k),
+   '["record_id","revision","state","tags","title"]','task shape');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(t->'record_id') FROM jsonb_array_elements(result->'blockers') t),
+   jsonb_build_array(risk_open->'record_id'),'open risks only');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(t->'record_id') FROM jsonb_array_elements(result->'owner_preferences') t),
+   jsonb_build_array(preference->'record_id'),'accepted universal decisions only');
+ PERFORM pg_temp.assert_equal(to_jsonb(char_length(result->'owner_preferences'->0->>'body_markdown')),'1000','preference body truncated');
+ result:=maven.memory_project_context(jsonb_build_object('project_id',other_project,'session_id',requester->'record_id'));
+ PERFORM pg_temp.assert_equal(result->'latest_handover','null','no foreign handover');
+ PERFORM pg_temp.assert_equal(result->'active_peers','[]','no foreign peers');
+ -- Batched current revisions for visible memory only.
+ result:=maven.memory_revisions(jsonb_build_object('record_ids',jsonb_build_array(a->'record_id',main_checkpoint->'record_id',gen_random_uuid())));
+ PERFORM pg_temp.assert_equal(result->'revisions',jsonb_build_object(a->>'record_id',1,main_checkpoint->>'record_id',2),'current revisions');
+ UPDATE maven.records SET visibility_state='blocked' WHERE id=(d->>'record_id')::uuid;
+ PERFORM pg_temp.assert_equal(maven.memory_revisions(jsonb_build_object('record_ids',jsonb_build_array(d->'record_id')))->'revisions','{}','hidden record omitted');
+ -- Inline exact page bodies while small; metadata only when large.
+ UPDATE maven.pages SET authority_state='revoked' WHERE slug IN ('fixture-cycle-a','fixture-cycle-b');
+ result:=maven.memory_context('{}');
+ PERFORM pg_temp.assert_equal(result->'bodies_inline','true','small context inline');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_object('body',p->'body_markdown','sha',p->'body_sha256') FROM jsonb_array_elements(result->'pages') p WHERE p->>'slug'='fixture-directive'),
+   jsonb_build_object('body','Exact fixture instruction','sha',encode(sha256(convert_to('Exact fixture instruction','UTF8')),'hex')),'inline body and digest');
+ PERFORM pg_temp.publish(jsonb_build_object('slug','fixture-large-a','page_kind','directive','title','Large','body_markdown',repeat('z',60000),'scope','{}'::jsonb,'authority_state','active'));
+ PERFORM pg_temp.publish(jsonb_build_object('slug','fixture-large-b','page_kind','directive','title','Large','body_markdown',repeat('z',60000),'scope','{}'::jsonb,'authority_state','active'));
+ result:=maven.memory_context('{}');
+ PERFORM pg_temp.assert_equal(result->'bodies_inline','false','large context uses page reads');
+ IF EXISTS (SELECT 1 FROM jsonb_array_elements(result->'pages') p WHERE p ? 'body_markdown' OR p ? 'body_sha256') THEN
+   RAISE EXCEPTION 'large context leaked partial inline bodies';
+ END IF;
+ -- Dispatcher: locked service state, generation, protocol gate and exact route results in one statement.
+ SELECT generation INTO generation_value FROM maven.instruction_state WHERE singleton;
+ envelope:=maven.memory_request('/v1/memory/search','{"query":"ble","tag":"perf-fixture"}',NULL,NULL,'fixture-reader',4);
+ PERFORM pg_temp.assert_equal(((envelope->'service_state')-'instance_id'::text)-'recovery_epoch'::text,
+   '{"schema_version":2,"state":"ready","data_scope":"owner_memory"}','dispatcher service state');
+ PERFORM pg_temp.assert_equal(envelope->'authority_generation',to_jsonb(generation_value),'dispatcher generation');
+ PERFORM pg_temp.assert_equal(envelope->'result',maven.memory_search('{"query":"ble","tag":"perf-fixture"}'),'dispatcher route result');
+ envelope:=maven.memory_request('/v1/memory/context','{}',NULL,NULL,'fixture-reader',4);
+ PERFORM pg_temp.assert_equal(envelope->'authority_generation',envelope->'result'->'authority_generation','context generation is authoritative');
+ envelope:=maven.memory_request('/v1/memory/project_context',jsonb_build_object('project_id',project,'session_id',requester->'record_id'),NULL,NULL,'fixture-reader',4);
+ PERFORM pg_temp.assert_equal(envelope->'result'->'latest_handover'->'summary','"Main work handover"','dispatched project context');
+ envelope:=maven.memory_request('/v1/memory/revisions',jsonb_build_object('record_ids',jsonb_build_array(a->'record_id')),NULL,NULL,'fixture-reader',4);
+ PERFORM pg_temp.assert_equal(envelope->'result'->'revisions'->(a->>'record_id'),'1','dispatched revisions');
+ PERFORM pg_temp.assert_equal(maven.memory_request('/v1/unknown','{}',NULL,NULL,'fixture-reader',4)->'result','{"status":"invalid_request"}','unknown route');
+ write_request:=pg_temp.request('note','{"title":"Dispatched","body_markdown":"one call","category":"reference"}');
+ envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
+ PERFORM pg_temp.assert_equal(envelope->'result'->'revision','1','dispatched write');
+ envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
+ PERFORM pg_temp.assert_equal(envelope->'result'->'replayed','true','dispatched write replays');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',write_request->'record_id'))->'actor_id','"fixture-owner"','dispatched provenance');
+ -- Governed writes assert their authority generation under a share lock; stale writes commit nothing.
+ write_request:=pg_temp.request('note','{"title":"Governed","body_markdown":"current authority","category":"reference"}')
+   || jsonb_build_object('authority_generation',generation_value);
+ envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
+ PERFORM pg_temp.assert_equal(envelope->'result'->'revision','1','current generation commits');
+ UPDATE maven.instruction_state SET generation=generation+1 WHERE singleton;
+ envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
+ PERFORM pg_temp.assert_equal(envelope->'result'->'replayed','true','committed request replays after authority moves');
+ write_request:=pg_temp.request('note','{"title":"Stale","body_markdown":"superseded authority","category":"reference"}')
+   || jsonb_build_object('authority_generation',generation_value);
+ envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
+ PERFORM pg_temp.assert_equal(jsonb_build_object('generation',envelope->'authority_generation','result',envelope->'result'),
+   jsonb_build_object('generation',generation_value+1,'result','{"status":"context_stale"}'::jsonb),'stale write refused with current generation');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',write_request->'record_id')),
+   '{"status":"record_unavailable"}','stale write committed nothing');
+ IF EXISTS (SELECT 1 FROM maven.memory_receipts WHERE request_key=(write_request->>'request_key')::uuid) THEN
+   RAISE EXCEPTION 'stale write left a receipt';
+ END IF;
+ envelope:=maven.memory_request('/v1/memory/write',write_request || jsonb_build_object('authority_generation','1'),
+   NULL,NULL,'fixture-owner',4);
+ PERFORM pg_temp.assert_equal(envelope->'result','{"status":"invalid_request"}','non-numeric generation refused');
+ UPDATE maven.instruction_state SET generation=generation-1 WHERE singleton;
+ UPDATE maven.service_state SET state='maintenance' WHERE singleton;
+ envelope:=maven.memory_request('/v1/memory/read',jsonb_build_object('record_id',a->'record_id'),NULL,NULL,'fixture-reader',4);
+ PERFORM pg_temp.assert_equal(jsonb_build_object('state',envelope->'service_state'->'state','result',envelope->'result'),
+   '{"state":"maintenance","result":null}','maintenance never runs a route');
+ UPDATE maven.service_state SET state='ready' WHERE singleton;
+ envelope:=maven.memory_request('/v1/memory/read',jsonb_build_object('record_id',a->'record_id'),NULL,NULL,'fixture-reader',3);
+ PERFORM pg_temp.assert_equal(envelope->'result','{"status":"client_incompatible"}','old protocol refused');
+ PERFORM set_config('maven.client_protocol','4',true);
+END $$;
+"""
+
+SQL_DISPATCH_ROLE = r"""
+CREATE ROLE maven_dispatch_fixture;
+GRANT USAGE ON SCHEMA maven TO maven_dispatch_fixture;
+GRANT EXECUTE ON FUNCTION maven.memory_request(text,jsonb,text,text,text,integer),maven.memory_service_state() TO maven_dispatch_fixture;
+SET LOCAL ROLE maven_dispatch_fixture;
+DO $$
+BEGIN
+ IF jsonb_typeof(maven.memory_request('/v1/memory/search','{"query":"ble"}',NULL,NULL,'fixture-reader',4)->'result'->'records')<>'array' THEN
+   RAISE EXCEPTION 'application role cannot dispatch';
+ END IF;
+ IF maven.memory_service_state()->'service_state'->>'data_scope' IS DISTINCT FROM 'owner_memory' THEN
+   RAISE EXCEPTION 'application role cannot read locked service state';
+ END IF;
+ BEGIN
+   PERFORM maven.memory_project_context('{}');
+   RAISE EXCEPTION 'route function directly executable';
+ EXCEPTION WHEN insufficient_privilege THEN NULL;
+ END;
+ BEGIN
+   PERFORM maven.memory_snippet('x','{}');
+   RAISE EXCEPTION 'helper directly executable';
+ EXCEPTION WHEN insufficient_privilege THEN NULL;
+ END;
+END $$;
+RESET ROLE;
+"""
+
 SQL_APPLICATION_STATE_LOCK = r"""
 CREATE ROLE maven_state_guard_fixture;
 GRANT USAGE ON SCHEMA maven TO maven_state_guard_fixture;
@@ -747,13 +1014,16 @@ class OwnerPostgreSQLTests(unittest.TestCase):
                            "(SELECT id FROM maven.memory_items WHERE data->>'title'='Corrected'),'revision',1))")
         once_expression = "jsonb_build_object('sequence',nextval('fixture_evaluation'),'body',repeat('x',70000))"
         statements.extend([
-            "SELECT set_config('maven.client_protocol','3',true);", SQL_HELPERS,
+            "SELECT set_config('maven.client_protocol','4',true);", SQL_HELPERS,
             "SAVEPOINT native_checkpoints;", SQL_NATIVE_CHECKPOINTS,
             "ROLLBACK TO SAVEPOINT native_checkpoints; RELEASE SAVEPOINT native_checkpoints;",
             "SAVEPOINT skill_bundles;", SQL_SKILL_BUNDLES,
             "ROLLBACK TO SAVEPOINT skill_bundles; RELEASE SAVEPOINT skill_bundles;",
             "SAVEPOINT named_skill_context;", SQL_NAMED_SKILL_CONTEXT,
             "ROLLBACK TO SAVEPOINT named_skill_context; RELEASE SAVEPOINT named_skill_context;", SQL_BEHAVIOR,
+            "SAVEPOINT performance; SET CONSTRAINTS ALL DEFERRED;", SQL_PERFORMANCE,
+            "SET CONSTRAINTS ALL IMMEDIATE;", SQL_DISPATCH_ROLE,
+            "ROLLBACK TO SAVEPOINT performance; RELEASE SAVEPOINT performance;",
             "CREATE TEMP TABLE fixture_wire AS " + store.json_result_sql(read_expression) + ";",
             "CREATE TEMP SEQUENCE fixture_evaluation;",
             "CREATE TEMP TABLE fixture_once AS " + store.json_result_sql(once_expression) + ";",

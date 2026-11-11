@@ -78,6 +78,20 @@ class LocalUpdateTests(unittest.TestCase):
             write_skill(modified, plan[1][1], plan[1][2])
         self.assertEqual(modified.read_bytes(), b'owner edit')
 
+    def test_owned_guidance_block_is_upgraded_and_edited_block_is_preserved(self):
+        from tools.harness import _block, _text_change
+        path = self.base / 'AGENTS.md'
+        old = '\n' + _block('old guidance')
+        path.write_text('# Mine\n' + old)
+        path.chmod(0o600)
+        prior = {'path': str(path), 'format': 'text-block', 'key': 'maven', 'value': old, 'created': False}
+        change = _text_change(path, 'new guidance', prior=prior)
+        self.assertEqual(change.after.decode(), '# Mine\n\n' + _block('new guidance'))
+        self.assertEqual(change.receipt['value'], '\n' + _block('new guidance'))
+        path.write_text('# Mine\n' + old.replace('old guidance', 'owner edit'))
+        with self.assertRaisesRegex(ValueError, 'differs'):
+            _text_change(path, 'new guidance', prior=prior)
+
 
 class CloudInspectionTests(unittest.TestCase):
     def test_only_data_resource_removal_or_replacement_is_a_risk(self):

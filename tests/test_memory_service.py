@@ -2,11 +2,14 @@
 
 import base64
 from io import BytesIO
+import hashlib
 import json
 import unittest
 from unittest.mock import Mock, patch
 
 from tools.memory import admin, service, store, validation
+
+REAL_MAKE_STORE = service.make_store
 
 INSTANCE = "10000000-0000-4000-8000-000000000001"
 EPOCH = "10000000-0000-4000-8000-000000000002"
@@ -52,7 +55,7 @@ def resolution():
 
 def event(body=None, path="/v1/records/change"):
     return {"rawPath": path, "rawQueryString": "", "body": json.dumps(change() if body is None else body),
-            "headers": {"x-maven-memory-protocol": "3"},
+            "headers": {"x-maven-memory-protocol": str(validation.CLIENT_PROTOCOL)},
             "requestContext": {"http": {"method": "POST"},
                                "authorizer": {"iam": {"userArn": ACTOR}}}}
 
@@ -274,11 +277,12 @@ class HandlerTests(unittest.TestCase):
         self.factory.assert_not_called()
 
     def test_owner_scope_only_reaches_instruction_creation(self):
-        self.factory.return_value.perform.return_value = {}
+        self.factory.return_value.perform.return_value = ({}, 7)
         body = proposal()
         body["data_scope"] = "owner"
         self.assertEqual(service.handler(event(body, "/v1/proposals/create"), None)["statusCode"], 200)
-        self.factory.return_value.perform.assert_called_once_with("/v1/proposals/create", body, ACTOR, client_protocol=3)
+        self.factory.return_value.perform.assert_called_once_with("/v1/proposals/create", body, ACTOR,
+                                                                  client_protocol=validation.CLIENT_PROTOCOL)
         self.factory.reset_mock()
         body = change()
         body["data_scope"] = "owner"
@@ -310,16 +314,17 @@ class HandlerTests(unittest.TestCase):
                 request["headers"] = {"userArn": APPROVAL_ACTOR}
                 self.assertEqual(service.handler(request, None)["statusCode"], 403)
                 self.factory.assert_not_called()
-        self.factory.return_value.perform.return_value = {}
+        self.factory.return_value.perform.return_value = ({}, 7)
         for path, body in [("/v1/proposals/challenge", {"proposal_id": EPOCH}),
                            ("/v1/proposals/resolve", resolution())]:
             request = event(body, path)
             request["requestContext"]["authorizer"]["iam"]["userArn"] = APPROVAL_ACTOR
             self.assertEqual(service.handler(request, None)["statusCode"], 200)
-            self.factory.return_value.perform.assert_called_with(path, body, APPROVAL_ACTOR, client_protocol=3)
+            self.factory.return_value.perform.assert_called_with(path, body, APPROVAL_ACTOR,
+                                                                 client_protocol=validation.CLIENT_PROTOCOL)
 
     def test_lookup_allows_either_role_but_ordinary_routes_require_client(self):
-        self.factory.return_value.perform.return_value = {}
+        self.factory.return_value.perform.return_value = ({}, 7)
         for actor in (ACTOR, APPROVAL_ACTOR):
             request = event({"request_key": KEY}, "/v1/operations/lookup")
             request["requestContext"]["authorizer"]["iam"]["userArn"] = actor
@@ -345,14 +350,15 @@ class HandlerTests(unittest.TestCase):
     def test_large_utf8_proposal_accepts_plain_and_base64_body(self):
         body = proposal()
         body["candidate"]["body_markdown"] = "😀" * (validation.MAX_BODY_BYTES // 4)
-        self.factory.return_value.perform.return_value = {}
+        self.factory.return_value.perform.return_value = ({}, 7)
         for encoded in (False, True):
             request = event(body, "/v1/proposals/create")
             if encoded:
                 request["body"] = base64.b64encode(request["body"].encode()).decode()
                 request["isBase64Encoded"] = True
             self.assertEqual(service.handler(request, None)["statusCode"], 200)
-            self.factory.return_value.perform.assert_called_with("/v1/proposals/create", body, ACTOR, client_protocol=3)
+            self.factory.return_value.perform.assert_called_with("/v1/proposals/create", body, ACTOR,
+                                                                 client_protocol=validation.CLIENT_PROTOCOL)
 
     def test_raw_request_size_and_encoding_fail_closed(self):
         for path, maximum in [("/v1/records/change", 8192),
@@ -384,6 +390,55 @@ class HandlerTests(unittest.TestCase):
             self.assertEqual(result["statusCode"], status)
             self.assertEqual(json.loads(result["body"]), {"status": code, "request_key": KEY})
 
+    def test_success_carries_generation_and_validation_detail_names_fields(self):
+        self.factory.return_value.perform.return_value = ({"records": []}, 11)
+        result = service.handler(event({"query": "ble"}, "/v1/memory/search"), None)
+        self.assertEqual(json.loads(result["body"]),
+                         {"status": "ready", "data": {"records": []}, "authority_generation": 11})
+        self.factory.reset_mock()
+        body = {"query": "private-value", "after_id": RECORD}
+        result = service.handler(event(body, "/v1/memory/search"), None)
+        detail = json.loads(result["body"])["detail"]
+        self.assertEqual(result["statusCode"], 422)
+        self.assertIn("after_id", detail)
+        self.assertNotIn("private-value", detail)
+        self.factory.assert_not_called()
+
+    def test_new_memory_routes_are_client_role_only(self):
+        self.factory.return_value.perform.return_value = ({"revisions": {}}, 3)
+        for path, body in [("/v1/memory/project_context", {"project_id": RECORD, "session_id": KEY}),
+                           ("/v1/memory/revisions", {"record_ids": [RECORD]})]:
+            with self.subTest(path=path):
+                self.assertEqual(service.handler(event(body, path), None)["statusCode"], 200)
+                request = event(body, path)
+                request["requestContext"]["authorizer"]["iam"]["userArn"] = APPROVAL_ACTOR
+                self.assertEqual(service.handler(request, None)["statusCode"], 403)
+
+    def test_container_reuses_sdk_clients(self):
+        import boto3
+        service._CLIENTS.clear()
+        self.addCleanup(service._CLIENTS.clear)
+        with patch.object(boto3, "client") as client:
+            first, second = REAL_MAKE_STORE(CONFIG, None), REAL_MAKE_STORE(CONFIG, None)
+        self.assertEqual(sorted(call.args[0] for call in client.call_args_list), ["rds-data", "s3"])
+        self.assertIs(first.db.client, second.db.client)
+        self.assertIs(first.s3, second.s3)
+        self.assertIs(first.cache, service.CONTROL_CACHE)
+
+
+def wire_rows(document):
+    raw = json.dumps(document).encode()
+    checksum = hashlib.sha256(raw).hexdigest()
+    return {"records": [[{"longValue": offset + 1},
+                         {"stringValue": base64.b64encode(raw[offset:offset + store.JSON_CHUNK_BYTES]).decode("ascii")},
+                         {"longValue": len(raw)}, {"stringValue": checksum}]
+                        for offset in range(0, len(raw), store.JSON_CHUNK_BYTES)]}
+
+
+def envelope(result, *, state="ready", generation=5):
+    return {"service_state": store.control_document(CONFIG, state), "authority_generation": generation,
+            "result": result}
+
 
 class DataAPIContractTests(unittest.TestCase):
     def setUp(self):
@@ -391,12 +446,20 @@ class DataAPIContractTests(unittest.TestCase):
         self.data.begin_transaction.return_value = {"transactionId": "tx"}
         self.s3 = Mock()
         self.s3.get_object.side_effect = lambda **_: control_response()
-        self.storage = store.Store(CONFIG, self.data, self.s3)
+        self.cache = store.ControlCache()
+        self.storage = store.Store(CONFIG, self.data, self.s3, control_cache=self.cache)
 
     def script_result(self, result):
+        """Legacy /v1/records/* and lookup path: explicit transaction, unchanged statements."""
         self.data.execute_statement.side_effect = [
-            {}, scalar(store.control_document(CONFIG, "ready")), {},
-            {"records": [[{"booleanValue": True}]]}, scalar(result)]
+            {}, scalar(envelope(None)), {}, {"records": [[{"booleanValue": True}]]}, scalar(result)]
+
+    def dispatch(self, result, **kwargs):
+        self.data.execute_statement.side_effect = [wire_rows(envelope(result, **kwargs))]
+
+    def parameters(self):
+        return {item["name"]: item["value"].get("stringValue", item["value"].get("longValue"))
+                for item in self.data.execute_statement.call_args.kwargs["parameters"]}
 
     def test_owner_scope_and_candidate_hash_cross_database_boundary_unchanged(self):
         request = proposal()
@@ -406,13 +469,94 @@ class DataAPIContractTests(unittest.TestCase):
             "version": "1.0.0", "sha256": "a" * 64, "size_bytes": 123,
             "manifest_sha256": "b" * 64, "load_policy": "always",
         }
-        self.script_result({"proposal_id": EPOCH, "state": "pending"})
-        self.storage.perform("/v1/proposals/create", request, ACTOR)
-        parameters = {item["name"]: item["value"]["stringValue"]
-                      for item in self.data.execute_statement.call_args.kwargs["parameters"]}
+        self.dispatch({"proposal_id": EPOCH, "state": "pending"})
+        self.assertEqual(self.storage.perform("/v1/proposals/create", request, ACTOR),
+                         ({"proposal_id": EPOCH, "state": "pending"}, 5))
+        parameters = self.parameters()
+        self.assertIn("maven.memory_request(", self.data.execute_statement.call_args.kwargs["sql"])
+        self.assertEqual(parameters["route"], "/v1/proposals/create")
         self.assertEqual(json.loads(parameters["request"]), request)
         self.assertEqual(parameters["candidate_hash"], validation.digest(request["candidate"]))
-        self.assertEqual(parameters["hash"], validation.digest(request))
+        self.assertEqual(parameters["request_hash"], validation.digest(request))
+        self.assertEqual(parameters["protocol"], 1)
+
+    def test_read_is_one_data_api_call_and_reuses_control_briefly(self):
+        # Before migration 013 a read was begin, set_config, lock_service_state, set_config,
+        # memory_protocol_allowed, route statement and commit: seven Data API calls.
+        for _ in range(2):
+            self.dispatch({"records": [], "next_after_id": None, "next_offset": None}, generation=9)
+            result, generation = self.storage.perform("/v1/memory/search", {"query": "ble"}, ACTOR,
+                                                      client_protocol=4)
+            self.assertEqual(generation, 9)
+        self.assertEqual(self.data.execute_statement.call_count, 2)
+        self.data.begin_transaction.assert_not_called()
+        self.data.commit_transaction.assert_not_called()
+        self.assertNotIn("transactionId", self.data.execute_statement.call_args.kwargs)
+        self.assertEqual(self.s3.get_object.call_count, 1)
+        self.assertIsNone(self.parameters()["request_hash"])
+        self.cache.fetched_at -= store.CONTROL_TTL_SECONDS + 1
+        self.dispatch({"records": []})
+        self.storage.perform("/v1/memory/search", {}, ACTOR)
+        self.assertEqual(self.s3.get_object.call_count, 2)
+
+    def test_mutation_is_one_statement_inside_rollbackable_transaction(self):
+        self.cache.put(CONFIG, store.control_document(CONFIG, "ready"))
+        self.dispatch({"record_id": RECORD, "revision": 1, "request_key": KEY, "replayed": False})
+        result, generation = self.storage.perform("/v1/memory/write", {"request_key": KEY}, ACTOR)
+        self.assertEqual((result["revision"], generation), (1, 5))
+        self.assertEqual(self.data.execute_statement.call_count, 1)
+        self.assertEqual(self.data.execute_statement.call_args.kwargs["transactionId"], "tx")
+        self.data.begin_transaction.assert_called_once()
+        self.data.commit_transaction.assert_called_once()
+        # Mutations never trust the cache: control is fetched before and after the statement.
+        self.assertEqual(self.s3.get_object.call_count, 2)
+        self.dispatch({"record_id": RECORD, "revision": 1})
+        self.s3.get_object.side_effect = [control_response(), control_response("maintenance")]
+        with self.assertRaises(validation.MemoryError) as error:
+            self.storage.perform("/v1/memory/write", {"request_key": KEY}, ACTOR)
+        self.assertEqual(error.exception.status, "context_stale")
+        self.assertEqual(self.data.commit_transaction.call_count, 1)
+        self.data.rollback_transaction.assert_called_once()
+        self.assertIsNone(self.cache.get(CONFIG))
+
+    def test_database_state_mismatch_is_stale_and_clears_cache(self):
+        for document in [envelope({"records": []}, state="maintenance"),
+                         {**envelope({"records": []}), "service_state": {
+                             **store.control_document(CONFIG, "ready"), "recovery_epoch": RECORD}},
+                         {**envelope({"records": []}), "service_state": None}]:
+            self.data.execute_statement.side_effect = [wire_rows(document)]
+            with self.subTest(document=document["service_state"]), self.assertRaises(validation.MemoryError) as error:
+                self.storage.perform("/v1/memory/search", {}, ACTOR)
+            self.assertEqual(error.exception.status, "context_stale")
+            self.assertIsNone(self.cache.get(CONFIG))
+
+    def test_route_statuses_map_exactly_and_unknown_is_ambiguous(self):
+        for result, status, http in [({"status": "client_incompatible"}, "client_incompatible", 409),
+                                     ({"status": "record_unavailable"}, "record_unavailable", 404),
+                                     ({"status": "invalid_request"}, "invalid_request", 422),
+                                     ({"status": "surprise"}, "temporarily_unavailable", 503),
+                                     (None, "temporarily_unavailable", 503)]:
+            self.dispatch(result)
+            with self.subTest(result=result), self.assertRaises(validation.MemoryError) as error:
+                self.storage.perform("/v1/memory/read", {"record_id": RECORD}, ACTOR)
+            self.assertEqual((error.exception.status, error.exception.http_status), (status, http))
+        self.dispatch({"status": "revision_conflict", "current_revision": 3})
+        with self.assertRaises(validation.MemoryError) as error:
+            self.storage.perform("/v1/memory/write", {"request_key": KEY}, ACTOR)
+        self.assertEqual(error.exception.metadata, {"current_revision": 3})
+        self.data.commit_transaction.assert_not_called()
+
+    def test_legacy_routes_keep_explicit_transaction_and_report_generation(self):
+        self.script_result({"record_id": RECORD, "revision": 1, "request_key": KEY, "replayed": False})
+        result, generation = self.storage.perform("/v1/records/change", change(), ACTOR)
+        self.assertEqual((result["revision"], generation), (1, 5))
+        self.assertIn("maven.memory_service_state()",
+                      self.data.execute_statement.call_args_list[1].kwargs["sql"])
+        self.data.commit_transaction.assert_called_once()
+        # The pre-013 per-request sequence, still used only by /v1/records/* and lookup: 7 Data API calls.
+        calls = (self.data.begin_transaction.call_count + self.data.execute_statement.call_count
+                 + self.data.commit_transaction.call_count)
+        self.assertEqual(calls, 7)
 
     def test_legacy_rollout_is_admin_only_and_unknown_modes_fail_closed(self):
         legacy = {**store.control_document(CONFIG, "ready"), "data_scope": "synthetic"}

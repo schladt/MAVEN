@@ -28,19 +28,30 @@ CONFIG_KEYS = {'cluster_arn', 'app_secret_arn', 'admin_secret_arn', 'database',
                'journal_bucket', 'instance_id', 'recovery_epoch', 'region',
                'client_role_arn', 'admin_role_arn', 'approval_role_arn', 'endpoint', 'schema_version'}
 OPTIONAL_CONFIG_KEYS = {'skill_bucket'}
+# context_stale: the service refused or rolled back the write because authority or service
+# state changed under it; nothing committed.
 DEFINITIVE_MUTATION_ERRORS = frozenset({
     'revision_conflict', 'invalid_request', 'not_authorized', 'claim_conflict',
     'project_archived', 'idempotency_conflict', 'setting_conflict',
-    'reference_unavailable', 'session_unavailable',
+    'reference_unavailable', 'session_unavailable', 'context_stale',
 })
 
 
 class MemoryClientError(Exception):
-    """A deliberately content-free error, safe to return through agent tools."""
-    def __init__(self, code: str, *, request_key: str | None = None):
+    """A deliberately content-free error, safe to return through agent tools.
+
+    `detail` names only offending fields/kinds (never values), bounded by the service.
+    """
+    def __init__(self, code: str, *, request_key: str | None = None, detail: str | None = None):
         super().__init__(code)
         self.code = code
         self.request_key = request_key
+        self.detail = detail
+
+
+def _detail(result: dict) -> str | None:
+    value = result.get('detail')
+    return value if isinstance(value, str) and 0 < len(value) <= 200 else None
 
 
 def read_json(path: Path, *, maximum: int = MAX_RESPONSE) -> dict:
@@ -164,6 +175,8 @@ class MemoryClient:
         self.http.trust_env = False  # Do not forward signed requests through an ambient proxy.
         from .environment import transport_ca_bundle
         self.http.verify = transport_ca_bundle()
+        # Authority generation reported by the most recent successful response.
+        self.last_generation: int | None = None
 
     def close(self):
         self.http.close()
@@ -221,19 +234,28 @@ class MemoryClient:
             else:
                 code = result['status']
                 if status == 200 and code == 'ready' and isinstance(result.get('data'), dict):
-                    return result
+                    generation = result.get('authority_generation')
+                    self.last_generation = generation if type(generation) is int and generation >= 0 else None
+                    # A lookup receipt proves only that this key committed, not that it
+                    # committed this body; callers verify reconciled writes by read-back.
+                    return {**result, 'reconciled': True} if uncertain else result
                 if uncertain and status == 404:
                     # Absence may race an in-flight commit. Preserve the key for explicit same-request retry.
                     raise MemoryClientError('outcome_unknown', request_key=request_key)
                 if request_key and ((status >= 500 and code not in ('warming', 'context_stale')) or status == 200):
                     uncertain = True
                 elif status not in (429, 503) or code not in ('warming', 'temporarily_unavailable', 'rate_limited'):
+                    if uncertain:
+                        # Only a rejection of the original mutation proves nothing committed;
+                        # a rejected lookup leaves the outcome open and the journal in place.
+                        raise MemoryClientError('outcome_unknown', request_key=request_key)
                     allowed = DEFINITIVE_MUTATION_ERRORS | {
                         'record_unavailable', 'operation_unavailable', 'proposal_unavailable',
                         'page_unavailable', 'proposal_conflict', 'approval_invalid',
-                        'authentication_required', 'context_stale', 'client_incompatible',
+                        'authentication_required', 'client_incompatible',
                         'dependency_unavailable', 'dependency_conflict', 'context_incomplete'}
-                    raise MemoryClientError(code if code in allowed else 'service_failure', request_key=request_key)
+                    raise MemoryClientError(code if code in allowed else 'service_failure', request_key=request_key,
+                                            detail=_detail(result) if code in allowed else None)
             remaining = deadline-time.monotonic()
             if remaining > 0:
                 time.sleep(min(remaining, random.uniform(delay/2, delay)))
@@ -373,7 +395,11 @@ class MemoryClient:
                 'load_mode': 'synthetic_test_only'}
 
     def load_context(self, body: dict | None = None, *, budget: float = 90.0) -> dict:
-        """Load complete applicable approved authority, rejecting mixed generations."""
+        """Load complete applicable approved authority, rejecting mixed generations.
+
+        Inline bodies arrive in one consistent response; larger contexts fall back to
+        pinned chunked reads followed by a generation recheck.
+        """
         request = {} if body is None else dict(body)
         deadline = time.monotonic() + budget
 
@@ -423,6 +449,15 @@ class MemoryClient:
 
         for slug in catalog:
             visit(slug)
+        inline = context.get('bodies_inline', False)
+        if type(inline) is not bool:
+            raise MemoryClientError('invalid_service_response')
+        if inline:
+            # Bodies are returned once, in verified instructions; pages stay metadata.
+            return {**response, 'data': {
+                **context, 'pages': [{key: value for key, value in page.items() if key != 'body_markdown'}
+                                     for page in pages],
+                'instructions': [self._inline_page(catalog[slug], generation) for slug in ordered]}}
         instructions = []
         for slug in ordered:
             metadata = catalog[slug]
@@ -443,3 +478,33 @@ class MemoryClient:
                 or current.get('minimum_client_protocol') != context['minimum_client_protocol']):
             raise MemoryClientError('context_stale')
         return {**response, 'data': {**current, 'instructions': instructions}}
+
+    @staticmethod
+    def _inline_page(page: dict, generation: int) -> dict:
+        """Verify an inline body against its digest and the approved candidate content hash."""
+        from .validation import digest as candidate_digest
+        body, body_digest = page.get('body_markdown'), page.get('body_sha256')
+        if (not isinstance(body, str) or not body or not isinstance(body_digest, str)
+                or not re.fullmatch(r'[0-9a-f]{64}', body_digest)):
+            raise MemoryClientError('invalid_service_response')
+        try:
+            encoded = body.encode('utf-8')
+        except UnicodeError:
+            raise MemoryClientError('invalid_service_response') from None
+        if len(encoded) > 131072 or hashlib.sha256(encoded).hexdigest() != body_digest:
+            raise MemoryClientError('invalid_service_response')
+        if page.get('page_kind') not in ('directive', 'skill', 'procedure'):
+            raise MemoryClientError('instruction_not_loadable')
+        try:
+            candidate = {key: page[key] for key in ('slug', 'page_kind', 'title', 'scope')}
+            candidate.update(body_markdown=body, authority_state='active')
+            for key in ('requires', 'bundle'):
+                if key in page:
+                    candidate[key] = page[key]
+            if candidate_digest(candidate) != page['content_hash']:
+                raise MemoryClientError('invalid_service_response')
+        except (KeyError, ValueError, TypeError):
+            raise MemoryClientError('invalid_service_response') from None
+        # Context selects only active, operative, published owner pages.
+        return {**page, 'authority_state': 'active', 'candidate_authority_state': 'active',
+                'operative': True, 'authority_generation': generation}

@@ -16,7 +16,7 @@ import uuid
 from tools.coordination import private_lock, session_uuid
 from .boundary import BoundaryError, digest, private_path, read_private, save_private
 from .client import DEFINITIVE_MUTATION_ERRORS
-from .validation import reject_secrets, source as validate_source, text, validate
+from .validation import MemoryError, reject_secrets, source as validate_source, text, validate
 
 
 class MaintenanceError(BoundaryError):
@@ -25,6 +25,8 @@ class MaintenanceError(BoundaryError):
 
 TERMINAL = {'completed', 'superseded', 'cancelled'}
 ORDINARY_KINDS = {'entity', 'fact', 'relationship', 'task', 'decision', 'risk', 'note', 'setting', 'operation'}
+# apply returns with continue=true after this much work instead of outliving caller timeouts.
+APPLY_BUDGET_SECONDS = 20.0
 
 
 def now():
@@ -59,6 +61,7 @@ class Maintenance:
         self.lock = self.runtime + '/maintenance.lock'
         self.binding = {'root': str(self.root), 'session_id': self.session_id,
                         'project_id': self.project_id}
+        self.apply_budget = APPLY_BUDGET_SECONDS
 
     def _load(self):
         if not private_path(self.root, self.path).exists():
@@ -103,6 +106,13 @@ class Maintenance:
         return unique_refs(refs)
 
     @staticmethod
+    def _task_effects(item):
+        return [{'record': effect['record'], 'claim': deepcopy(effect.get('claim')),
+                 'task_state': effect.get('task_state'), 'claim_receipt': deepcopy(effect.get('claim_receipt'))}
+                for effect in item.get('effects', [])
+                if effect['state'] == 'saved' and 'task_action' in effect['request']]
+
+    @staticmethod
     def _brief(item):
         return {key: deepcopy(item[key]) for key in
                 ('operation_id', 'sequence', 'workstream', 'state', 'automatic', 'summary',
@@ -110,25 +120,63 @@ class Maintenance:
                      'saved_refs': Maintenance._refs(item),
                      'pending_effects': sum(effect['state'] not in ('saved', 'superseded')
                                             for effect in item.get('effects', [])),
-                     'task_effects': [{'record': effect['record'], 'claim': deepcopy(effect.get('claim')),
-                                       'task_state': effect.get('task_state'),
-                                       'claim_receipt': deepcopy(effect.get('claim_receipt'))}
-                                      for effect in item.get('effects', [])
-                                      if effect['state'] == 'saved' and 'task_action' in effect['request']]}
+                     'task_effects': Maintenance._task_effects(item)}
 
-    def status(self, operation_id=None):
+    @staticmethod
+    def _overview(item):
+        """Bounded progress summary; full effects (with request bodies) only on detail=True."""
+        counts = {'saved': 0, 'applying': 0, 'pending': 0, 'failed': 0}
+        for effect in item.get('effects', []):
+            bucket = {'saved': 'saved', 'applying': 'applying', 'uncertain': 'applying',
+                      'pending': 'pending', 'failed': 'failed'}.get(effect['state'])
+            if bucket:
+                counts[bucket] += 1
+        result = {'operation_id': item['operation_id'], 'workstream': item['workstream'],
+                  'state': item['state'], 'counts': counts, 'saved_refs': Maintenance._refs(item),
+                  'last_error': item.get('error'),
+                  'pending_effects': [effect['request']['record_id'] for effect in item.get('effects', [])
+                                      if effect['state'] not in ('saved', 'superseded')]}
+        task_effects = Maintenance._task_effects(item)
+        if task_effects:
+            # Workers need the returned fence to plan the next task phase.
+            result['task_effects'] = task_effects
+        return result
+
+    def _result(self, status, item, *, detail, **fields):
+        if detail:
+            return {'status': status, 'assignment': self._brief(item), **fields}
+        return {'status': status, **self._overview(item), **fields}
+
+    @staticmethod
+    def _checkpoint_overview(checkpoint):
+        return {key: deepcopy(checkpoint[key]) for key in
+                ('checkpoint_id', 'state', 'cutoff', 'created_at', 'completed_at', 'receipt') if key in checkpoint} | {
+                    'assignment_count': len(checkpoint['assignments']),
+                    'ref_count': len(checkpoint.get('refs', checkpoint['explicit_refs']))}
+
+    def status(self, operation_id=None, *, detail=False):
         with private_lock(self.root, self.lock):
             state = self._load()
             if operation_id:
-                return {'status': 'ready', 'live_state_checked': False,
-                        'assignment': deepcopy(self._get(state, operation_id))}
-            return {'status': 'paused' if state['paused'] else 'ready',
-                    'binding': dict(self.binding), 'live_state_checked': False,
-                    'automatic_updates': not state['paused'], 'pause_anchor': state['pause_anchor'],
-                    'catch_up': deepcopy(state['catch_up']),
-                    'assignments': [self._brief(item) for item in state['assignments'].values()],
-                    'checkpoints': [deepcopy(item) for item in state['checkpoints'].values()],
-                    'pending_count': sum(item['state'] not in TERMINAL for item in state['assignments'].values())}
+                item = self._get(state, operation_id)
+                if detail:
+                    return {'status': 'ready', 'live_state_checked': False, 'assignment': deepcopy(item)}
+                return {'status': 'ready', 'live_state_checked': False, **self._overview(item)}
+            result = {'status': 'paused' if state['paused'] else 'ready',
+                      'binding': dict(self.binding), 'live_state_checked': False,
+                      'automatic_updates': not state['paused'], 'pause_anchor': state['pause_anchor'],
+                      'catch_up': deepcopy(state['catch_up']),
+                      'pending_count': sum(item['state'] not in TERMINAL for item in state['assignments'].values())}
+            if detail:
+                return {**result, 'assignments': [self._brief(item) for item in state['assignments'].values()],
+                        'checkpoints': [deepcopy(item) for item in state['checkpoints'].values()]}
+            states = {}
+            for item in state['assignments'].values():
+                states[item['state']] = states.get(item['state'], 0) + 1
+            return {**result, 'assignment_states': states,
+                    'assignments': [self._overview(item) for item in state['assignments'].values()
+                                    if item['state'] not in TERMINAL],
+                    'checkpoints': [self._checkpoint_overview(item) for item in state['checkpoints'].values()]}
 
     def enqueue(self, intent, *, source, context='', workstream='project', automatic=True,
                 operation_id=None, supersede=False):
@@ -175,8 +223,8 @@ class Maintenance:
 
     def claim(self, operation_id, *, worker):
         text(worker, 160)
-        # Fresh approved context is a prerequisite to semantic work, not to queuing intent.
-        context = self.service.context()
+        # Current approved authority is a prerequisite to semantic work, not to queuing intent.
+        context_ref = self.service.authority_ref()
         with self._transaction() as state:
             item = self._get(state, operation_id)
             if state['paused'] and item['automatic']:
@@ -196,8 +244,10 @@ class Maintenance:
             if item['state'] == 'queued':
                 item['state'] = 'claimed'
             result = deepcopy(item)
-        return {'status': 'ready', 'assignment': result, 'context': context,
-                'instructions': 'Read current target records, reconcile only this intent, then apply exact revisions and complete. Do not activate instructions.'}
+        return {'status': 'ready', 'assignment': result, 'context_ref': context_ref,
+                'instructions': 'Read current target records, reconcile only this intent, then apply exact revisions '
+                                'and complete. Do not activate instructions. context_ref names the approved authority '
+                                'generation and pages governing this work; load bodies with maven_context if needed.'}
 
     def release(self, operation_id, *, worker_token, worker_stopped):
         if worker_stopped is not True:
@@ -257,16 +307,27 @@ class Maintenance:
                            ('record_id', 'expected_revision', 'source', 'request_key', 'lease_seconds', 'fence')
                            if key in body}
                 request.update(action=task_action, session_id=self.session_id, change_reason=body['reason'])
-                validate('/v1/memory/claim', request)
+                self._validate('/v1/memory/claim', request, index)
             else:
                 request = {key: body[key] for key in
                            ('kind', 'data', 'record_id', 'expected_revision', 'tags', 'source', 'request_key')}
                 request.update(classification='Sensitive', data_scope='owner', change_reason=body['reason'])
                 if scope == 'project':
                     request['project_id'] = self.project_id
-                validate('/v1/memory/write', request)
+                self._validate('/v1/memory/write', request, index)
             effects.append({'state': 'pending', 'request': body})
         return effects
+
+    @staticmethod
+    def _validate(route, request, index):
+        """Local schema check before any network call; the field-level detail names no values."""
+        from .client import MemoryClientError
+        try:
+            validate(route, request)
+        except MemoryError as error:
+            detail = error.metadata.get('detail')
+            raise MemoryClientError(error.status,
+                                    detail=f'changes[{index}]: {detail}'[:200] if detail else None) from None
 
     def _execute(self, request):
         if 'task_action' not in request:
@@ -306,7 +367,7 @@ class Maintenance:
             item['state'] = ('superseded' if item.get('superseded_by') else 'blocked') if definitive else 'uncertain'
             item['error'] = code
 
-    def apply(self, operation_id, *, worker_token, changes=None):
+    def apply(self, operation_id, *, worker_token, changes=None, detail=False):
         with self._transaction() as state:
             item = self._get(state, operation_id)
             self._worker(item, worker_token)
@@ -328,13 +389,15 @@ class Maintenance:
                     item['changes_digest'] = changes_digest
             if not item.get('changes_digest'):
                 raise MaintenanceError('a reconciled change set is required')
+        deadline = time.monotonic() + self.apply_budget
+        progressed = False
         while True:
             with self._transaction() as state:
                 item = self._get(state, operation_id)
                 self._worker(item, worker_token)
                 if item.get('superseded_by'):
                     item['state'] = 'superseded'
-                    return {'status': 'superseded', 'assignment': self._brief(item)}
+                    return self._result('superseded', item, detail=detail)
                 if state['paused'] and item['automatic']:
                     item['state'] = 'claimed'
                     return {'status': 'paused', 'operation_id': operation_id}
@@ -343,7 +406,13 @@ class Maintenance:
                     if any(effect['state'] in ('uncertain', 'applying', 'failed') for effect in item['effects']):
                         raise MaintenanceError('change set has an unresolved effect')
                     item['state'] = 'applied'
-                    return {'status': 'applied', 'cloud_saved': True, 'assignment': self._brief(item)}
+                    return self._result('applied', item, detail=detail, cloud_saved=True)
+                if progressed and time.monotonic() >= deadline:
+                    # No effect is in flight: the same worker continues with apply and no changes.
+                    return self._result('applying', item, detail=detail, cloud_saved=False, state='applying',
+                                        **{'continue': True}, next_action=(
+                                            'Call apply again with the same worker_token and no changes to continue; '
+                                            'poll status, never resubmit the change set.'))
                 effect['state'] = 'applying'
                 item['state'] = 'applying'
                 request = deepcopy(effect['request'])
@@ -361,13 +430,14 @@ class Maintenance:
                     item['scopes'].append(request['scope'])
                 item['state'] = 'claimed'
                 item.pop('error', None)
+            progressed = True
 
-    def revise(self, operation_id, *, worker_token, changes):
+    def revise(self, operation_id, *, worker_token, changes, detail=False):
         with self._transaction() as state:
             item = self._get(state, operation_id)
             self._worker(item, worker_token)
             if item.get('changes_digest') == digest(changes) and item['state'] in ('claimed', 'applied'):
-                return {'status': item['state'], 'assignment': self._brief(item)}
+                return self._result(item['state'], item, detail=detail)
             if item['state'] != 'applied' and not (item['state'] == 'blocked' and item.get('error') in DEFINITIVE_MUTATION_ERRORS):
                 raise MaintenanceError('a new plan requires a fully verified phase or a definitive conflict')
             if private_path(self.root, self.runtime + '/pending-memory.json').exists():
@@ -380,7 +450,7 @@ class Maintenance:
             item['changes_digest'] = digest(changes)
             item['state'] = 'claimed'
             item.pop('error', None)
-            return {'status': 'ready', 'assignment': self._brief(item)}
+            return self._result('ready', item, detail=detail)
 
     def complete(self, operation_id, *, worker_token, summary, no_changes=False):
         text(summary, 12000)
@@ -457,26 +527,64 @@ class Maintenance:
             item.pop('error', None)
             return {'status': item['state'], 'cloud_saved': True, 'assignment': self._brief(item)}
 
+    def _prevalidate(self, operation_id, source, change):
+        """Reject malformed explicit input before anything is queued or sent."""
+        validate_source(source)
+        with private_lock(self.root, self.lock):
+            state = self._load()
+            self._normalize_changes({'operation_id': operation_id, 'source': dict(source)}, [change], 1, state)
+
+    def _cancel_rejected(self, operation_id, error):
+        """A definitive rejection of an explicit request leaves nothing pending; uncertain
+        outcomes and persisted effects stay for exact recovery."""
+        if not (isinstance(error, (MaintenanceError, MemoryError))
+                or getattr(error, 'code', None) in DEFINITIVE_MUTATION_ERRORS):
+            return
+        with self._transaction() as state:
+            item = state['assignments'].get(operation_id)
+            if (item is None or item['state'] not in ('queued', 'claimed', 'blocked') or item.get('completion')
+                    or item.get('completion_request')
+                    or any(effect['state'] not in ('pending', 'failed', 'superseded') for effect in item['effects'])):
+                return
+            item.update(state='cancelled', cancelled_at=now(),
+                        error=getattr(error, 'code', None) or getattr(error, 'status', None) or 'rejected')
+            item.pop('worker_token', None)
+            item.pop('worker', None)
+
+    def _explicit(self, operation_id, worker, change, summary):
+        try:
+            token = self.claim(operation_id, worker=worker)['assignment']['worker_token']
+            self.apply(operation_id, worker_token=token, changes=[change])
+            return self.complete(operation_id, worker_token=token, summary=summary)
+        except Exception as error:
+            self._cancel_rejected(operation_id, error)
+            raise
+
+    @staticmethod
+    def _rejected(item):
+        if item['state'] == 'cancelled':
+            raise MaintenanceError('this explicit request was definitively rejected and cancelled; '
+                                   'correct it and retry with a new operation_id')
+
     def save(self, kind, data, *, source, scope='project', record_id=None,
              expected_revision=0, tags=(), reason='Explicitly save memory', operation_id=None, request_key=None):
+        operation_id = session_uuid(operation_id) if operation_id else str(uuid.uuid4())
         intent = {'kind': kind, 'data': data, 'scope': scope, 'record_id': record_id,
                   'expected_revision': expected_revision, 'tags': list(tags), 'request_key': request_key}
-        queued = self.enqueue(reason, source=source, context='Explicit save digest: ' + digest(intent),
-                              workstream='record:' + (record_id or 'new'), automatic=False,
-                              operation_id=operation_id, supersede=False)
-        operation_id = queued['assignment']['operation_id']
-        if queued['assignment']['state'] == 'completed':
-            return {'status': 'saved', 'cloud_saved': True, 'assignment': self._brief(queued['assignment'])}
-        claimed = self.claim(operation_id, worker='explicit-save')
-        token = claimed['assignment']['worker_token']
         change = {'kind': kind, 'data': data, 'scope': scope, 'expected_revision': expected_revision,
                   'tags': list(tags), 'reason': reason}
         if record_id:
             change['record_id'] = record_id
         if request_key is not None:
             change['request_key'] = request_key
-        self.apply(operation_id, worker_token=token, changes=[change])
-        result = self.complete(operation_id, worker_token=token, summary=reason)
+        self._prevalidate(operation_id, source, change)
+        queued = self.enqueue(reason, source=source, context='Explicit save digest: ' + digest(intent),
+                              workstream='record:' + (record_id or 'new'), automatic=False,
+                              operation_id=operation_id, supersede=False)
+        if queued['assignment']['state'] == 'completed':
+            return {'status': 'saved', 'cloud_saved': True, 'assignment': self._brief(queued['assignment'])}
+        self._rejected(queued['assignment'])
+        result = self._explicit(operation_id, 'explicit-save', change, reason)
         result['status'] = 'saved'
         return result
 
@@ -490,15 +598,15 @@ class Maintenance:
         change.update({key: value for key, value in
                        (('lease_seconds', lease_seconds), ('fence', fence), ('request_key', request_key))
                        if value is not None})
+        identifier = session_uuid(operation_id) if operation_id else str(uuid.uuid4())
+        self._prevalidate(identifier, source, change)
         queued = self.enqueue(reason, source=source, context='Task action digest: ' + digest(change),
                               workstream='record:' + record_id, automatic=False,
-                              operation_id=operation_id, supersede=False)
-        identifier = queued['assignment']['operation_id']
+                              operation_id=identifier, supersede=False)
         if queued['assignment']['state'] != 'completed':
-            token = self.claim(identifier, worker='explicit-task')['assignment']['worker_token']
-            self.apply(identifier, worker_token=token, changes=[change])
-            self.complete(identifier, worker_token=token, summary=reason)
-        item = self.status(identifier)['assignment']
+            self._rejected(queued['assignment'])
+            self._explicit(identifier, 'explicit-task', change, reason)
+        item = self.status(identifier, detail=True)['assignment']
         effect = next(effect for effect in item['effects'] if effect['state'] == 'saved')
         return {'status': 'saved', 'cloud_saved': True, 'assignment': self._brief(item),
                 'record': effect['record'], 'claim': effect['claim'], 'task_state': effect['task_state'],
@@ -513,12 +621,15 @@ class Maintenance:
                 state['pause_anchor'] = anchor
                 state['paused_at'] = now()
             state['paused'] = True
-            return {'status': 'paused', 'automatic_updates': False,
-                    'message': 'MAVEN: automatic memory updates paused. Submitted writes may finish; explicit operations remain available.',
-                    'pause_anchor': state['pause_anchor'], 'pending_count': sum(
-                        item['state'] not in TERMINAL for item in state['assignments'].values())}
+            result = {'status': 'paused', 'automatic_updates': False,
+                      'message': 'MAVEN: automatic memory updates paused. Submitted writes may finish; explicit operations remain available.',
+                      'pause_anchor': state['pause_anchor'], 'pending_count': sum(
+                          item['state'] not in TERMINAL for item in state['assignments'].values())}
+        self.service.invalidate(authority=False)
+        return result
 
-    def resume(self, *, fresh=False, discussion=None, source=None, context_complete=False):
+    def resume(self, *, fresh=False, discussion=None, source=None, context_complete=False,
+               nothing_to_record=False):
         if discussion is not None:
             text(discussion, 24000, empty=True)
             reject_secrets({'discussion': discussion, 'source': source})
@@ -528,6 +639,7 @@ class Maintenance:
                 return {'status': 'ready', 'automatic_updates': True, 'catch_up': deepcopy(state['catch_up'])}
             if fresh:
                 state.update(paused=False, catch_up=None, pause_anchor=None)
+                self.service.invalidate(authority=False)
                 return {'status': 'ready', 'automatic_updates': True, 'catch_up': None,
                         'message': 'MAVEN: automatic memory resumed fresh; paused discussion was not reviewed.'}
             if discussion is None:
@@ -538,6 +650,10 @@ class Maintenance:
             if source is None:
                 raise MaintenanceError('catch-up requires actual discussion provenance')
             validate_source(source)
+            if nothing_to_record and any(item['workstream'] == 'resume-catch-up' and item['state'] not in TERMINAL
+                                         for item in state['assignments'].values()):
+                raise MaintenanceError('an earlier catch-up is still pending; complete it before resuming '
+                                       'with nothing to record')
             operation_id = str(uuid.uuid4())
             result = self._enqueue(state, operation_id, {
                 'intent': 'Review available paused discussion and reconcile relevant authorized memory changes.',
@@ -548,7 +664,20 @@ class Maintenance:
             result.update(automatic_updates=True, context_complete=bool(context_complete),
                           message='MAVEN: memory resumed; catch-up queued.' if context_complete else
                           'MAVEN: memory resumed; catch-up covers available discussion only. Missing history is not reconstructed.')
+        self.service.invalidate(authority=False)
+        if not nothing_to_record:
             return result
+        # The caller reviewed the discussion and found nothing to record: complete inline.
+        token = self.claim(operation_id, worker='resume-catch-up')['assignment']['worker_token']
+        completed = self.complete(operation_id, worker_token=token, no_changes=True,
+                                  summary='Reviewed the available paused discussion; nothing needed recording.')
+        with self._transaction() as state:
+            if (state['catch_up'] or {}).get('operation_id') == operation_id:
+                state['catch_up']['state'] = 'completed'
+            catch_up = deepcopy(state['catch_up'])
+        return {'status': 'ready', 'automatic_updates': True, 'cloud_saved': True, 'catch_up': catch_up,
+                'context_complete': bool(context_complete), 'assignment': completed['assignment'],
+                'message': 'MAVEN: memory resumed; the paused discussion had nothing to record.'}
 
     def checkpoint(self, *, summary, refs=(), checkpoint_id=None, wait=False, wait_seconds=20):
         text(summary, 12000)

@@ -153,6 +153,15 @@ Installation/tool availability does not authorize capturing unrelated chats.
 - **“Pause automatic updates”** affects this session only; explicit operations remain
   available. **“Resume”** catches up from available discussion; **“Resume fresh”**
   does not look back. Missing context is disclosed.
+- After a harness restart the assistant checks `maven_status` before saying it is
+  connected and resumes only your exact session. Ask **“What instructions do you
+  have?”** to list active cloud instructions (`maven_instructions`). Answers say
+  whether they came from this conversation or were re-read from MAVEN.
+- Search is ranked with snippets; records tagged or stated `archived` drop out of
+  default results. Client/customer engagement details stay project-scoped. Standing
+  policies you state can be offered as instructions for future sessions.
+- In a folder that is not enabled, ask explicitly to **“use what MAVEN knows”** for a
+  read-only universal consultation that creates no session and captures nothing.
 - **“Wrap up”** closes this memory session after verified required writes, not other
   sessions or shared credentials. Summaries separate universal/project changes and
   pending work. Outages preserve private pending evidence, never a false saved claim.

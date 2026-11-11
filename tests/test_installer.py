@@ -105,7 +105,7 @@ class InstallerTests(unittest.TestCase):
             for home, identifier in zip(homes, identifiers):
                 save_private(home / 'runtime/setup/state.json', {'administration_operation': identifier})
                 save_private(home / 'runtime/administration' / (identifier + '.json'), {
-                    'state': 'blocked', 'step': 'identity_inspect', 'receipts': []})
+                    'state': 'blocked', 'step': 'identity_inspect', 'receipts': [], 'parameters': {'mode': 'update'}})
                 (home / '.env').write_text('MAVEN_AWS_PROFILE=owner\n')
                 (home / '.env').chmod(0o600)
             args = argparse.Namespace(home=homes[0])
@@ -116,6 +116,8 @@ class InstallerTests(unittest.TestCase):
                 install._options(args)
             self.assertEqual(args.home, homes[1])
             self.assertEqual(args.setup_operation, identifiers[1])
+            # Resume continues the unfinished operation in its own mode, not a connection check.
+            self.assertEqual(args.setup_mode, 'update')
             self.assertTrue(args.check_existing)
             self.assertFalse(args.local_only)
             self.assertEqual((homes[0] / '.env').read_text(), 'MAVEN_AWS_PROFILE=owner\n')

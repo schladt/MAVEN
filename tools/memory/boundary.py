@@ -1,6 +1,7 @@
 """Verified DB session/checkpoint receipts; local files are pointers, never authority."""
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import os
@@ -77,11 +78,21 @@ class MemoryBoundary:
         self.project_id = session_uuid(project_id)
         self.session_id = session_uuid(session_id)
         self.harness, self.harness_session = harness, harness_session
+        # Generation of the authority governing this boundary's writes; the service refuses a
+        # write made under any other generation (context_stale) and commits nothing.
+        self.authority_generation = None
         self.runtime = f'.maven/runtime/sessions/{self.session_id}'
         self.SESSION_PATH = self.runtime + '/session.json'
         self.pending_path = self.runtime + '/pending-memory.json'
 
     def invoke(self, route, body):
+        """Reject malformed requests with field-level detail before any network call."""
+        from .client import MemoryClientError
+        from .validation import MemoryError, validate
+        try:
+            validate('/v1/memory/' + route, body)
+        except MemoryError as error:
+            raise MemoryClientError(error.status, detail=error.metadata.get('detail')) from None
         result = self.client.invoke('/v1/memory/' + route, body)
         if result.get('status') != 'ready' or not isinstance(result.get('data'), dict):
             raise BoundaryError('memory service returned no verified result')
@@ -105,6 +116,7 @@ class MemoryBoundary:
         return record
 
     def _complete_request(self, route, body, result):
+        """Verify a reconciled receipt by exact read-back: a lookup proves the key, not this body."""
         record = self.read(body['record_id'], body['expected_revision'] + 1,
                            scope='universal' if route == 'write' and body.get('project_id') is None else 'context')
         if (result.get('record_id') != body['record_id'] or result.get('request_key') != body['request_key']
@@ -119,12 +131,7 @@ class MemoryBoundary:
         else:
             if record.get('kind') != 'task' or record['data']['state'] != result.get('state'):
                 raise BoundaryError('task claim state does not match exact read-back')
-            if body['action'] == 'claim':
-                if (result.get('session_id') != self.session_id or type(result.get('fence')) is not int
-                        or result['fence'] < 1 or not isinstance(result.get('expires_at'), str)):
-                    raise BoundaryError('task claim receipt has no verified fence')
-            elif result.get('session_id') is not None or result.get('fence') != body['fence']:
-                raise BoundaryError('task claim release receipt does not match request')
+            self._claim_receipt(body, result)
             # Historical versions deliberately omit mutable claims. The exact
             # operation receipt proves the old effect, not ownership of a live lease.
             current = self.read(body['record_id'], scope='context')
@@ -138,48 +145,99 @@ class MemoryBoundary:
                     raise BoundaryError('current task claim release does not match read-back')
                 record = current
             record = dict(record, claim_receipt=result)
+        return self._finish_request(route, body, record, result)
+
+    def _claim_receipt(self, body, result):
+        if body['action'] == 'claim':
+            if (result.get('session_id') != self.session_id or type(result.get('fence')) is not int
+                    or result['fence'] < 1 or not isinstance(result.get('expires_at'), str)):
+                raise BoundaryError('task claim receipt has no verified fence')
+        elif result.get('session_id') is not None or result.get('fence') != body['fence']:
+            raise BoundaryError('task claim release receipt does not match request')
+
+    def _complete_receipt(self, route, body, result, target):
+        """Bind a direct receipt to its exact request without a read-back.
+
+        The service commits exactly this body under its request key and CAS revision, and
+        replays only an identical canonical request; the record is the request applied.
+        """
+        if (result.get('record_id') != body['record_id'] or result.get('request_key') != body['request_key']
+                or type(result.get('revision')) is not int or result['revision'] != body['expected_revision'] + 1):
+            raise BoundaryError('memory mutation receipt does not match the request')
+        identity = {'record_id': body['record_id'], 'revision': result['revision']}
+        if route == 'write':
+            record = {**identity, 'kind': body['kind'], 'classification': body['classification'],
+                      'data_scope': body['data_scope'], 'project_id': body.get('project_id'),
+                      'data': deepcopy(body['data']), 'tags': list(body.get('tags', []))}
+        else:
+            state = {'claim': 'in_progress', 'complete': 'completed', 'release': 'open'}[body['action']]
+            if result.get('state') != state or target.get('kind') != 'task':
+                raise BoundaryError('task claim receipt does not match the requested transition')
+            self._claim_receipt(body, result)
+            claim = ({key: result[key] for key in ('session_id', 'fence', 'expires_at')}
+                     if body['action'] == 'claim' else None)
+            record = {**identity, **{key: deepcopy(target[key]) for key in
+                                     ('kind', 'classification', 'data_scope', 'project_id', 'tags')},
+                      'data': dict(deepcopy(target['data']), state=state), 'claim': claim,
+                      'claim_receipt': result}
+        return self._finish_request(route, body, record, result)
+
+    def _finish_request(self, route, body, record, result):
         save_private(self.root, self.runtime + '/last-memory-write.json', {
             'route': route, 'request_key': body['request_key'], 'record': self.ref(record), 'result': result})
         private_path(self.root, self.pending_path).unlink(missing_ok=True)
         return record
 
-    def _validate_request(self, route, body):
+    def _validate_request(self, route, body, *, target=None):
+        """Reject malformed mutations before any network call; returns a claim's exact target."""
+        from .client import MemoryClientError
         from .validation import MemoryError, validate
         if route not in ('write', 'claim'):
             raise BoundaryError('only typed memory mutations can use the session journal')
         try:
             validate('/v1/memory/' + route, body)
         except MemoryError as error:
-            raise BoundaryError('invalid typed memory mutation: ' + error.status) from None
+            raise MemoryClientError(error.status, detail=error.metadata.get('detail')) from None
         if route == 'write' and (body.get('project_id') not in (None, self.project_id)
                                 or body.get('classification') != 'Sensitive' or body.get('data_scope') != 'owner'):
             raise BoundaryError('memory mutation does not match selected project or universal scope')
         if route == 'claim' and body.get('session_id') != self.session_id:
             raise BoundaryError('task claim belongs to another session')
         if route == 'claim':
-            self.read(body['record_id'], body['expected_revision'], scope='context')
+            if target is None:
+                target = self.read(body['record_id'], body['expected_revision'], scope='context')
+            elif target.get('record_id') != body['record_id'] or target.get('revision') != body['expected_revision']:
+                raise BoundaryError('task claim target differs from the exact requested version')
         if route == 'write' and body['kind'] in ('session', 'checkpoint', 'operation'):
             if (body.get('project_id') != self.project_id or
                     (body['record_id'] if body['kind'] == 'session' else body['data']['session_id']) != self.session_id):
                 raise BoundaryError('lifecycle record belongs to another project or session')
+        return target
 
-    def _submit(self, route, body):
-        self._validate_request(route, body)
+    def _submit(self, route, body, *, target=None):
+        target = self._validate_request(route, body, target=target)
         if private_path(self.root, self.pending_path).exists():
             raise BoundaryError('an unresolved cloud request exists; run explicit recover before further writes')
+        if self.authority_generation is not None and 'authority_generation' not in body:
+            body = dict(body, authority_generation=self.authority_generation)
         request = {'route': route, 'body': body, 'session_id': self.session_id}
         request['digest'] = digest(request)
         save_private(self.root, self.pending_path, request)
         from .client import DEFINITIVE_MUTATION_ERRORS, MemoryClientError
         try:
-            result = self.invoke(route, body)
+            response = self.client.invoke('/v1/memory/' + route, body)
         except MemoryClientError as error:
             if error.code in DEFINITIVE_MUTATION_ERRORS:
                 save_private(self.root, self.runtime + '/failed-memory-write.json',
                              {'request': request, 'status': error.code})
                 private_path(self.root, self.pending_path).unlink()
             raise
-        return result, self._complete_request(route, body, result)
+        result = response.get('data')
+        if response.get('status') != 'ready' or not isinstance(result, dict):
+            raise BoundaryError('memory service returned no verified result')
+        if response.get('reconciled'):
+            return result, self._complete_request(route, body, result)
+        return result, self._complete_receipt(route, body, result, target)
 
     def submit(self, route, body):
         """Journal an exact caller-owned request key. Caller holds the session lock/writer guard."""
@@ -266,6 +324,7 @@ class MemoryBoundary:
                 or not any(page.get('page_kind') == 'directive' for page in instructions)
                 or type(data.get('authority_generation')) is not int):
             raise BoundaryError('required approved DB authority is missing')
+        self.authority_generation = data['authority_generation']
         return data
 
     @staticmethod
@@ -288,48 +347,50 @@ class MemoryBoundary:
         pointer = read_private(self.root, self.SESSION_PATH)
         if pointer.get('record_id') != self.session_id:
             raise BoundaryError('session pointer does not match the explicitly selected session')
-        record = self.read(self.session_id)
+        return self.verified_session(self.read(self.session_id), closed=closed)
+
+    def verified_session(self, record, *, closed=False):
+        """Check an already-read session record exactly as session() would."""
         meta = self.metadata(record)
-        if (record.get('kind') != 'session' or meta.get('root') != str(self.root)
+        if (record.get('record_id') != self.session_id or record.get('kind') != 'session'
+                or meta.get('root') != str(self.root)
                 or record['data']['state'] not in (('active', 'closed', 'abandoned') if closed else ('active',))):
             raise BoundaryError('an exact bound active cloud session is required')
         return record
 
-    def search(self, kind, state=None, *, scope='project'):
-        after = None
-        while True:
-            body = {'kind': kind, 'project_id': self.project_id, 'scope': scope, 'limit': 20}
-            if state is not None:
-                body['state'] = state
-            if after:
-                body['after_id'] = after
-            page = self.invoke('search', body)
-            for item in page['records']:
-                if item.get('data_scope') != 'owner':
-                    continue
-                record = self.read(item['record_id'], scope=scope)
-                if record['kind'] == kind and (state is None or record['data']['state'] == state):
-                    yield record
-            after = page['next_after_id']
-            if after is None:
-                return
-
     def project_context(self):
-        completed = []
-        peers = []
-        for record in self.search('session'):
-            if record['record_id'] == self.session_id:
-                continue
-            if record['data']['state'] == 'closed' and record['data'].get('workflow') == 'maven-workflow':
-                completed.append(record)
-            elif record['data']['state'] == 'active':
-                peers.append(record)
-        completed.sort(key=lambda record: (
-            self.metadata(record).get('completed_at') or record.get('recorded_at', ''), record['record_id']), reverse=True)
-        return {'previous_handover': completed[0] if completed else None,
-                'tasks': [record for record in self.search('task', scope='context')
-                          if record['data']['state'] in ('open', 'in_progress', 'blocked')],
-                'blockers': list(self.search('risk', 'open', scope='context')), 'active_peers': peers}
+        """Latest handover across the project, peers, open work and owner preferences in one request."""
+        data = self.invoke('project_context', {'project_id': self.project_id, 'session_id': self.session_id})
+        handover = data.get('latest_handover')
+        lists = ('active_peers', 'tasks', 'blockers', 'owner_preferences')
+        if ((handover is not None and not isinstance(handover, dict))
+                or any(not isinstance(data.get(key), list)
+                       or any(not isinstance(item, dict) for item in data[key]) for key in lists)
+                or any(peer.get('session_id') == self.session_id for peer in data['active_peers'])):
+            raise BoundaryError('memory service returned no verified project context')
+        return {'latest_handover': handover, **{key: data[key] for key in lists}}
+
+    def revisions(self, record_ids):
+        """Current visible revision per record, one request per hundred identifiers."""
+        identifiers = list(dict.fromkeys(record_ids))
+        result = {}
+        for start in range(0, len(identifiers), 100):
+            chunk = identifiers[start:start + 100]
+            revisions = self.invoke('revisions', {'record_ids': chunk}).get('revisions')
+            if (not isinstance(revisions, dict) or set(revisions) - set(chunk)
+                    or any(type(value) is not int or value < 1 for value in revisions.values())):
+                raise BoundaryError('memory service returned no verified revisions')
+            result.update(revisions)
+        return result
+
+    def verify_refs(self, refs, *, current=False, message='memory reference is unavailable or changed'):
+        """Exact versions must exist (current=True: still be latest) without one read per reference."""
+        revisions = self.revisions([ref['record_id'] for ref in refs])
+        for ref in refs:
+            actual = revisions.get(ref['record_id'])
+            if actual is None or (actual != ref['revision'] if current else actual < ref['revision']):
+                raise BoundaryError(message)
+        return revisions
 
     def start(self, git_base):
         context = self.context()
@@ -368,10 +429,9 @@ class MemoryBoundary:
         context = self.context()
         if len(refs) > 99:
             raise BoundaryError('too many checkpoint memory references')
-        for ref in refs:
-            current = self.read(ref['record_id'])
-            if current['revision'] != ref['revision'] or current['kind'] in ('session', 'checkpoint'):
-                raise BoundaryError('summary memory references must be current work records')
+        if any(ref['record_id'] == self.session_id for ref in refs):
+            raise BoundaryError('summary memory references must be current work records')
+        self.verify_refs(refs, current=True, message='summary memory references must be current work records')
         meta = self.metadata(record)
         meta.update(git_base=git_base, candidate_digest=candidate_digest, authority=self.authority(context),
                     phase='summarized', summary=summary, memory_refs=refs, writers_quiescent=True,
@@ -396,9 +456,8 @@ class MemoryBoundary:
                     or meta.get('reservation_id') != reservation_id
                     or meta.get('authority') != self.authority(self.context())):
                 return ['DB session summary is stale for this candidate, reservation or authority']
-            for ref in meta.get('memory_refs', []):
-                if self.read(ref['record_id'])['revision'] != ref['revision']:
-                    return ['DB work reference changed after the session summary']
+            self.verify_refs(meta.get('memory_refs', []), current=True,
+                             message='DB work reference changed after the session summary')
             return []
         except BoundaryError as error:
             return [str(error)]
@@ -437,12 +496,18 @@ class MemoryBoundary:
                 or not resume and current['revision'] != ref['revision']
                 or self.metadata(original)['authority'] != self.authority(self.context())):
             raise BoundaryError('DB checkpoint receipt is stale or does not match the exact proposal')
+        revisions = self.revisions([memory_ref['record_id'] for memory_ref in data['memory_refs']])
         for memory_ref in data['memory_refs']:
-            actual = self.read(memory_ref['record_id'])
-            if resume and actual['record_id'] == self.session_id and self.metadata(actual).get('last_checkpoint') == ref:
-                actual = self.read(memory_ref['record_id'], memory_ref['revision'])
-            if actual['revision'] != memory_ref['revision']:
-                raise BoundaryError('required DB memory receipt changed after approval')
+            actual = revisions.get(memory_ref['record_id'])
+            if actual == memory_ref['revision']:
+                continue
+            # Resuming after closure advanced only this session record past the approved
+            # version; retained history still proves the approved version.
+            if (resume and memory_ref['record_id'] == self.session_id and actual is not None
+                    and actual > memory_ref['revision']
+                    and self.metadata(self.read(self.session_id)).get('last_checkpoint') == ref):
+                continue
+            raise BoundaryError('required DB memory receipt changed after approval')
         return current
 
     def link_checkpoint(self, proposal, commit, remote):

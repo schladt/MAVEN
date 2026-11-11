@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from functools import wraps
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -16,11 +17,11 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import BaseModel, ConfigDict, Field
 
 from tools.administration import AdminInputError
-from tools.coordination import session_uuid
+from tools.coordination import SessionBusy, session_uuid
 from tools.memory.boundary import BoundaryError, digest, private_path, read_private, save_private
 from tools.memory.client import MemoryClientError
 from tools.memory.maintenance import Maintenance, MaintenanceError
-from tools.memory.validation import MemoryError
+from tools.memory.validation import MEMORY_DATA_FIELDS, MemoryError
 from tools.project import ProjectError, instance_home
 from tools.setup_common import SetupPending
 
@@ -52,7 +53,43 @@ Git publication is optional through maven_git and requires exact review/approval
 push or back up source files. Cloud migrations and active instruction changes require separate approval.
 During outages preserve accepted local operations and say pending/degraded; required current authority
 cannot be replaced by cached instructions. Recover original requests explicitly, never by minting new IDs.
+After a harness restart check maven_status before saying connected; resume only the exact listed session.
+List cloud instructions with maven_instructions. Say whether a memory answer came from this conversation
+or was re-read from MAVEN. Unbound universal consultation is read-only and needs explicit owner intent.
 """
+
+
+AVAILABILITY_CODES = frozenset({'warming', 'temporarily_unavailable', 'transport_unavailable',
+                                'outcome_unknown', 'rate_limited', 'service_failure'})
+ADMIN_DETAIL_KEYS = ('choice_checkpoints', 'responses', 'navigation', 'retired_interactions')
+KEEP_WARM_SECONDS = 240
+
+
+def _data_fields():
+    lines = []
+    for kind in sorted(MEMORY_DATA_FIELDS):
+        fields = MEMORY_DATA_FIELDS[kind]
+        lines.append(f"{kind}: required {', '.join(fields.get('required', [])) or 'none'}; "
+                     f"optional {', '.join(fields.get('optional', [])) or 'none'}")
+    return '\n'.join(lines)
+
+
+RECORD_MODEL = f"""Per-kind data fields (change.data):
+{_data_fields()}
+Limits: at most 50 changes per maintenance apply/revise, at most 100 checkpoint refs, tags at most 20.
+subject_id (where a kind accepts it) must name an existing entity record, not a note or other kind.
+Mark obsolete records with tag 'archived' or data.state 'archived'; search excludes them by default.
+Rejections return error/detail naming the problem field; fix the input instead of retrying unchanged."""
+
+
+def _available(code):
+    return code in AVAILABILITY_CODES or code.startswith('selected_login_')
+
+
+def _without_admin_detail(result):
+    if isinstance(result, dict):
+        return {key: value for key, value in result.items() if key not in ADMIN_DETAIL_KEYS}
+    return result
 
 
 class Source(BaseModel):
@@ -123,6 +160,9 @@ class MavenApplication:
         self.initialized = False
         self._resume_initialization = False
         self._lock = threading.RLock()
+        self._unbound_client = None
+        self._warm_stop = threading.Event()
+        self._warm_thread = None
 
     def initialize(self, root, *, harness='mcp', harness_session=None, session_id=None,
                    resume=False, assignment_id=None):
@@ -198,6 +238,7 @@ class MavenApplication:
                          {**self.binding, 'initialized': True})
         self.initialized = True
         self._resume_initialization = True
+        self._start_keep_warm()
         return {'status': 'ready', 'binding': dict(self.binding), 'memory': result,
                 'automatic_updates': state['automatic_updates'], 'pending_count': state['pending_count'],
                 'assignment_id': self.assignment_id,
@@ -226,9 +267,79 @@ class MavenApplication:
         from tools.administration import AdminOperations
         return (self.admin_factory or AdminOperations)(self.home)
 
+    def keep_warm_enabled(self):
+        value = os.environ.get('MAVEN_KEEP_WARM')
+        if value is None and self.env.exists():
+            try:
+                from tools.memory.environment import load_environment
+                value = load_environment(self.env).get('MAVEN_KEEP_WARM')
+            except Exception:
+                value = None
+        return value == '1'
+
+    def _start_keep_warm(self):
+        # Optional (default off): each ping is a billed request that keeps the database awake.
+        if self._warm_thread is not None or not self.keep_warm_enabled():
+            return
+        thread = threading.Thread(target=self._keep_warm, name='maven-keep-warm', daemon=True)
+        self._warm_thread = thread
+        thread.start()
+
+    def _keep_warm(self):
+        while not self._warm_stop.wait(KEEP_WARM_SECONDS):
+            service = self.service
+            client = getattr(service, 'client', None)
+            if not self.initialized or client is None:
+                continue
+            try:
+                client.invoke('/v1/pages/index', {'limit': 1})
+            except Exception:
+                pass  # Best effort; real calls report availability themselves.
+
+    def unbound_client(self):
+        """Read-only client from the home environment: no session, binding or capture."""
+        with self._lock:
+            if self._unbound_client is None:
+                from tools.memory.environment import configured_client
+                self._unbound_client = configured_client(self.env)
+            return self._unbound_client
+
+    def sign_in(self):
+        """Exact daily-use sign-in into MAVEN's private login cache; None when not configured."""
+        from tools.memory.environment import load_environment, sign_in
+        try:
+            values = load_environment(self.env)
+            if not values.get('MAVEN_AWS_PROFILE') or not values.get('MAVEN_AWS_LOGIN_CACHE'):
+                return None
+            exact = sign_in(values)
+        except (OSError, ValueError, KeyError, MemoryClientError):
+            return None
+        return {'profile': exact['profile'], 'command': exact['command'],
+                'note': 'Run in a terminal; a plain `aws login` is not read by MAVEN. Never enter credentials in chat.'}
+
+    def rebind_hint(self, start=None):
+        from tools.memory.lifecycle import registered_sessions
+        directory = Path(start or Path.cwd()).resolve()
+        root = next((candidate for candidate in (directory, *directory.parents)
+                     if (candidate / '.maven/project.json').is_file()), None)
+        if root is None:
+            return None
+        sessions = [{'session_id': item.get('session_id'), 'harness': item.get('harness')}
+                    for item in registered_sessions(root) if item.get('state') == 'active']
+        if not sessions:
+            return None
+        return {'root': str(root), 'active_sessions': sessions,
+                'next_action': 'This MCP process is not bound. Ask the owner which exact session to continue, '
+                               'then call maven_initialize with that root, session_id and resume=true; '
+                               'never pick the newest session or report connected before it returns ready.'}
+
     def close(self):
+        self._warm_stop.set()
         if self.service is not None:
             self.service.close()
+        if self._unbound_client is not None:
+            self._unbound_client.close()
+            self._unbound_client = None
 
 class MavenMCPServer(MCPServer):
     async def call_tool(self, name, arguments, context=None):
@@ -259,10 +370,34 @@ def create_server(application=None):
             try:
                 return function(*args, **kwargs)
             except MemoryClientError as error:
-                return {'status': 'uncertain' if error.code == 'outcome_unknown' else 'blocked',
-                        'error': error.code, 'request_key': error.request_key,
-                        'binding': app.binding, 'cloud_saved': False,
-                        'message': 'MAVEN: memory unavailable or blocked; preserve pending operations and inspect status.'}
+                if error.code == 'selected_login_unavailable_or_expired':
+                    exact = app.sign_in()
+                    return {'status': 'blocked', 'error': error.code, 'request_key': error.request_key,
+                            'binding': app.binding, 'cloud_saved': False, 'sign_in': exact,
+                            'message': 'MAVEN: the daily-use AWS sign-in is missing or expired. Ask the owner to run '
+                                       + (f'`{exact["command"]}`' if exact else 'the MAVEN sign-in for this home')
+                                       + ' in a terminal (a plain `aws login` is not read by MAVEN), then retry the '
+                                       'same request. Pending operations are preserved.'}
+                if _available(error.code):
+                    return {'status': 'uncertain' if error.code == 'outcome_unknown' else 'blocked',
+                            'error': error.code, 'request_key': error.request_key,
+                            'binding': app.binding, 'cloud_saved': False,
+                            'message': 'MAVEN: memory unavailable; preserve pending operations and inspect status.'}
+                if error.code == 'context_stale':
+                    return {'status': 'error', 'error': 'context_stale', 'request_key': error.request_key,
+                            'binding': app.binding, 'cloud_saved': False,
+                            'message': 'Approved instructions changed since this session loaded them; nothing was '
+                                       'saved. Reload with maven_context, follow the current instructions, then retry.'}
+                detail = getattr(error, 'detail', None)
+                return {'status': 'error', 'error': error.code, 'detail': detail,
+                        'request_key': error.request_key, 'binding': app.binding, 'cloud_saved': False,
+                        'message': f'MAVEN rejected the request ({error.code})' +
+                                   (f': {detail}' if detail else '') +
+                                   '. Correct the request; memory itself is available.'}
+            except SessionBusy:
+                return {'status': 'error', 'error': 'session_busy', 'binding': app.binding,
+                        'cloud_saved': False,
+                        'message': 'Another operation holds this session lock; retry shortly with the same request.'}
             except MaintenanceError as error:
                 return {'status': 'blocked', 'error': str(error), 'binding': app.binding, 'cloud_saved': False}
             except (BoundaryError, ProjectError):
@@ -270,7 +405,11 @@ def create_server(application=None):
                         'binding': app.binding, 'cloud_saved': False,
                         'next_action': 'Inspect the exact session status and retained operation evidence.'}
             except MemoryError as error:
-                return {'status': 'blocked', 'error': error.status, 'cloud_saved': False}
+                detail = error.metadata.get('detail')
+                if _available(error.status):
+                    return {'status': 'blocked', 'error': error.status, 'cloud_saved': False}
+                return {'status': 'error', 'error': error.status, 'detail': detail, 'cloud_saved': False,
+                        'message': f'MAVEN rejected the request ({error.status})' + (f': {detail}' if detail else '')}
             except AdminInputError as error:
                 return {'status': 'error', 'error': 'invalid_request', 'message': str(error),
                         'binding': app.binding, 'cloud_saved': False}
@@ -285,6 +424,60 @@ def create_server(application=None):
                 return {'status': 'error', 'error': 'operation_failed', 'binding': app.binding,
                         'cloud_saved': False, 'next_action': 'Inspect retained operation evidence before retrying.'}
         return invoke
+
+    def unbound_requested(unbound, scope):
+        return unbound or not app.initialized and scope == 'universal'
+
+    def unbound_search(*, query, kind, after_id, limit, include_archived, offset):
+        body = {'scope': 'universal', 'limit': limit}
+        if query:
+            body['query'] = query
+        for key, value in (('kind', kind), ('after_id', after_id), ('offset', offset)):
+            if value is not None:
+                body[key] = value
+        if include_archived:
+            body['include_archived'] = True
+        result = app.unbound_client().invoke('/v1/memory/search', body)
+        page = result.get('data') if result.get('status') == 'ready' else None
+        if not isinstance(page, dict) or not isinstance(page.get('records'), list):
+            raise BoundaryError('memory service returned no verified result')
+        return dict(page, records=[item for item in page['records']
+                                   if item.get('data_scope') == 'owner' and item.get('project_id') is None],
+                    scope='universal', unbound=True)
+
+    def unbound_read(record_id, revision):
+        body = {'record_id': record_id}
+        if revision is not None:
+            body['revision'] = revision
+        result = app.unbound_client().invoke('/v1/memory/read', body)
+        record = result.get('data') if result.get('status') == 'ready' else None
+        if (not isinstance(record, dict) or record.get('record_id') != record_id
+                or record.get('project_id') is not None or record.get('data_scope') != 'owner'
+                or revision is not None and record.get('revision') != revision):
+            raise BoundaryError('memory record scope or revision mismatch')
+        return {**record, 'unbound': True}
+
+    def unbound_instructions():
+        client, pages, after, generation = app.unbound_client(), [], None, None
+        while True:
+            request = {'limit': 10} if after is None else {'limit': 10, 'after_slug': after}
+            result = client.invoke('/v1/pages/index', request)
+            data = result.get('data') if result.get('status') == 'ready' else None
+            if not isinstance(data, dict) or not isinstance(data.get('pages'), list):
+                raise BoundaryError('memory service returned no verified result')
+            if generation is not None and data.get('authority_generation') != generation:
+                raise BoundaryError('authority changed while listing instructions; retry')
+            generation = data.get('authority_generation')
+            for page in data['pages']:
+                if (isinstance(page, dict) and page.get('data_scope') == 'owner'
+                        and 'project' not in (page.get('scope') or {})):
+                    pages.append({'slug': page.get('slug'), 'page_kind': page.get('page_kind'),
+                                  'title': page.get('title'), 'revision': page.get('revision'),
+                                  'requires': page.get('requires', []), 'loaded': False})
+            after = data.get('next_after_slug')
+            if after is None or not data['pages']:
+                break
+        return {'authority_generation': generation, 'pages': pages, 'unbound': True}
 
     @server.tool()
     @guarded
@@ -304,42 +497,80 @@ def create_server(application=None):
     @server.tool(annotations=read_hint)
     @guarded
     def maven_status(summary: bool = False) -> dict[str, Any]:
-        """Inspect local binding and pending maintenance without replaying cloud writes. Request summary for universal/project/pending updates; do not announce routine successes individually."""
+        """Inspect local binding and pending maintenance without replaying cloud writes. Request summary for universal/project/pending updates; do not announce routine successes individually. sign_in is the exact command that renews MAVEN's daily-use AWS sign-in (a plain aws login is not read by MAVEN)."""
+        exact = app.sign_in()
         if app.service is None:
-            return {'status': 'not_initialized', 'home': str(app.home), 'env': str(app.env),
-                    'live_state_checked': False, 'next_action': 'Select an enabled project or use guided project setup.'}
-        result = {'binding': dict(app.binding), 'initialized': app.initialized,
-                  'session': app.service.status(), 'maintenance': app.maintenance.status()}
-        if summary:
-            result.update(app.maintenance.summary())
+            result = {'status': 'not_initialized', 'home': str(app.home), 'env': str(app.env),
+                      'live_state_checked': False,
+                      'next_action': 'Not connected: select an enabled project or use guided project setup.'}
+            hint = app.rebind_hint()
+            if hint is not None:
+                result['rebind_hint'] = hint
+                result['next_action'] = hint['next_action']
+        else:
+            result = {'binding': dict(app.binding), 'initialized': app.initialized,
+                      'session': app.service.status(), 'maintenance': app.maintenance.status()}
+            if summary:
+                result.update(app.maintenance.summary())
+        if exact is not None:
+            result['sign_in'] = exact
         return result
+
+    @server.tool(annotations=read_hint)
+    @guarded
+    def maven_instructions() -> dict[str, Any]:
+        """List the active cloud instructions (directives, skills, procedures): slug, kind, title, revision, requires and whether each is loaded in this session. Read-only. Use this to answer "what instructions/skills does MAVEN have"; use maven_context to load bodies. Before initialization it lists universal instructions from the home environment with loaded false."""
+        if app.initialized:
+            return app.service.instructions()
+        return unbound_instructions()
 
     @server.tool(annotations=read_hint)
     @guarded
     def maven_search(query: str = '', kind: str | None = None,
                      scope: Literal['context', 'project', 'universal', 'all'] = 'context',
                      project_id: str | None = None, after_id: str | None = None,
-                     limit: int = Field(default=20, ge=1, le=20)) -> dict[str, Any]:
-        """Search universal plus current-project memory by default. Other project IDs or all-project search require an explicit cross-project consultation request. Follow pagination and read relevant exact records."""
+                     limit: int = Field(default=20, ge=1, le=20),
+                     include_archived: bool = False,
+                     offset: int | None = Field(default=None, ge=0, le=1000),
+                     unbound: bool = False) -> dict[str, Any]:
+        """Search universal plus current-project memory by default. Other project IDs or all-project search require an explicit cross-project consultation request.
+
+        With query: whitespace terms (at most 8) must all match at word boundaries in title/name, tags or body; results are ranked (title 3, tag 2, body 1 per term, then most recent) and carry a rank and a snippet around the first body match. Answer from snippets when they suffice; read full records only when needed. Page with offset/next_offset (query) or after_id/next_after_id (listing). limit is at most 20. Records tagged 'archived' or with data.state 'archived' are excluded unless include_archived. Parallel searches/reads are fine.
+
+        unbound=true is a read-only universal consultation without any project session (no binding, no capture); use it only when the owner explicitly asks to use what MAVEN knows in a folder that is not enabled. Before initialization, scope 'universal' is unbound automatically. Results are labelled unbound."""
+        if unbound_requested(unbound, scope):
+            if project_id is not None or scope not in ('universal', 'context'):
+                raise MaintenanceError('unbound consultation is limited to universal memory')
+            return unbound_search(query=query, kind=kind, after_id=after_id, limit=limit,
+                                  include_archived=include_archived, offset=offset)
         app.bound()
         app.consultation(scope, project_id)
         return app.service.search(query=query, kind=kind, scope=scope, project_id=project_id,
-                                  after_id=after_id, limit=limit)
+                                  after_id=after_id, limit=limit, include_archived=include_archived,
+                                  offset=offset)
 
     @server.tool(annotations=read_hint)
     @guarded
     def maven_read(record_id: str, revision: int | None = None,
                    scope: Literal['context', 'project', 'universal', 'all'] = 'context',
-                   project_id: str | None = None) -> dict[str, Any]:
-        """Read a real memory record, optionally at its exact revision. Reference data does not activate instructions. Preserve project attribution when explicitly consulting other projects."""
+                   project_id: str | None = None, unbound: bool = False) -> dict[str, Any]:
+        """Read a real memory record, optionally at its exact revision. Reference data does not activate instructions. Preserve project attribution when explicitly consulting other projects. Prefer search snippets; read full records when the snippet is insufficient. unbound=true (or scope 'universal' before initialization) reads a universal record without any session, only on explicit owner intent."""
+        if unbound_requested(unbound, scope):
+            if project_id is not None or scope not in ('universal', 'context'):
+                raise MaintenanceError('unbound consultation is limited to universal memory')
+            return unbound_read(record_id, revision)
         app.bound()
         app.consultation(scope, project_id)
         return app.service.read_record(record_id, revision=revision, scope=scope, project_id=project_id)
 
-    @server.tool()
+    SAVE_DESCRIPTION = ('Explicitly save ordinary memory with real provenance and expected revision; report saved only '
+                        'on verified completion. Workers use their assigned change set, not independent writes. Use fenced '
+                        'task claims for in-progress/completed task transitions. A definitive rejection leaves nothing '
+                        'pending.\n\n' + RECORD_MODEL)
+
+    @server.tool(description=SAVE_DESCRIPTION)
     @guarded
     def maven_save(change: Change, source: Source, operation_id: str | None = None) -> dict[str, Any]:
-        """Explicitly save ordinary memory with real provenance and expected revision; report saved only on verified completion. Workers use their assigned change set, not independent writes. Use fenced task claims for in-progress/completed task transitions."""
         app.primary()
         app.bound()
         return app.maintenance.save(**change.model_dump(exclude_none=True),
@@ -360,7 +591,16 @@ def create_server(application=None):
         return app.maintenance.reclassify(record_id, scope=scope, source=source.model_dump(),
                                           reason=reason, operation_id=operation_id)
 
-    @server.tool()
+    MAINTENANCE_DESCRIPTION = (
+        'Manage bounded semantic memory work; queued is not cloud-saved. Claim, read current records, apply exact '
+        'revisions, then complete. Task changes use task_action and real lease fences: apply claim, read returned '
+        'task/fence, revise the next phase, apply, then complete the assignment. Revise preserves verified earlier '
+        'effects. Supersede only genuinely replaced workstream intent. status/apply/revise return summaries (state, '
+        'counts, saved_refs, last_error, pending_effects); pass detail=true for full effects. apply stops after a '
+        'time budget with continue=true: call apply again with the same worker_token and no changes; poll status, '
+        'never resubmit. claim returns a context_ref, not instruction bodies.\n\n' + RECORD_MODEL)
+
+    @server.tool(description=MAINTENANCE_DESCRIPTION)
     @guarded
     def maven_maintenance(action: Literal['enqueue', 'claim', 'apply', 'revise', 'complete', 'release', 'status'],
                           operation_id: str | None = None, intent: str | None = None,
@@ -368,8 +608,7 @@ def create_server(application=None):
                           automatic: bool = True, supersede: bool = False, worker: str | None = None,
                           worker_token: str | None = None, changes: list[Change | TaskChange] | None = None,
                           summary: str | None = None, no_changes: bool = False,
-                          worker_stopped: bool = False) -> dict[str, Any]:
-        """Manage bounded semantic memory work; queued is not cloud-saved. Claim, read current records, apply exact revisions, then complete. Task changes use task_action and real lease fences: apply claim, read returned task/fence, revise the next phase, apply, then complete the assignment. Revise preserves verified earlier effects. Supersede only genuinely replaced workstream intent."""
+                          worker_stopped: bool = False, detail: bool = False) -> dict[str, Any]:
         app.bound()
         if action == 'enqueue':
             app.primary()
@@ -382,7 +621,7 @@ def create_server(application=None):
             raise MaintenanceError('this maintenance action requires its original operation identity')
         app.assignment(operation_id)
         if action == 'status':
-            return app.maintenance.status(operation_id)
+            return app.maintenance.status(operation_id, detail=detail)
         if action == 'claim':
             if worker is None:
                 raise MaintenanceError('claim requires an actual worker label')
@@ -390,12 +629,13 @@ def create_server(application=None):
         if action == 'apply':
             return app.maintenance.apply(operation_id, worker_token=worker_token,
                                          changes=[item.model_dump(exclude_none=True) for item in changes]
-                                         if changes is not None else None)
+                                         if changes is not None else None, detail=detail)
         if action == 'revise':
             if changes is None:
                 raise MaintenanceError('revise requires a reread and reconciled change set')
             return app.maintenance.revise(operation_id, worker_token=worker_token,
-                                          changes=[item.model_dump(exclude_none=True) for item in changes])
+                                          changes=[item.model_dump(exclude_none=True) for item in changes],
+                                          detail=detail)
         if action == 'complete':
             if summary is None:
                 raise MaintenanceError('completion requires a truthful summary')
@@ -444,13 +684,15 @@ def create_server(application=None):
     @server.tool()
     @guarded
     def maven_resume(fresh: bool = False, discussion: str | None = None,
-                     source: Source | None = None, context_complete: bool = False) -> dict[str, Any]:
-        """Resume with catch-up by default: retrieve available paused discussion and supply its real source. Disclose missing history. Explicit resume fresh skips look-back and creates no transcript backlog."""
+                     source: Source | None = None, context_complete: bool = False,
+                     nothing_to_record: bool = False) -> dict[str, Any]:
+        """Resume with catch-up by default: retrieve available paused discussion and supply its real source. Disclose missing history. Explicit resume fresh skips look-back and creates no transcript backlog. nothing_to_record=true completes the catch-up inline with no changes when the paused discussion held nothing worth saving."""
         app.primary()
         app.bound()
         return app.maintenance.resume(fresh=fresh, discussion=discussion,
                                        source=source.model_dump() if source else None,
-                                       context_complete=context_complete)
+                                       context_complete=context_complete,
+                                       nothing_to_record=nothing_to_record)
 
     @server.tool()
     @guarded
@@ -483,12 +725,18 @@ def create_server(application=None):
                      kind: Literal['setup', 'project', 'install', 'uninstall', 'recovery'] | None = None,
                      parameters: dict[str, Any] | None = None, operation_id: str | None = None,
                      interaction_id: str | None = None, revision: int | None = None,
-                     response: dict[str, Any] | None = None) -> dict[str, Any]:
+                     response: dict[str, Any] | None = None, detail: bool = False) -> dict[str, Any]:
         """Drive real resumable administration. Present persisted questions/full exact reviews, capture actual owner responses, then explicitly advance. Back revises unsubmitted choices only, never rolls back external effects. Project/machine/cloud removal are independent. Login, secrets and affected-harness shutdown use secure external handoffs.
 
         respond: pass the pending_interaction's interaction_id and revision. A form response is an object with exactly its field names. A review response is {approved: bool, review_digest: <the review's digest>, source: {origin, excerpt} describing the owner's actual answer, confirmations: <the review's confirmations, usually {}>}. Invalid input returns error invalid_request with a message naming the problem.
 
-        Updating an existing installation: begin kind "setup" with parameters {mode: "update"} (optional absolute "checkout"). It checks local software and harness skills, then the database schema, service stack and bundled instructions, asking for review only where something differs."""
+        Updating an existing installation: begin kind "setup" with parameters {mode: "update"} (optional absolute "checkout"). It checks local software and harness skills, then the database schema, service stack and bundled instructions, asking for review only where something differs.
+
+        Responses omit choice_checkpoints, responses, navigation and retired_interactions unless detail=true."""
+        result = administer(action, kind, parameters, operation_id, interaction_id, revision, response)
+        return result if detail else _without_admin_detail(result)
+
+    def administer(action, kind, parameters, operation_id, interaction_id, revision, response):
         admin = app.admin()
         if action == 'begin':
             if kind is None:
@@ -512,7 +760,7 @@ def create_server(application=None):
         """Begin explicit first-time project enablement or selection through persisted owner choices; parameters is {root: absolute project folder}. Memory does not require Git. Never use the installation checkout as an implicit project.
 
         This only begins the operation. Answer its pending_interaction and advance it with maven_admin (kind "project") using the returned operation_id."""
-        return app.admin().begin('project', parameters)
+        return _without_admin_detail(app.admin().begin('project', parameters))
 
     @server.tool()
     @guarded
