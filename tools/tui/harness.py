@@ -39,13 +39,13 @@ def _cloud_context(home, outcome):
 
 
 def _verified(home, outcome):
-    from tools.memory.environment import load_environment
-    from tools.memory.client import MemoryClientError
-    from tools.setup_common import expected_account, SetupPending
     if not (isinstance(outcome, dict) and outcome.get('instance_ready') is True
             and outcome.get('home') == str(home) and isinstance(outcome.get('binding'), dict)
             and all(outcome.get(key) for key in ('instance_id', 'account', 'region', 'profile'))):
         return False
+    from tools.memory.environment import load_environment
+    from tools.memory.client import MemoryClientError
+    from tools.setup_common import expected_account, SetupPending
     try:
         values = load_environment(home / '.env')
         return (values == outcome['binding']

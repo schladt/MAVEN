@@ -36,22 +36,24 @@ def _lines(value):
 def _wizard(ui):
     # All backend flags have a field. Namespace defaults come from the same CLI
     # parser, but user-entered text never passes through argparse/SystemExit.
+    # Scope-specific pages appear only when their Scopes checkbox is selected.
+    # The Machine page always appears: its home also defaults project/cloud work.
     pages = [
-        ('Scopes', [
+        ('Scopes', None, [
             _boolean('project_scope', 'Detach, archive, or reactivate projects'),
             _boolean('machine', 'Remove machine installation(s)'),
             _boolean('cloud', 'Retire or purge a cloud instance'),
             _boolean('offline', 'Offline local work only (no cloud inventory)')],
          'Scopes are independent. Opening this dashboard does not contact the cloud. '
          'Inventory may contact the cloud only after you approve the selections.'),
-        ('Projects', [
+        ('Projects', 'project_scope', [
             _optional('project', 'Project roots to detach (one absolute path per line)', multiline=True),
             _optional('reactivate_project', 'Project roots to reactivate instead (one per line)', multiline=True),
             _boolean('archive_project', 'Also archive selected cloud projects (all their checkouts)'),
             _optional('project_home', 'Installation home for project cloud operations')],
          'Reactivation is reversible and cannot accompany machine/cloud removal. '
          'Offline detachment preserves unresolved cloud evidence.'),
-        ('Machine', [
+        ('Machine', None, [
             _optional('home', 'Installation homes (one per line; blank uses default or all-homes discovery)',
                       cli._default_home(), multiline=True),
             _boolean('all_homes', 'Include all discovered current-user homes'),
@@ -59,7 +61,7 @@ def _wizard(ui):
          'Home selection also supplies the default installation for project/cloud work. '
          'Multiple homes, all-homes, and legacy adoption require machine removal. '
          'Exact discovered inventories will be reviewed before any removal.'),
-        ('Cloud', [
+        ('Cloud', 'cloud', [
             _optional('cloud_home', 'Installation home for cloud inventory'),
             Field('cloud_mode', 'Cloud removal policy', 'retire', kind='select',
                   choices=(('Retire — preserve recoverable data (default)', 'retire'),
@@ -69,15 +71,25 @@ def _wizard(ui):
             _optional('retained_resource', 'Previously retained resource ARNs (one per line)', multiline=True)],
          'Retirement is the default. Purge and session abandonment require separate '
          'instance confirmations after full resource review. Unselected/shared resources remain.'),
-        ('Recovery', [
+        ('Recovery', None, [
             _optional('export', 'Private artifact export directory (blank preserves in place)'),
             _optional('output', 'Private plan/recovery directory (blank uses ~/.maven-uninstall/<UUID>)')],
          'Recovery and export directories must be outside every selected removal root. '
          'Keep the complete plan, journal, runner, and staged dependencies for recovery.')]
     values = {}
+
+    def shown(page):
+        return page[1] is None or bool(values.get(page[1]))
+
+    def step(index, direction):
+        index += direction
+        while 0 <= index < len(pages) and not shown(pages[index]):
+            index += direction
+        return index
+
     index = 0
     while True:
-        title, fields, description = pages[index]
+        title, _, fields, description = pages[index]
         ui.stage(title)
         fields = [Field(field.name, field.label, values.get(field.name, field.default),
                         field.kind, field.choices, field.required) for field in fields]
@@ -85,12 +97,18 @@ def _wizard(ui):
         if result is None:
             if index == 0:
                 return None
-            index -= 1
+            index = step(index, -1)
             continue
         values.update(result)
-        if index < len(pages) - 1:
-            index += 1
+        if step(index, 1) < len(pages):
+            index = step(index, 1)
             continue
+        # A page hidden after its scope was deselected contributes parser defaults,
+        # never stale entries that would request options for an unselected scope.
+        for page in pages:
+            if not shown(page):
+                for field in page[2]:
+                    values.pop(field.name, None)
         args = cli.parser().parse_args(['plan'])
         for name in vars(args):
             if name not in values:
@@ -104,8 +122,6 @@ def _wizard(ui):
         error = None
         if values['project_scope'] and not (args.project or args.reactivate_project):
             error = 'Project scope requires at least one detach or reactivation root.'
-        elif not values['project_scope'] and (args.project or args.reactivate_project or args.archive_project or args.project_home):
-            error = 'Enable project scope or clear the project fields.'
         elif not (values['project_scope'] or args.machine or args.cloud):
             error = 'Select at least one scope.'
         if error:
