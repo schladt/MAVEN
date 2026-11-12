@@ -25,6 +25,7 @@ HARNESS_PATHS = {
     'gemini': ('.gemini/settings.json', '.gemini/GEMINI.md', '.gemini/skills'),
 }
 SKILLS = ('maven', 'maven-maintenance', 'maven-update')
+CLAUDE_SETTINGS = '.claude/settings.json'
 
 
 @dataclass(frozen=True)
@@ -297,12 +298,16 @@ def _text_change(path: Path, body: str, *, toml=False, prior: dict | None = None
 
 
 def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
-                     ca_bundle: Path | None = None, paths=None) -> list[Change]:
+                     ca_bundle: Path | None = None, paths=None, statusline: bool = False) -> list[Change]:
     """Plan against an explicit user home (also supports an inactive staging home).
 
     Never copy ambient credentials, PATH, or model runtime settings. MAVEN loads
     its selected private .env and login cache itself. Explicit trust paths are
     nonsecret and carried even by clients that sanitize process environments.
+
+    ``statusline`` adds the optional Claude Code ``statusLine`` command in the default
+    profile's settings.json. A different existing status line is preserved: its change
+    writes nothing and its unowned receipt carries ``conflict``.
     """
     home = home.expanduser().absolute()
     user_home = (user_home or Path.home()).expanduser().absolute()
@@ -357,9 +362,32 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
                            'created_container': not before or 'mcpServers' not in _json(before)}
                 changes.append(Change(path, before, _encode(value), receipt))
         changes.append(_text_change(context_path, guidance, prior=receipts.get(str(context_path))))
+    if statusline:
+        if 'claude' not in harnesses:
+            raise ValueError('The MAVEN status line is a Claude Code option; select the claude harness.')
+        if 'claude' in (paths or {}):
+            raise ValueError('The MAVEN status line supports only the default Claude Code profile, '
+                             'not custom --harness-config paths.')
+        changes.append(_statusline_change(home, user_home / CLAUDE_SETTINGS))
     if len({change.path for change in changes}) != len(changes):
         raise ValueError('Integration targets overlap; select distinct configuration/context files')
     return changes
+
+
+def _statusline_change(home: Path, path: Path) -> Change:
+    """Plan the owned top-level statusLine; never replace an owner's different one."""
+    entry = {'type': 'command', 'command': str(home / 'venv/bin/maven-statusline')}
+    before = _read(path)
+    value = _json(before)
+    receipt = {'path': str(path), 'format': 'json-setting', 'key': 'statusLine', 'value': entry}
+    if 'statusLine' in value:
+        receipt.update(created=False, owned=False)
+        if value['statusLine'] != entry:
+            receipt['conflict'] = (f'Existing Claude Code statusLine preserved; the MAVEN status line '
+                                   f'was not added: {path}')
+        return Change(path, before, before, receipt)
+    value['statusLine'] = entry
+    return Change(path, before, _encode(value), {**receipt, 'created': before is None})
 
 
 def _owned_text_blocks(home: Path) -> dict[str, dict]:
@@ -419,15 +447,16 @@ def removal_content(receipt: dict) -> bytes | None:
     before = _read(path)
     if before is None:
         return None
-    if receipt['format'] == 'json-entry':
+    if receipt['format'] in ('json-entry', 'json-setting'):
         document = _json(before)
-        servers = document.get('mcpServers', {})
-        if receipt['key'] not in servers:
+        entries = document.get('mcpServers', {}) if receipt['format'] == 'json-entry' else document
+        if receipt['key'] not in entries:
             return None
-        if servers[receipt['key']] != receipt['value']:
-            raise ValueError(f'Modified MAVEN MCP entry preserved: {path}')
-        del servers[receipt['key']]
-        if not servers and receipt.get('created_container'):
+        if entries[receipt['key']] != receipt['value']:
+            label = 'MCP' if receipt['format'] == 'json-entry' else receipt['key']
+            raise ValueError(f'Modified MAVEN {label} entry preserved: {path}')
+        del entries[receipt['key']]
+        if receipt['format'] == 'json-entry' and not entries and receipt.get('created_container'):
             document.pop('mcpServers', None)
         return b'' if not document and receipt['created'] else _encode(document)
     if receipt['format'] != 'text-block':

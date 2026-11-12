@@ -151,6 +151,45 @@ class LocalUninstallTests(unittest.TestCase):
         self.assertFalse((self.home / 'runtime').exists())
         self.assertTrue(read_private(root / '.maven/integration.json')['integrations'])
 
+    def test_project_uninstall_of_home_root_removes_home_selection_and_says_so(self):
+        root, _ = self.project()
+        other, _ = self.project('other-project')
+        pointer = self.home / 'home.json'
+        save_private(pointer, {'schema': 1, 'root': str(root.resolve()), 'project_id': 'd9a12c41-67cf-4d8a-a70f-29bbf25f99e6'})
+        unrelated = local.plan_project(other, self.home, offline=True)
+        self.assertFalse(any(item['kind'] == 'local_home_unset' for item in unrelated['actions']))
+        fragment = local.plan_project(root, self.home, offline=True)
+        self.assertTrue(any(str(pointer) in warning and 'turned off' in warning for warning in fragment['warnings']))
+        self.apply(fragment)
+        self.assertFalse(pointer.exists())
+
+    def test_project_uninstall_preserves_home_selection_changed_since_review(self):
+        root, _ = self.project()
+        pointer = self.home / 'home.json'
+        save_private(pointer, {'schema': 1, 'root': str(root.resolve())})
+        fragment = local.plan_project(root, self.home, offline=True)
+        save_private(pointer, {'schema': 1, 'root': str(root.resolve()), 'label': 'changed'})
+        with self.assertRaisesRegex(UninstallError, 'changed since review'):
+            self.apply(fragment)
+        self.assertTrue(pointer.exists())
+
+    def test_machine_purge_lists_home_files_and_tolerates_later_home_state(self):
+        self.runtime()
+        save_private(self.home / 'home.json', {'schema': 1})
+        (self.home / 'runtime').mkdir(mode=0o700, exist_ok=True)
+        log = self.home / 'runtime/start-choices.jsonl'
+        log.write_text('{}\n')
+        fragment = local.plan_machine(self.home, offline=True)
+        self.assertTrue(any(str(self.home / 'home.json') in warning and str(log) in warning
+                            for warning in fragment['warnings']))
+        self.apply_before_purge(fragment)
+        log.write_text('{}\n{}\n')
+        (self.home / 'runtime/active').mkdir(mode=0o700)
+        (self.home / 'runtime/active/session.json').write_text('{}')
+        save_private(self.home / 'home.json', {'schema': 1, 'changed': True})
+        self.purge(fragment)
+        self.assertFalse(self.home.exists())
+
     def test_export_is_private_verified_copy_and_partial_write_resumes(self):
         root, pending = self.project()
         original = (root / '.maven/project.json').read_bytes()

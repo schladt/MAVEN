@@ -49,6 +49,19 @@ Git or issue reports. Metadata can itself be sensitive. Local originals are not
 uploaded automatically by workspace intake, but their paths, provenance and hashes
 are recorded as metadata. Restrict who can read those records.
 
+**Forget and Erase.** Archive and Forget hide records; only Erase removes content.
+Both run only through an owner-approved `maven_admin` kind `cleanup` operation under
+the separately assumed administration role, never through agent memory tools. Erase
+is a narrow, audited exception to immutable history: it rewrites every revision, the
+current content, source excerpts owned only by erased records, fact values and memory
+receipt results to a tombstone, and records an immutable receipt (ids, version
+counts, actor, reason, approval digest; no content). It cannot reach Aurora automated
+backups, which keep old content up to 30 days, or copies already sent to external
+models, transcripts or Git. Local runtime files (last-write receipts, failed-write
+records, maintenance effects) are swept on this machine by every clean-up; other
+machines keep any cached copy until they next run a MAVEN clean-up. A pending request
+journal for an erased record is never deleted: it blocks the sweep until recovered.
+
 ## Local state
 
 Keep instance and project private configuration owner-owned and inaccessible to other

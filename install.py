@@ -149,9 +149,14 @@ def main(argv=None) -> int:
     parser.add_argument('--harness-stopped', action='store_true',
                         help='Confirm affected harnesses are closed before changing live integration files')
     parser.add_argument('--ca-bundle', type=Path, help='Explicit trusted PEM CA bundle, e.g. supplied by corporate IT')
+    parser.add_argument('--claude-statusline', action='store_true',
+                        help="With --harness claude: show the active MAVEN project in Claude Code's status line "
+                             '(an owned statusLine entry; an existing different status line is preserved)')
     parser.add_argument('--local-only', action='store_true',
                         help='Install local tools only; no prompts, login, cloud setup, or project initialization')
     args = parser.parse_args(argv)
+    if args.claude_statusline and 'claude' not in args.harness:
+        parser.error('--claude-statusline applies only together with --harness claude')
     try:
         # Bootstrap pip must inherit explicitly approved corporate trust settings.
         _configure_ca(args.ca_bundle)
@@ -172,6 +177,10 @@ def main(argv=None) -> int:
                 home = args.home.expanduser().absolute()
                 if args.uninstall:
                     handoff.update(home=home, uninstall=True)
+                    ui.close_when_finished()
+                    return 0
+                if args.home_action:
+                    handoff.update(home=home, home_action=args.home_action)
                     ui.close_when_finished()
                     return 0
                 if args.restart_operation:
@@ -213,25 +222,10 @@ def main(argv=None) -> int:
         if result or not handoff:
             return result
         # The first app is closed before the installed setup app owns the terminal.
-        home = handoff['home']
         from tools.tui.bootstrap import run_terminal
-        if handoff.get('uninstall'):
-            python = home / 'venv/bin/python'
-            command = [str(python) if python.is_file() else sys.executable, '-m', 'tools.uninstall']
-        elif handoff.get('restart_operation'):
-            python = home / 'venv/bin/python'
-            command = [str(python) if python.is_file() else sys.executable, '-m', 'tools.setup',
-                       '--home', str(home), '--restart-operation', handoff['restart_operation']]
-        else:
-            command = [str(home / 'venv/bin/python'), '-m', 'tools.setup', '--home', str(home),
-                       '--mode', handoff['mode']]
-            if handoff.get('operation'):
-                command.extend(['--operation', handoff['operation']])
-            if handoff.get('fresh_operation'):
-                command.append('--fresh-operation')
         return run_terminal(
-            command, cwd=Path(__file__).resolve().parent,
-            env=dict(os.environ, MAVEN_HOME=str(home), PYTHONPATH=str(Path(__file__).resolve().parent)),
+            _handoff_command(handoff), cwd=Path(__file__).resolve().parent,
+            env=dict(os.environ, MAVEN_HOME=str(handoff['home']), PYTHONPATH=str(Path(__file__).resolve().parent)),
         )
     except (EOFError, KeyboardInterrupt, OperationPaused):
         _notify('Installation paused; existing private configuration is preserved.', file=sys.stderr)
@@ -239,6 +233,26 @@ def main(argv=None) -> int:
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         _notify(f'Installation stopped: {exc}', file=sys.stderr)
         return 1
+
+
+def _handoff_command(handoff):
+    """The installed program that continues the task chosen in the installer menu."""
+    home = handoff['home']
+    python = home / 'venv/bin/python'
+    if handoff.get('uninstall'):
+        return [str(python) if python.is_file() else sys.executable, '-m', 'tools.uninstall']
+    if handoff.get('home_action'):
+        return [str(python), '-m', 'tools.tui.administration', '--home', str(home),
+                '--action', handoff['home_action']]
+    if handoff.get('restart_operation'):
+        return [str(python) if python.is_file() else sys.executable, '-m', 'tools.setup',
+                '--home', str(home), '--restart-operation', handoff['restart_operation']]
+    command = [str(python), '-m', 'tools.setup', '--home', str(home), '--mode', handoff['mode']]
+    if handoff.get('operation'):
+        command.extend(['--operation', handoff['operation']])
+    if handoff.get('fresh_operation'):
+        command.append('--fresh-operation')
+    return command
 
 
 def _saved_installation(home):
@@ -336,6 +350,7 @@ def _options(args):
     ui = require()
     args.uninstall = False
     args.restart_operation = None
+    args.home_action = None
     while True:
         stage('Choose a task')
         home = (args.home or Path(os.environ.get('MAVEN_HOME', '~/.maven'))).expanduser().absolute()
@@ -353,6 +368,8 @@ def _options(args):
                   if pending else []),
                 *([('Update MAVEN — local software and harness skills, then cloud service, database schema '
                     'and instructions, each separately reviewed', 'upgrade')] if completed and not pending else []),
+                *([('Set up or change MAVEN Home — choose, change or turn off the Home project', 'home')]
+                  if completed and not pending else []),
                 ('Update local MAVEN software — preserve cloud settings; no AWS login or cloud changes', 'update'),
                 ('Set up a separate instance — choose another private installation folder', 'separate'),
                 ('Uninstall — find an installation and choose what to remove', 'uninstall'),
@@ -386,6 +403,18 @@ def _options(args):
             return
         if task == 'restart':
             args.home, args.restart_operation = home, pending
+            return
+        if task == 'home':
+            action = 'enable'
+            if (home / 'home.json').exists() or (home / 'home.json').is_symlink():
+                action = ui.choose('MAVEN Home', [
+                    ('Change MAVEN Home — choose a different Home folder or project', 'enable'),
+                    ('Turn off MAVEN Home — remove only this machine’s Home selection', 'disable'),
+                    ('Back to task selection', 'back'),
+                ], description=f'MAVEN Home is set up in {home / "home.json"}. Each change is reviewed before it is applied.')
+                if action == 'back':
+                    continue
+            args.home, args.home_action = home, action
             return
         if task == 'uninstall':
             from tools.tui.installations import choose_removal_home
@@ -516,7 +545,8 @@ def _install(args, handoff=None):
         try:
             plan = skill_plan(roots, home)
             integrations = integration_plan(home, selected_harnesses,
-                                            user_home=integration_home, ca_bundle=ca_bundle, paths=custom)
+                                            user_home=integration_home, ca_bundle=ca_bundle, paths=custom,
+                                            statusline=getattr(args, 'claude_statusline', False))
             retired_skills = retired_skill_plan(home, roots)
         except ValueError as exc:
             if current() is None:
@@ -541,7 +571,8 @@ def _install(args, handoff=None):
                     str(path) for path, _ in retired_skills) or '(none)'),
                 f'Integration mode: {"inactive staging" if staging else "live"}',
                 'Exact MAVEN integration content (unrelated configuration preserved):\n' + ('\n'.join(
-                    f'{change.path}\n{change.receipt["value"]}' for change in integrations
+                    (f'Conflict, not changed: {change.receipt["conflict"]}' if change.receipt.get('conflict')
+                     else f'{change.path}\n{change.receipt["value"]}') for change in integrations
                     if change.receipt is not None) or '(none)'),
             ])
             summary = (f'Install/update MAVEN software in {home}.\n'

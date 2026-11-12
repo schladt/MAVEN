@@ -32,6 +32,8 @@ runtime, model credential or immortal worker conversation is required.
 | Instance `venv/`, installed resources | Executables, bootstrap guidance and proposed authority | Code, never live owner policy |
 | Instance `.env` | Explicit endpoint, named profiles, identity and integration settings | Private connection settings, not credentials or memory |
 | Project `.maven/project.json` | Canonical root/cloud project and optional Git configuration | Explicit local selection |
+| Home `home.json` (optional, 0600) | Per-machine pointer to the owner-configured MAVEN Home project | Explicit owner opt-in via `maven_admin` kind `home` |
+| Private `runtime/start-choices.jsonl`, `runtime/active/` | Local start-choice log and active line for status lines | Local only, never sent to the cloud |
 | Private project/session runtime | Assignment generations, cutoff manifests, journals and receipts | Pending-work/recovery evidence, not cloud-saved memory |
 | Private administration runtime | Persisted reviews, interactions and recovery references | Exact operation evidence, not blanket approval |
 | Project `.maven/sensitive/` | Approved preserved originals | Private artifacts, not instructions |
@@ -40,13 +42,17 @@ runtime, model credential or immortal worker conversation is required.
 `MAVEN_HOME` selects the installation (default `~/.maven`). Every operation resolves
 home/instance, project where applicable, and work session explicitly. No global
 current-project/session pointer, newest-receipt inference or cwd rebinding is allowed.
+The configured MAVEN Home is the one explicit, owner-chosen root; outside an enabled
+project the owner picks Start Home, Create Project or Read Only at each session start.
 Transport identity is distinct from durable session identity. New/forked sessions get
 new identities; explicit resume retains the original. Workers inherit scoped work
 from the originating session with distinct operation/writer identity.
 
 ## Scope, concurrency and completion
 
-Default retrieval combines universal and current-project records. Explicit universal,
+Default retrieval combines universal and current-project records. Universal holds only
+preferences, instructions and general lessons, never customer- or project-specific
+detail; owner-level tasks and people/organization awareness belong to Home. Explicit universal,
 project and owner-wide consultation remain available. Project scopes organize the
 owner's knowledge; actual AWS/instance identity controls access. Scope promotion uses
 source-linked representations retaining original project/revision and caveats. Scope

@@ -20,6 +20,7 @@ from tools.uninstall.local import (
 
 NAMES = {'omp': 'OMP', 'claude': 'Claude Code', 'codex': 'Codex',
          'copilot': 'Copilot', 'gemini': 'Gemini'}
+STATUSLINE_LABEL = "Show the active MAVEN project in Claude Code's status line"
 
 
 def _ownership(home):
@@ -93,11 +94,15 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
     ui.stage('Connect your coding harness')
     user_home = Path.home()
     # The selection form already supports skip; avoid a redundant configure gate.
+    statusline = False
     while True:
         fields = [Field(name, label, name in result['selected'], kind='bool', help=(
             f'MCP: {user_home / HARNESS_PATHS[name][0]}\n'
             f'Startup guidance: {user_home / HARNESS_PATHS[name][1]}\n'
             f'Skills: {user_home / HARNESS_PATHS[name][2]}')) for name, label in NAMES.items()]
+        fields.append(Field('statusline', STATUSLINE_LABEL, statusline, kind='bool', required=False, help=(
+            'Applies only when Claude Code is selected. Adds an owned statusLine command to '
+            f'{user_home / ".claude/settings.json"}; an existing different status line is preserved.')))
         values = ui.form('Choose the harnesses you use', fields,
                          description=('Select any installed harnesses, or leave all unchecked to skip. '
                                       'These are your default user-profile locations. Differing MAVEN '
@@ -107,6 +112,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
             return result
         selected = [name for name in NAMES if values[name]]
         result['selected'] = selected
+        statusline = bool(values.get('statusline')) and 'claude' in selected
         if not selected:
             return result
         roots = [user_home / HARNESS_PATHS[name][2] for name in selected]
@@ -119,7 +125,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                 _launcher_owned(home, prior, launcher_repair)
             if ca_bundle is None and os.environ.get('AWS_CA_BUNDLE'):
                 ca_bundle = Path(os.environ['AWS_CA_BUNDLE']).expanduser().absolute()
-            changes = integration_plan(home, selected, ca_bundle=ca_bundle)
+            changes = integration_plan(home, selected, ca_bundle=ca_bundle, statusline=statusline)
             skills = skill_plan(roots, home)
             retired = retired_skill_plan(home, roots)
         except (OSError, ValueError, UninstallError) as exc:
@@ -135,7 +141,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
         visible = [f'MAVEN home: {home}', 'Harnesses: ' + ', '.join(NAMES[name] for name in selected),
                    'Only these local changes are proposed:']
         if launcher_repair is None and not skills and not retired and all(
-                change.before == change.after for change in changes):
+                change.before == change.after and not change.receipt.get('conflict') for change in changes):
             result.update(status='unchanged', reason='Identical local harness files preserved; no writes were needed.')
             return result
         details = []
@@ -149,6 +155,9 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                            'launcher’s group-write bit if still present; record its exact 0755 ownership '
                            'without adopting any other runtime changes.\n' + json.dumps(launcher_repair, indent=2))
         for change in changes:
+            if change.receipt.get('conflict'):
+                visible.append('Conflict, not changed: ' + change.receipt['conflict'])
+                continue
             action = 'Preserve identical content' if change.before == change.after else 'Add MAVEN content'
             visible.append(f'{action}: {change.path}')
             details.append(f'{change.path}\nExact MAVEN entry/block:\n' +
@@ -274,10 +283,34 @@ def show_completion(ui, home, result, *, outcome=None):
     return result
 
 
+def offer_home(ui, home):
+    """Optional MAVEN Home step; Skip changes nothing and never blocks completion."""
+    from tools.home import load_home
+    if load_home(home) is not None:
+        return {'status': 'present'}
+    choice = ui.choose('Set up MAVEN Home (optional)', [
+        ('Set up MAVEN Home — choose the project used when no other project is active', 'home'),
+        ('Skip — nothing changes; set it up later from the installer menu', 'skip'),
+    ], description='MAVEN Home is an ordinary project folder that agents can offer when you work outside any '
+                   'MAVEN project. Every change is shown in an exact review before it is applied.')
+    if choice != 'home':
+        return {'status': 'skipped'}
+    from tools.tui.administration import present
+    from tools.setup_common import SetupPending
+    try:
+        code = present(ui, home, kind='home', parameters={'action': 'enable'})
+    except (OperationPaused, SetupPending, ValueError, OSError) as exc:
+        ui.message(f'MAVEN Home was not finished: {exc}. Setup is complete; resume Home later from the installer menu.')
+        return {'status': 'paused'}
+    return {'status': 'completed' if code == 0 else 'stopped'}
+
+
 def finish_setup(ui, home, outcome):
-    """Offer optional harness integration only after a verified setup outcome."""
+    """Offer optional harness integration and MAVEN Home only after a verified setup outcome."""
     home = Path(home).expanduser().absolute()
     if not _verified(home, outcome):
         raise ValueError('Harness setup handoff requires a verified setup outcome for this exact MAVEN home.')
     result = configure_harnesses(ui, home, context=_cloud_context(home, outcome))
-    return show_completion(ui, home, result, outcome=outcome)
+    result = show_completion(ui, home, result, outcome=outcome)
+    offer_home(ui, home)
+    return result

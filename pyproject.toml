@@ -34,6 +34,7 @@ maven-workflow = "tools.workflow:main"
 maven-uninstall = "tools.uninstall.cli:main"
 maven-mcp = "tools.mcp.server:main"
 maven-git = "tools.git_workflow:main"
+maven-statusline = "tools.statusline:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

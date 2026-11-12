@@ -305,9 +305,7 @@ while “resume fresh” does not. See [workflow](workflow.md) for these boundar
 
 After restarting a harness, the assistant checks `maven_status` before claiming a
 connection; an unbound process lists the active registered sessions for the folder and
-resumes only the exact one. In a folder that is not enabled, an explicit owner request
-to “use what MAVEN knows” allows a read-only universal search/read (`unbound=true`)
-without enabling the folder, creating a session or capturing discussion.
+resumes only the exact one. Outside an enabled project, see the start choice below.
 
 **Optional keep-warm:** set `MAVEN_KEEP_WARM=1` in the private `.env` (or the MCP
 process environment) to have an initialized MCP process ping the instruction index every
@@ -320,6 +318,43 @@ Additional projects only need their own explicit enablement, not another instanc
 deployment. A new/forked session gets its own identity; explicit resume preserves the
 original. Cwd changes, transport reconnection and newest receipts never select a new
 project/session implicitly. Missing access blocks dependent work, not unrelated chat.
+
+### MAVEN Home and the start choice
+
+At the start of each session the assistant calls `maven_status` with its workspace
+folder. Inside an enabled project it initializes that project as before. Anywhere
+else it asks one line, every time:
+
+```text
+MAVEN: no project here — Start Home, Create Project, or Read Only?
+```
+
+- **Start Home** initializes your MAVEN Home (offered only when Home is configured).
+- **Create Project** runs normal enablement for a folder; `$HOME`, `/`, `~/.maven` and
+  the MAVEN checkout are refused.
+- **Read Only** (also the result of not answering) creates no session and captures
+  nothing. When you ask, the assistant consults universal knowledge, and Home if you
+  want it, read-only.
+
+The answer is recorded locally only. Subagents and maintenance workers inherit the
+choice and never ask. Nothing is captured without a project or Home choice, and a cwd
+change never rebinds a session. The assistant prints the active line, such as
+`MAVEN: Home (<label>)`, `MAVEN: project <name>` or `MAVEN: read-only`, at start and
+whenever it changes.
+
+**MAVEN Home** is an optional, per-machine project for your life, personal and work
+tasks, and awareness of people and organizations (for example tag `client:<slug>`).
+Set it up, change it or disable it with **“Set up or change MAVEN Home”** in the
+installer, or ask the assistant (`maven_admin` kind `home`). Disabling leaves cloud
+data untouched. Home is the one explicit, owner-configured exception to MAVEN never
+choosing a root by itself. A Home session also starts with a short **project index**:
+every MAVEN project's name, archived state and last activity (up to 100), with no
+project details, so the assistant knows what exists and which project to open.
+
+Scoping: **universal** holds preferences, instructions and general lessons only;
+nothing specific to one customer or project, because universal records appear in every
+project. **Home** holds the owner-level material above. **Project** holds that
+project's detail. When unsure, the assistant chooses Home, not universal.
 
 ### Installer options and harnesses
 

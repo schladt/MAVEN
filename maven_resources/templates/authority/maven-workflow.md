@@ -4,7 +4,11 @@ Proposed skill: apply only as current applicable owner-approved cloud authority.
 
 ## Enable and initialize
 
-Confirm the absolute root, selected instance and existing project or authorized creation with genuine source evidence. Reject `/`; do not auto-register the installation checkout or silently rebind an ambiguous/subdirectory root. Memory requires neither Git nor a no-Git selection. Journal generated identities before mutation and preserve interrupted setup receipts.
+Confirm the absolute root, selected instance and existing project or authorized creation with genuine source evidence. Reject `/`, `$HOME`, `~/.maven` and the MAVEN checkout; do not auto-register the installation checkout or silently rebind an ambiguous/subdirectory root. Memory requires neither Git nor a no-Git selection. Journal generated identities before mutation and preserve interrupted setup receipts.
+
+## Start choice and active line
+
+At session start, check status with the workspace directory. Inside an enabled project, initialize it. Elsewhere, ask the returned one-line start question every time: Start Home (initialize the owner-configured Home), Create Project (normal explicit enablement) or Read Only (no session, no capture; consult universal and optionally Home read-only only when asked). No answer means Read Only. Record the answer locally only, never in the cloud. Capture only after a project or Home choice. Home is a per-machine opt-in set up, changed or disabled through owner-reviewed administration; it is the one explicit, owner-configured exception to never choosing a root. Subagents and maintenance workers inherit the parent's choice and never ask. Always show the returned active line (Home, project, read-only or off) at start and whenever it changes.
 
 For explicitly enabled projects, native harness guidance initializes subsequent supported sessions. Show `MAVEN: initializing for <project>...`, then ready only after binding and complete current applicable authority/dependencies, handover, tasks and blockers load. Show paused readiness or a precise initialization-blocked reason as appropriate. A new project's absent handover is normal; missing authority is not. If automatic startup is unavailable, disclose the gap and initialize explicitly with visible chat output. Tool discovery, a server process or stderr logs are not readiness.
 

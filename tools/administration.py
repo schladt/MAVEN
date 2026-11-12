@@ -17,12 +17,30 @@ from pathlib import Path
 import re
 import subprocess
 import sys
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from tools.interaction import Field
 from tools.setup_common import SetupPending, private_directory, read_private, save_json, setup_lock
 
 _LEGACY_STARTER_REVIEWS = frozenset(('starter_prepare', 'starter_submit', 'starter_activate', 'starter_renew'))
+HOME_TAG = 'maven-home'
+CLEANUP_ACTIONS = ('review', 'forget', 'restore', 'erase')
+CLEANUP_LIMIT = 200
+_LIFECYCLE_KINDS = ('session', 'checkpoint', 'operation')
+# What the SQL keeps of a memory receipt result after erase; the same keys survive locally.
+_RECEIPT_KEYS = ('record_id', 'revision', 'request_key', 'replayed')
+ERASE_CAVEATS = (
+    'Erase cannot be undone: every revision of each record becomes a content-free tombstone, its tags become '
+    '["erased"] and the record stays forgotten.',
+    'Aurora automated backups keep the old content up to 30 days; erase cannot reach them.',
+    'This machine\'s local MAVEN runtime files (last-write receipts, failed-write records and maintenance '
+    'state, for every project registered on this machine and the Home folder) are swept after the cloud '
+    'erase; every file changed is reported. Checkpoint manifests hold only record references and are kept.',
+    'Other machines keep any locally cached copy until they next run a MAVEN clean-up (any clean-up action '
+    'sweeps them).',
+)
+# Local replacement for content of records erased earlier, when that erase's tombstone is not at hand.
+ERASED_LOCAL = {'erased': True}
 
 
 class AdminInputError(ValueError):
@@ -121,6 +139,158 @@ def _discover_stacks(values):
     return sorted(found, key=lambda item: (item['name'], item['stack_id']))
 
 
+def _cleanup_ids(value):
+    """An explicit, bounded, duplicate-free list of canonical record UUIDs."""
+    if not isinstance(value, list) or not value:
+        raise AdminInputError('Select at least one record id for clean-up.')
+    if len(value) > CLEANUP_LIMIT:
+        raise AdminInputError(f'Select at most {CLEANUP_LIMIT} records per clean-up operation; split larger selections.')
+    for item in value:
+        try:
+            canonical = str(UUID(item))
+        except (ValueError, TypeError, AttributeError):
+            canonical = None
+        if canonical != item:
+            raise AdminInputError('Clean-up record ids must be canonical lowercase record UUIDs.')
+    if len(set(value)) != len(value):
+        raise AdminInputError('Each clean-up record id may be selected once.')
+    return list(value)
+
+
+def _cleanup_reason(value):
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 500:
+        raise AdminInputError('The clean-up reason is required text of at most 500 characters; never include '
+                              'the content being forgotten or erased.')
+    return value.strip()
+
+
+def _erased_request(body, tombstone):
+    """One journaled write request with its content replaced; identity and request key are kept."""
+    erased = dict(body)
+    if 'data' in erased and not (isinstance(erased['data'], dict) and erased['data'].get('erased') is True):
+        erased['data'] = deepcopy(tombstone)
+    if 'tags' in erased:
+        erased['tags'] = ['erased']
+    if isinstance(erased.get('source'), dict) and 'excerpt' in erased['source']:
+        erased['source'] = {**erased['source'], 'excerpt': 'erased'}
+    for key in ('change_reason', 'reason'):
+        if key in erased:
+            erased[key] = 'erased'
+    return erased
+
+
+def _sweep_session(root, session, ids, tombstone):
+    """Plan the content rewrites of one local session runtime: ({file name: new value}, blockers).
+
+    An unresolved request (a pending-memory.json journal or an unfinished maintenance effect) for an
+    erased record is never rewritten or deleted: it must be recovered first.
+    """
+    from tools.memory.boundary import BoundaryError, digest, private_path, read_private
+    runtime = f'.maven/runtime/sessions/{session}'
+    updates, blockers = {}, []
+
+    def load(name):
+        try:
+            if not private_path(root, runtime + '/' + name).exists():
+                return None
+            return read_private(root, runtime + '/' + name)
+        except BoundaryError:
+            blockers.append(f'{Path(root) / runtime / name}: unreadable or not owner-private; inspect it, then advance.')
+            return None
+
+    pending = load('pending-memory.json')
+    if pending is not None and (pending.get('body') or {}).get('record_id') in ids:
+        blockers.append(f'{Path(root) / runtime / "pending-memory.json"}: unresolved memory request for erased record '
+                        f'{pending["body"]["record_id"]}. Recover it in that session (maven_recover), then advance.')
+    last = load('last-memory-write.json')
+    if last is not None and isinstance(last.get('result'), dict):
+        result = last['result']
+        if ((last.get('record') or {}).get('record_id') in ids or result.get('record_id') in ids) \
+                and set(result) - set(_RECEIPT_KEYS):
+            updates['last-memory-write.json'] = {**last, 'result': {key: result[key] for key in _RECEIPT_KEYS
+                                                                    if key in result}}
+    failed = load('failed-memory-write.json')
+    request = (failed or {}).get('request')
+    if isinstance(request, dict) and isinstance(request.get('body'), dict) and request['body'].get('record_id') in ids:
+        body = _erased_request(request['body'], tombstone)
+        if body != request['body']:
+            rewritten = {key: value for key, value in request.items() if key != 'digest'}
+            rewritten['body'] = body
+            rewritten['digest'] = digest(rewritten)
+            updates['failed-memory-write.json'] = {**failed, 'request': rewritten}
+    maintenance = load('maintenance.json')
+    if maintenance is not None:
+        changed, dirty = deepcopy(maintenance), False
+        for assignment in (changed.get('assignments') or {}).values():
+            for effect in assignment.get('effects', []):
+                request = effect.get('request') or {}
+                if request.get('record_id') not in ids:
+                    continue
+                if effect.get('state') in ('pending', 'applying', 'uncertain'):
+                    blockers.append(f'{Path(root) / runtime / "maintenance.json"}: maintenance assignment '
+                                    f'{assignment.get("operation_id")} has an unresolved effect for erased record '
+                                    f'{request["record_id"]}. Recover or finish it, then advance.')
+                    continue
+                erased = _erased_request(request, tombstone)
+                if erased != request:
+                    effect['request'], dirty = erased, True
+        if dirty:
+            updates['maintenance.json'] = changed
+    return updates, blockers
+
+
+def _session_directories(root):
+    from tools.memory.boundary import BoundaryError, private_path
+    try:
+        base = private_path(root, '.maven/runtime/sessions')
+    except BoundaryError:
+        return []
+    if not base.is_dir():
+        return []
+    found = []
+    for path in sorted(base.iterdir()):
+        try:
+            canonical = str(UUID(path.name))
+        except ValueError:
+            continue
+        if canonical == path.name and path.is_dir() and not path.is_symlink():
+            found.append(path.name)
+    return found
+
+
+def sweep_erased(roots, ids, tombstone):
+    """Rewrite erased records' content in this machine's local runtime under each roots' sessions.
+
+    All roots are checked first; any unresolved request referencing an erased record refuses the
+    whole sweep before a file is changed. Returns every file touched.
+    """
+    from tools.coordination import SESSION_LOCK_TIMEOUT, CoordinationError, private_lock, session_lock
+    from tools.memory.boundary import save_private
+    ids = frozenset(ids)
+    targets = [(root, session) for root in roots for session in _session_directories(root)]
+    blockers = [item for root, session in targets for item in _sweep_session(root, session, ids, tombstone)[1]]
+    if blockers:
+        raise SetupPending('The local sweep was refused; nothing local was changed. Resolve first:\n'
+                           + '\n'.join(blockers))
+    touched = []
+    for root, session in targets:
+        runtime = f'.maven/runtime/sessions/{session}'
+        try:
+            with session_lock(root, session), private_lock(root, runtime + '/maintenance.lock',
+                                                            timeout=SESSION_LOCK_TIMEOUT):
+                updates, blockers = _sweep_session(root, session, ids, tombstone)
+                if blockers:
+                    raise SetupPending('The local sweep stopped; resolve, then advance:\n' + '\n'.join(blockers)
+                                       + ('\nAlready swept: ' + ', '.join(touched) if touched else ''))
+                for name, value in sorted(updates.items()):
+                    save_private(root, runtime + '/' + name, value)
+                    touched.append(str(Path(root) / runtime / name))
+        except CoordinationError:
+            raise SetupPending(f'Session {session} in {root} is busy; advance this operation again shortly.'
+                               + ('\nAlready swept: ' + ', '.join(touched) if touched else '')) from None
+    return {'roots': [str(root) for root in roots], 'sessions_checked': len(targets), 'files_touched': touched}
+
+
 class AdminOperations:
     """Explicit, restartable setup/install/project/removal/recovery operations."""
 
@@ -160,6 +330,8 @@ class AdminOperations:
                           'offline', 'export', 'optional_resource', 'retained_resource',
                           'abandon_sessions', 'output', 'adopt_legacy', 'plan_path'},
             'recovery': {'operation_id', 'root', 'session_id', 'action'},
+            'home': {'action', 'root', 'project_id', 'label'},
+            'cleanup': {'action', 'record_ids', 'reason'},
         }
         if kind not in allowed or not isinstance(parameters, dict) or set(parameters) - allowed[kind]:
             raise AdminInputError('Unsupported administration kind or parameters.')
@@ -172,6 +344,18 @@ class AdminOperations:
         if kind == 'install' and (not isinstance(parameters.get('harness', []), list)
                 or any(not isinstance(item, str) for item in parameters.get('harness', []))):
             raise AdminInputError('Install harness must be an explicit list of names.')
+        if kind == 'home' and (parameters.get('action', 'enable') not in ('enable', 'disable')
+                or any(not isinstance(parameters.get(key, ''), str) for key in ('root', 'project_id', 'label'))):
+            raise AdminInputError('Home action must be enable or disable; root, project_id and label are text.')
+        if kind == 'cleanup':
+            if parameters.get('action') not in CLEANUP_ACTIONS:
+                raise AdminInputError('Clean-up action must be review, forget, restore or erase.')
+            if parameters['action'] == 'review' and set(parameters) != {'action'}:
+                raise AdminInputError('The clean-up review is read-only and takes no records or reason.')
+            if 'record_ids' in parameters:
+                _cleanup_ids(parameters['record_ids'])
+            if 'reason' in parameters:
+                _cleanup_reason(parameters['reason'])
         if 'source' in parameters and kind == 'setup':
             _source(parameters['source'])
         self._prepare()
@@ -283,6 +467,16 @@ class AdminOperations:
                     if answer['connection'].startswith('/'):
                         from tools.memory.environment import load_environment
                         _connection_config(load_environment(Path(answer['connection'])))
+                if key == 'cleanup_selection':
+                    _cleanup_ids(re.split(r'[\s,]+', response['record_ids'].strip()))
+                    _cleanup_reason(response['reason'])
+                if key == 'home':
+                    try:
+                        self._home_selection(response)
+                    except (ValueError, SetupPending) as error:
+                        raise AdminInputError(str(error)) from None
+                    except OSError:
+                        raise AdminInputError('Select an accessible Home folder.') from None
                 if key == 'project':
                     if not Path(response['root']).is_absolute() or not Path(response['root']).is_dir():
                         raise AdminInputError('Select an absolute existing project directory.')
@@ -383,7 +577,8 @@ class AdminOperations:
         if isinstance(review, dict):
             targets = {name: review[name] for name in
                        ('instance_id', 'identity', 'selection', 'instance', 'targets',
-                        'machine_homes', 'scopes', 'region', 'mode', 'connection')
+                        'machine_homes', 'scopes', 'region', 'mode', 'connection',
+                        'home_file', 'remove', 'consent', 'replaces')
                        if name in review}
             if key == 'starter_collection':
                 targets = {}
@@ -465,7 +660,8 @@ class AdminOperations:
             state.pop('handoff', None)
             if state['step'] in ('connection', 'plan', 'apply', 'initialize', 'migrate',
                                   'migration_bind', 'starter_submit', 'starter_activate',
-                                  'update_service_apply', 'project_apply', 'removal_apply', 'recover'):
+                                  'update_service_apply', 'project_apply', 'removal_apply', 'recover',
+                                  'home_apply', 'home_disable', 'cleanup_apply', 'cleanup_sweep'):
                 state['effect_sequence'] = state.get('effect_sequence', 0) + 1
             self._save(state)  # Persist the phase before any potentially uncertain effect.
             try:
@@ -1235,6 +1431,403 @@ class AdminOperations:
                 reviewed_environment=binding['environment']))
             self._receipt(state, step, result)
             state.update(state='completed', outcome=result)
+
+    def _home_selection(self, answer):
+        """Normalize one Home form answer; local checks only, no cloud access."""
+        from tools.home import HomeError, validate_root
+        from tools.project import load_project
+        mode = answer.get('mode')
+        if mode not in ('enabled', 'existing', 'create'):
+            raise HomeError('Choose how the Home folder is selected.')
+        root = Path(str(answer.get('root', '')).strip()).expanduser()
+        if not root.is_absolute():
+            raise HomeError('Home folder must be an absolute path')
+        if mode == 'create' and not root.exists() and not root.is_symlink():
+            parent = root.parent
+            if not parent.is_dir():
+                raise HomeError('The parent folder of a new Home folder must exist')
+            # A new child of the user home is allowed; any other parent gets the full Home checks.
+            if parent.resolve() != Path.home().resolve():
+                parent = validate_root(self.home, parent)
+            root = parent.resolve() / root.name
+        else:
+            root = validate_root(self.home, root)
+        project_id = str(answer.get('project_id', '')).strip()
+        enabled = (root / '.maven/project.json').exists() or (root / '.maven/project.json').is_symlink()
+        if mode == 'enabled':
+            if not enabled:
+                raise HomeError('This folder is not an enabled MAVEN project; choose another option.')
+            current = load_project(root)['project_id']
+            if project_id and project_id != current:
+                raise HomeError('This folder belongs to a different MAVEN project than the UUID entered.')
+            project_id = current
+        elif enabled:
+            raise HomeError('This folder is already an enabled MAVEN project; choose "Use an already enabled project folder".')
+        elif mode == 'existing':
+            try:
+                project_id = str(UUID(project_id))
+            except ValueError:
+                raise HomeError('Enter the exact existing MAVEN project UUID.') from None
+        else:
+            if project_id:
+                raise HomeError('A new project gets its UUID when it is created; leave the project UUID blank.')
+            if root.exists() and any(root.iterdir()):
+                raise HomeError('A new Home project needs a new or empty folder.')
+            project_id = None
+        label = str(answer.get('label', '')).strip() or root.name
+        return {'mode': mode, 'root': str(root), 'project_id': project_id, 'label': label,
+                'replace': answer.get('replace') is True}
+
+    def _home_client(self):
+        from tools.memory.environment import configured_client
+        return configured_client(self.home / '.env')
+
+    def _home_projects(self):
+        """Universal project entities on this instance that carry the maven-home tag."""
+        client = self._home_client()
+        try:
+            page = client.invoke('/v1/memory/search', {'kind': 'entity', 'tag': HOME_TAG, 'scope': 'universal'})['data']
+        finally:
+            client.close()
+        return sorted(({'project_id': record['record_id'], 'name': record.get('data', {}).get('name')}
+                       for record in page.get('records', [])
+                       if record.get('data', {}).get('entity_type') == 'project'
+                       and HOME_TAG in (record.get('tags') or [])), key=lambda item: item['project_id'])
+
+    @staticmethod
+    def _home_conflicts(project_id, homes, current):
+        """Other projects already serving as Home: tagged on the instance or selected on this machine."""
+        others = {item['project_id'] for item in homes if item['project_id'] != project_id}
+        if current and 'invalid' not in current and current['project_id'] != project_id:
+            others.add(current['project_id'])
+        return sorted(others)
+
+    def _tag_home(self, state, project_id, source):
+        """Write the next entity revision with the maven-home tag; kind, scope and data unchanged."""
+        client = self._home_client()
+        try:
+            record = client.invoke('/v1/memory/read', {'record_id': project_id})['data']
+            if (record.get('kind') != 'entity' or record.get('data_scope') != 'owner'
+                    or record.get('project_id') is not None
+                    or record.get('data', {}).get('entity_type') != 'project'):
+                raise SetupPending('The Home project is not a universal owner project entity; it was not tagged.')
+            tags = list(record.get('tags') or [])
+            if HOME_TAG in tags:
+                return {'status': 'unchanged', 'record_id': project_id, 'revision': record['revision']}
+            client.invoke('/v1/memory/write', {
+                'request_key': str(uuid5(UUID(state['operation_id']), f'home-tag:{project_id}:{record["revision"]}')),
+                'record_id': project_id, 'expected_revision': record['revision'], 'kind': 'entity',
+                'classification': 'Sensitive', 'data_scope': record['data_scope'], 'data': record['data'],
+                'tags': [*tags, HOME_TAG], 'source': {'origin': source['origin'], 'excerpt': source['excerpt']},
+                'change_reason': 'Mark the owner-approved MAVEN Home project',
+            })
+        finally:
+            client.close()
+        return {'status': 'tagged', 'record_id': project_id, 'previous_revision': record['revision']}
+
+    def _home(self, state):
+        from tools.home import HOME_FILE, HomeError, load_home, remove_home, save_home, validate_root
+        from tools.project import load_project
+        step, parameters = state['step'], state['parameters']
+        path = str(self.home / HOME_FILE)
+        if parameters.get('action', 'enable') == 'disable':
+            current = load_home(self.home)
+            review = {'action': 'disable', 'remove': [path], 'current_home': current,
+                      'unchanged': 'Cloud memory, the project entity and its maven-home tag, and the project folder are not changed.'}
+            if step == 'start':
+                if current is None:
+                    state.update(state='completed', pending_interaction=None, outcome={
+                        'status': 'unchanged', 'removed': [], 'reason': 'MAVEN Home is not set up on this machine.'})
+                    return
+                state['presentation'] = {'title': 'Turn off MAVEN Home', 'purpose': 'Local Home selection only',
+                                         'target': path, 'description': '', 'details': ''}
+                self._review(state, 'home_disable', 'Turn off MAVEN Home on this machine: remove only ' + path,
+                             review, 'home_disable')
+            elif step == 'home_disable':
+                self._approved(state, 'home_disable', review)
+                removed = remove_home(self.home)
+                result = {'status': 'removed' if removed else 'unchanged', 'removed': [path] if removed else [],
+                          'cloud_changed': False}
+                self._receipt(state, step, result)
+                state.update(state='completed', outcome=result)
+            return
+        if step in ('start', 'home_selection'):
+            try:
+                homes, lookup = self._home_projects(), ''
+            except Exception:  # Discovery is optional; the owner can still enter the UUID.
+                homes, lookup = [], ' The lookup for an existing Home on this instance was unavailable.'
+            root = parameters.get('root', '')
+            enabled = bool(root) and Path(root).is_absolute() and (Path(root) / '.maven/project.json').is_file()
+            mode = 'enabled' if enabled else 'existing' if homes else 'create'
+            found = ''.join(f'\nExisting MAVEN Home on this instance: {item["name"] or "unnamed"} ({item["project_id"]})'
+                            for item in homes)
+            self._question(state, 'home', 'Choose the MAVEN Home folder', [
+                Field('mode', 'Home folder', mode, kind='select', choices=(
+                    ('Use an already enabled project folder', 'enabled'),
+                    ('Enable an existing folder for an existing MAVEN project (another machine)', 'existing'),
+                    ('Create a new project in a new or empty folder', 'create'))),
+                Field('root', 'Absolute Home folder, outside the MAVEN installation', root),
+                Field('project_id', 'Existing project UUID (blank for an enabled folder or a new project)',
+                      parameters.get('project_id') or (homes[0]['project_id'] if len(homes) == 1 else ''),
+                      required=False),
+                Field('label', 'Home label (blank uses the folder name)', parameters.get('label', ''), required=False),
+                Field('replace', 'Replace a different project that is already MAVEN Home', False, kind='bool',
+                      help='Required when another project is already Home. Its maven-home tag is left unchanged.'),
+            ], 'home_review', description='MAVEN Home is the project used when no other project is active. '
+                'Nothing is changed until you approve the exact review.' + found + lookup)
+        elif step == 'home_review':
+            try:
+                selection = self._home_selection(state['answers']['home'])
+            except (ValueError, OSError) as error:
+                raise SetupPending(str(error) if isinstance(error, ValueError) else 'Home folder is not accessible.') from None
+            homes, current = self._home_projects(), load_home(self.home)
+            others = self._home_conflicts(selection['project_id'], homes, current)
+            if others and not selection['replace']:
+                raise SetupPending('A different project is already MAVEN Home (' + ', '.join(others) + '). '
+                                   'Go back and select it, or explicitly choose Replace.')
+            binding = self._project_binding()
+            instance = binding['connection']['instance_id']
+            consent = (f'Use {selection["root"]} as MAVEN Home ("{selection["label"]}") on this machine for '
+                       + (f'project {selection["project_id"]}' if selection['project_id'] else 'a new project created now')
+                       + f' on MAVEN instance {instance}. When no project is active, agents may offer to start this '
+                       f'project\'s memory session. This approval is recorded in {path} and the project entity '
+                       'gets the maven-home tag; its data is unchanged.')
+            review = {'action': 'enable', 'selection': selection, 'instance_id': instance, 'home_file': path,
+                      'consent': consent, 'replaces': others, 'current_home': current, 'binding': binding}
+            values = binding['environment']
+            from tools.setup_common import expected_account
+            state['presentation'] = {'title': 'MAVEN Home', 'purpose': 'Daily-use memory access',
+                'account': expected_account(values), 'profile': values.get('MAVEN_AWS_PROFILE', 'Not selected'),
+                'principal': values.get('MAVEN_AWS_EXPECTED_PRINCIPAL', 'Unknown'), 'verified': False,
+                'region': values.get('MAVEN_AWS_REGION', 'us-east-1'), 'target': selection['root'],
+                'description': '', 'details': ''}
+            self._preflight(state, values, 'routine')
+            self._review(state, 'home_review', 'Approve MAVEN Home: exact folder, project, instance and consent',
+                         review, 'home_apply')
+        elif step == 'home_apply':
+            from tools.project_setup import setup_project
+            reviewed = state['approvals'][-1]['review']
+            source = self._approved(state, 'home_review', {**reviewed, 'binding': self._project_binding()})
+            selection = reviewed['selection']
+            root = Path(selection['root'])
+            prior = next((receipt['result'] for receipt in state['receipts'] if receipt['step'] == 'home_project'), None)
+            project_id = selection['project_id'] or (prior or {}).get('project_id')
+            if not selection['replace']:
+                others = self._home_conflicts(project_id, self._home_projects(), load_home(self.home))
+                if others:
+                    raise SetupPending('A different project became MAVEN Home after review (' + ', '.join(others)
+                                       + '); nothing was changed. Review a new Home selection.')
+            try:
+                if prior is None:
+                    if selection['mode'] == 'enabled':
+                        if load_project(root)['project_id'] != project_id:
+                            raise SetupPending('The reviewed folder now belongs to a different project; nothing was changed.')
+                        result = {'status': 'unchanged', 'root': str(root)}
+                    else:
+                        create = selection['mode'] == 'create'
+                        if create and not root.exists():
+                            root.mkdir()
+                        validate_root(self.home, root)
+                        result = setup_project(argparse.Namespace(
+                            root=root, env=self.home / '.env', non_interactive=True, create=create,
+                            project_id=None if create else project_id, name=selection['label'] if create else None,
+                            source_origin=source['origin'] if create else None,
+                            source_excerpt=source['excerpt'] if create else None,
+                            remote=None, accepted_url=None, branch=None, check=[],
+                            reviewed_environment=reviewed['binding']['environment']))
+                        project_id = result['project']['project_id']
+                    prior = {'project_id': project_id, 'setup': result}
+                    self._receipt(state, 'home_project', prior)
+                record = save_home(self.home, root=root, project_id=project_id, instance_id=reviewed['instance_id'],
+                                   label=selection['label'], consent=source)
+            except HomeError as error:
+                raise SetupPending(str(error)) from None
+            self._receipt(state, 'home_file', record)
+            tag = self._tag_home(state, project_id, source)
+            self._receipt(state, 'home_tag', tag)
+            state.update(state='completed', outcome={'status': 'ready', 'home': record, 'entity_tag': tag})
+
+    def _cleanup_admin(self):
+        """The separately assumed administration role, obtained exactly as the schema migration does."""
+        from tools.memory.client import selected_session
+        from tools.memory.environment import load_environment, memory_config
+        values = load_environment(self.home / '.env')
+        config = memory_config(values)
+        return values, config, selected_session(config, admin=True, environment=values)
+
+    def _cleanup_roots(self):
+        """Project roots known to this machine's session registry, plus the Home folder."""
+        from tools.coordination import private_lock
+        from tools.home import load_home
+        from tools.memory.boundary import private_path, read_private
+        roots = set()
+        if private_path(self.home, 'runtime/sessions.json').exists():
+            with private_lock(self.home, 'runtime/registry.lock'):
+                registry = read_private(self.home, 'runtime/sessions.json')
+            sessions = registry.get('sessions') if registry.get('schema') == 1 else None
+            if not isinstance(sessions, dict):
+                raise SetupPending('The local session registry is malformed; preserve it for recovery. Nothing was swept.')
+            roots.update(item['root'] for item in sessions.values()
+                         if isinstance(item, dict) and isinstance(item.get('root'), str))
+        home = load_home(self.home)
+        if home and 'invalid' not in home:
+            roots.add(home['root'])
+        return sorted(root for root in roots if Path(root).is_absolute() and Path(root).is_dir())
+
+    def _cleanup_blockers(self, ids):
+        """Unresolved local requests for these records; read-only."""
+        return [blocker for root in self._cleanup_roots() for session in _session_directories(root)
+                for blocker in _sweep_session(root, session, frozenset(ids), ERASED_LOCAL)[1]]
+
+    @staticmethod
+    def _cleanup_receipt(state, step):
+        return next((receipt['result'] for receipt in reversed(state['receipts']) if receipt['step'] == step), None)
+
+    def _cleanup_selection(self, state):
+        parameters, answer = state['parameters'], state['answers'].get('cleanup_selection')
+        if answer is not None:
+            return (_cleanup_ids(re.split(r'[\s,]+', answer['record_ids'].strip())),
+                    _cleanup_reason(answer['reason']))
+        return _cleanup_ids(parameters['record_ids']), _cleanup_reason(parameters['reason'])
+
+    def _cleanup(self, state):
+        """Clean-up review, Forget, Restore and Erase under the administration role.
+
+        Every clean-up first sweeps this machine's local runtime for all erased records. Forget,
+        Restore and Erase then apply only after an exact owner-approved review; the approved review
+        digest is passed to the SQL receipt.
+        """
+        from tools.memory import admin
+        from tools.setup_common import expected_account
+        step, parameters = state['step'], state['parameters']
+        action = parameters['action']
+        if step == 'start':
+            values, config, session = self._cleanup_admin()
+            state['presentation'] = {
+                'title': 'Memory clean-up', 'purpose': 'Administration role: ' + action,
+                'account': expected_account(values), 'profile': values.get('MAVEN_AWS_PROFILE', 'Not selected'),
+                'principal': values.get('MAVEN_AWS_EXPECTED_PRINCIPAL', 'Unknown'), 'verified': False,
+                'region': values.get('MAVEN_AWS_REGION', 'us-east-1'), 'target': config['instance_id'],
+                'description': '', 'details': ''}
+            self._preflight(state, values, 'sql')
+            erased = admin.cleanup_erased_ids(config, session)
+            sweep = sweep_erased(self._cleanup_roots(), erased, ERASED_LOCAL)
+            self._receipt(state, 'cleanup_local_sweep', {**sweep, 'erased_records': len(erased)})
+            if action == 'review':
+                found = admin.cleanup_candidates(config, session)
+                groups = {}
+                for entry in found['candidates']:
+                    groups.setdefault(entry['suggested'], []).append(entry)
+                outcome = {
+                    'status': 'ready', 'action': 'review', 'read_only': True,
+                    'total': len(found['candidates']), 'truncated': bool(found.get('truncated')),
+                    'groups': groups, 'local_sweep': sweep,
+                    'next': 'Nothing was changed in the cloud. Propose Forget, Erase or Archive per item and wait '
+                            'for the owner\'s choice. Archive is a normal maven_save revision adding the archived '
+                            'tag; Forget, Restore and Erase each begin a separate maven_admin cleanup operation '
+                            'with the owner-chosen record_ids and reason.'}
+                self._receipt(state, 'cleanup_candidates', {'total': outcome['total'],
+                                                            'truncated': outcome['truncated']})
+                state.update(state='completed', pending_interaction=None, outcome=outcome)
+                return
+            step = state['step'] = 'cleanup_selection'
+        if step == 'cleanup_selection':
+            if {'record_ids', 'reason'} <= parameters.keys():
+                step = state['step'] = 'cleanup_review'
+            else:
+                self._question(state, 'cleanup_selection', f'Select the records to {action}', [
+                    Field('record_ids', f'Record UUIDs, one per line (at most {CLEANUP_LIMIT})',
+                          '\n'.join(parameters.get('record_ids', [])), kind='multiline'),
+                    Field('reason', 'Reason recorded in the clean-up receipt (never the content itself)',
+                          parameters.get('reason', ''))], 'cleanup_review',
+                    description='Nothing is changed until you approve the exact review of these records.')
+                return
+        if step == 'cleanup_review':
+            ids, reason = self._cleanup_selection(state)
+            _, config, session = self._cleanup_admin()
+            described = {entry['record_id']: entry for entry in admin.cleanup_describe(config, session, ids)}
+            missing = [identifier for identifier in ids if not described.get(identifier, {}).get('found')]
+            if missing:
+                raise SetupPending('These records were not found on this instance: ' + ', '.join(missing)
+                                   + '. Begin a new clean-up with a corrected selection; nothing was changed.')
+            refused = [f'{identifier} ({described[identifier]["kind"]})' for identifier in ids
+                       if described[identifier]['kind'] in _LIFECYCLE_KINDS]
+            if refused:
+                raise SetupPending('Session, checkpoint and operation records are not cleaned up: '
+                                   + ', '.join(refused) + '. Nothing was changed.')
+            erased = [identifier for identifier in ids if described[identifier].get('erased')]
+            if erased:
+                raise SetupPending('Already erased records cannot be forgotten, restored or erased again: '
+                                   + ', '.join(erased) + '. Nothing was changed.')
+            if action == 'erase':
+                blockers = self._cleanup_blockers(ids)
+                if blockers:
+                    raise SetupPending('Erase refused before review; resolve first:\n' + '\n'.join(blockers))
+            records = [described[identifier] for identifier in ids]
+            effect = {
+                'forget': 'Set each record to forgotten: it disappears from search, startup context and every '
+                          'read, including revision reads. History is kept; Restore reverses it.',
+                'restore': 'Set each forgotten record back to visible.',
+                'erase': 'Rewrite every revision of each record, its current content, its sources\' excerpts, '
+                         'fact values and memory receipt results to a content-free tombstone. Irreversible.',
+            }[action]
+            review = {'action': action, 'instance_id': config['instance_id'], 'reason': reason,
+                      'record_ids': ids, 'records': records,
+                      'versions_affected': sum(record.get('versions', 0) for record in records),
+                      'effect': effect, 'caveats': list(ERASE_CAVEATS) if action == 'erase' else [],
+                      'receipt': 'An immutable clean-up receipt records the record ids, version counts, actor, '
+                                 'reason and this review digest; never content.'}
+            self._review(state, 'cleanup_review', f'Approve {action} of {len(ids)} record(s): exact records, '
+                         'versions and caveats', review, 'cleanup_apply')
+        elif step == 'cleanup_apply':
+            values, config, session = self._cleanup_admin()
+            reviewed = state['approvals'][-1]['review']
+            self._approved(state, 'cleanup_review', {**reviewed, 'instance_id': config['instance_id']})
+            approval_digest = state['answers']['cleanup_review']['review_digest']
+            ids = reviewed['record_ids']
+            current = {entry['record_id']: entry for entry in admin.cleanup_describe(config, session, ids)}
+            changed = [record['record_id'] for record in reviewed['records']
+                       if (current.get(record['record_id']) or {}).get('revision') != record['revision']
+                       or current[record['record_id']].get('kind') != record['kind']]
+            if changed:
+                raise SetupPending('Reviewed candidate changed (' + ', '.join(changed) + '); approval is invalid. '
+                                   'Begin a new clean-up review. Nothing was changed.')
+            actor = (values.get('MAVEN_AWS_EXPECTED_PRINCIPAL') or 'owner') + ' via maven_admin cleanup ' + state['operation_id']
+            if action == 'erase':
+                blockers = self._cleanup_blockers(ids)
+                if blockers:
+                    raise SetupPending('Erase refused; nothing was changed. Resolve first:\n' + '\n'.join(blockers))
+                if all(current[identifier].get('erased') for identifier in ids):
+                    # An interrupted earlier attempt completed in the cloud; never erase twice.
+                    result = {'status': 'already_erased', 'receipt_id': None, 'records': []}
+                else:
+                    result = admin.erase_records(config, session, ids, actor=actor, reason=reviewed['reason'],
+                                                 approval_digest=approval_digest)
+                self._receipt(state, 'cleanup_apply', result)
+                state['step'] = 'cleanup_sweep'
+                self._cleanup_sweep(state)
+            else:
+                result = admin.forget_records(config, session, ids, restore=action == 'restore', actor=actor,
+                                              reason=reviewed['reason'], approval_digest=approval_digest)
+                self._receipt(state, 'cleanup_apply', result)
+                state.update(state='completed', pending_interaction=None, outcome={
+                    'status': 'completed', 'action': action, 'receipt_id': result['receipt_id'],
+                    'changed': result.get('changed', []), 'unchanged': result.get('unchanged', []),
+                    'local_sweep': self._cleanup_receipt(state, 'cleanup_local_sweep')})
+        elif step == 'cleanup_sweep':
+            self._cleanup_sweep(state)
+        else:
+            raise SetupPending('Unknown clean-up phase; retain evidence and use the matching implementation.')
+
+    def _cleanup_sweep(self, state):
+        applied = self._cleanup_receipt(state, 'cleanup_apply')
+        reviewed = state['approvals'][-1]['review']
+        sweep = sweep_erased(self._cleanup_roots(), reviewed['record_ids'], applied.get('tombstone') or ERASED_LOCAL)
+        self._receipt(state, 'cleanup_sweep', sweep)
+        state.update(state='completed', pending_interaction=None, outcome={
+            'status': 'completed', 'action': 'erase', 'receipt_id': applied.get('receipt_id'),
+            'records': applied.get('records', []), 'local_sweep_before': self._cleanup_receipt(state, 'cleanup_local_sweep'),
+            'local_sweep': sweep, 'caveats': reviewed['caveats']})
 
     def _removal_access(self, state, home):
         from tools.memory.environment import load_environment

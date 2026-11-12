@@ -298,6 +298,16 @@ class SessionRegistry:
                 raise CoordinationError('session still has unresolved writes or Git publication')
             del state['sessions'][session_id]
 
+    def abandon(self, session_id):
+        """Owner-confirmed: another session no longer runs. Mark an active local registration
+        abandoned, retaining its entry (writers, caches) for explicit recovery; True if changed."""
+        with self.transaction() as state:
+            item = state['sessions'].get(session_uuid(session_id))
+            if item is None or item.get('state') != 'active':
+                return False
+            item['state'] = 'abandoned'
+            return True
+
     def recover_writers(self, root, session_id, tokens):
         """Owner attests these exact interrupted operations have stopped; never guess."""
         with self.transaction() as state:

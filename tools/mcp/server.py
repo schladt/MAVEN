@@ -54,8 +54,12 @@ push or back up source files. Cloud migrations and active instruction changes re
 During outages preserve accepted local operations and say pending/degraded; required current authority
 cannot be replaced by cached instructions. Recover original requests explicitly, never by minting new IDs.
 After a harness restart check maven_status before saying connected; resume only the exact listed session.
+At session start call maven_status with your workspace cwd. With start_hint, ask its one-line question every time;
+answer via maven_initialize (home=true for Start Home), maven_project, or maven_start (read_only/off; no answer
+means read_only). Always print the returned active line at start and on any change; never rebind on a cwd change.
 List cloud instructions with maven_instructions. Say whether a memory answer came from this conversation
-or was re-read from MAVEN. Unbound universal consultation is read-only and needs explicit owner intent.
+or was re-read from MAVEN. Unbound universal consultation is read-only and needs explicit owner intent;
+include_home adds the Home project to it. Read Only and off never capture.
 """
 
 
@@ -158,16 +162,17 @@ class MavenApplication:
         self.assignment_id = None
         self.binding = None
         self.initialized = False
+        self.choice = None
         self._resume_initialization = False
         self._lock = threading.RLock()
         self._unbound_client = None
         self._warm_stop = threading.Event()
         self._warm_thread = None
 
-    def initialize(self, root, *, harness='mcp', harness_session=None, session_id=None,
-                   resume=False, assignment_id=None):
+    def initialize(self, root=None, *, harness='mcp', harness_session=None, session_id=None,
+                   resume=False, assignment_id=None, home=False, cwd=None):
         from tools.memory.lifecycle import SessionService
-        root = Path(root).expanduser().resolve(strict=True)
+        root = self._selected_root(root, home)
         session_id = session_uuid(session_id) if session_id else None
         assignment_id = session_uuid(assignment_id) if assignment_id else None
         with self._lock:
@@ -224,7 +229,62 @@ class MavenApplication:
                 result = self.service.context()
             else:
                 result = self.service.initialize(resume=self._resume_initialization)
-            return self._ready(result)
+            result = self._ready(result)
+            if result['status'] == 'ready' and self.assignment_id is None and not self._record_start(
+                    result['active'], cwd or root, harness=harness, harness_session=harness_session, folder=cwd):
+                result['choice_recorded'] = False
+            return result
+
+    def home_selection(self):
+        """The valid Home selection; refuses a missing or invalid home.json."""
+        from tools.home import load_home
+        selected = load_home(self.home)
+        if selected is None:
+            raise MaintenanceError('MAVEN Home is not configured; enable it with maven_admin kind "home"')
+        if 'invalid' in selected:
+            raise MaintenanceError(f"MAVEN Home is invalid: {selected['invalid']}")
+        return selected
+
+    def _selected_root(self, root, home):
+        if not home:
+            if not root:
+                raise MaintenanceError('initialize requires an explicit root or home=true')
+            return Path(root).expanduser().resolve(strict=True)
+        selected = Path(self.home_selection()['root'])
+        if root and Path(root).expanduser().resolve(strict=True) != selected:
+            raise MaintenanceError('root and home=true select different folders')
+        return selected.resolve(strict=True)
+
+    def active(self):
+        """What is active in this process: the bound Home or project, else the last non-session choice."""
+        from tools.home import active, load_home
+        if self.binding is None:
+            return dict(self.choice) if self.choice else active('off')
+        selected = load_home(self.home)
+        if selected and 'invalid' not in selected and selected['project_id'] == self.binding['project_id']:
+            return active('home', label=selected['label'], project_id=self.binding['project_id'])
+        return active('project', label=Path(self.binding['root']).name, project_id=self.binding['project_id'])
+
+    def _record_start(self, current, cwd, *, harness, harness_session, folder):
+        # The session is already ready; an unwritable private log must not hide that.
+        from tools.home import HomeError, record_choice, write_active
+        try:
+            record_choice(self.home, cwd, current['mode'], harness=harness, harness_session=harness_session)
+            write_active(self.home, current, harness_session=harness_session, folder=folder)
+        except (OSError, HomeError):
+            return False
+        return True
+
+    def start(self, choice, cwd, *, harness='mcp', harness_session=None):
+        """Record a sessionless Read Only/off choice; local only, never a cloud call."""
+        from tools.home import active, record_choice, write_active
+        with self._lock:
+            if self.binding is not None:
+                raise MaintenanceError('this MCP process is already bound; its active session stays selected')
+            record_choice(self.home, cwd, choice, harness=harness, harness_session=harness_session)
+            self.choice = active(choice)
+            write_active(self.home, self.choice, harness_session=harness_session, folder=cwd)
+            return dict(self.choice)
 
     def _ready(self, result):
         if not isinstance(result, dict) or result.get('status') != 'ready':
@@ -239,10 +299,12 @@ class MavenApplication:
         self.initialized = True
         self._resume_initialization = True
         self._start_keep_warm()
-        return {'status': 'ready', 'binding': dict(self.binding), 'memory': result,
+        current = self.active()
+        selected = (f"Home ({current['label']}) context" if current['mode'] == 'home' else 'project context')
+        return {'status': 'ready', 'binding': dict(self.binding), 'memory': result, 'active': current,
                 'automatic_updates': state['automatic_updates'], 'pending_count': state['pending_count'],
                 'assignment_id': self.assignment_id,
-                'message': 'MAVEN: ready — project context loaded; automatic memory updates ' +
+                'message': f'MAVEN: ready — {selected} loaded; automatic memory updates ' +
                            ('enabled.' if state['automatic_updates'] else 'paused.')}
 
     def bound(self, *, require_ready=True):
@@ -428,8 +490,20 @@ def create_server(application=None):
     def unbound_requested(unbound, scope):
         return unbound or not app.initialized and scope == 'universal'
 
-    def unbound_search(*, query, kind, after_id, limit, include_archived, offset):
-        body = {'scope': 'universal', 'limit': limit}
+    def unbound_projects(scope, project_id, include_home):
+        """Project IDs an unbound consultation may see: universal (None), plus Home on request."""
+        if scope not in ('universal', 'context'):
+            raise MaintenanceError('unbound consultation is limited to universal memory')
+        home_id = app.home_selection()['project_id'] if include_home else None
+        if project_id is not None and project_id != home_id:
+            raise MaintenanceError('unbound consultation is limited to universal memory'
+                                   + (' and the Home project' if include_home else ''))
+        return home_id
+
+    def unbound_search(*, query, kind, after_id, limit, include_archived, offset, home_id=None):
+        # Scope 'context' with the Home project ranks and pages universal plus Home in one search.
+        body = ({'scope': 'context', 'project_id': home_id, 'limit': limit} if home_id else
+                {'scope': 'universal', 'limit': limit})
         if query:
             body['query'] = query
         for key, value in (('kind', kind), ('after_id', after_id), ('offset', offset)):
@@ -442,17 +516,17 @@ def create_server(application=None):
         if not isinstance(page, dict) or not isinstance(page.get('records'), list):
             raise BoundaryError('memory service returned no verified result')
         return dict(page, records=[item for item in page['records']
-                                   if item.get('data_scope') == 'owner' and item.get('project_id') is None],
-                    scope='universal', unbound=True)
+                                   if item.get('data_scope') == 'owner' and item.get('project_id') in (None, home_id)],
+                    scope='universal_and_home' if home_id else 'universal', unbound=True)
 
-    def unbound_read(record_id, revision):
+    def unbound_read(record_id, revision, home_id=None):
         body = {'record_id': record_id}
         if revision is not None:
             body['revision'] = revision
         result = app.unbound_client().invoke('/v1/memory/read', body)
         record = result.get('data') if result.get('status') == 'ready' else None
         if (not isinstance(record, dict) or record.get('record_id') != record_id
-                or record.get('project_id') is not None or record.get('data_scope') != 'owner'
+                or record.get('project_id') not in (None, home_id) or record.get('data_scope') != 'owner'
                 or revision is not None and record.get('revision') != revision):
             raise BoundaryError('memory record scope or revision mismatch')
         return {**record, 'unbound': True}
@@ -481,12 +555,24 @@ def create_server(application=None):
 
     @server.tool()
     @guarded
-    def maven_initialize(root: str, harness: str = 'mcp', harness_session: str | None = None,
+    def maven_initialize(root: str | None = None, harness: str = 'mcp', harness_session: str | None = None,
                          session_id: str | None = None, resume: bool = False,
-                         assignment_id: str | None = None) -> dict[str, Any]:
-        """Initialize an explicitly enabled project and load complete current authority. Announce initialization before calling, then readiness or a blocker. Restore an exact binding, never the newest session."""
+                         assignment_id: str | None = None, home: bool = False,
+                         cwd: str | None = None) -> dict[str, Any]:
+        """Initialize an explicitly enabled project and load complete current authority. Announce initialization before calling, then readiness or a blocker. Restore an exact binding, never the newest session.
+
+        home=true (root omitted) starts MAVEN Home from the configured ~/.maven/home.json and is refused when it is missing or invalid. cwd is the agent's workspace folder; the start choice is recorded locally for it. The result carries active {mode, label, project_id, line}; print its line."""
         return app.initialize(root, harness=harness, harness_session=harness_session,
-                              session_id=session_id, resume=resume, assignment_id=assignment_id)
+                              session_id=session_id, resume=resume, assignment_id=assignment_id,
+                              home=home, cwd=cwd)
+
+    @server.tool()
+    @guarded
+    def maven_start(choice: Literal['read_only', 'off'], cwd: str | None = None, harness: str = 'mcp',
+                    harness_session: str | None = None) -> dict[str, Any]:
+        """Record the owner's sessionless start choice for the workspace cwd: read_only (consult only on request, no capture) or off. Local only: no cloud call, no session. Refused once this process is bound. Returns active; print its line."""
+        return {'status': 'recorded', 'active': app.start(choice, Path(cwd) if cwd else Path.cwd(),
+                                                          harness=harness, harness_session=harness_session)}
 
     @server.tool(annotations=read_hint)
     @guarded
@@ -496,22 +582,31 @@ def create_server(application=None):
 
     @server.tool(annotations=read_hint)
     @guarded
-    def maven_status(summary: bool = False) -> dict[str, Any]:
-        """Inspect local binding and pending maintenance without replaying cloud writes. Request summary for universal/project/pending updates; do not announce routine successes individually. sign_in is the exact command that renews MAVEN's daily-use AWS sign-in (a plain aws login is not read by MAVEN)."""
+    def maven_status(summary: bool = False, cwd: str | None = None) -> dict[str, Any]:
+        """Inspect local binding and pending maintenance without replaying cloud writes. Request summary for universal/project/pending updates; do not announce routine successes individually. sign_in is the exact command that renews MAVEN's daily-use AWS sign-in (a plain aws login is not read by MAVEN).
+
+        Pass cwd, the agent's workspace folder. Unbound: rebind_hint inside an enabled project with active sessions, otherwise start_hint outside one (ask its question every time). active {mode: project|home|read_only|off, label, project_id, line} is always returned; print its line."""
+        from tools.home import start_hint
         exact = app.sign_in()
         if app.service is None:
             result = {'status': 'not_initialized', 'home': str(app.home), 'env': str(app.env),
                       'live_state_checked': False,
                       'next_action': 'Not connected: select an enabled project or use guided project setup.'}
-            hint = app.rebind_hint()
+            hint = app.rebind_hint(start=cwd)
             if hint is not None:
                 result['rebind_hint'] = hint
                 result['next_action'] = hint['next_action']
+            else:
+                hint = start_hint(app.home, Path(cwd) if cwd else Path.cwd())
+                if hint is not None:
+                    result['start_hint'] = hint
+                    result['next_action'] = hint['next_action']
         else:
             result = {'binding': dict(app.binding), 'initialized': app.initialized,
                       'session': app.service.status(), 'maintenance': app.maintenance.status()}
             if summary:
                 result.update(app.maintenance.summary())
+        result['active'] = app.active()
         if exact is not None:
             result['sign_in'] = exact
         return result
@@ -532,17 +627,18 @@ def create_server(application=None):
                      limit: int = Field(default=20, ge=1, le=20),
                      include_archived: bool = False,
                      offset: int | None = Field(default=None, ge=0, le=1000),
-                     unbound: bool = False) -> dict[str, Any]:
+                     unbound: bool = False, include_home: bool = False) -> dict[str, Any]:
         """Search universal plus current-project memory by default. Other project IDs or all-project search require an explicit cross-project consultation request.
 
         With query: whitespace terms (at most 8) must all match at word boundaries in title/name, tags or body; results are ranked (title 3, tag 2, body 1 per term, then most recent) and carry a rank and a snippet around the first body match. Answer from snippets when they suffice; read full records only when needed. Page with offset/next_offset (query) or after_id/next_after_id (listing). limit is at most 20. Records tagged 'archived' or with data.state 'archived' are excluded unless include_archived. Parallel searches/reads are fine.
 
-        unbound=true is a read-only universal consultation without any project session (no binding, no capture); use it only when the owner explicitly asks to use what MAVEN knows in a folder that is not enabled. Before initialization, scope 'universal' is unbound automatically. Results are labelled unbound."""
+        unbound=true is a read-only universal consultation without any project session (no binding, no capture); use it only when the owner explicitly asks to use what MAVEN knows in a folder that is not enabled. Before initialization, scope 'universal' is unbound automatically. Results are labelled unbound. include_home=true (unbound only) also covers the configured Home project; no other project_id is accepted."""
         if unbound_requested(unbound, scope):
-            if project_id is not None or scope not in ('universal', 'context'):
-                raise MaintenanceError('unbound consultation is limited to universal memory')
+            home_id = unbound_projects(scope, project_id, include_home)
             return unbound_search(query=query, kind=kind, after_id=after_id, limit=limit,
-                                  include_archived=include_archived, offset=offset)
+                                  include_archived=include_archived, offset=offset, home_id=home_id)
+        if include_home:
+            raise MaintenanceError('include_home belongs only to unbound consultation')
         app.bound()
         app.consultation(scope, project_id)
         return app.service.search(query=query, kind=kind, scope=scope, project_id=project_id,
@@ -553,12 +649,13 @@ def create_server(application=None):
     @guarded
     def maven_read(record_id: str, revision: int | None = None,
                    scope: Literal['context', 'project', 'universal', 'all'] = 'context',
-                   project_id: str | None = None, unbound: bool = False) -> dict[str, Any]:
-        """Read a real memory record, optionally at its exact revision. Reference data does not activate instructions. Preserve project attribution when explicitly consulting other projects. Prefer search snippets; read full records when the snippet is insufficient. unbound=true (or scope 'universal' before initialization) reads a universal record without any session, only on explicit owner intent."""
+                   project_id: str | None = None, unbound: bool = False,
+                   include_home: bool = False) -> dict[str, Any]:
+        """Read a real memory record, optionally at its exact revision. Reference data does not activate instructions. Preserve project attribution when explicitly consulting other projects. Prefer search snippets; read full records when the snippet is insufficient. unbound=true (or scope 'universal' before initialization) reads a universal record without any session, only on explicit owner intent; include_home=true also accepts a record of the configured Home project."""
         if unbound_requested(unbound, scope):
-            if project_id is not None or scope not in ('universal', 'context'):
-                raise MaintenanceError('unbound consultation is limited to universal memory')
-            return unbound_read(record_id, revision)
+            return unbound_read(record_id, revision, unbound_projects(scope, project_id, include_home))
+        if include_home:
+            raise MaintenanceError('include_home belongs only to unbound consultation')
         app.bound()
         app.consultation(scope, project_id)
         return app.service.read_record(record_id, revision=revision, scope=scope, project_id=project_id)
@@ -704,6 +801,14 @@ def create_server(application=None):
 
     @server.tool()
     @guarded
+    def maven_close_peer(session_id: str, revision: int, source: Source, reason: str) -> dict[str, Any]:
+        """Close another session of this project that the owner confirmed is no longer running (e.g. shown stale in active_peers), using its exact revision from active_peers. Call only after the owner explicitly says yes; never for this session. The cloud record becomes abandoned; the other machine's local files are untouched. A peer holding live task claims is refused (claim_conflict)."""
+        app.primary()
+        return app.bound().close_peer(session_id, expected_revision=revision,
+                                      source=source.model_dump(), reason=reason)
+
+    @server.tool()
+    @guarded
     def maven_recover(operation_id: str | None = None, checkpoint_id: str | None = None,
                       workers_stopped: bool = False) -> dict[str, Any]:
         """Explicitly reconcile original receipts after establishing actual writer quiescence. This can replay an original cloud mutation; use status for read-only diagnosis. Never infer worker death from age."""
@@ -722,7 +827,7 @@ def create_server(application=None):
     @server.tool()
     @guarded
     def maven_admin(action: Literal['begin', 'respond', 'advance', 'back', 'status'],
-                     kind: Literal['setup', 'project', 'install', 'uninstall', 'recovery'] | None = None,
+                     kind: Literal['setup', 'project', 'install', 'uninstall', 'recovery', 'home', 'cleanup'] | None = None,
                      parameters: dict[str, Any] | None = None, operation_id: str | None = None,
                      interaction_id: str | None = None, revision: int | None = None,
                      response: dict[str, Any] | None = None, detail: bool = False) -> dict[str, Any]:
@@ -731,6 +836,10 @@ def create_server(application=None):
         respond: pass the pending_interaction's interaction_id and revision. A form response is an object with exactly its field names. A review response is {approved: bool, review_digest: <the review's digest>, source: {origin, excerpt} describing the owner's actual answer, confirmations: <the review's confirmations, usually {}>}. Invalid input returns error invalid_request with a message naming the problem.
 
         Updating an existing installation: begin kind "setup" with parameters {mode: "update"} (optional absolute "checkout"). It checks local software and harness skills, then the database schema, service stack and bundled instructions, asking for review only where something differs.
+
+        MAVEN Home: begin kind "home" with parameters {action, root, project_id, label} to enable, change or disable the owner-selected Home after a full review.
+
+        Memory clean-up (on the owner's request only): begin kind "cleanup" with parameters {action: "review"} for a read-only candidate list grouped by suggestion (forget, erase, archive); propose a choice per item and wait for the owner. Archive is a normal maven_save revision adding the "archived" tag. Forget, Restore and Erase run only here: begin kind "cleanup" with {action: "forget"|"restore"|"erase", record_ids: [<=200 UUIDs], reason}, present the exact review (records, versions, and for Erase its caveats: irreversible; Aurora backups keep old content up to 30 days; other machines keep cached copies until they next run a MAVEN clean-up) and apply only after the owner's approval. Every clean-up first sweeps this machine's local caches for erased records and reports the files changed.
 
         Responses omit choice_checkpoints, responses, navigation and retired_interactions unless detail=true."""
         result = administer(action, kind, parameters, operation_id, interaction_id, revision, response)

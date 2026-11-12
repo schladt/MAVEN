@@ -1149,5 +1149,498 @@ class PermissionPreflightTests(unittest.TestCase):
         session.client.assert_not_called()
 
 
+class HomeAdministrationTests(unittest.TestCase):
+    """MAVEN Home enable/disable with a fake memory service and fake project setup."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.home = self.base / 'maven-home'
+        self.home.mkdir(mode=0o700)
+        self.source = {'origin': 'owner chat message 7', 'excerpt': 'Yes, make this folder my MAVEN Home.'}
+        environment = patch.dict(os.environ, {'HOME': str(self.base)})
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.instance = str(uuid4())
+        (self.home / '.env').write_text('MAVEN_MEMORY_INSTANCE_ID=' + json.dumps(self.instance) + '\n')
+        (self.home / '.env').chmod(0o600)
+        self.binding = {'connection': {'instance_id': self.instance, 'recovery_epoch': str(uuid4()),
+                                       'endpoint': 'https://instance.example'},
+                        'environment': {'MAVEN_AWS_PROFILE': 'owner'}}
+        binding = patch.object(AdminOperations, '_project_binding', side_effect=lambda: self.binding)
+        binding.start()
+        self.addCleanup(binding.stop)
+        preflight = patch('tools.setup_common.permission_preflight', return_value={
+            'status': 'Passed', 'checks': [], 'limitations': ['Fixture.'], 'remediation': ''})
+        preflight.start()
+        self.addCleanup(preflight.stop)
+        self.entities, self.writes, self.lookup_fails = {}, [], False
+        client = Mock()
+        client.invoke.side_effect = self.invoke
+        started = patch.object(AdminOperations, '_home_client', side_effect=self.client_factory(client))
+        started.start()
+        self.addCleanup(started.stop)
+        self.controller = AdminOperations(self.home)
+
+    def client_factory(self, client):
+        def factory():
+            if self.lookup_fails:
+                raise MemoryClientError('service_unavailable')
+            return client
+        return factory
+
+    def entity(self, name, *, tags=()):
+        identifier = str(uuid4())
+        self.entities[identifier] = {'record_id': identifier, 'revision': 3, 'kind': 'entity',
+                                     'classification': 'Sensitive', 'data_scope': 'owner', 'project_id': None,
+                                     'data': {'entity_type': 'project', 'name': name, 'aliases': ['x']},
+                                     'tags': list(tags)}
+        return identifier
+
+    def invoke(self, route, body):
+        if route == '/v1/memory/search':
+            self.assertEqual(body, {'kind': 'entity', 'tag': 'maven-home', 'scope': 'universal'})
+            return {'status': 'ready', 'data': {'records': [
+                record for record in self.entities.values() if 'maven-home' in record['tags']]}}
+        if route == '/v1/memory/read':
+            return {'status': 'ready', 'data': json.loads(json.dumps(self.entities[body['record_id']]))}
+        if route == '/v1/memory/write':
+            self.writes.append(body)
+            record = self.entities[body['record_id']]
+            self.assertEqual(body['expected_revision'], record['revision'])
+            record.update(revision=record['revision'] + 1, tags=body['tags'], data=body['data'])
+            return {'status': 'ready', 'data': {'record_id': body['record_id'], 'revision': record['revision']}}
+        self.fail('Unexpected route ' + route)
+
+    def enable_folder(self, root, project_id):
+        root.mkdir(exist_ok=True)
+        (root / '.maven').mkdir(mode=0o700, exist_ok=True)
+        save_private(root / '.maven/project.json', {
+            'schema': 1, 'project_id': project_id, 'root': str(root), 'git_enabled': False,
+            'remote': None, 'accepted_url': None, 'branch': None, 'checks': []})
+
+    def fake_setup(self, created=None):
+        def setup(args):
+            project_id = created if args.create else args.project_id
+            if args.create:
+                self.entities[project_id] = {**self.entities.pop('pending'), 'record_id': project_id}
+            self.enable_folder(args.root, project_id)
+            return {'status': 'ready', 'project': {'project_id': project_id, 'root': str(args.root)}}
+        return setup
+
+    def answer(self, result, **values):
+        question = result['pending_interaction']
+        self.assertEqual(question['key'], 'home')
+        response = {'mode': 'create', 'root': '', 'project_id': '', 'label': '', 'replace': False, **values}
+        return self.controller.respond(result['operation_id'], question['interaction_id'],
+                                       question['revision'], response)
+
+    def approve(self, result):
+        question = result['pending_interaction']
+        self.assertEqual(question['kind'], 'review')
+        return self.controller.respond(result['operation_id'], question['interaction_id'], question['revision'],
+                                       {'approved': True, 'review_digest': question['review_digest'],
+                                        'source': self.source})
+
+    def test_create_mode_creates_project_saves_consent_and_tags_entity_with_exact_revision(self):
+        from tools.home import load_home
+        result = self.controller.begin('home', {})
+        self.assertEqual(next(field['default'] for field in result['pending_interaction']['fields']
+                              if field['name'] == 'mode'), 'create')
+        root = self.base / 'Assistant'
+        result = self.controller.advance(self.answer(result, root=str(root))['operation_id'])
+        review = result['pending_interaction']['review']
+        self.assertEqual(review['selection'], {'mode': 'create', 'root': str(root), 'project_id': None,
+                                               'label': 'Assistant', 'replace': False})
+        self.assertEqual(review['instance_id'], self.instance)
+        self.assertIn(str(root), review['consent'])
+        self.assertFalse(root.exists())
+        result = self.approve(result)
+        created = str(uuid4())
+        self.entities['pending'] = {'revision': 1, 'kind': 'entity', 'classification': 'Sensitive',
+                                    'data_scope': 'owner', 'project_id': None, 'tags': [],
+                                    'data': {'entity_type': 'project', 'name': 'Assistant', 'aliases': []}}
+        original = json.loads(json.dumps(self.entities['pending']['data']))
+        with patch('tools.project_setup.setup_project', side_effect=self.fake_setup(created)) as setup:
+            result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['state'], 'completed', result.get('error'))
+        args = setup.call_args.args[0]
+        self.assertTrue(args.create)
+        self.assertEqual((args.name, args.source_origin, args.source_excerpt),
+                         ('Assistant', self.source['origin'], self.source['excerpt']))
+        home = load_home(self.home)
+        self.assertEqual((home['root'], home['project_id'], home['label'], home['consent']),
+                         (str(root), created, 'Assistant', self.source))
+        self.assertEqual((self.home / 'home.json').stat().st_mode & 0o777, 0o600)
+        self.assertEqual(len(self.writes), 1)
+        write = self.writes[0]
+        self.assertEqual((write['record_id'], write['expected_revision'], write['kind'], write['data_scope']),
+                         (created, 1, 'entity', 'owner'))
+        self.assertEqual(write['data'], original)
+        self.assertEqual(write['tags'], ['maven-home'])
+        self.assertNotIn('project_id', write)
+        self.assertEqual(write['source'], self.source)
+
+    def test_second_machine_offers_discovered_home_and_binds_existing_project_without_rewriting_tag(self):
+        existing = self.entity('Nexus', tags=['maven-home'])
+        result = self.controller.begin('home', {})
+        defaults = {field['name']: field['default'] for field in result['pending_interaction']['fields']}
+        self.assertEqual((defaults['mode'], defaults['project_id']), ('existing', existing))
+        self.assertIn(existing, result['pending_interaction']['description'])
+        root = self.base / 'nexus'
+        root.mkdir()
+        result = self.controller.advance(self.answer(result, mode='existing', root=str(root),
+                                                     project_id=existing)['operation_id'])
+        self.assertEqual(result['pending_interaction']['review']['replaces'], [])
+        result = self.approve(result)
+        with patch('tools.project_setup.setup_project', side_effect=self.fake_setup()) as setup:
+            result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['state'], 'completed', result.get('error'))
+        args = setup.call_args.args[0]
+        self.assertFalse(args.create)
+        self.assertEqual(args.project_id, existing)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(result['outcome']['entity_tag']['status'], 'unchanged')
+
+    def test_enabled_folder_skips_project_setup_and_unreachable_lookup_is_not_fatal(self):
+        project = self.entity('Personal')
+        root = self.base / 'personal'
+        self.enable_folder(root, project)
+        self.lookup_fails = True
+        result = self.controller.begin('home', {'root': str(root), 'label': 'Me'})
+        self.assertEqual(result['state'], 'awaiting_decision')
+        self.assertIn('unavailable', result['pending_interaction']['description'])
+        self.lookup_fails = False
+        result = self.controller.advance(self.answer(result, mode='enabled', root=str(root), label='Me')['operation_id'])
+        self.assertEqual(result['pending_interaction']['review']['selection']['project_id'], project)
+        result = self.approve(result)
+        with patch('tools.project_setup.setup_project') as setup:
+            result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['state'], 'completed', result.get('error'))
+        setup.assert_not_called()
+        self.assertEqual([write['tags'] for write in self.writes], [['maven-home']])
+        self.assertEqual(self.entities[project]['data']['aliases'], ['x'])
+
+    def test_unsafe_roots_and_mismatched_modes_are_refused_before_review(self):
+        project = self.entity('Personal')
+        enabled = self.base / 'enabled'
+        self.enable_folder(enabled, project)
+        full = self.base / 'full'
+        full.mkdir()
+        (full / 'notes.txt').write_text('keep')
+        cases = [dict(mode='enabled', root=str(self.home)), dict(mode='enabled', root=str(self.base)),
+                 dict(mode='create', root='relative/path'), dict(mode='create', root=str(self.home / 'inside')),
+                 dict(mode='create', root=str(full)), dict(mode='existing', root=str(enabled), project_id=project),
+                 dict(mode='existing', root=str(full), project_id='not-a-uuid'),
+                 dict(mode='enabled', root=str(full))]
+        for values in cases:
+            with self.subTest(values=values):
+                result = self.controller.begin('home', {})
+                with self.assertRaises(ValueError):
+                    self.answer(result, **values)
+        self.assertFalse((self.home / 'home.json').exists())
+        self.assertFalse((self.home / 'inside').exists())
+
+    def test_second_home_needs_explicit_replace_and_approval_is_bound_to_review(self):
+        self.entity('Old Home', tags=['maven-home'])
+        project = self.entity('New Home')
+        root = self.base / 'new-home'
+        self.enable_folder(root, project)
+        result = self.controller.begin('home', {})
+        result = self.controller.advance(self.answer(result, mode='enabled', root=str(root))['operation_id'])
+        self.assertEqual(result['state'], 'blocked')
+        self.assertIn('already MAVEN Home', result['error'])
+        result = self.controller.begin('home', {})
+        result = self.controller.advance(self.answer(result, mode='enabled', root=str(root),
+                                                     replace=True)['operation_id'])
+        self.assertEqual(len(result['pending_interaction']['review']['replaces']), 1)
+        result = self.approve(result)
+        self.binding = {**self.binding, 'connection': {**self.binding['connection'], 'instance_id': str(uuid4())}}
+        result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['state'], 'blocked')
+        self.assertIn('candidate changed', result['error'])
+        self.assertFalse((self.home / 'home.json').exists())
+        self.assertEqual(self.writes, [])
+
+    def test_disable_reviews_and_removes_only_home_selection(self):
+        project = self.entity('Personal', tags=['maven-home'])
+        root = self.base / 'personal'
+        self.enable_folder(root, project)
+        from tools.home import save_home
+        save_home(self.home, root=root, project_id=project, instance_id=self.instance, label='Me',
+                  consent=self.source)
+        before = {path: path.read_bytes() for path in (root / '.maven/project.json', self.home / '.env')}
+        result = self.controller.begin('home', {'action': 'disable'})
+        self.assertEqual(result['pending_interaction']['review']['remove'], [str(self.home / 'home.json')])
+        self.assertTrue((self.home / 'home.json').exists())
+        result = self.controller.advance(self.approve(result)['operation_id'])
+        self.assertEqual(result['state'], 'completed')
+        self.assertFalse((self.home / 'home.json').exists())
+        self.assertEqual({path: path.read_bytes() for path in before}, before)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.entities[project]['tags'], ['maven-home'])
+        again = self.controller.begin('home', {'action': 'disable'})
+        self.assertEqual((again['state'], again['outcome']['status']), ('completed', 'unchanged'))
+
+    def test_home_parameters_are_validated(self):
+        for parameters in ({'action': 'remove'}, {'mode': 'create'}, {'root': 7}):
+            with self.subTest(parameters=parameters), self.assertRaises(ValueError):
+                self.controller.begin('home', parameters)
+
+
+class CleanupAdministrationTests(unittest.TestCase):
+    """Memory clean-up with mocked admin SQL functions and a real local runtime fixture."""
+
+    def setUp(self):
+        from tools.memory.boundary import save_private as save_runtime
+        self.save_runtime = save_runtime
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.base = Path(self.temporary.name).resolve()
+        self.home = self.base / 'maven-home'
+        self.home.mkdir(mode=0o700)
+        self.instance = str(uuid4())
+        self.source = {'origin': 'owner chat message 9', 'excerpt': 'Yes, go ahead with exactly that.'}
+        values = {'MAVEN_AWS_PROFILE': 'owner', 'MAVEN_AWS_EXPECTED_PRINCIPAL': 'arn:aws:sts::123456789012:assumed-role/Owner/me'}
+        self.session = object()
+        admin_session = patch.object(AdminOperations, '_cleanup_admin',
+                                     side_effect=lambda: (values, {'instance_id': self.instance}, self.session))
+        admin_session.start()
+        self.addCleanup(admin_session.stop)
+        preflight = patch('tools.setup_common.permission_preflight', return_value={
+            'status': 'Passed', 'checks': [], 'limitations': ['Fixture.'], 'remediation': ''})
+        preflight.start()
+        self.addCleanup(preflight.stop)
+        self.records, self.erased = {}, []
+        self.sql = {}
+        for name, effect in (('cleanup_erased_ids', lambda config, session: list(self.erased)),
+                             ('cleanup_candidates', None), ('cleanup_describe', self.describe),
+                             ('forget_records', None), ('erase_records', None)):
+            mocked = patch('tools.memory.admin.' + name, create=True, side_effect=effect)
+            self.sql[name] = mocked.start()
+            self.addCleanup(mocked.stop)
+        self.root = self.base / 'project'
+        self.root.mkdir()
+        self.session_id = str(uuid4())
+        save_runtime(self.home, 'runtime/sessions.json', {'schema': 1, 'reservations': {}, 'sessions': {
+            self.session_id: {'root': str(self.root), 'project_id': str(uuid4()), 'state': 'active'}}})
+        self.runtime = f'.maven/runtime/sessions/{self.session_id}'
+        self.controller = AdminOperations(self.home)
+
+    def record(self, kind='note', revision=2):
+        identifier = str(uuid4())
+        self.records[identifier] = {'record_id': identifier, 'found': True, 'kind': kind, 'scope': 'project',
+                                    'project_id': str(uuid4()), 'title': 'Customer Acme notes',
+                                    'revision': revision, 'visibility_state': 'visible', 'archived': False,
+                                    'superseded': True, 'versions': revision, 'erased': False}
+        return identifier
+
+    def describe(self, config, session, ids):
+        self.assertIs(session, self.session)
+        return [dict(self.records[identifier]) if identifier in self.records
+                else {'record_id': identifier, 'found': False} for identifier in ids]
+
+    def approve(self, result):
+        question = result['pending_interaction']
+        self.assertEqual((question['kind'], question['key']), ('review', 'cleanup_review'))
+        return self.controller.respond(result['operation_id'], question['interaction_id'], question['revision'],
+                                       {'approved': True, 'review_digest': question['review_digest'],
+                                        'source': self.source})
+
+    def write_runtime(self, name, value):
+        self.save_runtime(self.root, self.runtime + '/' + name, value)
+
+    def read_runtime(self, name):
+        return json.loads((self.root / self.runtime / name).read_text())
+
+    @staticmethod
+    def write_request(record_id, secret='Acme Corp private'):
+        return {'kind': 'note', 'scope': 'project', 'record_id': record_id, 'expected_revision': 1,
+                'reason': 'Note about ' + secret, 'source': {'origin': 'chat', 'excerpt': secret},
+                'data': {'title': secret, 'body_markdown': secret}, 'tags': ['client:acme'],
+                'request_key': str(uuid4())}
+
+    def test_review_is_read_only_groups_candidates_and_sweeps_earlier_erasures(self):
+        old = str(uuid4())
+        self.erased = [old]
+        self.write_runtime('last-memory-write.json', {
+            'route': 'write', 'request_key': 'key-1', 'record': {'record_id': old, 'revision': 2},
+            'result': {'record_id': old, 'revision': 2, 'request_key': 'key-1', 'data': {'title': 'Acme'}}})
+        candidates = [{'record_id': str(uuid4()), 'suggested': suggested, 'reasons': [reason], 'title': reason}
+                      for suggested, reason in (('erase', 'superseded'), ('forget', 'duplicate'),
+                                                ('archive', 'stale_task'), ('forget', 'archived'))]
+        self.sql['cleanup_candidates'].side_effect = None
+        self.sql['cleanup_candidates'].return_value = {'candidates': candidates, 'truncated': False}
+        result = self.controller.begin('cleanup', {'action': 'review'})
+        self.assertEqual(result['state'], 'completed', result.get('error'))
+        outcome = result['outcome']
+        self.assertTrue(outcome['read_only'])
+        self.assertEqual(outcome['total'], 4)
+        self.assertEqual({key: [item['reasons'][0] for item in value] for key, value in outcome['groups'].items()},
+                         {'erase': ['superseded'], 'forget': ['duplicate', 'archived'], 'archive': ['stale_task']})
+        self.assertIn('maven_save', outcome['next'])
+        self.assertEqual(outcome['local_sweep']['files_touched'], [str(self.root / self.runtime / 'last-memory-write.json')])
+        self.assertEqual(self.read_runtime('last-memory-write.json')['result'],
+                         {'record_id': old, 'revision': 2, 'request_key': 'key-1'})
+        for name in ('forget_records', 'erase_records', 'cleanup_describe'):
+            self.sql[name].assert_not_called()
+
+    def test_forget_and_restore_apply_only_after_approval_with_the_review_digest(self):
+        for action in ('forget', 'restore'):
+            with self.subTest(action=action):
+                first, second = self.record(), self.record()
+                self.sql['forget_records'].reset_mock()
+                self.sql['forget_records'].side_effect = None
+                self.sql['forget_records'].return_value = {'receipt_id': str(uuid4()), 'changed': [first],
+                                                           'unchanged': [second]}
+                result = self.controller.begin('cleanup', {'action': action, 'record_ids': [first, second],
+                                                           'reason': 'Obsolete duplicates'})
+                question = result['pending_interaction']
+                review = question['review']
+                self.assertEqual((review['action'], review['record_ids'], review['versions_affected'], review['caveats']),
+                                 (action, [first, second], 4, []))
+                self.assertEqual([record['record_id'] for record in review['records']], [first, second])
+                self.sql['forget_records'].assert_not_called()
+                declined = self.controller.respond(result['operation_id'], question['interaction_id'],
+                                                   question['revision'], {'approved': False,
+                                                                          'review_digest': question['review_digest']})
+                self.assertEqual(self.controller.advance(declined['operation_id'])['state'], 'paused')
+                self.sql['forget_records'].assert_not_called()
+                result = self.controller.advance(self.approve(declined)['operation_id'])
+                self.assertEqual(result['state'], 'completed', result.get('error'))
+                call = self.sql['forget_records'].call_args
+                self.assertEqual(call.args[2], [first, second])
+                self.assertEqual(call.kwargs['restore'], action == 'restore')
+                self.assertEqual(call.kwargs['approval_digest'], question['review_digest'])
+                self.assertEqual(call.kwargs['reason'], 'Obsolete duplicates')
+                self.assertIn(result['operation_id'], call.kwargs['actor'])
+                self.assertEqual((result['outcome']['changed'], result['outcome']['unchanged']), ([first], [second]))
+
+    def test_form_selection_and_changed_records_invalidate_approval(self):
+        target = self.record()
+        result = self.controller.begin('cleanup', {'action': 'forget'})
+        question = result['pending_interaction']
+        self.assertEqual(question['key'], 'cleanup_selection')
+        for bad in ('', 'not-a-uuid', '\n'.join(str(uuid4()) for _ in range(201)), target + '\n' + target):
+            with self.subTest(bad=bad[:40]), self.assertRaises(ValueError):
+                self.controller.respond(result['operation_id'], question['interaction_id'], question['revision'],
+                                        {'record_ids': bad, 'reason': 'Old'})
+        result = self.controller.respond(result['operation_id'], question['interaction_id'], question['revision'],
+                                         {'record_ids': target + '\n', 'reason': 'Old'})
+        result = self.approve(self.controller.advance(result['operation_id']))
+        self.records[target]['revision'] += 1
+        result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['state'], 'blocked')
+        self.assertIn('Reviewed candidate changed', result['error'])
+        self.sql['forget_records'].assert_not_called()
+
+    def test_empty_oversized_and_invalid_selections_are_refused(self):
+        valid = str(uuid4())
+        for parameters in ({'action': 'forget', 'record_ids': []},
+                           {'action': 'erase', 'record_ids': [str(uuid4()) for _ in range(201)]},
+                           {'action': 'forget', 'record_ids': [valid, valid]},
+                           {'action': 'forget', 'record_ids': [valid.upper()]},
+                           {'action': 'forget', 'record_ids': 'all'},
+                           {'action': 'forget', 'record_ids': [valid], 'reason': ''},
+                           {'action': 'review', 'record_ids': [valid]},
+                           {'action': 'delete', 'record_ids': [valid]}, {}):
+            with self.subTest(parameters=str(parameters)[:60]), self.assertRaises(ValueError):
+                self.controller.begin('cleanup', parameters)
+        self.sql['cleanup_erased_ids'].assert_not_called()
+        lifecycle, missing = self.record(kind='session'), str(uuid4())
+        for ids, message in (([lifecycle], 'not cleaned up'), ([missing], 'not found')):
+            result = self.controller.begin('cleanup', {'action': 'forget', 'record_ids': ids, 'reason': 'x'})
+            self.assertEqual(result['state'], 'blocked')
+            self.assertIn(message, result['error'])
+        self.sql['forget_records'].assert_not_called()
+
+    def test_erase_lists_caveats_and_sweeps_only_erased_records_content(self):
+        from tools.administration import ERASE_CAVEATS
+        target, other = self.record(), self.record()
+        kept = self.write_request(other, 'Keep me')
+        swept = self.write_request(target)
+        self.write_runtime('maintenance.json', {'schema': 1, 'assignments': {'op-1': {
+            'operation_id': 'op-1', 'state': 'completed', 'effects': [
+                {'state': 'saved', 'request': swept, 'record': {'record_id': target, 'revision': 2}},
+                {'state': 'saved', 'request': kept, 'record': {'record_id': other, 'revision': 2}}]}}})
+        self.write_runtime('last-memory-write.json', {
+            'route': 'write', 'request_key': swept['request_key'], 'record': {'record_id': target, 'revision': 2},
+            'result': {'record_id': target, 'revision': 2, 'request_key': swept['request_key'],
+                       'replayed': False, 'data': {'title': 'Acme Corp private'}}})
+        failed = {'route': 'write', 'body': self.write_request(target), 'session_id': self.session_id, 'digest': 'x'}
+        self.write_runtime('failed-memory-write.json', {'request': failed, 'status': 'revision_conflict'})
+        manifest = {'manifest': {'session_id': self.session_id, 'memory_refs': [{'record_id': target, 'revision': 2}],
+                                 'summary': 'Checkpoint'}, 'status': 'checkpointed'}
+        self.write_runtime('checkpoints/' + str(uuid4()) + '.json', manifest)
+        result = self.controller.begin('cleanup', {'action': 'erase', 'record_ids': [target], 'reason': 'Client data'})
+        review = result['pending_interaction']['review']
+        self.assertEqual(review['caveats'], list(ERASE_CAVEATS))
+        text = ' '.join(review['caveats'])
+        self.assertIn('30 days', text)
+        self.assertIn('Other machines keep any locally cached copy until they next run a MAVEN clean-up', text)
+        self.assertIn('cannot be undone', text)
+        self.sql['erase_records'].assert_not_called()
+        receipt = str(uuid4())
+        tombstone = {'erased': True, 'erased_at': '2026-11-11T00:00:00Z', 'receipt_id': receipt}
+        self.sql['erase_records'].side_effect = None
+        self.sql['erase_records'].return_value = {'receipt_id': receipt, 'erased_at': tombstone['erased_at'],
+                                                  'tombstone': tombstone,
+                                                  'records': [{'record_id': target, 'versions': 2}]}
+        digest = result['pending_interaction']['review_digest']
+        result = self.controller.advance(self.approve(result)['operation_id'])
+        self.assertEqual(result['state'], 'completed', result.get('error'))
+        self.assertEqual(self.sql['erase_records'].call_args.kwargs['approval_digest'], digest)
+        touched = sorted(result['outcome']['local_sweep']['files_touched'])
+        self.assertEqual(touched, sorted(str(self.root / self.runtime / name) for name in
+                                         ('failed-memory-write.json', 'last-memory-write.json', 'maintenance.json')))
+        effects = self.read_runtime('maintenance.json')['assignments']['op-1']['effects']
+        self.assertEqual(effects[0]['request']['data'], tombstone)
+        self.assertEqual(effects[0]['request']['tags'], ['erased'])
+        self.assertEqual((effects[0]['request']['request_key'], effects[0]['record']),
+                         (swept['request_key'], {'record_id': target, 'revision': 2}))
+        self.assertEqual(effects[1]['request'], kept)
+        self.assertEqual(self.read_runtime('last-memory-write.json')['result'],
+                         {'record_id': target, 'revision': 2, 'request_key': swept['request_key'], 'replayed': False})
+        body = self.read_runtime('failed-memory-write.json')['request']['body']
+        self.assertEqual((body['data'], body['request_key']), (tombstone, failed['body']['request_key']))
+        everything = ''.join(path.read_text() for path in (self.root / self.runtime).rglob('*.json'))
+        self.assertEqual(everything.count('Acme Corp private'), 0)
+        self.assertIn('Keep me', everything)
+        self.assertEqual(json.loads(next((self.root / self.runtime / 'checkpoints').iterdir()).read_text()), manifest)
+
+    def test_pending_journal_for_erased_record_refuses_erase_and_sweep(self):
+        from tools.administration import sweep_erased
+        target = self.record()
+        pending = {'route': 'write', 'body': self.write_request(target), 'session_id': self.session_id}
+        self.write_runtime('pending-memory.json', pending)
+        last = {'route': 'write', 'request_key': 'k', 'record': {'record_id': target, 'revision': 2},
+                'result': {'record_id': target, 'revision': 2, 'data': 'Acme'}}
+        self.write_runtime('last-memory-write.json', last)
+        result = self.controller.begin('cleanup', {'action': 'erase', 'record_ids': [target], 'reason': 'x'})
+        self.assertEqual(result['state'], 'blocked')
+        self.assertIn('pending-memory.json', result['error'])
+        self.sql['erase_records'].assert_not_called()
+        with self.assertRaises(SetupPending):
+            sweep_erased([str(self.root)], [target], {'erased': True})
+        self.assertEqual(self.read_runtime('pending-memory.json'), pending)
+        self.assertEqual(self.read_runtime('last-memory-write.json'), last)
+        # An earlier erasure with an unresolved journal blocks every clean-up, including the review.
+        self.erased = [target]
+        blocked = self.controller.begin('cleanup', {'action': 'review'})
+        self.assertEqual(blocked['state'], 'blocked')
+        self.sql['cleanup_candidates'].assert_not_called()
+        (self.root / self.runtime / 'pending-memory.json').unlink()
+        self.write_runtime('maintenance.json', {'schema': 1, 'assignments': {'op-2': {
+            'operation_id': 'op-2', 'state': 'uncertain',
+            'effects': [{'state': 'uncertain', 'request': self.write_request(target)}]}}})
+        with self.assertRaises(SetupPending) as raised:
+            sweep_erased([str(self.root)], [target], {'erased': True})
+        self.assertIn('unresolved effect', str(raised.exception))
+        self.assertEqual(self.read_runtime('last-memory-write.json'), last)
+
+
+
+
 if __name__ == '__main__':
     unittest.main()

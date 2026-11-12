@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import stat
 import tempfile
 import uuid
@@ -209,10 +210,22 @@ class MemoryBoundary:
             elif target.get('record_id') != body['record_id'] or target.get('revision') != body['expected_revision']:
                 raise BoundaryError('task claim target differs from the exact requested version')
         if route == 'write' and body['kind'] in ('session', 'checkpoint', 'operation'):
-            if (body.get('project_id') != self.project_id or
-                    (body['record_id'] if body['kind'] == 'session' else body['data']['session_id']) != self.session_id):
+            owner = body['record_id'] if body['kind'] == 'session' else body['data']['session_id']
+            if (body.get('project_id') != self.project_id
+                    or owner != self.session_id and not self._peer_abandonment(body)):
                 raise BoundaryError('lifecycle record belongs to another project or session')
         return target
+
+    def _peer_abandonment(self, body):
+        """The only lifecycle write for another session: this session's owner-confirmed abandonment of it."""
+        if body['kind'] != 'session' or body['data'].get('state') != 'abandoned':
+            return False
+        try:
+            meta = json.loads(body['data']['summary'])
+        except (ValueError, TypeError):
+            return False
+        return (isinstance(meta, dict) and meta.get('abandoned_by') == self.session_id
+                and meta.get('boundary_outcome') == 'abandoned-by-owner')
 
     def _submit(self, route, body, *, target=None):
         target = self._validate_request(route, body, target=target)
@@ -359,16 +372,20 @@ class MemoryBoundary:
         return record
 
     def project_context(self):
-        """Latest handover across the project, peers, open work and owner preferences in one request."""
+        """Latest handover across the project, peers, open work and owner preferences in one request.
+        The MAVEN Home project also receives `project_index` (identity, name, state, last activity)."""
         data = self.invoke('project_context', {'project_id': self.project_id, 'session_id': self.session_id})
         handover = data.get('latest_handover')
         lists = ('active_peers', 'tasks', 'blockers', 'owner_preferences')
+        index = data.get('project_index')
         if ((handover is not None and not isinstance(handover, dict))
                 or any(not isinstance(data.get(key), list)
                        or any(not isinstance(item, dict) for item in data[key]) for key in lists)
+                or (index is not None and (not isinstance(index, list) or len(index) > 100
+                                           or any(not isinstance(item, dict) for item in index)))
                 or any(peer.get('session_id') == self.session_id for peer in data['active_peers'])):
             raise BoundaryError('memory service returned no verified project context')
-        return {'latest_handover': handover, **{key: data[key] for key in lists}}
+        return {'latest_handover': handover, **{key: data[key] for key in lists}, 'project_index': index}
 
     def revisions(self, record_ids):
         """Current visible revision per record, one request per hundred identifiers."""
@@ -401,6 +418,7 @@ class MemoryBoundary:
         prepared = skills.start()
         data = {'state': 'active', 'workflow': 'maven-workflow', 'summary': json.dumps({
             'root': str(self.root), 'harness': self.harness, 'harness_session': self.harness_session,
+            'machine': socket.gethostname().split('.')[0] or None,
             'git_base': git_base, 'authority': self.authority(context), 'phase': 'started'}, sort_keys=True)}
         record = self.write('session', data, record_id=self.session_id, tags=['work-session'])
         save_private(self.root, self.SESSION_PATH, self.ref(record))
@@ -607,3 +625,18 @@ class MemoryBoundary:
         return self.ref(self.write('session', dict(record['data'], state='abandoned', summary=json.dumps(meta)),
                         record_id=self.session_id, expected_revision=record['revision'], tags=record['tags'],
                         reason='Explicitly cancel requester session without claiming completed work'))
+
+    def abandon_peer(self, record, *, reason, source):
+        """Owner-confirmed closure of another active session of this project that no longer runs.
+        Only its cloud record changes; that session's machine and local files are untouched."""
+        import datetime
+        if (record.get('kind') != 'session' or record.get('project_id') != self.project_id
+                or record.get('record_id') == self.session_id or record['data'].get('state') != 'active'):
+            raise BoundaryError('only another active session of this project can be closed')
+        meta = self.metadata(record)
+        meta.update(phase='abandoned', boundary_outcome='abandoned-by-owner', abandoned_by=self.session_id,
+                    abandoned_at=datetime.datetime.now(datetime.timezone.utc).isoformat(), reason=reason)
+        return self.ref(self.write('session', dict(record['data'], state='abandoned',
+                                   summary=json.dumps(meta, sort_keys=True)), record_id=record['record_id'],
+                                   expected_revision=record['revision'], tags=record['tags'],
+                                   source=source, reason=reason))

@@ -129,9 +129,15 @@ class SessionRecoveryTests(unittest.TestCase):
         client = unittest.mock.MagicMock()
         client.invoke.return_value = {'status': 'ready', 'data': data}
         memory = MemoryBoundary(client, Path('/project'), project, session)
-        self.assertEqual(memory.project_context(), data)
+        self.assertEqual(memory.project_context(), dict(data, project_index=None))
         client.invoke.assert_called_once_with('/v1/memory/project_context',
                                               {'project_id': project, 'session_id': session})
+        index = [{'project_id': project, 'name': 'nexus', 'archived': False, 'last_activity': None, 'home': True}]
+        client.invoke.return_value = {'status': 'ready', 'data': dict(data, project_index=index)}
+        self.assertEqual(memory.project_context()['project_index'], index)
+        client.invoke.return_value = {'status': 'ready', 'data': dict(data, project_index=index * 101)}
+        with self.assertRaises(BoundaryError):
+            memory.project_context()
         client.invoke.return_value = {'status': 'ready', 'data': dict(data, active_peers=[{'session_id': session}])}
         with self.assertRaises(BoundaryError):
             memory.project_context()
@@ -179,6 +185,7 @@ class MemoryCloud:
         self.generation = 1
         self.last_generation = None
         self.sequence = {}
+        self.stale = set()  # Session IDs the fixture reports as stale peers.
         self.lose_next = False
         self.closed = False
 
@@ -223,7 +230,9 @@ class MemoryCloud:
         peers = [{'session_id': identifier,
                   'harness': _json.loads(record['data']['summary']).get('harness'), 'started_at': None,
                   'latest_checkpoint_at': None,
-                  'latest_summary': latest[identifier]['data'].get('summary') if identifier in latest else None}
+                  'latest_summary': latest[identifier]['data'].get('summary') if identifier in latest else None,
+                  'machine': _json.loads(record['data']['summary']).get('machine'), 'last_activity': None,
+                  'stale': identifier in self.stale, 'revision': record['revision']}
                  for identifier, record in sessions.items()
                  if identifier != requester and record['data']['state'] == 'active']
 
@@ -320,6 +329,13 @@ class MemoryCloud:
         if (current['revision'] if current else 0) != body['expected_revision']:
             raise MemoryClientError('revision_conflict')
         revision = body['expected_revision'] + 1
+        if action == 'write' and body['kind'] == 'session' and current is not None:
+            if current['data']['state'] in ('closed', 'abandoned'):
+                raise MemoryClientError('revision_conflict')
+            if body['data']['state'] != 'active' and any(
+                    (record.get('claim') or {}).get('session_id') == body['record_id']
+                    for record in self.records.values()):
+                raise MemoryClientError('claim_conflict')
         if action == 'write':
             record = {key: copy.deepcopy(body[key]) for key in ('record_id', 'kind', 'data', 'classification', 'data_scope')}
             record.update(revision=revision, project_id=body.get('project_id'), tags=body.get('tags', []))
@@ -745,6 +761,141 @@ class MemoryLifecycleTests(unittest.TestCase):
         refs = self.cloud.records[result['checkpoint']['receipt']['record_id']]['data']['memory_refs']
         self.assertIn(MemoryBoundary.ref(setting), refs)
         self.assertIn(MemoryBoundary.ref(operation), refs)
+
+    def peer_session(self, *, project=None, state='active', revision=3):
+        identifier = str(uuid.uuid4())
+        record = {'record_id': identifier, 'revision': revision, 'kind': 'session', 'classification': 'Sensitive',
+                  'data_scope': 'owner', 'project_id': project or self.project, 'tags': ['work-session'],
+                  'data': {'state': state, 'workflow': 'maven-workflow', 'summary': json.dumps(
+                      {'root': '/other-machine/project', 'harness': 'omp', 'machine': 'old-laptop',
+                       'phase': 'started'}, sort_keys=True)}}
+        self.cloud.records[identifier] = record
+        self.cloud.history[(identifier, revision)] = json.loads(json.dumps(record))
+        return identifier
+
+    def writes(self):
+        return [body for route, body in self.cloud.calls if route in ('/v1/memory/write', '/v1/memory/claim')]
+
+    def test_close_stale_peer_abandons_its_exact_revision_with_owner_metadata(self):
+        from tools.memory.lifecycle import registered_sessions
+        self.service.initialize()
+        peer = self.peer_session()
+        self.cloud.stale.add(peer)
+        self.service.registry.register(self.root, self.project, peer, {}, memory_only=True)
+        self.service.registry.activate(self.root, peer)
+        [shown] = self.service.context()['context']['active_peers']
+        self.assertEqual((shown['session_id'], shown['stale'], shown['machine'], shown['revision']),
+                         (peer, True, 'old-laptop', 3))
+        reason = 'Owner confirmed the old laptop session is no longer running'
+        result = self.service.close_peer(peer, expected_revision=shown['revision'], source=self.source, reason=reason)
+        self.assertEqual(result['status'], 'peer_closed')
+        self.assertEqual(result['closed_session'], {'record_id': peer, 'revision': 4})
+        self.assertTrue(result['local_registration_closed'])
+        [body] = [body for body in self.writes() if body['record_id'] == peer]
+        self.assertEqual((body['expected_revision'], body['source'], body['change_reason']), (3, self.source, reason))
+        record = self.cloud.records[peer]
+        self.assertEqual(record['data']['state'], 'abandoned')
+        meta = json.loads(record['data']['summary'])
+        self.assertEqual({key: meta[key] for key in ('root', 'harness', 'machine')},
+                         {'root': '/other-machine/project', 'harness': 'omp', 'machine': 'old-laptop'})
+        self.assertEqual((meta['phase'], meta['boundary_outcome'], meta['abandoned_by'], meta['reason']),
+                         ('abandoned', 'abandoned-by-owner', self.identifier, reason))
+        self.assertIn('abandoned_at', meta)
+        self.assertEqual(self.cloud.records[self.identifier]['data']['state'], 'active')
+        self.assertEqual(self.service.context()['context']['active_peers'], [])
+        self.assertEqual({item['session_id']: item['state'] for item in registered_sessions(self.root, home=self.env.parent)},
+                         {self.identifier: 'active', peer: 'abandoned'})
+        self.assertIsNone(self.service.status()['pending_request'])
+        with self.assertRaises(BoundaryError):  # A closed peer is never rewritten again.
+            self.service.close_peer(peer, expected_revision=4, source=self.source, reason=reason)
+
+    def test_close_peer_with_unknown_outcome_recovers_its_original_request(self):
+        from tools.memory.lifecycle import registered_sessions
+        self.service.initialize()
+        peer = self.peer_session()
+        self.service.registry.register(self.root, self.project, peer, {}, memory_only=True)
+        self.service.registry.activate(self.root, peer)
+        self.cloud.lose_next = True
+        with self.assertRaises(MemoryClientError):
+            self.service.close_peer(peer, expected_revision=3, source=self.source, reason='Owner confirmed it stopped')
+        self.assertEqual(self.service.status()['pending_request']['record_id'], peer)
+        recovered = self.service.recover()['recovery']
+        self.assertEqual(recovered['record'], {'record_id': peer, 'revision': 4})
+        self.assertEqual(self.cloud.records[peer]['data']['state'], 'abandoned')
+        self.assertEqual(self.cloud.records[self.identifier]['data']['state'], 'active')
+        self.assertEqual({item['session_id']: item['state'] for item in registered_sessions(self.root, home=self.env.parent)},
+                         {self.identifier: 'active', peer: 'abandoned'})
+
+    def test_close_peer_refuses_self_other_project_closed_and_changed_sessions(self):
+        self.service.initialize()
+        reason = 'Owner confirmed it stopped'
+        current = self.peer_session()
+        cases = {'self': (self.identifier, 1), 'other project': (self.peer_session(project=str(uuid.uuid4())), 3),
+                 'closed': (self.peer_session(state='closed'), 3),
+                 'abandoned': (self.peer_session(state='abandoned'), 3), 'revision mismatch': (current, 2)}
+        before = json.loads(json.dumps(self.cloud.records))
+        writes = len(self.writes())
+        for name, (identifier, revision) in cases.items():
+            with self.subTest(name), self.assertRaises(BoundaryError):
+                self.service.close_peer(identifier, expected_revision=revision, source=self.source, reason=reason)
+        with self.assertRaises(BoundaryError):
+            self.service.close_peer(current, expected_revision=3, source=self.source, reason=' ')
+        self.assertEqual(self.cloud.records, before)
+        self.assertEqual(len(self.writes()), writes)
+        self.assertIsNone(self.service.status()['pending_request'])
+
+    def test_close_peer_holding_live_claim_is_a_definitive_claim_conflict(self):
+        self.service.initialize()
+        peer = self.peer_session()
+        task = self.service.save('task', {'title': 'Peer work', 'description': '', 'state': 'open'}, source=self.source)
+        self.cloud.records[task['record_id']]['claim'] = {'session_id': peer, 'fence': 1,
+                                                          'expires_at': '2099-01-01T00:00:00Z'}
+        before = json.loads(json.dumps(self.cloud.records))
+        with self.assertRaises(MemoryClientError) as error:
+            self.service.close_peer(peer, expected_revision=3, source=self.source, reason='Owner confirmed it stopped')
+        self.assertEqual(error.exception.code, 'claim_conflict')
+        self.assertEqual(self.cloud.records, before)
+        self.assertIsNone(self.service.status()['pending_request'])
+        self.assertEqual(self.service.save('note', self.note, source=self.source)['revision'], 1)
+
+    def test_lifecycle_writes_for_other_sessions_stay_refused_on_every_other_path(self):
+        self.service.initialize()
+        peer = self.peer_session()
+        memory = self.service._memory()
+        record = self.cloud.records[peer]
+        meta = json.loads(record['data']['summary'])
+        owner = dict(meta, abandoned_by=self.identifier, boundary_outcome='abandoned-by-owner')
+        writes = len(self.writes())
+        sessions = {
+            'still active': dict(record['data'], summary=json.dumps(owner)),
+            'closed': dict(record['data'], state='closed', summary=json.dumps(owner)),
+            'abandoned without owner metadata': dict(record['data'], state='abandoned'),
+            'abandoned by another session': dict(record['data'], state='abandoned', summary=json.dumps(
+                dict(owner, abandoned_by=str(uuid.uuid4())))),
+            'other outcome': dict(record['data'], state='abandoned', summary=json.dumps(
+                dict(owner, boundary_outcome='explicitly-cancelled'))),
+        }
+        for name, data in sessions.items():
+            with self.subTest(name), self.assertRaises(BoundaryError):
+                memory.write('session', data, record_id=peer, expected_revision=3, tags=record['tags'])
+        abandoned = dict(record['data'], state='abandoned', summary=json.dumps(owner))
+        foreign = {'record_id': peer, 'expected_revision': 3, 'kind': 'session', 'classification': 'Sensitive',
+                   'data_scope': 'owner', 'project_id': str(uuid.uuid4()), 'data': abandoned, 'tags': [],
+                   'source': self.source, 'change_reason': 'Other project', 'request_key': str(uuid.uuid4())}
+        with self.assertRaises(BoundaryError):
+            memory.submit('write', foreign)
+        with self.assertRaises(BoundaryError):
+            memory.write('checkpoint', {'session_id': peer, 'cutoff': 0, 'memory_refs': [], 'state': 'prepared'})
+        with self.assertRaises(BoundaryError):
+            memory.write('operation', {'session_id': peer, 'name': 'peer-op', 'state': 'completed', 'summary': '{}'})
+        with self.assertRaises(BoundaryError):
+            self.service.save('session', abandoned, source=self.source, record_id=peer, expected_revision=3)
+        with self.assertRaises(BoundaryError):
+            self.service.save('operation', {'session_id': peer, 'name': 'peer-op', 'state': 'completed',
+                                            'summary': '{}'}, source=self.source)
+        self.assertEqual(len(self.writes()), writes)
+        self.assertEqual(self.cloud.records[peer], record)
+        self.assertIsNone(self.service.status()['pending_request'])
 
 class WireCloud(MemoryCloud):
     """Answers the real signed client at its HTTP boundary, so every service request is counted."""

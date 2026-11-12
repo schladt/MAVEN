@@ -24,6 +24,10 @@ from .common import (UninstallError, canonical, checked_path, digest, file_diges
 
 MANIFEST = 'installation.json'
 REGISTRY = '.maven-installations/installations.json'
+# tools.home owns these names; the recovery runner snapshot stays stdlib-only.
+HOME_POINTER = 'home.json'
+START_CHOICES = 'runtime/start-choices.jsonl'
+ACTIVE_STATE = 'runtime/active'
 
 
 def _exists(path):
@@ -260,6 +264,7 @@ def plan_project(root, home, *, offline=False, archive=False, export=None):
         raise UninstallError(f'Detached configuration already exists; preserve it for review: {destination}')
     fragment['actions'].append(_action('local_project_detach', config, 60, home=str(home),
         root=str(root), inventory=entries, destination=str(destination)))
+    _plan_home_pointer(fragment, root, home)
     if export is not None:
         _export(fragment, config, export, home, root, stage=59, move=False)
         _project_exports(fragment, root, home, export)
@@ -273,6 +278,36 @@ def plan_project(root, home, *, offline=False, archive=False, export=None):
     if not _exists(receipt):
         fragment['warnings'].append('Legacy project integration: no ownership receipt; ignore rules and other integration files are preserved.')
     return fragment
+
+
+def _plan_home_pointer(fragment, root, home):
+    """A project uninstall of the selected MAVEN Home root also turns Home off on this machine."""
+    path = home / HOME_POINTER
+    if not _exists(path):
+        return
+    try:
+        selected = read_private(path).get('root')
+    except (OSError, ValueError, UninstallError, AttributeError):
+        fragment['warnings'].append(f'{path} could not be read safely; it is preserved. MAVEN refuses an invalid Home selection when it loads.')
+        return
+    if not isinstance(selected, str) or Path(selected).resolve() != root.resolve():
+        return
+    fragment['actions'].append(_action('local_home_unset', path, 60, home=str(home),
+        root=str(root), inventory=inventory(path)))
+    fragment['warnings'].append(f'This folder is the MAVEN Home on this machine: {path} is removed, so MAVEN Home '
+                                'is turned off here. Cloud memory and the project entity (including its maven-home '
+                                'tag) are unchanged.')
+
+
+def _unset_home(action):
+    path = Path(action['target'])
+    if not _exists(path):
+        return {'status': 'removed', 'path': str(path), 'home_unset': True}
+    if inventory(path) != action['details']['inventory']:
+        raise UninstallError(f'MAVEN Home selection changed since review; preserved: {path}')
+    path.unlink()
+    _sync(path.parent)
+    return {'status': 'removed', 'path': str(path), 'home_unset': True}
 
 
 def _shared_skills(home, selected_homes):
@@ -375,9 +410,13 @@ def plan_machine(home, *, selected_homes=(), offline=False, export=None, adopt_l
     fragment['retained'] = [item for item in fragment['retained'] if item not in inside]
     fragment['actions'].append(_action('local_home_purge', home, 110, home=str(home), root=None,
                                        inventory=entries))
+    home_files = [str(home / name) for name in (HOME_POINTER, START_CHOICES, START_CHOICES + '.1', ACTIVE_STATE)
+                  if _exists(home / name)]
     fragment['warnings'].append(
         f'The whole installation folder {home} is permanently deleted after removal, including private '
         'settings (.env), saved AWS sign-in caches, unfinished setup state and detached session records'
+        + (', the MAVEN Home selection and local start-choice records (' + ', '.join(home_files) + ')'
+           if home_files else '')
         + (', and these files that did not match the installer receipt: ' + ', '.join(item['path'] for item in inside)
            if inside else '') + '. '
         + ('Settings and runtime records are archived to the export directory first; sign-in caches, '
@@ -595,6 +634,10 @@ def _export_execute(action, progress, save):
 _PURGE_WRITTEN = re.compile(r'runtime(/(registry\.lock|uninstall\.json|uninstall-complete\.json|setup/lock'
                             r'|uninstall-sessions-[0-9a-f]+\.json|uninstall-completed-history-[0-9a-f]+\.json))?')
 _PURGE_REWRITTEN = {MANIFEST, 'runtime/sessions.json'}
+# Home selection, start-choice log and status-line state that sessions or a Home change may
+# rewrite after review; they are inside the reviewed folder and deleted with it.
+_PURGE_HOME_STATE = re.compile(re.escape(HOME_POINTER) + '|' + re.escape(START_CHOICES) + r'(\.1)?'
+                               + '|' + re.escape(ACTIVE_STATE) + r'(/[^/]+)?')
 
 
 def _purge_home(action, progress, save):
@@ -614,7 +657,7 @@ def _purge_home(action, progress, save):
         current = inventory(home)
         changed = sorted(name for name, item in current.items()
                          if not _PURGE_WRITTEN.fullmatch(name) and name not in _PURGE_REWRITTEN
-                         and expected.get(name) != item)
+                         and not _PURGE_HOME_STATE.fullmatch(name) and expected.get(name) != item)
         if changed:
             raise UninstallError('Installation folder changed since review; preserved: '
                                  + ', '.join(str(home / name) for name in changed[:10]))
@@ -689,6 +732,8 @@ def execute(action, progress, save):
             return _remove(action, progress, save)
         if kind == 'local_project_detach':
             return _detach(action, progress, save)
+        if kind == 'local_home_unset':
+            return _unset_home(action)
         if kind == 'local_export':
             return _export_execute(action, progress, save)
         raise UninstallError(f'Unsupported local uninstall action: {kind}')

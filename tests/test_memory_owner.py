@@ -872,6 +872,40 @@ BEGIN
  result:=maven.memory_project_context(jsonb_build_object('project_id',other_project,'session_id',requester->'record_id'));
  PERFORM pg_temp.assert_equal(result->'latest_handover','null','no foreign handover');
  PERFORM pg_temp.assert_equal(result->'active_peers','[]','no foreign peers');
+ -- MAVEN Home index: only the maven-home-tagged project's context lists projects, without details.
+ IF maven.memory_project_context(jsonb_build_object('project_id',project,'session_id',requester->'record_id')) ? 'project_index' THEN
+   RAISE EXCEPTION 'untagged project received a project index';
+ END IF;
+ PERFORM pg_temp.write(pg_temp.request('entity','{"entity_type":"project","name":"Context fixture","aliases":[]}')
+   || jsonb_build_object('record_id',project,'expected_revision',1,'tags',jsonb_build_array('maven-home')));
+ INSERT INTO maven.project_lifecycle(project_id,archived,generation,action_key,actor_id)
+   VALUES (other_project,true,1,repeat('a',64),'fixture-owner');
+ result:=maven.memory_project_context(jsonb_build_object('project_id',project,'session_id',requester->'record_id'));
+ PERFORM pg_temp.assert_equal(result->'latest_handover'->'summary','"Main work handover"','home keeps project context');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(jsonb_build_object('name',x->'name','home',x->'home','archived',x->'archived',
+     'active',x->'last_activity'<>'null'::jsonb) ORDER BY ordinality)
+   FROM jsonb_array_elements(result->'project_index') WITH ORDINALITY t(x,ordinality) WHERE x->>'project_id' IN (project::text,other_project::text)),
+   '[{"name":"Context fixture","home":true,"archived":false,"active":true},{"name":"Other context","home":false,"archived":true,"active":false}]',
+   'index lists projects by activity with archive state');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(DISTINCT k ORDER BY k) FROM jsonb_array_elements(result->'project_index') x, jsonb_object_keys(x) k),
+   '["archived","home","last_activity","name","project_id"]','index carries identity only');
+ IF jsonb_array_length(result->'project_index')>100 THEN RAISE EXCEPTION 'index unbounded'; END IF;
+ IF maven.memory_project_context(jsonb_build_object('project_id',other_project,'session_id',requester->'record_id')) ? 'project_index' THEN
+   RAISE EXCEPTION 'non-Home project received a project index';
+ END IF;
+ PERFORM pg_temp.assert_equal(maven.memory_project_context('{}'),'{"status":"invalid_request"}','invalid request unchanged');
+ -- Peers carry machine, last activity and staleness (no activity for 24 hours).
+ write_request:=pg_temp.request('session',jsonb_build_object('state','active','summary',
+   jsonb_build_object('harness','omp','machine','laptop')::text)) || jsonb_build_object('project_id',project);
+ PERFORM pg_temp.write(write_request);
+ UPDATE maven.records SET updated_at=now()-interval '48 hours' WHERE id=(write_request->>'record_id')::uuid;
+ result:=maven.memory_project_context(jsonb_build_object('project_id',project,'session_id',requester->'record_id'));
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_object('machine',p->'machine','stale',p->'stale','revision',p->'revision')
+   FROM jsonb_array_elements(result->'active_peers') p WHERE p->'session_id'=write_request->'record_id'),
+   '{"machine":"laptop","stale":true,"revision":1}','stale peer from another machine');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_object('machine',p->'machine','stale',p->'stale')
+   FROM jsonb_array_elements(result->'active_peers') p WHERE p->'session_id'=main_session->'record_id'),
+   '{"machine":null,"stale":false}','recently active peer');
  -- Batched current revisions for visible memory only.
  result:=maven.memory_revisions(jsonb_build_object('record_ids',jsonb_build_array(a->'record_id',main_checkpoint->'record_id',gen_random_uuid())));
  PERFORM pg_temp.assert_equal(result->'revisions',jsonb_build_object(a->>'record_id',1,main_checkpoint->>'record_id',2),'current revisions');
@@ -970,6 +1004,246 @@ END $$;
 RESET ROLE;
 """
 
+SQL_CLEANUP = r"""
+CREATE FUNCTION pg_temp.refused(statement text, expected text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+ EXECUTE statement;
+ RAISE EXCEPTION 'fixture assertion: not refused (%)', expected;
+EXCEPTION WHEN invalid_parameter_value THEN
+ IF SQLERRM IS DISTINCT FROM 'cleanup_refused:' || expected THEN
+   RAISE EXCEPTION 'fixture assertion: refusal % instead of %', SQLERRM, expected;
+ END IF;
+END $$;
+CREATE FUNCTION pg_temp.immutable(statement text, label text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+ EXECUTE statement;
+ RAISE EXCEPTION 'fixture assertion: history changed (%)', label;
+EXCEPTION WHEN insufficient_privilege THEN
+ IF SQLERRM IS DISTINCT FROM 'immutable history' THEN RAISE EXCEPTION 'fixture assertion: % (%)', SQLERRM, label; END IF;
+END $$;
+CREATE FUNCTION pg_temp.candidate(candidates jsonb, target jsonb) RETURNS jsonb LANGUAGE sql AS $$
+ SELECT x FROM jsonb_array_elements(candidates) x WHERE x->'record_id'=target->'record_id'
+$$;
+DO $$
+DECLARE
+ digest text:=repeat('d',64); project uuid; result jsonb; candidates jsonb; entry jsonb; tombstone jsonb; receipt uuid;
+ superseded jsonb; archived jsonb; stale jsonb; dup_old jsonb; dup_new jsonb; big jsonb; client jsonb; lifecycle jsonb;
+ hidden jsonb; plain jsonb; work jsonb; secret jsonb; session_request jsonb; keeper jsonb; claim_request jsonb;
+ legacy uuid; legacy_source uuid; shared uuid; exclusive uuid; page uuid; source uuid; forget_receipt uuid;
+BEGIN
+ result:=pg_temp.write(pg_temp.request('entity','{"entity_type":"project","name":"Cleanup fixture","aliases":[]}'));
+ project:=(result->>'record_id')::uuid;
+ superseded:=pg_temp.request('note','{"title":"Cleanup superseded","body_markdown":"Old copy","category":"reference"}') || '{"tags":["maven-scope-superseded"]}';
+ archived:=pg_temp.request('note','{"title":"Cleanup archived","body_markdown":"Done","category":"reference"}') || '{"tags":["archived"]}';
+ stale:=pg_temp.request('task','{"title":"Cleanup stale","description":"Untouched","state":"blocked"}');
+ dup_old:=pg_temp.request('note','{"title":"Cleanup Duplicate","body_markdown":"First","category":"reference"}') || jsonb_build_object('project_id',project);
+ dup_new:=pg_temp.request('note','{"title":"cleanup duplicate","body_markdown":"Second","category":"reference"}') || jsonb_build_object('project_id',project);
+ big:=pg_temp.request('note',jsonb_build_object('title','Cleanup oversized','body_markdown',repeat('z',20001),'category','reference'));
+ client:=pg_temp.request('note','{"title":"Cleanup client","body_markdown":"Client detail","category":"reference"}') || '{"tags":["client:fixture"]}';
+ lifecycle:=pg_temp.request('session','{"state":"active","summary":"Cleanup lifecycle"}') || '{"tags":["archived"]}';
+ hidden:=pg_temp.request('note','{"title":"Cleanup hidden","body_markdown":"Invisible","category":"reference"}') || '{"tags":["archived"]}';
+ plain:=pg_temp.request('note','{"title":"Cleanup plain","body_markdown":"Nothing to clean","category":"reference"}');
+ PERFORM pg_temp.write(superseded); PERFORM pg_temp.write(archived); PERFORM pg_temp.write(stale);
+ PERFORM pg_temp.write(dup_old); PERFORM pg_temp.write(dup_new); PERFORM pg_temp.write(big); PERFORM pg_temp.write(client);
+ PERFORM pg_temp.write(lifecycle); PERFORM pg_temp.write(hidden); PERFORM pg_temp.write(plain);
+ UPDATE maven.records SET updated_at=now()-interval '31 days' WHERE id=(stale->>'record_id')::uuid;
+ UPDATE maven.records SET updated_at=now()-interval '1 day' WHERE id=(dup_old->>'record_id')::uuid;
+ UPDATE maven.records SET visibility_state='blocked' WHERE id=(hidden->>'record_id')::uuid;
+ -- Review candidates: reasons, suggestions, scope; lifecycle kinds, invisible and clean records excluded.
+ result:=maven.cleanup_candidates();
+ PERFORM pg_temp.assert_equal(result->'truncated','false','candidate list bounded');
+ candidates:=result->'candidates';
+ entry:=pg_temp.candidate(candidates,superseded);
+ PERFORM pg_temp.assert_equal(entry->'reasons','["superseded"]','superseded reason');
+ PERFORM pg_temp.assert_equal(entry->'suggested','"erase"','superseded suggests erase');
+ PERFORM pg_temp.assert_equal(entry-'updated_at',jsonb_build_object('record_id',superseded->'record_id','kind','note','scope','universal',
+   'project_id',NULL,'title','Cleanup superseded','revision',1,'reasons','["superseded"]'::jsonb,'suggested','erase'),'candidate shape');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,archived)->'reasons','["archived"]','archived reason');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,archived)->'suggested','"forget"','archived suggests forget');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,stale)->'reasons','["stale_task"]','stale task reason');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,stale)->'suggested','"archive"','stale task suggests archive');
+ entry:=pg_temp.candidate(candidates,dup_old);
+ PERFORM pg_temp.assert_equal(entry->'reasons','["duplicate"]','older duplicate reason');
+ PERFORM pg_temp.assert_equal(entry->'suggested','"forget"','duplicate suggests forget');
+ PERFORM pg_temp.assert_equal(entry->'scope','"project"','project scope');
+ PERFORM pg_temp.assert_equal(entry->'project_id',to_jsonb(project),'project id');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,dup_new),NULL,'newest duplicate kept');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,big)->'reasons','["oversized"]','oversized reason');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,big)->'suggested','"archive"','oversized suggests archive');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,client)->'reasons','["client_universal"]','client universal reason');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,client)->'suggested','"forget"','client universal suggests forget');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,lifecycle),NULL,'lifecycle kinds excluded');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,hidden),NULL,'invisible records excluded');
+ PERFORM pg_temp.assert_equal(pg_temp.candidate(candidates,plain),NULL,'clean records excluded');
+ IF EXISTS (SELECT 1 FROM jsonb_array_elements(candidates) x JOIN maven.records r ON r.id=(x->>'record_id')::uuid
+            WHERE r.kind IN ('session','checkpoint','operation','page','source')) THEN
+   RAISE EXCEPTION 'fixture assertion: lifecycle, page or source candidate';
+ END IF;
+ -- Exact review entries in request order; duplicates collapse; unknown ids are reported.
+ source:=gen_random_uuid();
+ result:=maven.cleanup_describe(ARRAY[(archived->>'record_id')::uuid,source,(archived->>'record_id')::uuid]);
+ PERFORM pg_temp.assert_equal(result,jsonb_build_array(jsonb_build_object('record_id',archived->'record_id','found',true,'kind','note',
+   'scope','universal','project_id',NULL,'title','Cleanup archived','revision',1,'visibility_state','visible','archived',true,
+   'superseded',false,'erased',false,'versions',1),jsonb_build_object('record_id',source,'found',false)),'describe entries');
+ PERFORM pg_temp.refused('SELECT maven.cleanup_describe(ARRAY(SELECT gen_random_uuid() FROM generate_series(1,201)))','record_count');
+ -- Refusals: lifecycle kinds, pages, sources, unknown ids, counts, digest, actor and reason.
+ SELECT id INTO page FROM maven.pages LIMIT 1;
+ SELECT id INTO source FROM maven.sources LIMIT 1;
+ PERFORM pg_temp.refused(format('SELECT maven.forget_records(ARRAY[%L]::uuid[],false,%L,%L,%L)',lifecycle->>'record_id','fixture-owner','Forget',digest),'lifecycle_kind');
+ PERFORM pg_temp.refused(format('SELECT maven.erase_records(ARRAY[%L]::uuid[],%L,%L,%L)',lifecycle->>'record_id','fixture-owner','Erase',digest),'lifecycle_kind');
+ PERFORM pg_temp.refused(format('SELECT maven.forget_records(ARRAY[%L]::uuid[],false,%L,%L,%L)',page,'fixture-owner','Forget',digest),'instruction_page');
+ PERFORM pg_temp.refused(format('SELECT maven.erase_records(ARRAY[%L]::uuid[],%L,%L,%L)',page,'fixture-owner','Erase',digest),'instruction_page');
+ PERFORM pg_temp.refused(format('SELECT maven.erase_records(ARRAY[%L]::uuid[],%L,%L,%L)',source,'fixture-owner','Erase',digest),'unsupported_kind');
+ PERFORM pg_temp.refused(format('SELECT maven.forget_records(ARRAY[%L]::uuid[],false,%L,%L,%L)',gen_random_uuid(),'fixture-owner','Forget',digest),'record_unavailable');
+ PERFORM pg_temp.refused(format('SELECT maven.forget_records(ARRAY[%L]::uuid[],true,%L,%L,%L)',hidden->>'record_id','fixture-owner','Restore',digest),'record_blocked');
+ PERFORM pg_temp.refused(format('SELECT maven.forget_records(%L::uuid[],false,%L,%L,%L)','{}','fixture-owner','Forget',digest),'record_count');
+ PERFORM pg_temp.refused(format('SELECT maven.erase_records(ARRAY(SELECT gen_random_uuid() FROM generate_series(1,201)),%L,%L,%L)','fixture-owner','Erase',digest),'record_count');
+ PERFORM pg_temp.refused(format('SELECT maven.forget_records(ARRAY[%L]::uuid[],false,%L,%L,%L)',plain->>'record_id','fixture-owner','Forget',upper(digest)),'approval_digest');
+ PERFORM pg_temp.refused(format('SELECT maven.erase_records(ARRAY[%L]::uuid[],%L,%L,%L)',plain->>'record_id','fixture-owner','Erase','x'),'approval_digest');
+ PERFORM pg_temp.refused(format('SELECT maven.forget_records(ARRAY[%L]::uuid[],false,%L,%L,%L)',plain->>'record_id','','Forget',digest),'actor');
+ PERFORM pg_temp.refused(format('SELECT maven.forget_records(ARRAY[%L]::uuid[],false,%L,%L,%L)',plain->>'record_id','fixture-owner',' ',digest),'reason');
+ IF EXISTS (SELECT 1 FROM maven.cleanup_receipts) THEN RAISE EXCEPTION 'fixture assertion: refusal wrote a receipt'; END IF;
+ -- Forget hides a project task from read, revision read, search, lookup, revisions and project context.
+ work:=pg_temp.request('task','{"title":"Forgettable work","description":"Project item","state":"open"}') || jsonb_build_object('project_id',project);
+ PERFORM pg_temp.write(work);
+ PERFORM pg_temp.assert_equal(pg_temp.write(work || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',1,
+   'data',work->'data' || '{"description":"Second revision"}'))->'revision','2','forget target revised');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',work->'record_id'))->'revision','2','visible before forget');
+ PERFORM pg_temp.assert_equal(maven.memory_search(jsonb_build_object('query','Forgettable','scope','project','project_id',project))->'records'->0->'record_id',
+   work->'record_id','searchable before forget');
+ PERFORM pg_temp.assert_equal((SELECT x->'record_id' FROM jsonb_array_elements(maven.memory_project_context(jsonb_build_object('project_id',project,
+   'session_id',gen_random_uuid()))->'tasks') x WHERE x->'record_id'=work->'record_id'),work->'record_id','project context before forget');
+ result:=maven.forget_records(ARRAY[(work->>'record_id')::uuid,(work->>'record_id')::uuid],false,'fixture-owner','Forget fixture',digest);
+ forget_receipt:=(result->>'receipt_id')::uuid;
+ PERFORM pg_temp.assert_equal(result-'receipt_id',jsonb_build_object('changed',jsonb_build_array(work->'record_id'),'unchanged','[]'::jsonb),'forget result');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_array(action,to_jsonb(record_ids),revisions,actor,reason,approval_digest)
+   FROM maven.cleanup_receipts WHERE id=forget_receipt),jsonb_build_array('forget',jsonb_build_array(work->'record_id'),
+   jsonb_build_object(work->>'record_id',2),'fixture-owner','Forget fixture',digest),'forget receipt');
+ PERFORM pg_temp.assert_equal((SELECT to_jsonb(visibility_state) FROM maven.records WHERE id=(work->>'record_id')::uuid),'"forgotten"','forgotten state');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',work->'record_id'))->'status','"record_unavailable"','forgotten read');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',work->'record_id','revision',1))->'status','"record_unavailable"','forgotten revision read');
+ PERFORM pg_temp.assert_equal(maven.memory_search(jsonb_build_object('query','Forgettable','scope','all'))->'records','[]','forgotten search');
+ PERFORM pg_temp.assert_equal(maven.memory_search(jsonb_build_object('scope','project','project_id',project,'kind','task'))->'records','[]','forgotten listing');
+ PERFORM pg_temp.assert_equal(maven.memory_lookup((work->>'request_key')::uuid),NULL,'forgotten receipt lookup');
+ PERFORM pg_temp.assert_equal(maven.memory_revisions(jsonb_build_object('record_ids',jsonb_build_array(work->'record_id')))->'revisions','{}','forgotten revisions');
+ PERFORM pg_temp.assert_equal(to_jsonb(EXISTS (SELECT 1 FROM jsonb_array_elements(maven.memory_project_context(jsonb_build_object('project_id',project,
+   'session_id',gen_random_uuid()))->'tasks') x WHERE x->'record_id'=work->'record_id')),'false','forgotten project context');
+ PERFORM pg_temp.assert_equal(pg_temp.write(work || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',2))->'status','"record_unavailable"','forgotten not writable');
+ result:=maven.forget_records(ARRAY[(work->>'record_id')::uuid],false,'fixture-owner','Forget again',digest);
+ PERFORM pg_temp.assert_equal(result-'receipt_id',jsonb_build_object('changed','[]'::jsonb,'unchanged',jsonb_build_array(work->'record_id')),'forget idempotent');
+ result:=maven.forget_records(ARRAY[(work->>'record_id')::uuid],true,'fixture-owner','Restore fixture',digest);
+ PERFORM pg_temp.assert_equal(result->'changed',jsonb_build_array(work->'record_id'),'restore changed');
+ PERFORM pg_temp.assert_equal((SELECT to_jsonb(action) FROM maven.cleanup_receipts WHERE id=(result->>'receipt_id')::uuid),'"restore"','restore receipt');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',work->'record_id','revision',1))->'data',work->'data','restored revision read');
+ PERFORM pg_temp.assert_equal(maven.memory_search(jsonb_build_object('query','Forgettable','scope','all'))->'records'->0->'record_id',work->'record_id','restored search');
+ PERFORM pg_temp.assert_equal(to_jsonb(EXISTS (SELECT 1 FROM jsonb_array_elements(maven.memory_project_context(jsonb_build_object('project_id',project,
+   'session_id',gen_random_uuid()))->'tasks') x WHERE x->'record_id'=work->'record_id')),'true','restored project context');
+ -- Erase: a claimed universal task (two versions, a claim receipt), plus a legacy fact; one source is shared.
+ session_request:=pg_temp.request('session','{"state":"active","summary":"Erase fixture session"}'); PERFORM pg_temp.write(session_request);
+ secret:=pg_temp.request('task','{"title":"Call Acme Corp","description":"Acme Corp customer detail","state":"open"}')
+   || '{"source":{"origin":"Acme Corp call","excerpt":"Acme Corp customer detail"},"change_reason":"Acme Corp follow-up"}';
+ PERFORM pg_temp.write(secret);
+ claim_request:=jsonb_build_object('request_key',gen_random_uuid(),'record_id',secret->'record_id','expected_revision',1,
+   'session_id',session_request->'record_id','action','claim','lease_seconds',60,'source',secret->'source','change_reason','Acme Corp claim');
+ PERFORM pg_temp.assert_equal(pg_temp.write(claim_request,'claim')->'fence','1','erase target claimed');
+ keeper:=pg_temp.request('note','{"title":"Cleanup keeper","body_markdown":"Kept","category":"reference"}'); PERFORM pg_temp.write(keeper);
+ SELECT source_id INTO shared FROM maven.record_sources WHERE record_id=(secret->>'record_id')::uuid AND revision=1;
+ SELECT source_id INTO exclusive FROM maven.record_sources WHERE record_id=(secret->>'record_id')::uuid AND revision=2;
+ INSERT INTO maven.record_sources(record_id,revision,source_id,source_revision) VALUES ((keeper->>'record_id')::uuid,1,shared,1);
+ SELECT id,source_id INTO legacy,legacy_source FROM maven.facts LIMIT 1;
+ result:=maven.erase_records(ARRAY[(secret->>'record_id')::uuid,legacy],'fixture-owner','Erase fixture',digest);
+ receipt:=(result->>'receipt_id')::uuid; tombstone:=result->'tombstone';
+ PERFORM pg_temp.assert_equal(tombstone,jsonb_build_object('erased',true,'erased_at',result->'erased_at','receipt_id',receipt),'tombstone shape');
+ PERFORM pg_temp.assert_equal(tombstone,maven.cleanup_tombstone(receipt),'tombstone fixed by receipt');
+ PERFORM pg_temp.assert_equal(result->'records',(SELECT jsonb_agg(jsonb_build_object('record_id',id,'versions',versions) ORDER BY id)
+   FROM (VALUES ((secret->>'record_id')::uuid,2),(legacy,(SELECT count(*)::integer FROM maven.record_versions WHERE record_id=legacy))) v(id,versions)),'erase result');
+ PERFORM pg_temp.assert_equal(to_jsonb(current_setting('maven.erase_receipt',true)),'""','erase authorization cleared');
+ IF EXISTS (SELECT 1 FROM maven.record_versions WHERE record_id IN ((secret->>'record_id')::uuid,legacy,exclusive,legacy_source)
+   AND (snapshot<>tombstone OR content_hash<>encode(sha256(convert_to(tombstone::text,'UTF8')),'hex') OR change_reason<>'erased')) THEN
+   RAISE EXCEPTION 'fixture assertion: version not rewritten to the tombstone';
+ END IF;
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_array(data,tags,subject_id,claim_session,claim_expires_at) FROM maven.memory_items
+   WHERE id=(secret->>'record_id')::uuid),jsonb_build_array(tombstone,'["erased"]'::jsonb,NULL,NULL,NULL),'current data tombstoned');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_array(value,value_type) FROM maven.facts WHERE id=legacy),'[null,"null"]','legacy fact value erased');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(visibility_state ORDER BY id) FROM maven.records WHERE id IN ((secret->>'record_id')::uuid,legacy)),
+   '["forgotten","forgotten"]','erase implies forgotten');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_array(origin,excerpt) FROM maven.sources WHERE id=exclusive),'["erased","erased"]','exclusive source blanked');
+ PERFORM pg_temp.assert_equal((SELECT to_jsonb(excerpt) FROM maven.sources WHERE id=legacy_source),'"erased"','legacy fact source blanked');
+ PERFORM pg_temp.assert_equal((SELECT jsonb_build_array(origin,excerpt) FROM maven.sources WHERE id=shared),'["Acme Corp call","Acme Corp customer detail"]','shared source kept');
+ PERFORM pg_temp.assert_equal((SELECT snapshot FROM maven.record_versions WHERE record_id=shared),secret->'source','shared source history kept');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',keeper->'record_id'))->'data',keeper->'data','keeper readable');
+ IF EXISTS (SELECT 1 FROM maven.memory_receipts m, jsonb_object_keys(m.result) k WHERE m.record_id=(secret->>'record_id')::uuid
+   AND k NOT IN ('record_id','revision','request_key','replayed')) OR (SELECT count(*) FROM maven.memory_receipts
+   WHERE record_id=(secret->>'record_id')::uuid)<>2 THEN
+   RAISE EXCEPTION 'fixture assertion: write receipts keep claim details';
+ END IF;
+ IF EXISTS (SELECT 1 FROM maven.records r JOIN maven.record_versions v ON v.record_id=r.id
+   WHERE strpos(v.snapshot::text || v.change_reason,'Acme')>0 AND r.id NOT IN (shared,(keeper->>'record_id')::uuid))
+   OR EXISTS (SELECT 1 FROM maven.memory_items WHERE strpos(data::text,'Acme')>0)
+   OR EXISTS (SELECT 1 FROM maven.memory_receipts m WHERE strpos(m.result::text,'Acme')>0)
+   OR EXISTS (SELECT 1 FROM maven.sources WHERE strpos(origin || excerpt,'Acme')>0 AND id<>shared) THEN
+   RAISE EXCEPTION 'fixture assertion: erased content remains outside the shared source';
+ END IF;
+ PERFORM pg_temp.assert_equal(maven.cleanup_erased_ids(),jsonb_build_object('record_ids',(SELECT jsonb_agg(id ORDER BY id)
+   FROM unnest(ARRAY[(secret->>'record_id')::uuid,legacy]) id)),'erased ids listed');
+ PERFORM pg_temp.assert_equal(maven.cleanup_describe(ARRAY[(secret->>'record_id')::uuid])->0->'erased','true','describe shows erased');
+ -- Erased records stay unreadable and cannot be restored or erased again.
+ PERFORM pg_temp.refused(format('SELECT maven.forget_records(ARRAY[%L]::uuid[],true,%L,%L,%L)',secret->>'record_id','fixture-owner','Restore',digest),'record_erased');
+ PERFORM pg_temp.refused(format('SELECT maven.erase_records(ARRAY[%L]::uuid[],%L,%L,%L)',legacy,'fixture-owner','Erase',digest),'record_erased');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',secret->'record_id'))->'status','"record_unavailable"','erased read');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',secret->'record_id','revision',1))->'status','"record_unavailable"','erased revision read');
+ PERFORM pg_temp.assert_equal(maven.memory_lookup((secret->>'request_key')::uuid),NULL,'erased receipt lookup');
+ PERFORM pg_temp.assert_equal(maven.memory_search('{"query":"Acme","scope":"all"}')->'records','[]','erased search');
+ -- Receipts are immutable and content-free.
+ IF EXISTS (SELECT 1 FROM maven.cleanup_receipts c WHERE strpos(to_jsonb(c)::text,'Acme')>0 OR strpos(to_jsonb(c)::text,'Forgettable')>0
+   OR EXISTS (SELECT 1 FROM jsonb_each(c.revisions) r WHERE jsonb_typeof(r.value)<>'number')) THEN
+   RAISE EXCEPTION 'fixture assertion: receipt carries content';
+ END IF;
+ PERFORM pg_temp.immutable(format('UPDATE maven.cleanup_receipts SET reason=%L WHERE id=%L','changed',receipt),'receipt update');
+ PERFORM pg_temp.immutable(format('DELETE FROM maven.cleanup_receipts WHERE id=%L',receipt),'receipt delete');
+ -- Outside erase_records, history stays immutable, including with a forged or stale authorization.
+ PERFORM pg_temp.immutable(format('UPDATE maven.record_versions SET change_reason=%L WHERE record_id=%L','changed',keeper->>'record_id'),'version update');
+ PERFORM pg_temp.immutable(format('DELETE FROM maven.record_versions WHERE record_id=%L',secret->>'record_id'),'version delete');
+ PERFORM pg_temp.immutable(format('UPDATE maven.memory_receipts SET result=%L WHERE record_id=%L','{}',keeper->>'record_id'),'receipt result update');
+ PERFORM pg_temp.immutable(format('DELETE FROM maven.memory_receipts WHERE record_id=%L',secret->>'record_id'),'memory receipt delete');
+ PERFORM pg_temp.immutable(format('UPDATE maven.record_sources SET role=role WHERE record_id=%L',keeper->>'record_id'),'citation update');
+ PERFORM pg_temp.immutable(format('DELETE FROM maven.record_sources WHERE record_id=%L',secret->>'record_id'),'citation delete');
+ PERFORM set_config('maven.erase_receipt',forget_receipt::text,true);
+ PERFORM pg_temp.immutable(format('UPDATE maven.record_versions SET snapshot=%L,content_hash=%L,change_reason=%L WHERE record_id=%L',
+   tombstone,encode(sha256(convert_to(tombstone::text,'UTF8')),'hex'),'erased',keeper->>'record_id'),'forget receipt cannot authorize');
+ PERFORM set_config('maven.erase_receipt',receipt::text,true);
+ PERFORM pg_temp.immutable(format('UPDATE maven.record_versions SET snapshot=%L,content_hash=%L,change_reason=%L WHERE record_id=%L',
+   tombstone,encode(sha256(convert_to(tombstone::text,'UTF8')),'hex'),'erased',keeper->>'record_id'),'unerased record stays immutable');
+ PERFORM pg_temp.immutable(format('UPDATE maven.record_versions SET change_reason=%L WHERE record_id=%L','other',secret->>'record_id'),'only the tombstone');
+ PERFORM pg_temp.immutable(format('DELETE FROM maven.record_versions WHERE record_id=%L',secret->>'record_id'),'delete never allowed');
+ PERFORM pg_temp.immutable(format('DELETE FROM maven.memory_receipts WHERE record_id=%L',secret->>'record_id'),'receipt delete never allowed');
+ PERFORM set_config('maven.erase_receipt','',true);
+ BEGIN
+   UPDATE maven.memory_items SET data=tombstone,tags='["erased"]' WHERE id=(keeper->>'record_id')::uuid;
+   RAISE EXCEPTION 'fixture assertion: tombstone accepted outside erase';
+ EXCEPTION WHEN check_violation THEN NULL;
+ END;
+END $$;
+CREATE ROLE maven_cleanup_fixture;
+GRANT USAGE ON SCHEMA maven TO maven_cleanup_fixture;
+SET LOCAL ROLE maven_cleanup_fixture;
+DO $$
+DECLARE statement text;
+BEGIN
+ FOREACH statement IN ARRAY ARRAY['SELECT maven.cleanup_candidates()','SELECT maven.cleanup_describe(ARRAY[]::uuid[])',
+   'SELECT maven.cleanup_erased_ids()','SELECT maven.forget_records(ARRAY[gen_random_uuid()],false,''a'',''b'',repeat(''d'',64))',
+   'SELECT maven.erase_records(ARRAY[gen_random_uuid()],''a'',''b'',repeat(''d'',64))','SELECT maven.cleanup_erase_receipt()',
+   'SELECT * FROM maven.cleanup_receipts'] LOOP
+   BEGIN
+     EXECUTE statement;
+     RAISE EXCEPTION 'fixture assertion: non-owner executed %', statement;
+   EXCEPTION WHEN insufficient_privilege THEN NULL;
+   END;
+ END LOOP;
+END $$;
+RESET ROLE;
+"""
+
 SQL_APPLICATION_STATE_LOCK = r"""
 CREATE ROLE maven_state_guard_fixture;
 GRANT USAGE ON SCHEMA maven TO maven_state_guard_fixture;
@@ -1021,6 +1295,8 @@ class OwnerPostgreSQLTests(unittest.TestCase):
             "ROLLBACK TO SAVEPOINT skill_bundles; RELEASE SAVEPOINT skill_bundles;",
             "SAVEPOINT named_skill_context;", SQL_NAMED_SKILL_CONTEXT,
             "ROLLBACK TO SAVEPOINT named_skill_context; RELEASE SAVEPOINT named_skill_context;", SQL_BEHAVIOR,
+            "SAVEPOINT cleanup; SET CONSTRAINTS ALL DEFERRED;", SQL_CLEANUP,
+            "SET CONSTRAINTS ALL IMMEDIATE; ROLLBACK TO SAVEPOINT cleanup; RELEASE SAVEPOINT cleanup;",
             "SAVEPOINT performance; SET CONSTRAINTS ALL DEFERRED;", SQL_PERFORMANCE,
             "SET CONSTRAINTS ALL IMMEDIATE;", SQL_DISPATCH_ROLE,
             "ROLLBACK TO SAVEPOINT performance; RELEASE SAVEPOINT performance;",

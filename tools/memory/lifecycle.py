@@ -10,7 +10,7 @@ from tools.coordination import SessionRegistry, session_lock, session_uuid
 from tools.project import default_environment, load_project, project_values
 from .boundary import BoundaryError, MemoryBoundary, digest, private_path, read_private, save_private
 
-PROJECT_CONTEXT_KEYS = ('latest_handover', 'active_peers', 'tasks', 'blockers', 'owner_preferences')
+PROJECT_CONTEXT_KEYS = ('latest_handover', 'active_peers', 'tasks', 'blockers', 'owner_preferences', 'project_index')
 
 
 def registered_sessions(root, *, home=None):
@@ -344,6 +344,31 @@ class SessionService:
                 _, claimed = memory._submit('claim', body, target=record)
                 return self._observe(claimed)
 
+    def close_peer(self, session_id, *, expected_revision, source, reason):
+        """Abandon another active session of this project that the owner confirmed no longer runs.
+        Only its cloud record (and an active registration on this machine) changes."""
+        peer = session_uuid(session_id)
+        if peer == self.session_id:
+            raise BoundaryError('this session closes only through its own finish or cancel')
+        if type(expected_revision) is not int or expected_revision < 1:
+            raise BoundaryError('closing another session requires its exact current revision')
+        if not isinstance(reason, str) or not reason.strip():
+            raise BoundaryError('closing another session requires the owner reason')
+        with session_lock(self.root, self.session_id):
+            memory = self._memory()
+            self._ready(memory, write=True)
+            with self._writer():
+                record = memory.read(peer, scope='all')
+                if record['kind'] != 'session' or record.get('project_id') != self.project_id:
+                    raise BoundaryError('only a session of this project can be closed')
+                if record['data'].get('state') != 'active':
+                    raise BoundaryError('the other session is no longer active')
+                if record['revision'] != expected_revision:
+                    raise BoundaryError('the other session changed after the owner confirmed it; reload context')
+                closed = memory.abandon_peer(record, reason=reason, source=source)
+            local = self.registry.abandon(peer)
+            return self._observe(self._report('peer_closed', closed_session=closed, local_registration_closed=local))
+
     def checkpoint(self, *, summary, refs, cutoff, checkpoint_id):
         checkpoint_id = session_uuid(checkpoint_id)
         if not isinstance(summary, str) or not summary.strip() or type(cutoff) is not int or cutoff < 0:
@@ -456,6 +481,10 @@ class SessionService:
             # Recovery may complete a session closure or other lifecycle write.
             self._session_checked = False
             result = memory.recover()
+            record = (result or {}).get('record') or {}
+            if (result or {}).get('route') == 'write' and record.get('record_id') not in (None, self.session_id):
+                # The only lifecycle write for another session is an owner-confirmed peer close.
+                self.registry.abandon(record['record_id'])
             return self._report('recovered', recovery=result, next_action='Resume the original operation or initialize this session')
 
     def close(self):

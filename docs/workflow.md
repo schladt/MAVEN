@@ -8,6 +8,13 @@ real source evidence. Installation is not permission to capture unrelated chats.
 The installation checkout is not automatically a project; `/` is not a valid root.
 No Git repository, remote, branch or explicit no-Git choice is needed for memory.
 
+Outside an enabled project, each session starts with one question, asked every time:
+**Start Home**, **Create Project** or **Read Only** (no answer means Read Only; nothing
+is captured). The answer is recorded locally only; subagents inherit it and never ask.
+The assistant prints the active line (`MAVEN: Home (<label>)`, `MAVEN: project <name>`,
+`MAVEN: read-only`) at start and on any change. See
+[MAVEN Home and the start choice](getting-started.md#maven-home-and-the-start-choice).
+
 For an enabled project, supported harness guidance initializes subsequent sessions:
 
 ```text
@@ -45,6 +52,7 @@ each record and stay quiet on success.
 | “Reconcile the plan with these changes.” | Bounded semantic assignment that reads current records and reconciles affected tasks/plan |
 | “That lesson applies everywhere.” / “Keep this project-specific.” | Source-linked scope correction retaining history and project caveats |
 | “MAVEN status.” | Binding, readiness, maintenance mode, pending assignments, uncertain requests and last verified relevant results |
+| “Clean up my memory.” | Read-only clean-up review (`maven_admin` kind `cleanup`, action `review`): candidates grouped by suggested Forget, Erase or Archive; nothing changes until the owner chooses per item |
 
 The owner controls knowledge throughout the selected instance. Scopes organize
 retrieval, not hard owner access walls. Default consultation includes universal and
@@ -156,11 +164,11 @@ arguments. The shipped tool groups are:
 
 | Intent | Tools and important boundaries |
 | --- | --- |
-| Selection and current context | `maven_project`, `maven_initialize`, `maven_context`; initialize only an explicitly enabled project |
-| Inspection and consultation | `maven_status(summary=true)`, `maven_instructions`, `maven_search`, `maven_read`; default `scope="context"`, explicit `project`, `universal` or `all` as intended. Search is ranked with `rank`/`snippet` (page with `offset`/`next_offset` for queries, `after_id` otherwise; `limit` ≤ 20; `include_archived` for obsolete records). `unbound=true` is a read-only universal consultation without a session, used only on explicit owner intent |
+| Selection and current context | `maven_status(cwd=…)` (returns `start_hint` and `active`), `maven_project`, `maven_initialize` (`home=true` for Home), `maven_start` (`read_only`/`off`, local record only), `maven_context`; initialize only an explicitly enabled project or the configured Home |
+| Inspection and consultation | `maven_status(summary=true)`, `maven_instructions`, `maven_search`, `maven_read`; default `scope="context"`, explicit `project`, `universal` or `all` as intended. Search is ranked with `rank`/`snippet` (page with `offset`/`next_offset` for queries, `after_id` otherwise; `limit` ≤ 20; `include_archived` for obsolete records). `unbound=true` is a read-only universal consultation without a session, used only on explicit owner intent; `include_home=true` adds the configured Home |
 | Mutations and scope | `maven_save`, `maven_scope`, `maven_claim`; real source origin/excerpt, expected revisions and actual task fences |
 | Semantic assignments | `maven_maintenance` actions `enqueue`, `claim`, `apply`, `revise`, `complete`, `release`, `status`; preserve operation identity and worker token. Status/apply/revise return summaries unless `detail=true`; at most 50 changes per apply; an apply that returns `continue=true` is continued with the same token and no changes |
-| Session boundaries | `maven_checkpoint`, `maven_pause`, `maven_resume`, `maven_finish`; finish uses a verified checkpoint covering accepted work |
+| Session boundaries | `maven_checkpoint`, `maven_pause`, `maven_resume`, `maven_finish`; finish uses a verified checkpoint covering accepted work. `maven_close_peer(session_id, revision, source, reason)` marks another session of this project abandoned (exact `revision` from `active_peers`) only after the owner confirms it no longer runs; never this session, refused while it holds live task claims, and that machine's local files are untouched |
 | Recovery and administration | `maven_recover`, `maven_admin`; inspection does not replay mutations, recovery may |
 | Optional publication | `maven_git` actions `configure`, `inspect`, `apply`, `status`, `recover`, `cancel`, `pause`; exact reviewed candidate/owner source and actual cooperating-writer quiescence for publication |
 
@@ -180,6 +188,21 @@ conversation or was re-read from MAVEN. Client/customer engagement details stay
 project-scoped even when the default prefers universal. Offer to turn standing owner
 policies into project or universal instructions through the instruction review flow.
 Mark obsolete records with tag `archived` (or `data.state` `archived`).
+
+**Clean-up** is offered on the owner's request, never automatically. The read-only
+review lists stale open tasks, duplicates, archived and superseded records, oversized
+notes and universal records tagged `client:*`, each with a suggested action. Archive
+is a normal `maven_save` revision adding `archived`. **Forget** (hidden from search,
+startup and every read; reversible with `restore`) and **Erase** (every revision,
+current content, owned source excerpts, fact values and receipt results rewritten to a
+content-free tombstone; irreversible) run only through an owner-approved `maven_admin`
+kind `cleanup` operation with at most 200 record ids and a reason. Its exact review
+lists every record and version count; approval writes an immutable receipt with the
+review digest and no content. Erase caveats: Aurora automated backups keep old content
+up to 30 days; other machines keep any locally cached copy until they next run a MAVEN
+clean-up. Every clean-up first sweeps this machine's local runtime (every registered
+project and the Home folder) for erased records and reports each file changed; an
+unresolved request for an erased record blocks the sweep until it is recovered.
 
 An interrupted closure retains its original checkpoint and finish intent. Restore
 the exact binding even if initialization reports that the session is closing or

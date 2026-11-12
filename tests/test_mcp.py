@@ -214,6 +214,36 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
             unknown.initialize(self.root)
         self.assertEqual(len([r for r in self.cloud.records.values() if r['kind'] == 'session']), 1)
 
+    async def test_close_peer_requires_bound_primary_session_and_passes_arguments(self):
+        peer = str(uuid.uuid4())
+        record = {'record_id': peer, 'revision': 3, 'kind': 'session', 'classification': 'Sensitive',
+                  'data_scope': 'owner', 'project_id': self.project, 'tags': ['work-session'],
+                  'data': {'state': 'active', 'summary': json.dumps({'harness': 'omp', 'machine': 'old-laptop'})}}
+        self.cloud.records[peer] = record
+        self.cloud.history[(peer, 3)] = json.loads(json.dumps(record))
+        arguments = {'session_id': peer, 'revision': 3, 'source': SOURCE, 'reason': 'Owner confirmed it stopped'}
+        unbound, _ = await self.call('maven_close_peer', arguments)
+        self.assertTrue(unbound.is_error)
+        binding = await self.initialize()
+        _, queued = await self.call('maven_maintenance', {'action': 'enqueue', 'intent': 'Preserve finding', 'source': SOURCE})
+        worker = self.application()
+        worker.initialize(self.root, session_id=binding['session_id'], resume=True,
+                          assignment_id=queued['assignment']['operation_id'])
+        refused, _ = await self.call('maven_close_peer', arguments, server=create_server(worker))
+        self.assertTrue(refused.is_error)
+        self.assertEqual(self.cloud.records[peer], record)
+        with patch.object(SessionService, 'close_peer', autospec=True,
+                          return_value={'status': 'peer_closed'}) as close:
+            result, value = await self.call('maven_close_peer', arguments)
+        self.assertFalse(result.is_error, value)
+        close.assert_called_once_with(self.app.service, peer, expected_revision=3, source=SOURCE,
+                                      reason='Owner confirmed it stopped')
+        result, value = await self.call('maven_close_peer', arguments)
+        self.assertFalse(result.is_error, value)
+        self.assertEqual(value['closed_session'], {'record_id': peer, 'revision': 4})
+        self.assertEqual(self.cloud.records[peer]['data']['state'], 'abandoned')
+        self.assertEqual(self.cloud.records[binding['session_id']]['data']['state'], 'active')
+
     async def test_pending_and_paused_are_not_saved_and_errors_hide_credentials(self):
         await self.initialize()
         await self.call('maven_pause')
@@ -324,6 +354,158 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status['rebind_hint']['active_sessions'], [{'session_id': active, 'harness': 'omp'}])
         self.assertIn('resume=true', status['next_action'])
 
+    def configure_home(self, label='nexus'):
+        from tools.home import save_home
+        self.home.mkdir(mode=0o700, exist_ok=True)
+        (self.home / '.env').write_text('MAVEN_MEMORY_INSTANCE_ID="instance-one"\n')
+        (self.home / '.env').chmod(0o600)
+        root = (Path(self.temporary.name) / 'nexus').resolve()
+        root.mkdir()
+        project = str(uuid.uuid4())
+        save_private(root, '.maven/project.json', {'schema': 1, 'root': str(root), 'project_id': project})
+        save_home(self.home, root=root, project_id=project, instance_id='instance-one', label=label, consent=SOURCE)
+        return root, project
+
+    def scratch(self):
+        folder = (Path(self.temporary.name) / 'scratch').resolve()
+        folder.mkdir(exist_ok=True)
+        return folder
+
+    async def test_status_prefers_rebind_hint_then_start_hint_and_always_reports_active(self):
+        scratch = self.scratch()
+        _, outside = await self.call('maven_status', {'cwd': str(scratch)})
+        self.assertNotIn('rebind_hint', outside)
+        self.assertEqual((outside['start_hint']['folder'], outside['start_hint']['options']),
+                         (str(scratch), ['project', 'read_only']))
+        self.assertEqual(outside['next_action'], outside['start_hint']['next_action'])
+        self.assertEqual(outside['active']['mode'], 'off')
+        sessions = [{'session_id': str(uuid.uuid4()), 'harness': 'omp', 'state': 'active'}]
+        with patch('tools.memory.lifecycle.registered_sessions', return_value=sessions):
+            _, inside = await self.call('maven_status', {'cwd': str(self.root / '.maven')})
+        self.assertEqual(inside['rebind_hint']['root'], str(self.root.resolve()))
+        self.assertNotIn('start_hint', inside)
+        self.assertEqual(inside['active']['mode'], 'off')
+        _, idle = await self.call('maven_status', {'cwd': str(self.root)})
+        self.assertFalse({'rebind_hint', 'start_hint'} & set(idle))
+        self.assertEqual(idle['active']['mode'], 'off')
+        await self.initialize()
+        _, bound = await self.call('maven_status', {'cwd': str(scratch)})
+        self.assertFalse({'rebind_hint', 'start_hint'} & set(bound))
+        self.assertEqual((bound['active']['mode'], bound['active']['label'], bound['active']['project_id']),
+                         ('project', self.root.name, self.project))
+
+    async def test_home_initialize_binds_home_from_unrelated_cwd_and_never_rebinds(self):
+        from tools.home import last_choice, read_active
+        scratch = self.scratch()
+        missing, value = await self.call('maven_initialize', {'home': True, 'cwd': str(scratch)})
+        self.assertTrue(missing.is_error)
+        self.assertIn('not configured', value['error'])
+        root, project = self.configure_home()
+        (self.home / 'home.json').chmod(0o644)
+        invalid, value = await self.call('maven_initialize', {'home': True, 'cwd': str(scratch)})
+        self.assertTrue(invalid.is_error)
+        self.assertIn('invalid', value['error'])
+        (self.home / 'home.json').chmod(0o600)
+        mismatch, _ = await self.call('maven_initialize', {'home': True, 'root': str(self.root)})
+        self.assertTrue(mismatch.is_error)
+        self.assertIsNone(self.app.binding)
+        self.assertIsNone(last_choice(self.home, scratch))
+        result, ready = await self.call('maven_initialize', {
+            'home': True, 'cwd': str(scratch), 'harness': 'omp', 'harness_session': 'harness-1'})
+        self.assertFalse(result.is_error, ready)
+        self.assertEqual((ready['binding']['root'], ready['binding']['project_id']), (str(root), project))
+        self.assertEqual((ready['active']['mode'], ready['active']['label']), ('home', 'nexus'))
+        self.assertIn('Home (nexus)', ready['message'])
+        self.assertEqual(last_choice(self.home, scratch), 'home')
+        self.assertEqual(read_active(self.home, harness_session='harness-1')['mode'], 'home')
+        self.assertEqual(read_active(self.home, folder=scratch)['project_id'], project)
+        _, moved = await self.call('maven_status', {'cwd': str(self.root)})
+        self.assertEqual(moved['binding']['root'], str(root))
+        self.assertEqual(moved['active']['mode'], 'home')
+        self.assertFalse({'rebind_hint', 'start_hint'} & set(moved))
+        other, _ = await self.call('maven_initialize', {'root': str(self.root), 'cwd': str(self.root)})
+        self.assertTrue(other.is_error)
+        self.assertEqual(self.app.binding['root'], str(root))
+
+    async def test_start_records_read_only_without_any_cloud_call(self):
+        from tools.home import last_choice
+        scratch = self.scratch()
+        constructed, factory = [], self.app.service_factory
+        self.app.service_factory = lambda *args, **kwargs: constructed.append(args)
+        with patch.object(self.app, 'unbound_client', side_effect=AssertionError('no client')) as client:
+            result, value = await self.call('maven_start', {'choice': 'read_only', 'cwd': str(scratch)})
+            self.assertFalse(result.is_error, value)
+            self.assertEqual((value['status'], value['active']['mode']), ('recorded', 'read_only'))
+            _, status = await self.call('maven_status', {'cwd': str(scratch)})
+        client.assert_not_called()
+        self.assertEqual((constructed, self.cloud.calls), ([], []))
+        self.assertIsNone(self.app.binding)
+        self.assertEqual(last_choice(self.home, scratch), 'read_only')
+        self.assertEqual(status['active']['mode'], 'read_only')
+        self.assertEqual(status['start_hint']['last_choice'], 'read_only')
+        _, value = await self.call('maven_start', {'choice': 'off', 'cwd': str(scratch)})
+        self.assertEqual(value['active']['mode'], 'off')
+        self.app.service_factory = factory
+        await self.initialize()
+        refused, _ = await self.call('maven_start', {'choice': 'read_only', 'cwd': str(scratch)})
+        self.assertTrue(refused.is_error)
+        self.assertEqual(last_choice(self.home, scratch), 'off')
+
+    async def test_unbound_include_home_consults_only_universal_and_home(self):
+        identifiers = {}
+        with patch.object(self.app, 'unbound_client', return_value=self.cloud):
+            unconfigured, _ = await self.call('maven_search', {'query': 'clients', 'unbound': True, 'include_home': True})
+            self.assertTrue(unconfigured.is_error)
+            _, home_project = self.configure_home()
+            for name, owner in (('universal', None), ('home', home_project), ('project', self.project),
+                                ('other', str(uuid.uuid4()))):
+                identifier = identifiers[name] = str(uuid.uuid4())
+                self.cloud.records[identifier] = {
+                    'record_id': identifier, 'kind': 'decision', 'revision': 1, 'project_id': owner,
+                    'data': {'title': f'Never name clients ({name})', 'state': 'accepted'}, 'tags': [],
+                    'classification': 'Sensitive', 'data_scope': 'owner'}
+            _, plain = await self.call('maven_search', {'query': 'clients', 'unbound': True})
+            self.assertEqual([item['record_id'] for item in plain['records']], [identifiers['universal']])
+            result, found = await self.call('maven_search', {'query': 'clients', 'unbound': True, 'include_home': True})
+            self.assertFalse(result.is_error, found)
+            self.assertEqual({item['record_id'] for item in found['records']},
+                             {identifiers['universal'], identifiers['home']})
+            self.assertTrue(found['unbound'])
+            _, page = await self.call('maven_search', {'query': 'clients', 'unbound': True, 'include_home': True,
+                                                       'limit': 1})
+            self.assertEqual(len(page['records']), 1)
+            _, listed = await self.call('maven_search', {'unbound': True, 'include_home': True,
+                                                         'project_id': home_project})
+            self.assertEqual(len(listed['records']), 2)
+            _, record = await self.call('maven_read', {'record_id': identifiers['home'], 'unbound': True,
+                                                       'include_home': True})
+            self.assertEqual((record['project_id'], record['unbound']), (home_project, True))
+            _, record = await self.call('maven_read', {'record_id': identifiers['universal'], 'unbound': True,
+                                                       'include_home': True})
+            self.assertIsNone(record['project_id'])
+            for name, arguments in (
+                ('maven_read', {'record_id': identifiers['home'], 'unbound': True}),
+                ('maven_read', {'record_id': identifiers['other'], 'unbound': True, 'include_home': True}),
+                ('maven_read', {'record_id': identifiers['project'], 'unbound': True, 'include_home': True}),
+                ('maven_search', {'unbound': True, 'include_home': True, 'project_id': self.project}),
+                ('maven_search', {'unbound': True, 'include_home': True, 'scope': 'all'}),
+                ('maven_search', {'include_home': True}),
+            ):
+                denied, _ = await self.call(name, arguments)
+                self.assertTrue(denied.is_error, arguments)
+        self.assertIsNone(self.app.binding)
+        self.assertFalse(any(route == '/v1/memory/write' for route, _ in self.cloud.calls))
+
+    async def test_home_tool_schemas(self):
+        tools = {tool.name: tool for tool in await self.server.list_tools()}
+        self.assertIn('cwd', tools['maven_status'].input_schema['properties'])
+        self.assertTrue({'home', 'cwd'} <= set(tools['maven_initialize'].input_schema['properties']))
+        self.assertNotIn('root', tools['maven_initialize'].input_schema.get('required', []))
+        for name in ('maven_search', 'maven_read'):
+            self.assertIn('include_home', tools[name].input_schema['properties'])
+        self.assertIn('home', json.dumps(tools['maven_admin'].input_schema['properties']['kind']))
+        self.assertEqual(tools['maven_start'].input_schema['properties']['choice']['enum'], ['read_only', 'off'])
+
     async def test_expired_sign_in_returns_mavens_exact_login_command(self):
         self.home.mkdir(mode=0o700)
         cache = self.home / 'runtime' / 'aws-login-cache'
@@ -361,6 +543,23 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary, {'status': 'pending', 'pending_interaction': None})
         _, detailed = await self.call('maven_admin', {'action': 'status', 'operation_id': operation, 'detail': True})
         self.assertEqual(detailed, full)
+
+    async def test_admin_accepts_cleanup_kind(self):
+        tools = {tool.name: tool for tool in await self.server.list_tools()}
+        self.assertIn('cleanup', json.dumps(tools['maven_admin'].input_schema['properties']['kind']))
+        begun = []
+
+        class Admin:
+            def begin(self, kind, parameters):
+                begun.append((kind, parameters))
+                return {'operation_id': 'op', 'state': 'completed', 'outcome': {'action': 'review'}}
+
+        self.app.admin_factory = lambda home: Admin()
+        error, result = await self.call('maven_admin', {'action': 'begin', 'kind': 'cleanup',
+                                                        'parameters': {'action': 'review'}})
+        self.assertFalse(error.is_error)
+        self.assertEqual(begun, [('cleanup', {'action': 'review'})])
+        self.assertEqual(result['outcome'], {'action': 'review'})
 
     async def test_keep_warm_is_opt_in(self):
         with patch.dict('os.environ', {'MAVEN_KEEP_WARM': ''}):

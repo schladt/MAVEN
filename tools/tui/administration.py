@@ -1,12 +1,15 @@
 """Terminal presenter for the same persisted administration checkpoints as MCP."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
+from pathlib import Path
 import shlex
+import sys
 import time
 
-from tools.administration import AdminOperations
+from tools.administration import AdminInputError, AdminOperations
 from tools.interaction import Field, OperationPaused
 
 
@@ -209,16 +212,17 @@ def _aws_login(ui, controller, result, home, identifier):
         ui.message(status)
 
 
-def present(ui, home, *, operation_id=None, mode=None):
+def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=None):
     controller = AdminOperations(home)
-    parameters = {}
+    parameters = dict(parameters or {})
     if mode is not None:
         parameters['mode'] = mode
-    result = controller.status(operation_id) if operation_id else controller.begin('setup', parameters)
+    result = controller.status(operation_id) if operation_id else controller.begin(kind, parameters)
     identifier = result['operation_id']
     ui.message('Resumable administration operation: ' + identifier)
-    ui.message('Pause safely with Ctrl+Q. Resume the same operation: ' +
-               shlex.join(['maven-setup', '--home', str(home), '--operation', identifier]))
+    resume = (['maven-setup', '--home', str(home), '--operation', identifier] if result.get('kind', kind) == 'setup' else
+              [sys.executable, '-m', 'tools.tui.administration', '--home', str(home), '--operation', identifier])
+    ui.message('Pause safely with Ctrl+Q. Resume the same operation: ' + shlex.join(resume))
     wake_retries = 0
     while True:
         ui.checkpoint()
@@ -278,7 +282,12 @@ def present(ui, home, *, operation_id=None, mode=None):
                     if values is None:
                         continue
                     response['confirmations'] = values
-            result = controller.respond(identifier, question['interaction_id'], question['revision'], response)
+            try:
+                result = controller.respond(identifier, question['interaction_id'], question['revision'], response)
+            except AdminInputError as error:
+                # The saved question is unchanged; show why and ask it again.
+                ui.message('Not accepted: ' + str(error))
+                result = controller.status(identifier)
         elif result['state'] in ('completed', 'cancelled', 'abandoned'):
             outcome = result.get('outcome', result['state'])
             ui.message(_text(outcome))
@@ -303,3 +312,22 @@ def present(ui, home, *, operation_id=None, mode=None):
             result = controller.advance(identifier)
         else:
             result = controller.advance(identifier)
+
+
+def main(argv=None):
+    """Terminal entry for MAVEN Home: enable, change or turn off, or resume one exact operation."""
+    parser = argparse.ArgumentParser(description=main.__doc__)
+    parser.add_argument('--home', type=Path, default=Path(os.environ.get('MAVEN_HOME', str(Path.home() / '.maven'))))
+    parser.add_argument('--action', choices=('enable', 'disable'), default='enable')
+    parser.add_argument('--operation', help='Resume the exact persisted administration operation UUID')
+    args = parser.parse_args(argv)
+    home = args.home.expanduser().absolute()
+    os.environ['MAVEN_HOME'] = str(home)
+    from tools.tui import run_workflow
+    return run_workflow('MAVEN Home', ['Choose the Home folder', 'Review', 'Apply'],
+                        lambda ui: present(ui, home, operation_id=args.operation, kind='home',
+                                           parameters={'action': args.action}))
+
+
+if __name__ == '__main__':
+    sys.exit(main())

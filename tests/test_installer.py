@@ -349,6 +349,86 @@ with using(object()):
                 integration_plan(root / 'instance', ['claude'], user_home=root)
             self.assertEqual(json.loads(target.read_text())['mcpServers']['maven']['command'], 'owner')
 
+    def test_claude_statusline_is_optional_owned_and_selectively_removable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / '.claude/settings.json'
+            plain = integration_plan(root / 'instance', ['claude'], user_home=root)
+            self.assertNotIn(settings, [change.path for change in plain])
+            settings.parent.mkdir()
+            original = {'theme': 'dark', 'permissions': {'allow': ['Bash(ls)']}}
+            settings.write_text(json.dumps(original))
+            settings.chmod(0o600)
+            changes = integration_plan(root / 'instance', ['claude'], user_home=root, statusline=True)
+            change = next(change for change in changes if change.path == settings)
+            receipts = [apply_integration(item) for item in changes]
+            self.assertEqual(json.loads(settings.read_text()), dict(original, statusLine={
+                'type': 'command', 'command': str(root / 'instance/venv/bin/maven-statusline')}))
+            self.assertIsNot(change.receipt.get('owned'), False)
+            again = integration_plan(root / 'instance', ['claude'], user_home=root, statusline=True)
+            repeat = next(item for item in again if item.path == settings)
+            self.assertEqual((repeat.before, repeat.receipt['owned']), (repeat.after, False))
+            self.assertNotIn('conflict', repeat.receipt)
+            value = json.loads(settings.read_text())
+            value['theme'] = 'changed by owner after install'
+            settings.write_text(json.dumps(value))
+            for receipt in receipts:
+                remove_integration(receipt)
+            self.assertEqual(json.loads(settings.read_text()), dict(original, theme='changed by owner after install'))
+
+    def test_claude_statusline_created_settings_file_is_removed_entirely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / '.claude/settings.json'
+            changes = integration_plan(root / 'instance', ['claude'], user_home=root, statusline=True)
+            change = next(change for change in changes if change.path == settings)
+            self.assertIsNone(change.before)
+            receipt = apply_integration(change)
+            self.assertEqual(json.loads(settings.read_text())['statusLine']['type'], 'command')
+            remove_integration(receipt)
+            self.assertFalse(settings.exists())
+
+    def test_claude_statusline_conflicts_and_owner_edits_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / '.claude/settings.json'
+            settings.parent.mkdir()
+            owner = {'statusLine': {'type': 'command', 'command': '/owner/status.sh'}, 'model': 'opus'}
+            settings.write_text(json.dumps(owner))
+            settings.chmod(0o600)
+            changes = integration_plan(root / 'instance', ['claude'], user_home=root, statusline=True)
+            change = next(change for change in changes if change.path == settings)
+            self.assertEqual(change.before, change.after)
+            self.assertIs(change.receipt['owned'], False)
+            self.assertIn('conflict', change.receipt)
+            for item in changes:
+                apply_integration(item)
+            self.assertEqual(json.loads(settings.read_text()), owner)
+            with self.assertRaises(ValueError):
+                removal_content(change.receipt)
+            self.assertEqual(json.loads(settings.read_text()), owner)
+
+            settings.write_text(json.dumps({'model': 'opus'}))
+            change = next(change for change in integration_plan(
+                root / 'instance', ['claude'], user_home=root, statusline=True) if change.path == settings)
+            receipt = apply_integration(change)
+            edited = json.loads(settings.read_text())
+            edited['statusLine']['padding'] = 2
+            settings.write_text(json.dumps(edited))
+            with self.assertRaises(ValueError):
+                remove_integration(receipt)
+            self.assertEqual(json.loads(settings.read_text()), edited)
+
+    def test_claude_statusline_requires_the_default_claude_profile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with self.assertRaises(ValueError):
+                integration_plan(root / 'instance', ['omp'], user_home=root, statusline=True)
+            custom = {'claude': (root / 'custom/claude.json', root / 'custom/CLAUDE.md')}
+            with self.assertRaises(ValueError):
+                integration_plan(root / 'instance', ['claude'], user_home=root, paths=custom, statusline=True)
+            self.assertFalse((root / '.claude/settings.json').exists())
+
     def test_live_user_home_cannot_bypass_shutdown_as_staging(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -649,6 +729,76 @@ class HarnessFinishTests(unittest.TestCase):
             install._options(args)
         self.assertTrue(args.setup_fresh)
         self.assertIsNone(args.setup_operation)
+
+    def test_menu_home_entry_dispatches_home_operation_and_offers_turn_off_when_set(self):
+        self.completed()
+        args, ui = argparse.Namespace(home=self.home), Mock()
+        ui.choose.return_value = 'home'
+        with using(ui):
+            install._options(args)
+        self.assertIn('home', [value for _, value in ui.choose.call_args.args[1]])
+        self.assertEqual(args.home_action, 'enable')
+        self.assertFalse(args.uninstall)
+        command = install._handoff_command({'home': self.home, 'home_action': args.home_action})
+        self.assertEqual(command[1:], ['-m', 'tools.tui.administration', '--home', str(self.home),
+                                       '--action', 'enable'])
+        (self.home / 'home.json').write_text('{}')
+        ui.choose.side_effect = ['home', 'disable']
+        with using(ui):
+            install._options(args)
+        self.assertEqual(args.home_action, 'disable')
+        self.assertEqual(install._handoff_command({'home': self.home, 'home_action': 'disable'})[-1], 'disable')
+
+    def test_home_offer_appears_only_without_home_and_skip_writes_nothing(self):
+        from tools.tui import harness
+        outcome = {'status': 'skipped', 'selected': [], 'written': []}
+        before = sorted(str(path) for path in self.home.rglob('*'))
+        with patch.object(harness, '_verified', return_value=True), \
+                patch.object(harness, 'configure_harnesses', return_value=outcome), \
+                patch.object(harness, 'show_completion', return_value=outcome), \
+                patch.object(harness, '_cloud_context', return_value=''), \
+                patch('tools.tui.administration.present') as present:
+            ui = Mock()
+            ui.choose.return_value = 'skip'
+            self.assertEqual(harness.finish_setup(ui, self.home, {}), outcome)
+            self.assertEqual(ui.choose.call_args.args[0], 'Set up MAVEN Home (optional)')
+            present.assert_not_called()
+            self.assertEqual(sorted(str(path) for path in self.home.rglob('*')), before)
+            ui = Mock()
+            ui.choose.return_value = 'home'
+            present.return_value = 0
+            self.assertEqual(harness.finish_setup(ui, self.home, {}), outcome)
+            self.assertEqual(present.call_args.kwargs['kind'], 'home')
+            present.reset_mock()
+            present.side_effect = OperationPaused('paused')
+            self.assertEqual(harness.finish_setup(ui, self.home, {}), outcome)
+            present.reset_mock()
+            with patch('tools.home.load_home', return_value={'root': str(self.user)}):
+                ui = Mock()
+                self.assertEqual(harness.finish_setup(ui, self.home, {}), outcome)
+                ui.choose.assert_not_called()
+                present.assert_not_called()
+
+    def test_claude_statusline_opt_in_is_planned_and_existing_line_is_reviewed_as_conflict(self):
+        from tools.tui import harness
+        settings = self.user / '.claude/settings.json'
+        settings.parent.mkdir(parents=True)
+        owner = {'statusLine': {'type': 'command', 'command': 'owner-line'}}
+        settings.write_text(json.dumps(owner))
+        for claude, expected in ((False, False), (True, True)):
+            with self.subTest(claude=claude):
+                ui = self.ui()
+                ui.form.return_value = {**{name: name == ('claude' if claude else 'omp') for name in HARNESS_PATHS},
+                                        'statusline': True}
+                ui.review.return_value = False
+                with patch.object(harness, 'integration_plan', wraps=integration_plan) as plan:
+                    harness.configure_harnesses(ui, self.home)
+                self.assertIs(plan.call_args.kwargs['statusline'], expected)
+                if claude:
+                    body = ui.review.call_args.args[1]
+                    self.assertIn('Conflict, not changed', body)
+                    self.assertNotIn(f'Preserve identical content: {settings}', body)
+        self.assertEqual(json.loads(settings.read_text()), owner)
 
 
 if __name__ == '__main__':

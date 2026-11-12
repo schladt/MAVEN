@@ -158,10 +158,16 @@ Installation/tool availability does not authorize capturing unrelated chats.
   have?”** to list active cloud instructions (`maven_instructions`). Answers say
   whether they came from this conversation or were re-read from MAVEN.
 - Search is ranked with snippets; records tagged or stated `archived` drop out of
-  default results. Client/customer engagement details stay project-scoped. Standing
-  policies you state can be offered as instructions for future sessions.
-- In a folder that is not enabled, ask explicitly to **“use what MAVEN knows”** for a
-  read-only universal consultation that creates no session and captures nothing.
+  default results. Universal memory holds only preferences, instructions and general
+  lessons; customer- and project-specific detail never goes there. Standing policies
+  you state can be offered as instructions for future sessions.
+- Outside an enabled project, each session asks **Start Home, Create Project, or Read
+  Only?** every time; no answer means Read Only, which creates no session and captures
+  nothing (ask **“use what MAVEN knows”** to consult read-only). The assistant prints
+  the active line (for example `MAVEN: read-only`) at start and on any change. Optional
+  **MAVEN Home** holds your personal and work tasks and people/organization awareness;
+  set it up with the installer's **“Set up or change MAVEN Home”**. See
+  [MAVEN Home and the start choice](docs/getting-started.md#maven-home-and-the-start-choice).
 - **“Wrap up”** closes this memory session after verified required writes, not other
   sessions or shared credentials. Summaries separate universal/project changes and
   pending work. Outages preserve private pending evidence, never a false saved claim.
