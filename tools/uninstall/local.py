@@ -1187,17 +1187,21 @@ def _integration_references(home, selected_homes):
 
 
 def _plan_integrations(fragment, home, manifest, selected_homes):
-    from tools.harness import removal_content
+    from tools.harness import grouped_removal_content, removal_content
     shared, uncertain = _integration_references(home, selected_homes)
+    groups = {}
     for receipt in manifest.get('integrations', []):
         path = receipt['path']
         if not receipt.get('owned', True):
             fragment['retained'].append({'path': path, 'reason': 'Referenced existing integration; not owned by this installation'})
             continue
+        groups.setdefault(path, []).append(receipt)
+    for path, receipts in groups.items():
         try:
             if uncertain or path in shared:
                 raise UninstallError('Integration is shared or unselected installation ownership is uncertain')
-            after = removal_content(receipt)
+            after = (grouped_removal_content(receipts) if len(receipts) > 1
+                     else removal_content(receipts[0]))
             if after is None:
                 continue
             expected = inventory(Path(path))
@@ -1205,16 +1209,19 @@ def _plan_integrations(fragment, home, manifest, selected_homes):
             fragment['retained'].append({'path': path, 'reason': str(error)})
             continue
         fragment['actions'].append(_action('local_integration', path, 85,
-            home=str(home), root=None, receipt=receipt, inventory=expected,
+            home=str(home), root=None, receipt=receipts[0], inventory=expected,
+            **({'receipts': receipts} if len(receipts) > 1 else {}),
             after_sha256=hashlib.sha256(after).hexdigest(),
             manifest=file_digest(home / MANIFEST),
             selected_homes=[str(checked_path(item, exists=False)) for item in selected_homes]))
 
 
 def _remove_integration(action, progress, save):
-    from tools.harness import removal_content, remove_integration
+    from tools.harness import grouped_removal_content, removal_content, remove_integration, remove_integrations
     details = action['details']
     home, path = Path(details['home']), Path(action['target'])
+    # Old saved actions retain their original single-receipt approval and behavior.
+    receipts = details.get('receipts')
     with _sharing_locks(home, details['selected_homes']):
         shared, uncertain = _integration_references(home, details['selected_homes'])
         if uncertain or str(path) in shared:
@@ -1225,17 +1232,18 @@ def _remove_integration(action, progress, save):
         if current != details['inventory']:
             # Reconciliation verifies the exact reviewed result, including edits
             # performed by another selected home's identical removal action.
-            empty_owned_file = (details['receipt']['created']
+            empty_owned_file = ((any(item['created'] for item in receipts) if receipts
+                                 else details['receipt']['created'])
                                 and details['after_sha256'] == hashlib.sha256(b'').hexdigest())
             if ((_exists(path) and file_digest(path) == details['after_sha256'])
                     or (not _exists(path) and empty_owned_file)):
                 return {'status': 'removed', 'unrelated_content_preserved': True,
                         'already_at_reviewed_result': True}
             raise UninstallError('Integration changed after review; no unrelated content removed')
-        after = removal_content(details['receipt'])
+        after = grouped_removal_content(receipts) if receipts else removal_content(details['receipt'])
         if after is None or hashlib.sha256(after).hexdigest() != details['after_sha256']:
             raise UninstallError('Selective integration removal differs from reviewed content')
         progress['intent'] = 'remove exact integration'
         save()
-        result = remove_integration(details['receipt'])
+        result = remove_integrations(receipts) if receipts else remove_integration(details['receipt'])
         return {'status': 'removed', **result}

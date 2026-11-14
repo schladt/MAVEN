@@ -134,7 +134,9 @@ class SessionRecoveryTests(unittest.TestCase):
                                               {'project_id': project, 'session_id': session})
         index = [{'project_id': project, 'name': 'nexus', 'archived': False, 'last_activity': None, 'home': True}]
         client.invoke.return_value = {'status': 'ready', 'data': dict(data, project_index=index)}
-        self.assertEqual(memory.project_context()['project_index'], index)
+        self.assertEqual(memory.project_context()['project_index'],
+                         [{**{key: value for key, value in index[0].items() if key != 'home'},
+                           'is_current_context': True}])
         client.invoke.return_value = {'status': 'ready', 'data': dict(data, project_index=index * 101)}
         with self.assertRaises(BoundaryError):
             memory.project_context()

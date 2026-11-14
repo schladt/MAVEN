@@ -342,17 +342,22 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         bound_only, _ = await self.call('maven_search', {'scope': 'context'})
         self.assertTrue(bound_only.is_error)
 
-    async def test_status_offers_exact_rebind_after_restart(self):
-        active = str(uuid.uuid4())
-        sessions = [{'session_id': active, 'harness': 'omp', 'state': 'active'},
-                    {'session_id': str(uuid.uuid4()), 'harness': 'omp', 'state': 'closed'}]
-        with patch('tools.memory.lifecycle.registered_sessions', return_value=sessions) as registered, \
-                patch.object(Path, 'cwd', return_value=self.root / '.maven'):
-            _, status = await self.call('maven_status')
-        registered.assert_called_once_with(self.root.resolve())
+    async def test_status_resumes_only_exact_native_conversation_not_newest_peer(self):
+        _, first = await self.call('maven_initialize', {
+            'root': str(self.root), 'harness': 'omp', 'harness_session': 'conversation-a'})
+        peer = self.application()
+        peer.initialize(self.root, harness='omp', harness_session='conversation-b')
+        restarted = create_server(self.application())
+        _, status = await self.call('maven_status', {
+            'cwd': str(self.root / '.maven'), 'harness': 'omp', 'harness_session': 'conversation-a'},
+            server=restarted)
         self.assertEqual(status['status'], 'not_initialized')
-        self.assertEqual(status['rebind_hint']['active_sessions'], [{'session_id': active, 'harness': 'omp'}])
-        self.assertIn('resume=true', status['next_action'])
+        self.assertEqual(status['rebind_hint']['binding'], first['binding'])
+        _, fresh = await self.call('maven_status', {
+            'cwd': str(self.root), 'harness': 'omp', 'harness_session': 'conversation-c'}, server=restarted)
+        self.assertNotIn('binding', fresh['rebind_hint'])
+        self.assertEqual({item['session_id'] for item in fresh['rebind_hint']['local_sessions']},
+                         {first['binding']['session_id'], peer.binding['session_id']})
 
     def configure_home(self, label='nexus'):
         from tools.home import save_home
@@ -379,14 +384,12 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
                          (str(scratch), ['project', 'read_only']))
         self.assertEqual(outside['next_action'], outside['start_hint']['next_action'])
         self.assertEqual(outside['active']['mode'], 'off')
-        sessions = [{'session_id': str(uuid.uuid4()), 'harness': 'omp', 'state': 'active'}]
-        with patch('tools.memory.lifecycle.registered_sessions', return_value=sessions):
-            _, inside = await self.call('maven_status', {'cwd': str(self.root / '.maven')})
+        _, inside = await self.call('maven_status', {'cwd': str(self.root / '.maven')})
         self.assertEqual(inside['rebind_hint']['root'], str(self.root.resolve()))
         self.assertNotIn('start_hint', inside)
         self.assertEqual(inside['active']['mode'], 'off')
         _, idle = await self.call('maven_status', {'cwd': str(self.root)})
-        self.assertFalse({'rebind_hint', 'start_hint'} & set(idle))
+        self.assertEqual(idle['rebind_hint']['status'], 'initialize')
         self.assertEqual(idle['active']['mode'], 'off')
         await self.initialize()
         _, bound = await self.call('maven_status', {'cwd': str(scratch)})

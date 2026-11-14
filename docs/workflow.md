@@ -36,6 +36,52 @@ reloads current authority. Resume selects the original session explicitly, never
 newest receipt. A transport process is not a work session. Harness IDs are associated
 only when reliably exposed. Tree navigation does not undo writes or revive approvals.
 
+### Startup and recovery decisions
+
+Optional native adapters provide the real harness conversation ID to `maven_startup`.
+First inspect; then continue an unambiguous enabled-project selection. Inspection
+does not create a cloud session. An exact native conversation binding can resume
+automatically, including paused mode; a fresh conversation gets a separate session.
+Closed sessions stay closed. Continuing old work means a new session with the
+previous handover, not adopting another conversation's session.
+
+When no project is enabled, use the Home/project/Read Only choice above. A Git root
+alone does not enable MAVEN. Native hook context is routing information, never proof
+that current cloud authority has loaded. If hooks are unavailable or disabled,
+first-turn guidance runs the same workflow; if it is also unavailable, initialize
+explicitly rather than claiming automatic readiness.
+
+Startup reads up to 100 project-scoped session records and reports incomplete
+pagination explicitly. Old session-record updates are only a `possibly_stale`
+warning; initialized project context also includes peers' checkpoint activity.
+An observed prior end event without a verified finish is unfinished-work evidence,
+not proof of worker death. Offer review recovery, start new leaving peers alone, or
+Read Only. Never automatically close a peer, steal its task claims, or replay writes.
+Same-conversation pending/closing work retains its binding for exact recovery;
+use a separate conversation if the owner wants new work without recovering it.
+
+### Switch an already-bound folder
+
+Ask **“Switch this folder to the existing project …”**. The assistant begins
+`maven_admin` kind `project` with the exact `root`, then selects form mode `switch`,
+the destination `project_id`, and an empty `name`. Home administration has the same
+explicit mode and its separate Home replacement consent.
+
+The review pins the old/new project IDs, instance, local settings, preservation
+path and Home effect. Finish local sessions and resolve writers/unknown operations
+first. MAVEN archives the entire old `.maven` under a reviewed private sibling
+`.maven-preserved-<operation UUID>/.maven`, then installs the new binding; ordinary
+project files and Git configuration stay in place. A persistent barrier blocks new
+work during interrupted cutover. Resume the original reviewed operation rather
+than manually editing configuration or deleting locks.
+
+The old cloud project, records and Home tag are not deleted, merged or archived.
+Other machines are unchanged. If this folder was this machine's Home, the reviewed
+switch updates that local selection too. Cloud cleanup is a separate owner decision.
+The Home index uses `is_current_context` to identify the viewed project; it does not
+claim that only one project is Home across every machine.
+
+
 ## Everyday memory
 
 Within the enabled scope, the assistant maintains meaningful decisions, plans, tasks,
@@ -97,6 +143,22 @@ updates/promotions**, **project updates**, and **pending work**. Do not interrup
 every routine successful write. Explicit saves, checkpoint progress/completion,
 mode changes, conflicts, failures and requests for owner decisions remain visible.
 
+### Exiting the harness
+
+The optional OMP adapter offers **Wrap up and exit**, **Exit without wrapping up**,
+or **Stay** for an open exact-conversation binding. It cancels the immediate exit
+before asking the agent to pause new automatic maintenance, finish accepted work,
+checkpoint and close. It checks the exact closure receipt, not the assistant's text,
+before exiting. Failure leaves the harness open; report pending work and paused mode.
+
+OMP's hook does not cover forced exit, OS signals, restart, or programmatic shutdown;
+a repeated quit can bypass the pending dialog. Claude Code, Codex, Copilot CLI and
+Gemini CLI end hooks cannot veto exit. They record only best-effort local evidence,
+never a false successful wrap-up. Missing end events are expected after crashes.
+Use the next startup's recovery workflow; previously verified cloud memory remains
+saved even when final reconciliation or handover is unfinished.
+
+
 ## Pause and resume
 
 **“Pause automatic memory updates”** stops new automatic assignments in this session,
@@ -124,6 +186,15 @@ Read-only status does not replay mutations; explicit recovery may. Preserve priv
 runtime directories and receipts. Do not silently log in, change identities, elevate
 permissions, clear locks or discard evidence. Cancellation stops future work at safe
 boundaries and cannot roll back completed external effects.
+
+**“Review MAVEN recovery”** uses `maven_diagnose` for local state and repair choices;
+`maven_startup(action="inspect")` also checks sessions in the selected cloud project.
+Repair is specific: renew the selected login, reconcile an original request/checkpoint,
+finish its original closure, close an owner-confirmed stopped peer, or review a folder
+switch/local integration change. Read-only diagnosis never changes cloud records.
+Unknown writes require real relevant-worker quiescence before `maven_recover`.
+Neither a timestamp nor an end-hook event is that attestation.
+
 
 ## Optional Git publication
 
@@ -164,12 +235,12 @@ arguments. The shipped tool groups are:
 
 | Intent | Tools and important boundaries |
 | --- | --- |
-| Selection and current context | `maven_status(cwd=…)` (returns `start_hint` and `active`), `maven_project`, `maven_initialize` (`home=true` for Home), `maven_start` (`read_only`/`off`, local record only), `maven_context`; initialize only an explicitly enabled project or the configured Home |
+| Selection and current context | `maven_status(cwd=…, harness=…, harness_session=…)`, `maven_startup` (`inspect`, `continue`, explicit `new`; `home=true` only on Home choice), `maven_project`, `maven_initialize`, `maven_start` (`read_only`/`off`), `maven_context`; no guessed conversation IDs or implicit capture |
 | Inspection and consultation | `maven_status(summary=true)`, `maven_instructions`, `maven_search`, `maven_read`; default `scope="context"`, explicit `project`, `universal` or `all` as intended. Search is ranked with `rank`/`snippet` (page with `offset`/`next_offset` for queries, `after_id` otherwise; `limit` ≤ 20; `include_archived` for obsolete records). `unbound=true` is a read-only universal consultation without a session, used only on explicit owner intent; `include_home=true` adds the configured Home |
 | Mutations and scope | `maven_save`, `maven_scope`, `maven_claim`; real source origin/excerpt, expected revisions and actual task fences |
 | Semantic assignments | `maven_maintenance` actions `enqueue`, `claim`, `apply`, `revise`, `complete`, `release`, `status`; preserve operation identity and worker token. Status/apply/revise return summaries unless `detail=true`; at most 50 changes per apply; an apply that returns `continue=true` is continued with the same token and no changes |
 | Session boundaries | `maven_checkpoint`, `maven_pause`, `maven_resume`, `maven_finish`; finish uses a verified checkpoint covering accepted work. `maven_close_peer(session_id, revision, source, reason)` marks another session of this project abandoned (exact `revision` from `active_peers`) only after the owner confirms it no longer runs; never this session, refused while it holds live task claims, and that machine's local files are untouched |
-| Recovery and administration | `maven_recover`, `maven_admin`; inspection does not replay mutations, recovery may |
+| Recovery and administration | `maven_diagnose`, `maven_recover`, `maven_admin`; diagnosis does not replay mutations, recovery may; project/Home form mode `switch` is an exact reviewed folder rebind, not cloud cleanup |
 | Optional publication | `maven_git` actions `configure`, `inspect`, `apply`, `status`, `recover`, `cancel`, `pause`; exact reviewed candidate/owner source and actual cooperating-writer quiescence for publication |
 
 `maven_checkpoint` captures the cutoff and may return pending. After completing
@@ -181,10 +252,11 @@ and an honest `context_complete`; `fresh=true` skips look-back.
 nothing worth saving. `maven_admin` responses omit choice checkpoints, prior responses,
 navigation and retired interactions unless `detail=true`.
 
-After a harness restart, call `maven_status` before saying connected. When the process
-is unbound it returns a `rebind_hint` listing active registered sessions for the folder;
-resume only the exact retained one. Say whether a reported memory state came from this
-conversation or was re-read from MAVEN. Client/customer engagement details stay
+After a harness restart, call `maven_status` before saying connected. Its `rebind_hint`
+contains an exact `binding` only when the supplied genuine harness/conversation identity
+matches retained evidence; otherwise local sessions are peers, not a resume selection.
+Say whether memory state came from this conversation or was re-read from MAVEN.
+Client/customer engagement details stay
 project-scoped even when the default prefers universal. Offer to turn standing owner
 policies into project or universal instructions through the instruction review flow.
 Mark obsolete records with tag `archived` (or `data.state` `archived`).

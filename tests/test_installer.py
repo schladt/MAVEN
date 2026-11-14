@@ -224,9 +224,10 @@ with using(object()):
                 (path / 'pyvenv.cfg').write_text('test runtime; never executed\n')
                 (path / 'bin/python').write_text('test interpreter; never executed\n')
             def install_package(command):
-                launcher = home / 'venv/bin/maven-mcp'
-                launcher.write_text('#!/test-only/python\n')
-                launcher.chmod(0o775)
+                for name in ('maven-mcp', 'maven-session-hook'):
+                    launcher = home / 'venv/bin' / name
+                    launcher.write_text('#!/test-only/python\n')
+                    launcher.chmod(0o775)
             mask = os.umask(0o002)
             try:
                 with patch.object(Path, 'home', return_value=user), patch.dict(os.environ, {}, clear=True), \
@@ -243,6 +244,9 @@ with using(object()):
             launcher = home / 'venv/bin/maven-mcp'
             self.assertEqual(launcher.stat().st_mode & 0o7777, 0o755)
             self.assertIsNotNone(_read(launcher))
+            hook_launcher = home / 'venv/bin/maven-session-hook'
+            self.assertEqual(hook_launcher.stat().st_mode & 0o7777, 0o755)
+            self.assertIsNotNone(_read(hook_launcher))
             receipt = read_private(home / MANIFEST)
             self.assertEqual(receipt['owned'][str(home / 'venv')], inventory(home / 'venv'))
             self.assertFalse((user / '.omp').exists())
@@ -785,6 +789,7 @@ class HarnessFinishTests(unittest.TestCase):
         settings.parent.mkdir(parents=True)
         owner = {'statusLine': {'type': 'command', 'command': 'owner-line'}}
         settings.write_text(json.dumps(owner))
+        settings.chmod(0o600)
         for claude, expected in ((False, False), (True, True)):
             with self.subTest(claude=claude):
                 ui = self.ui()

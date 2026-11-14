@@ -53,10 +53,15 @@ Git publication is optional through maven_git and requires exact review/approval
 push or back up source files. Cloud migrations and active instruction changes require separate approval.
 During outages preserve accepted local operations and say pending/degraded; required current authority
 cannot be replaced by cached instructions. Recover original requests explicitly, never by minting new IDs.
-After a harness restart check maven_status before saying connected; resume only the exact listed session.
-At session start call maven_status with your workspace cwd. With start_hint, ask its one-line question every time;
-answer via maven_initialize (home=true for Start Home), maven_project, or maven_start (read_only/off; no answer
-means read_only). Always print the returned active line at start and on any change; never rebind on a cwd change.
+After a harness restart check maven_status before saying connected; resume only the exact conversation binding.
+At startup say MAVEN is checking and use maven_startup inspect with cwd and the real harness/conversation ID
+provided by the optional native hook. Then continue for unambiguous enabled projects; new explicitly leaves
+unfinished peers untouched. No enabled project: ask start_hint every time; Home requires its explicit choice.
+Read Only/off create no session. Never treat an old session as dead, adopt a peer by recency, or reopen a
+closed session. Use maven_diagnose for read-only recovery choices; repairs require exact original evidence.
+Print active.line and read all returned current authority before readiness. Preserve pause on exact resume.
+Optional OMP exit protection can request wrap-up, checkpoint and finish before verified exit; other harness
+shutdown events are best-effort only. Never claim closure because a hook ran or a process stopped.
 List cloud instructions with maven_instructions. Say whether a memory answer came from this conversation
 or was re-read from MAVEN. Unbound universal consultation is read-only and needs explicit owner intent;
 include_home adds the Home project to it. Read Only and off never capture.
@@ -172,10 +177,14 @@ class MavenApplication:
     def initialize(self, root=None, *, harness='mcp', harness_session=None, session_id=None,
                    resume=False, assignment_id=None, home=False, cwd=None):
         from tools.memory.lifecycle import SessionService
+        from tools.coordination import SessionRegistry, private_lock, project_binding_lock
+        from tools.startup import bind_conversation
         root = self._selected_root(root, home)
         session_id = session_uuid(session_id) if session_id else None
         assignment_id = session_uuid(assignment_id) if assignment_id else None
-        with self._lock:
+        with project_binding_lock(self.home, root), self._lock:
+            with private_lock(self.home, 'runtime/registry.lock'):
+                SessionRegistry(self.home)._allow_work(root)
             if self.assignment_id is not None and assignment_id != self.assignment_id:
                 raise MaintenanceError('a delegated connection cannot change its originating assignment')
             if assignment_id is not None and self.binding is None:
@@ -213,17 +222,20 @@ class MavenApplication:
                         raise MaintenanceError('project differs from the original persisted MCP binding')
                     if assignment_id:
                         maintenance.status(assignment_id)
+                    candidate = {**selection, 'project_id': service.project_id}
+                    if not assignment_id:
+                        if stored is None:
+                            save_private(root, path, {**candidate, 'initialized': False,
+                                                     'resume_required': resume})
+                        bind_conversation(self.home, candidate)
                 except Exception:
                     service.close()
                     raise
                 self.service, self.maintenance = service, maintenance
                 self.assignment_id = assignment_id
-                self.binding = {**selection, 'project_id': service.project_id}
+                self.binding = candidate
                 self._resume_initialization = (resume if stored is None else
                                                stored.get('initialized', False) or stored.get('resume_required', False))
-                if not assignment_id and stored is None:
-                    save_private(root, path, {**self.binding, 'initialized': False,
-                                             'resume_required': resume})
             self.initialized = False
             if self.assignment_id:
                 result = self.service.context()
@@ -379,21 +391,116 @@ class MavenApplication:
         return {'profile': exact['profile'], 'command': exact['command'],
                 'note': 'Run in a terminal; a plain `aws login` is not read by MAVEN. Never enter credentials in chat.'}
 
-    def rebind_hint(self, start=None):
-        from tools.memory.lifecycle import registered_sessions
-        directory = Path(start or Path.cwd()).resolve()
-        root = next((candidate for candidate in (directory, *directory.parents)
-                     if (candidate / '.maven/project.json').is_file()), None)
-        if root is None:
+    def rebind_hint(self, start=None, *, harness=None, harness_session=None):
+        from tools.startup import inspect_startup
+        report = inspect_startup(self.home, Path(start or Path.cwd()),
+                                 harness=harness, harness_session=harness_session)
+        if report['status'] == 'choose':
             return None
-        sessions = [{'session_id': item.get('session_id'), 'harness': item.get('harness')}
-                    for item in registered_sessions(root) if item.get('state') == 'active']
-        if not sessions:
-            return None
-        return {'root': str(root), 'active_sessions': sessions,
-                'next_action': 'This MCP process is not bound. Ask the owner which exact session to continue, '
-                               'then call maven_initialize with that root, session_id and resume=true; '
-                               'never pick the newest session or report connected before it returns ready.'}
+        binding = report.get('binding')
+        return {**report, 'next_action': (
+            'Resume only this exact conversation binding; inspect recovery first if flagged.'
+            if binding else 'This is a new conversation, not an existing peer. Use maven_startup to inspect '
+            'project sessions and initialize a separate session; never select the newest peer.')}
+
+    def startup(self, cwd, *, harness='mcp', harness_session=None, home=False, action='inspect'):
+        """Inspect first, then begin only an authorized unambiguous conversation."""
+        from tools.startup import inspect_startup, project_sessions
+        self.primary()
+        if action not in ('inspect', 'continue', 'new'):
+            raise MaintenanceError('startup action must be inspect, continue or new')
+        if self.choice and self.choice['mode'] in ('read_only', 'off') and not home:
+            return {'status': self.choice['mode'], 'active': self.active(), 'live_state_checked': False,
+                    'message': 'This conversation chose no capture. Select Home or a project explicitly before initializing.'}
+        if self.binding:
+            if (harness != self.binding['harness'] or harness_session != self.binding['harness_session']):
+                raise MaintenanceError('startup cannot replace this process or conversation binding')
+            if action == 'new':
+                raise MaintenanceError('this process is already bound; start a new harness conversation')
+            if action == 'continue':
+                return self.initialize(self.binding['root'], harness=harness, harness_session=harness_session,
+                                       session_id=self.binding['session_id'], resume=True, cwd=cwd)
+            return self.diagnose(cwd, harness=harness, harness_session=harness_session)
+        folder = self._selected_root(None, True) if home else Path(cwd)
+        report = inspect_startup(self.home, folder, harness=harness, harness_session=harness_session)
+        report['active'] = self.active()
+        report['live_state_checked'] = False
+        if report['status'] in ('choose', 'blocked'):
+            return report
+        if home and report['root'] != str(folder):
+            raise MaintenanceError('this conversation selected another project; use a new conversation to switch Home')
+        cloud = project_sessions(self.unbound_client(), report['project_id'])
+        report.update(cloud_sessions=cloud, live_state_checked=True)
+        binding = report.get('binding')
+        matching = next((item for item in cloud['sessions']
+                         if binding and item['session_id'] == binding['session_id']), None)
+        if binding and matching is None and report.get('resume_required'):
+            record = self.unbound_client().invoke('/v1/memory/read', {'record_id': binding['session_id']})
+            data = record.get('data', {})
+            if (record.get('status') != 'ready' or data.get('record_id') != binding['session_id']
+                    or data.get('project_id') != binding['project_id'] or data.get('kind') != 'session'
+                    or data.get('data_scope') != 'owner'):
+                raise BoundaryError('the exact prior cloud session could not be verified')
+            matching = {'state': data['data']['state']}
+        if binding and matching and matching['state'] != 'active' and report['status'] != 'closed':
+            report['status'] = 'recovery'
+            report['issues'].append({'kind': 'cloud_session_not_active', 'session_id': binding['session_id'],
+                                     'action': 'inspect_original_closure_or_abandonment'})
+        attention = [item for item in cloud['sessions'] if item.get('possibly_stale')
+                     and (not binding or item['session_id'] != binding['session_id'])]
+        report['peer_attention'] = attention
+        report['stale_warning'] = ('Age is not proof of process death. These timestamps are session record '
+                                   'updates; current project context also includes checkpoint activity.')
+        report['choices'] = ['review_recovery', 'start_new_without_taking_over', 'read_only'] if (
+            report['issues'] or attention) else []
+        if action == 'inspect':
+            return report
+        if report['status'] == 'recovery' and binding:
+            return {**report, 'recovery_initialize': {
+                        'root': binding['root'], 'session_id': binding['session_id'], 'resume': True,
+                        'harness': binding['harness'], 'harness_session': binding['harness_session']},
+                    'next_action': 'Restore this exact binding with maven_initialize, even if original pending '
+                    'work blocks readiness. Inspect with maven_diagnose; recover original requests only after '
+                    'relevant-worker quiescence. Use a separate conversation for new work; never overwrite '
+                    'this open binding.'}
+        if action == 'new' and binding and report['status'] != 'closed':
+            raise MaintenanceError('this conversation already has an open session; resume it or start another conversation')
+        if action == 'continue' and not binding and (report['issues'] or attention):
+            return {**report, 'status': 'decision_required', 'next_action':
+                    'Offer review recovery, explicitly start a new session leaving peers untouched, or Read Only.'}
+        result = self.initialize(report['root'], harness=harness, harness_session=harness_session,
+                                 session_id=binding['session_id'] if binding and report['status'] != 'closed' else None,
+                                 resume=bool(binding and report['status'] != 'closed'), cwd=cwd)
+        return {**result, 'startup_review': report}
+
+    def diagnose(self, cwd, *, harness='mcp', harness_session=None, home=False):
+        """Read-only repair plan; neither guesses quiescence nor replays a request."""
+        from tools.startup import inspect_startup
+        folder = self._selected_root(None, True) if home else Path(cwd)
+        result = inspect_startup(self.home, folder, harness=harness, harness_session=harness_session)
+        result.update(live_state_checked=False, active=self.active(), sign_in=self.sign_in())
+        if self.service is not None:
+            result.update(binding=dict(self.binding), session=self.service.status(),
+                          maintenance=self.maintenance.status())
+        result['repair_options'] = [
+            {'action': 'inspect', 'effect': 'Read local session, checkpoint and pending request evidence; no cloud writes.'},
+            {'action': 'inspect_retained_session', 'tool': 'maven_admin', 'kind': 'recovery',
+             'requires': 'Exact root and session_id, action diagnose; preserves the current conversation binding.'},
+            {'action': 'resume_administration', 'tool': 'maven_admin',
+             'requires': 'Inspect the original operation_id, then resume its pending choice or reviewed recovery; '
+                         'never replace an uncertain setup/removal/switch with a new operation.'},
+            {'action': 'recover_original', 'tool': 'maven_recover',
+             'requires': 'Exact bound session and verified relevant-worker quiescence; original operation IDs only.'},
+            {'action': 'close_abandoned_peer', 'tool': 'maven_close_peer',
+             'requires': 'Owner confirms the peer stopped; exact current revision, never age alone.'},
+            {'action': 'switch_folder', 'tool': 'maven_admin', 'kind': 'project',
+             'requires': 'Exact reviewed folder and existing destination project; old cloud data stays untouched.'},
+            {'action': 'repair_installation', 'tool': 'maven_admin', 'kind': 'setup',
+             'requires': 'Separate review of local software/integration or cloud changes.'},
+        ]
+        result['next_action'] = ('Choose the specific repair after inspection. Never clear locks, replace request '
+                                 'identities, close peers, merge projects or deploy infrastructure automatically.')
+        return result
 
     def close(self):
         self._warm_stop.set()
@@ -574,6 +681,23 @@ def create_server(application=None):
         return {'status': 'recorded', 'active': app.start(choice, Path(cwd) if cwd else Path.cwd(),
                                                           harness=harness, harness_session=harness_session)}
 
+    @server.tool()
+    @guarded
+    def maven_startup(cwd: str, harness: str = 'mcp', harness_session: str | None = None,
+                      home: bool = False, action: Literal['inspect', 'continue', 'new'] = 'inspect') -> dict[str, Any]:
+        """Visible startup and recovery workflow. Say MAVEN is checking, then inspect. No enabled project: ask start_hint, no automatic capture. home=true is only for the owner's Start Home choice.
+
+        Pass the real native harness conversation identity supplied by its hook; never PID/cwd/newest session. continue resumes only that exact conversation or starts a separate session in an enabled project. Stale/unfinished peers require a choice; new explicitly leaves them untouched. Closed sessions are never reopened. Read complete returned authority before declaring ready. Workers use their originating binding, never this tool."""
+        return app.startup(cwd, harness=harness, harness_session=harness_session, home=home, action=action)
+
+    @server.tool(annotations=read_hint)
+    @guarded
+    def maven_diagnose(cwd: str, harness: str = 'mcp', harness_session: str | None = None,
+                       home: bool = False) -> dict[str, Any]:
+        """Inspect local binding, pending work and precise repair choices without replay, closure, deployment or capture. Use maven_startup inspect for project-scoped cloud session checks. Repairs require the original operation and actual owner decisions."""
+        app.primary()
+        return app.diagnose(cwd, harness=harness, harness_session=harness_session, home=home)
+
     @server.tool(annotations=read_hint)
     @guarded
     def maven_context() -> dict[str, Any]:
@@ -582,7 +706,8 @@ def create_server(application=None):
 
     @server.tool(annotations=read_hint)
     @guarded
-    def maven_status(summary: bool = False, cwd: str | None = None) -> dict[str, Any]:
+    def maven_status(summary: bool = False, cwd: str | None = None, harness: str | None = None,
+                     harness_session: str | None = None) -> dict[str, Any]:
         """Inspect local binding and pending maintenance without replaying cloud writes. Request summary for universal/project/pending updates; do not announce routine successes individually. sign_in is the exact command that renews MAVEN's daily-use AWS sign-in (a plain aws login is not read by MAVEN).
 
         Pass cwd, the agent's workspace folder. Unbound: rebind_hint inside an enabled project with active sessions, otherwise start_hint outside one (ask its question every time). active {mode: project|home|read_only|off, label, project_id, line} is always returned; print its line."""
@@ -592,7 +717,7 @@ def create_server(application=None):
             result = {'status': 'not_initialized', 'home': str(app.home), 'env': str(app.env),
                       'live_state_checked': False,
                       'next_action': 'Not connected: select an enabled project or use guided project setup.'}
-            hint = app.rebind_hint(start=cwd)
+            hint = app.rebind_hint(start=cwd, harness=harness, harness_session=harness_session)
             if hint is not None:
                 result['rebind_hint'] = hint
                 result['next_action'] = hint['next_action']
@@ -837,7 +962,7 @@ def create_server(application=None):
 
         Updating an existing installation: begin kind "setup" with parameters {mode: "update"} (optional absolute "checkout"). It checks local software and harness skills, then the database schema, service stack and bundled instructions, asking for review only where something differs.
 
-        MAVEN Home: begin kind "home" with parameters {action, root, project_id, label} to enable, change or disable the owner-selected Home after a full review.
+        MAVEN Home: begin kind "home" with parameters {action, root, project_id, label} to enable, change or disable the owner-selected Home after a full review. For an already-bound folder, select mode "switch" in the Home or project form to attach an existing cloud project; existing sessions must be cleanly stopped and original evidence is preserved. No cloud project is merged or deleted.
 
         Memory clean-up (on the owner's request only): begin kind "cleanup" with parameters {action: "review"} for a read-only candidate list grouped by suggestion (forget, erase, archive); propose a choice per item and wait for the owner. Archive is a normal maven_save revision adding the "archived" tag. Forget, Restore and Erase run only here: begin kind "cleanup" with {action: "forget"|"restore"|"erase", record_ids: [<=200 UUIDs], reason}, present the exact review (records, versions, and for Erase its caveats: irreversible; Aurora backups keep old content up to 30 days; other machines keep cached copies until they next run a MAVEN clean-up) and apply only after the owner's approval. Every clean-up first sweeps this machine's local caches for erased records and reports the files changed.
 

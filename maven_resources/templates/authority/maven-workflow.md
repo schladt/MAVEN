@@ -14,6 +14,11 @@ For explicitly enabled projects, native harness guidance initializes subsequent 
 
 Retain explicit root/project/MAVEN session binding across cwd changes and restoration. Associate real harness-session metadata only when reliably exposed. New/forked sessions receive distinct identities; resume only the original explicitly selected session. Never use the newest receipt or another chat's identity. Reload current authority after compaction; tree navigation does not undo external writes or restore obsolete approvals.
 
+Optional native startup adapters trigger the shared `maven_startup` workflow. They supply a genuine native conversation ID when supported; local hook output is not cloud readiness. Inspect first, continue unambiguous exact resume or new-project-session choices, and present recovery/new-session/Read Only choices for unfinished peers. Closed sessions are never reopened. Do not close or take over a stale session on age alone. The Home index's `is_current_context` flag identifies this context's project, not all machines' Home selections.
+
+An already-bound folder may switch to an existing cloud project only through the explicit reviewed project/Home switch operation. Require local sessions/writers to be safely finished; preserve original runtime evidence outside the active new binding. Preserve unrelated files and Git configuration. Switching never deletes, merges or archives the old cloud project and never changes another machine's selection.
+
+
 ## Checkpoint and closure
 
 Ordinary checkpoints are nonblocking point-in-time operations where the harness supports later completion. Capture an explicit cutoff over accepted work and relevant source context; finish included assignments before declaring saved. New discussion/assignments belong to subsequent maintenance. Store a coherent truthful handover and exact immutable record/revision references. Later changes must not rewrite historical meaning. Pending, conflicted or uncertain included work leaves the checkpoint pending/blocked. Use an explicit checkpoint-and-wait request for synchronization through that boundary; foreground-only clients disclose their limitation.
@@ -22,6 +27,9 @@ Checkpoint waiting is bounded and may return pending honestly; it does not launc
 
 Wrap-up reconciles required memory work and closes only the selected session after verified persistence and no unresolved closure-blocking memory operations. Unpublished source can be reported as unfinished work without blocking closure. Memory checkpoint/closure never backs up files, commits, pushes, activates instructions, closes peers or revokes shared credentials. Show summaries at checkpoint completion, explicit wrap-up and on request, distinguishing universal promotions/updates, project updates and pending work. Keep routine maintenance successes quiet.
 
+When the owner chooses wrap-up-and-exit, pause new automatic maintenance before draining accepted work. An optional OMP pre-shutdown adapter can cancel exit and ask the agent to checkpoint/finish; automatic exit requires the exact verified closure. Other harness termination hooks cannot guarantee a remaining reasoning turn or veto exit. Best-effort end-event evidence is not a successful handover or proof all workers stopped. Startup offers recovery from original evidence after an unwrapped exit; missing conversation history is disclosed, never fabricated.
+
+
 ## Pause, resume and outage
 
 Pause automatic maintenance only in this session. Stop new automatic assignments and pause active work at safe boundaries where available; already-submitted writes may complete. Preserve accepted assignments and receipts. Do not build a separate archive/backlog of paused discussion. Explicit save, consult and checkpoint remain available and instruction checks stay in force.
@@ -29,6 +37,9 @@ Pause automatic maintenance only in this session. Stop new automatic assignments
 Default resume reviews available paused discussion and creates bounded catch-up work; disclose inaccessible portions and never claim complete reconstruction. Resume fresh does not look back. Persist mode and available context anchor without copying the whole transcript. Announce mode changes visibly.
 
 During outages preserve bounded authorized work and exact operation receipts privately. Distinguish locally pending, cloud-saved, blocked and uncertain; never report explicit saves/checkpoints complete without verified cloud receipts. Unrelated work may continue, but current-memory/authority dependencies wait. Recover original request identities after rereading current records; never silently log in, switch accounts, clear locks or discard evidence. Read-only status is separate from recovery that can replay writes. Cancellation is not rollback.
+
+Use `maven_diagnose` for read-only local repair choices and `maven_startup(action="inspect")` for scoped cloud session inspection. Repair acts only on an identified problem and original request/receipt: sign-in handoff, exact writer-quiescent recovery, owner-confirmed peer close, or reviewed local folder switch. Preserve uncertain outcomes. Cleanup, project archival, cloud deployment and deletion require their own separate owner decisions.
+
 
 ## Optional Git safety
 

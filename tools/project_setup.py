@@ -113,10 +113,19 @@ def _legacy(env, root, identity, non_interactive):
 
 
 def setup_project(args):
+    """Serialize folder selection with participating writers and reviewed switches."""
+    from tools.coordination import SessionRegistry, private_lock, project_binding_lock
+    home = Path(args.env).expanduser().absolute().parent
+    with project_binding_lock(home, args.root), private_lock(home, 'runtime/registry.lock', blocking=False):
+        SessionRegistry(home)._allow_work(args.root)
+        return _setup_project_locked(args)
+
+
+def _setup_project_locked(args):
     from tools.memory.client import MemoryClientError
     from tools.memory.environment import configured_client, load_environment, memory_config
     from tools.project import (
-        ProjectError, _ensure_ignore, _initialize, _uuid, _validate, load_project, validate_git,
+        ProjectError, _ensure_ignore, _initialize_bound, _uuid, _validate, load_project, validate_git,
     )
     if not args.non_interactive:
         stage('Project selection')
@@ -211,7 +220,7 @@ def setup_project(args):
                     client.close()
             initialize = {key: value for key, value in selected.items() if key != 'existing'}
             initialize.update(root=root, env=args.env, values=values)
-            _initialize(argparse.Namespace(**initialize))
+            _initialize_bound(argparse.Namespace(**initialize))
         project = load_project(root)
         if project['project_id'] != selected['project_id'] or (existing and project != existing):
             raise SetupPending('Project configuration changed during setup; preserve the receipt.')

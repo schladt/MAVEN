@@ -152,6 +152,10 @@ def main(argv=None) -> int:
     parser.add_argument('--claude-statusline', action='store_true',
                         help="With --harness claude: show the active MAVEN project in Claude Code's status line "
                              '(an owned statusLine entry; an existing different status line is preserved)')
+    parser.add_argument('--lifecycle-hooks', action=argparse.BooleanOptionalAction, default=True,
+                        help='Install native startup/end adapters with selected default/staged harnesses '
+                             '(default enabled; OMP 18.20+ also offers cancellable wrap-up then exit). '
+                             'Custom profile paths require --no-lifecycle-hooks.')
     parser.add_argument('--local-only', action='store_true',
                         help='Install local tools only; no prompts, login, cloud setup, or project initialization')
     args = parser.parse_args(argv)
@@ -337,6 +341,9 @@ def _advanced_options(args):
               help='For custom harness profiles or inactive staging, not your project folder.'),
         Field('stage_harnesses', 'Inactive staging home', str(args.stage_harnesses or ''), required=False,
               help='Write explicitly selected integrations away from live harness configuration.'),
+        Field('lifecycle_hooks', 'Install native harness lifecycle integration', args.lifecycle_hooks,
+              kind='bool', help='Only selected default/staged profiles. Startup checks, not readiness; '
+                                'OMP 18.20+ offers wrap-up before exit. Other end hooks cannot veto exit.'),
     ], description='These affect local software only. No AWS account, login or cloud resources are changed.',
        back=True)
     if selected is not None:
@@ -344,6 +351,7 @@ def _advanced_options(args):
         args.ca_bundle = Path(selected['ca']) if selected['ca'] else None
         args.skill_dir = [Path(line.strip()) for line in selected['skill_dirs'].splitlines() if line.strip()]
         args.stage_harnesses = Path(selected['stage_harnesses']) if selected['stage_harnesses'] else None
+        args.lifecycle_hooks = selected['lifecycle_hooks']
 
 
 def _options(args):
@@ -546,7 +554,8 @@ def _install(args, handoff=None):
             plan = skill_plan(roots, home)
             integrations = integration_plan(home, selected_harnesses,
                                             user_home=integration_home, ca_bundle=ca_bundle, paths=custom,
-                                            statusline=getattr(args, 'claude_statusline', False))
+                                            statusline=getattr(args, 'claude_statusline', False),
+                                            lifecycle=getattr(args, 'lifecycle_hooks', True))
             retired_skills = retired_skill_plan(home, roots)
         except ValueError as exc:
             if current() is None:
@@ -570,9 +579,13 @@ def _install(args, handoff=None):
                 'Exact owned legacy skills to retire:\n' + ('\n'.join(
                     str(path) for path, _ in retired_skills) or '(none)'),
                 f'Integration mode: {"inactive staging" if staging else "live"}',
+                f'Native lifecycle integration: {"enabled" if getattr(args, "lifecycle_hooks", True) else "not added or changed"}; '
+                'OMP 18.20+ quit dialog is optional; forced exits and other harnesses cannot guarantee wrap-up.',
                 'Exact MAVEN integration content (unrelated configuration preserved):\n' + ('\n'.join(
                     (f'Conflict, not changed: {change.receipt["conflict"]}' if change.receipt.get('conflict')
-                     else f'{change.path}\n{change.receipt["value"]}') for change in integrations
+                     else f'{change.path}\n{change.receipt["value"]}' +
+                     ('\nAlso create top-level JSON schema field: "version": 1'
+                      if change.receipt.get('created_version') else '')) for change in integrations
                     if change.receipt is not None) or '(none)'),
             ])
             summary = (f'Install/update MAVEN software in {home}.\n'
@@ -636,9 +649,10 @@ def _install(args, handoff=None):
         _install_command([str(python), '-m', 'pip', 'install', '--upgrade', package])
         # pip derives entry-point mode from its umask. Never leave 0775 launchers
         # for the harness reader, which correctly rejects group-writable files.
-        launcher_repair = launcher_permission_plan(home)
-        if launcher_repair is not None:
-            repair_launcher_permissions(home, launcher_repair)
+        for name in ('maven-mcp', 'maven-session-hook'):
+            launcher_repair = launcher_permission_plan(home, name=name)
+            if launcher_repair is not None:
+                repair_launcher_permissions(home, launcher_repair, name=name)
         if not environment.exists():
             body = (source / 'maven_resources' / 'templates' / 'environment.example').read_bytes()
             fd = os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
@@ -677,7 +691,9 @@ def _install(args, handoff=None):
                 _notify(f'Inactive integration staged under {integration_home}; live harness configuration unchanged. '
                         'Review and install against the selected profile after affected harnesses stop.')
             else:
-                _notify('Start a new harness session to load startup guidance. MCP connection alone is not project readiness.')
+                _notify('Start a new harness session to load startup guidance and native lifecycle integration. '
+                        'Hooks check identity; MCP connection alone is not project readiness. '
+                        'Only supported interactive OMP exits offer a wrap-up gate; forced exits bypass it.')
         elif deferred:
             _notify('Harness integration is pending. Stage with --stage-harnesses, or rerun after closing '
                     'affected harnesses with --harness-stopped.')

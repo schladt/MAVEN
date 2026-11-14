@@ -14,11 +14,11 @@ version, enterprise policy, or optional feature.
 
 | Client | Documented stdio configuration and environment | Startup, decisions and trust | Semantic maintenance baseline |
 | --- | --- | --- | --- |
-| [OMP](https://omp.sh/docs/mcp) | `.omp/mcp.json`, `~/.omp/agent/mcp.json`, or named-profile MCP config; `command`, `args`, `env`, optional `cwd`; review precedence | Native `AGENTS.md` guidance; visible chat readiness fallback. Review executable config; discovery is not enablement | Use available native background tasks only when exposed and responsive; otherwise foreground |
-| [Claude Code](https://code.claude.com/docs/en/mcp) | `mcpServers` in selected local/user configuration or project `.mcp.json`; stdio command/args/env | `CLAUDE.md` guidance; [SessionStart hooks](https://code.claude.com/docs/en/hooks) documented but not required by MAVEN. Project MCP approval/workspace trust can block loading | [Native subagents](https://code.claude.com/docs/en/sub-agents) documented, including background configuration; confirm worker tool access/permissions, else foreground |
-| [Codex](https://developers.openai.com/codex/mcp) | `[mcp_servers.<name>]` in selected `config.toml`; command/args/env and supported environment controls | `AGENTS.md` guidance; client trust/tool approval remains separate from MAVEN exact reviews | Foreground is portable baseline; use native agents only if the installed version exposes verified background execution |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers) | `~/.copilot/mcp-config.json`, `mcpServers`, local/stdio command/args/env; PATH inherited, other needed variables explicitly configured | Native `copilot-instructions.md` guidance. Project-level MCP has folder-trust requirements; use user configuration for non-Git projects | Foreground fallback; do not infer nonblocking background execution from tool discovery or custom-agent support |
-| [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/) | `settings.json` `mcpServers`: command/args/env/cwd; sensitive inherited variables may be filtered | `GEMINI.md` guidance; keep tool confirmations enabled (`trust: true` bypasses them). Client policy does not replace MAVEN review | Foreground fallback unless installed native background capabilities are actually available and verified |
+| [OMP](https://omp.sh/docs/mcp) | `.omp/mcp.json`, `~/.omp/agent/mcp.json`, or named-profile MCP config; `command`, `args`, `env`, optional `cwd`; review precedence | `AGENTS.md` fallback; optional native extension supplies exact session identity and startup context. OMP 18.20.0+ supports the cancellable ordinary-exit prompt described below | Use available native background tasks only when exposed and responsive; otherwise foreground |
+| [Claude Code](https://code.claude.com/docs/en/mcp) | `mcpServers` in selected local/user configuration or project `.mcp.json`; stdio command/args/env | `CLAUDE.md` fallback; optional [SessionStart/SessionEnd hooks](https://code.claude.com/docs/en/hooks). End is advisory, not an exit veto. Workspace trust can block loading | [Native subagents](https://code.claude.com/docs/en/sub-agents) documented, including background configuration; confirm worker tool access/permissions, else foreground |
+| [Codex](https://developers.openai.com/codex/mcp) | `[mcp_servers.<name>]` in selected `config.toml`; command/args/env and supported environment controls | `AGENTS.md` fallback; optional [SessionStart/SessionEnd hooks](https://developers.openai.com/codex/hooks) in supported versions. End is advisory; trust/tool approval remains separate from MAVEN exact reviews | Foreground is portable baseline; use native agents only if the installed version exposes verified background execution |
+| [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers) | `~/.copilot/mcp-config.json`, `mcpServers`, local/stdio command/args/env; PATH inherited, other needed variables explicitly configured | `copilot-instructions.md` fallback; optional [sessionStart/sessionEnd hooks](https://docs.github.com/en/copilot/reference/hooks-reference). End output cannot veto exit. Use user configuration for non-Git projects | Foreground fallback; do not infer nonblocking background execution from tool discovery or custom-agent support |
+| [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/) | `settings.json` `mcpServers`: command/args/env/cwd; sensitive inherited variables may be filtered | `GEMINI.md` fallback; optional [SessionStart/SessionEnd hooks](https://geminicli.com/docs/hooks/reference/). End is best-effort. Keep confirmations enabled; `trust: true` bypasses them | Foreground fallback unless installed native background capabilities are actually available and verified |
 
 Gemini's official documentation currently notes its transition to Antigravity CLI
 for some account tiers. A legacy skill destination is not proof of Antigravity MCP
@@ -61,17 +61,32 @@ not tested: no local `psql` facility was available. Live service/schema rollout,
 installed harness configuration, and active cloud instructions were not changed.
 
 
+For the lifecycle/folder-switch change, 288 focused offline checks covered startup,
+native hook envelopes, adapter installation/removal, project/Home rebinding,
+administration, real stdio MCP, session recovery/maintenance and Textual flows.
+The initial run passed 283 checks. Five failures were corrected (private-runtime
+directory handling and test-file permissions); all five passed their targeted rerun.
+The complete set was not rerun after those corrections. No AWS resources or separate
+Python environment were created; live installation and active authority were unchanged.
+
+OMP 18.20.0 was also launched in a real PTY with a disposable home, genuine native
+conversation ID and local fixture binding. The three-choice exit prompt rendered;
+its default **Stay** kept OMP open, and explicit **Exit without wrapping up** closed
+it normally. No provider credentials were supplied: startup reported the missing
+provider instead of readiness. End-to-end model-driven cloud wrap-up was not exercised.
+Other harnesses' lifecycle behavior was checked offline, not in their live runtimes.
+
 ### Optional capabilities and honest fallbacks
 
 | Capability | Required portable behavior | Optional enhancement / limitation |
 | --- | --- | --- |
-| Startup | Native guidance requests initialization on the first eligible turn; print initializing then ready/blocked based on actual results | A hook may trigger earlier; MCP connection alone cannot. If guidance is not loaded/executed, disclose the gap and explicitly initialize |
+| Startup | Native guidance invokes the shared inspection/initialization workflow; print checking, then initializing and ready/blocked based on actual results | Optional hooks inject exact-conversation startup context; they do not load cloud authority or create a session themselves. Missing/disabled hooks retain first-turn fallback |
 | Session identity | Preserve returned MAVEN binding in accessible session context/private evidence | Associate a native harness ID only when reliably exposed; never infer from PID, cwd or newest receipt |
 | Background reasoning | Foreground agent reads, reasons and reconciles bounded assignments | Native subagent may work while another user turn proceeds; must receive scoped context and access to MAVEN tools. MCP cannot launch it |
 | Catch-up | Resume from accessible paused discussion and disclose missing portions | Harness transcript APIs are optional, not a standard MCP facility; resume fresh avoids backfill |
 | Progress / notifications | Visible chat for initialization, explicit saves/checkpoints, mode changes and meaningful blockers | Native progress/status delivery where supported; routine successful updates stay quiet |
 | Owner decisions | Present full persisted review and bind the actual response to its identity/revision | Native dialogs/elicitation are optional; never forge consent or treat tool permission as exact target approval |
-| Shutdown | Journal effects before mutation and preserve uncertain outcomes | EOF/cancellation/process termination offers no guaranteed grace period or background completion; resume original evidence |
+| Shutdown | Journal effects before mutation; preserve uncertain outcomes and finish explicitly | OMP's optional ordinary-exit guard can cancel before wrap-up. Other clients' end hooks are advisory. Forced exit/EOF/signals guarantee neither grace nor background completion |
 
 The [MCP transport specification](https://modelcontextprotocol.io/specification/latest/basic/transports)
 defines client-launched stdio and transport-independent protocol semantics, not
@@ -84,8 +99,33 @@ Native standing-context references:
 [Codex AGENTS.md](https://developers.openai.com/codex/guides/agents-md),
 [Copilot custom instructions](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-custom-instructions),
 and [Gemini GEMINI.md](https://geminicli.com/docs/cli/gemini-md/).
-MAVEN installs first-eligible-turn guidance, not an executable startup hook or a
-guarantee that a model has initialized before accepting any user turn.
+MAVEN always installs first-eligible-turn guidance; optional lifecycle adapters add
+native events. Neither guarantees that authority is initialized before the first
+user input; readiness still requires the real MCP result and complete context.
+
+### Native lifecycle adapters
+
+The shared local helper stores only exact native-conversation bindings and observed
+end-event hints. It does not log in, contact AWS, copy transcripts or spawn agents.
+The main assistant uses `maven_startup` for cloud peer inspection and authorized
+initialization, or `maven_diagnose` for repair choices. An end event does not close a
+cloud session, prove writer death or mark unsaved work saved.
+
+OMP uses `session_start`/agent context and `session_before_shutdown` in a native
+extension. For an open exact MAVEN binding, the prompt offers wrap up and exit,
+exit without wrapping up, or stay. Wrap-up cancels immediate shutdown, lets the
+agent reconcile accepted work, then checks the exact finish receipt before exiting.
+Failure leaves the harness open. OMP 18.20.0+ documents this cancellable event; older
+versions retain first-turn guidance and explicit wrap-up.
+Forced exits, signals, restart and programmatic `ctx.shutdown()` bypass the guard;
+a second quit can bypass a pending prompt. It is a convenience, not crash recovery.
+
+Claude Code and Codex use `SessionStart` additional context with genuine `session_id`;
+Copilot uses `sessionStart` and `sessionId`; Gemini uses its own `SessionStart` output
+shape. Their end events are advisory/best-effort, never modeled as an OMP-equivalent
+veto. Hook timeout, policy or unsupported versions can suppress delivery. Startup
+still checks retained evidence and offers recovery when an end event was missed.
+Resume only the exact recorded conversation; stale peers are not interchangeable.
 
 ### Installation and update boundaries
 
@@ -101,6 +141,16 @@ configuration. Custom profiles use paired `--harness-config NAME=ABSOLUTE_FILE` 
 `--harness-context NAME=ABSOLUTE_FILE`, plus `--skill-dir PATH`. Actual writes require
 the existing stopped-harness approval. Supported native targets are OMP, Claude Code,
 Codex, Copilot CLI and Gemini CLI, not every client accepting a similar skill format.
+
+Native adapters are enabled by default with `--lifecycle-hooks`; disable them with
+`--no-lifecycle-hooks` or the TUI's **Install native MAVEN startup and shutdown
+integration** checkbox. They require the installed `maven-session-hook` executable.
+Review includes the extension/hook configuration and ownership receipts. Hooks,
+status-line and MCP entries sharing one configuration file are removed together
+under a single pinned-file review, preserving unrelated keys and refusing owner edits.
+Custom profile overrides currently require `--no-lifecycle-hooks`: MAVEN refuses to
+guess the hook destination or write default-profile hooks for a custom profile.
+Portable guidance and explicit wrap-up remain available.
 
 Codex integration uses an existing nonempty `AGENTS.override.md` when present,
 otherwise `AGENTS.md`. If Gemini's custom `context.fileName` excludes `GEMINI.md`,

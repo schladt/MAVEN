@@ -35,11 +35,12 @@ maven-uninstall = "tools.uninstall.cli:main"
 maven-mcp = "tools.mcp.server:main"
 maven-git = "tools.git_workflow:main"
 maven-statusline = "tools.statusline:main"
+maven-session-hook = "tools.session_hooks:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["tools", "tools.*", "maven_resources"]
 
 [tool.setuptools.package-data]
-maven_resources = ["config/*.json", "templates/*.example", "templates/skills/*/SKILL.md", "templates/harness/*.md", "templates/authority/*.md", "templates/authority/*.json", "infra/memory/*.json"]
+maven_resources = ["config/*.json", "templates/*.example", "templates/skills/*/SKILL.md", "templates/harness/*.md", "templates/harness/*.js", "templates/authority/*.md", "templates/authority/*.json", "infra/memory/*.json"]
 "tools.memory" = ["migrations/*.sql"]

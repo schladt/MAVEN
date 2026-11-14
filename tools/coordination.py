@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import os
 from pathlib import Path
 import time
@@ -77,6 +78,13 @@ def session_lock(root, session_id, *, shared=False, timeout=SESSION_LOCK_TIMEOUT
                         shared=shared, timeout=timeout)
 
 
+def project_binding_lock(home, root, *, shared=True):
+    """Stable root gate outside .maven; acquire before registry and session locks."""
+    key = hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()
+    return private_lock(home, f'runtime/project-bindings/{key}.lock', shared=shared,
+                        timeout=SESSION_LOCK_TIMEOUT)
+
+
 class SessionRegistry:
     def __init__(self, home=None):
         self.home = Path(home) if home is not None else instance_home()
@@ -110,7 +118,12 @@ class SessionRegistry:
         return result
 
     def _allow_work(self, root):
-        """Called only under registry.lock, shared with uninstall marker writes."""
+        """Called only under registry.lock, shared with removal and switch barriers."""
+        from tools.project_switch import barrier_path
+        barrier = barrier_path(self.home, root)
+        barrier = private_path(self.home, barrier.relative_to(self.home))
+        if barrier.is_symlink() or barrier.exists():
+            raise CoordinationError('project switch is unfinished; resume its exact reviewed administration operation before starting work')
         path = private_path(self.home, 'runtime/uninstall.json')
         if not path.exists():
             return

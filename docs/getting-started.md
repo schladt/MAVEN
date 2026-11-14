@@ -351,6 +351,26 @@ choosing a root by itself. A Home session also starts with a short **project ind
 every MAVEN project's name, archived state and last activity (up to 100), with no
 project details, so the assistant knows what exists and which project to open.
 
+To use the same Home knowledge on another machine, select the **same existing cloud
+project ID** during Home setup. Names are labels, not identity. For a folder already
+bound to the wrong project, ask **“Switch this folder to my existing Home project.”**
+The project/Home administration form has an explicit **switch** mode; it reviews
+old/new identities and local preservation before changing anything. Finish local
+sessions first. Old cloud data and other machines remain unchanged; no cleanup or
+merge is implied. The project index's `is_current_context` flag identifies the
+current view, not a globally unique Home project.
+
+Optional startup adapters supply the genuine native conversation identity. MAVEN
+resumes that exact open session, keeps paused mode, or creates a distinct session for
+a new conversation. Stale/unfinished peers offer recovery, new work without takeover,
+or Read Only; no peer is automatically closed. Ask **“Review MAVEN recovery”** for
+diagnosis without replaying writes.
+
+OMP's optional exit guard offers wrap-up/exit-anyway/stay for an open mapped session.
+It waits for verified MAVEN closure before automatically exiting. Other supported
+harness end hooks are best-effort notices, not exit prevention. Forced termination
+can bypass every hook; next-start recovery remains necessary.
+
 Scoping: **universal** holds preferences, instructions and general lessons only;
 nothing specific to one customer or project, because universal records appear in every
 project. **Home** holds the owner-level material above. **Project** holds that
@@ -392,6 +412,13 @@ For custom profiles, pair `--harness-config NAME=ABSOLUTE_FILE` with
 `--harness-context NAME=ABSOLUTE_FILE` and an explicit `--skill-dir PATH`. Actual
 integration changes still require stopped-harness approval. Normal installation
 includes `ui,mcp`; optional Google dependencies remain separate.
+
+Native startup/shutdown integration is enabled by default for selected harnesses.
+Uncheck **Install native MAVEN startup and shutdown integration** or pass
+`--no-lifecycle-hooks` to keep only portable startup guidance and explicit wrap-up.
+Custom profile overrides require that flag until an explicit native hook destination
+is supported; the installer will not guess or alter the wrong profile. Staging
+includes lifecycle files when enabled. Restart the selected harness after applying.
 
 ### Optional AWS Agent Toolkit
 

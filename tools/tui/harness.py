@@ -95,6 +95,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
     user_home = Path.home()
     # The selection form already supports skip; avoid a redundant configure gate.
     statusline = False
+    lifecycle = True
     while True:
         fields = [Field(name, label, name in result['selected'], kind='bool', help=(
             f'MCP: {user_home / HARNESS_PATHS[name][0]}\n'
@@ -103,6 +104,11 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
         fields.append(Field('statusline', STATUSLINE_LABEL, statusline, kind='bool', required=False, help=(
             'Applies only when Claude Code is selected. Adds an owned statusLine command to '
             f'{user_home / ".claude/settings.json"}; an existing different status line is preserved.')))
+        fields.append(Field('lifecycle', 'Install native MAVEN startup and shutdown integration',
+                            lifecycle, kind='bool', required=False, help=(
+            'Startup checks the genuine conversation identity; it never claims readiness. '
+            'OMP 18.20+ offers Wrap up and exit / Exit without wrapping up / Stay. '
+            'Other harness end hooks are best effort and cannot prevent exit.')))
         values = ui.form('Choose the harnesses you use', fields,
                          description=('Select any installed harnesses, or leave all unchecked to skip. '
                                       'These are your default user-profile locations. Differing MAVEN '
@@ -113,6 +119,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
         selected = [name for name in NAMES if values[name]]
         result['selected'] = selected
         statusline = bool(values.get('statusline')) and 'claude' in selected
+        lifecycle = bool(values.get('lifecycle', False))
         if not selected:
             return result
         roots = [user_home / HARNESS_PATHS[name][2] for name in selected]
@@ -123,9 +130,15 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
             launcher_repair = launcher_permission_plan(home, recorded=recorded_launcher)
             if launcher_repair is not None:
                 _launcher_owned(home, prior, launcher_repair)
+            if lifecycle:
+                hook = home / 'venv/bin/maven-session-hook'
+                if _read(hook) is None or not hook.stat().st_mode & 0o100:
+                    raise ValueError('Native lifecycle integration requires the installed maven-session-hook '
+                                     'launcher. Complete the reviewed local software update first.')
             if ca_bundle is None and os.environ.get('AWS_CA_BUNDLE'):
                 ca_bundle = Path(os.environ['AWS_CA_BUNDLE']).expanduser().absolute()
-            changes = integration_plan(home, selected, ca_bundle=ca_bundle, statusline=statusline)
+            changes = integration_plan(home, selected, ca_bundle=ca_bundle, statusline=statusline,
+                                       lifecycle=lifecycle)
             skills = skill_plan(roots, home)
             retired = retired_skill_plan(home, roots)
         except (OSError, ValueError, UninstallError) as exc:
@@ -162,6 +175,8 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
             visible.append(f'{action}: {change.path}')
             details.append(f'{change.path}\nExact MAVEN entry/block:\n' +
                            json.dumps(change.receipt['value'], indent=2, ensure_ascii=False))
+            if change.receipt.get('created_version'):
+                details.append(f'{change.path}\nAlso create top-level JSON schema field: "version": 1')
         for target, body, expected in skills:
             visible.append(('Update installer-owned skill: ' if expected else 'Create shipped skill: ') + str(target))
             details.append(f'{target}\n{body.decode()}')
@@ -198,9 +213,12 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
             source = Path(prior['source']) if prior.get('source') else resource_path('templates').parent
             if skill_plan(roots, home) != skills or retired_skill_plan(home, roots) != retired:
                 raise ValueError('Skill files changed since review; preserved. Review again before writing.')
+            checked = set()
             for change in changes:
-                if _read(change.path) != change.before:
+                # Native hooks can follow MCP/statusLine changes to the same JSON file.
+                if change.path not in checked and _read(change.path) != change.before:
                     raise ValueError(f'Integration changed since review; preserved: {change.path}')
+                checked.add(change.path)
             recorded_launcher = prior.get('owned', {}).get(str(home / 'venv'), {}).get('bin/maven-mcp')
             if launcher_permission_plan(home, recorded=recorded_launcher) != launcher_repair:
                 raise ValueError('Launcher changed since review; preserved.')
@@ -260,7 +278,7 @@ def show_completion(ui, home, result, *, outcome=None):
     if result.get('written'):
         lines.append('Completed local changes:\n' + '\n'.join(result['written']))
     if status in ('written', 'unchanged') or result.get('written'):
-        lines.append('Restart needed: start a new session of each affected harness to load its MCP configuration, startup guidance and skills.')
+        lines.append('Restart needed: start a new session of each affected harness to load its MCP configuration, startup guidance, lifecycle hooks and skills.')
     else:
         lines.append('Restart: no new harness configuration was applied in this step.')
     lines.append('Harness MCP connection: NOT YET VERIFIED. A successful cloud check does not prove a harness can connect.')

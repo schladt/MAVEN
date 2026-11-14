@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import stat
 import tempfile
 import tomllib
@@ -26,6 +27,13 @@ HARNESS_PATHS = {
 }
 SKILLS = ('maven', 'maven-maintenance', 'maven-update')
 CLAUDE_SETTINGS = '.claude/settings.json'
+LIFECYCLE_PATHS = {
+    'omp': '.omp/agent/extensions/maven-lifecycle.js',
+    'claude': CLAUDE_SETTINGS,
+    'codex': '.codex/hooks.json',
+    'copilot': '.copilot/hooks/maven-lifecycle.json',
+    'gemini': '.gemini/settings.json',
+}
 
 
 @dataclass(frozen=True)
@@ -176,8 +184,10 @@ def _read(path: Path) -> bytes | None:
 
 
 @contextmanager
-def _launcher(home: Path):
-    path = home / 'venv/bin/maven-mcp'
+def _launcher(home: Path, name='maven-mcp'):
+    if name not in ('maven-mcp', 'maven-session-hook'):
+        raise ValueError('Unsupported harness launcher')
+    path = home / 'venv/bin' / name
     for part in (path, *path.parents):
         if part.is_symlink():
             raise ValueError(f'Symlink launcher target preserved: {part}')
@@ -211,9 +221,9 @@ def _launcher_entry(descriptor):
             'size': info.st_size, 'sha256': digest.hexdigest()}
 
 
-def launcher_permission_plan(home: Path, *, recorded=None) -> dict | None:
+def launcher_permission_plan(home: Path, *, recorded=None, name='maven-mcp') -> dict | None:
     """Plan the historical 0775 repair, including its already-repaired receipt."""
-    with _launcher(home) as descriptor:
+    with _launcher(home, name) as descriptor:
         entry = _launcher_entry(descriptor)
     if entry['mode'] == 0o775 or (
             entry['mode'] == 0o755 and recorded == {**entry, 'mode': 0o775}):
@@ -221,11 +231,11 @@ def launcher_permission_plan(home: Path, *, recorded=None) -> dict | None:
     return None
 
 
-def repair_launcher_permissions(home: Path, expected: dict) -> None:
+def repair_launcher_permissions(home: Path, expected: dict, *, name='maven-mcp') -> None:
     """Change only the reviewed inode's mode; never follow links or replace bytes."""
     if expected.get('mode') != 0o775:
         raise ValueError('Only an exact 0775 launcher permission repair is supported.')
-    with _launcher(home) as descriptor:
+    with _launcher(home, name) as descriptor:
         if _launcher_entry(descriptor) != expected:
             raise ValueError('Launcher changed since review; preserved.')
         os.fchmod(descriptor, 0o755)
@@ -298,7 +308,8 @@ def _text_change(path: Path, body: str, *, toml=False, prior: dict | None = None
 
 
 def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
-                     ca_bundle: Path | None = None, paths=None, statusline: bool = False) -> list[Change]:
+                     ca_bundle: Path | None = None, paths=None, statusline: bool = False,
+                     lifecycle: bool = False) -> list[Change]:
     """Plan against an explicit user home (also supports an inactive staging home).
 
     Never copy ambient credentials, PATH, or model runtime settings. MAVEN loads
@@ -308,6 +319,8 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
     ``statusline`` adds the optional Claude Code ``statusLine`` command in the default
     profile's settings.json. A different existing status line is preserved: its change
     writes nothing and its unowned receipt carries ``conflict``.
+    ``lifecycle`` adds native startup/end hooks (and OMP's optional interactive quit
+    gate). Custom profiles are refused rather than silently targeting default paths.
     """
     home = home.expanduser().absolute()
     user_home = (user_home or Path.home()).expanduser().absolute()
@@ -317,6 +330,9 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
             'AWS_CA_BUNDLE', 'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE')})
     if any('$' in value or '\n' in value or '\r' in value for value in environment.values()):
         raise ValueError('Integration paths must be literal, without environment interpolation or newlines')
+    if lifecycle and paths:
+        raise ValueError('Native lifecycle integration supports default or staged profiles only; '
+                         'use --no-lifecycle-hooks for custom --harness-config paths.')
     guidance = resource_path('templates/harness/startup.md').read_text()
     receipts = _owned_text_blocks(home)
     changes = []
@@ -371,6 +387,27 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
         changes.append(_statusline_change(home, user_home / CLAUDE_SETTINGS))
     if len({change.path for change in changes}) != len(changes):
         raise ValueError('Integration targets overlap; select distinct configuration/context files')
+    if lifecycle:
+        prior = _owned_integrations(home)
+        for harness in dict.fromkeys(harnesses):
+            target = user_home / LIFECYCLE_PATHS[harness]
+            earlier = next((item for item in reversed(changes) if item.path == target), None)
+            before = earlier.after if earlier else _read(target)
+            if harness == 'omp':
+                body = resource_path('templates/harness/maven-lifecycle.js').read_text()
+                body = body.replace('__MAVEN_HOME_JSON__', json.dumps(str(home)))
+                body = body.replace('__MAVEN_HOOK_JSON__', json.dumps(str(home / 'venv/bin/maven-session-hook')))
+                changes.append(_lifecycle_file(target, before, body, prior.get((str(target), 'file', 'maven-lifecycle'))))
+            else:
+                changes.append(_lifecycle_hooks(home, harness, target, before,
+                    prior.get((str(target), 'json-hooks', 'maven-lifecycle'))))
+            change = changes[-1]
+            key = (str(target), change.receipt['format'], 'maven-lifecycle')
+            if key in prior and change.before != change.after:
+                from tools.uninstall.local import _integration_references
+                shared, uncertain = _integration_references(home, [])
+                if uncertain or str(target) in shared:
+                    raise ValueError(f'Shared lifecycle integration preserved; review every installation: {target}')
     return changes
 
 
@@ -388,6 +425,98 @@ def _statusline_change(home: Path, path: Path) -> Change:
         return Change(path, before, before, receipt)
     value['statusLine'] = entry
     return Change(path, before, _encode(value), {**receipt, 'created': before is None})
+
+
+def _owned_integrations(home: Path) -> dict:
+    from tools.uninstall.common import read_private
+    from tools.uninstall.local import MANIFEST
+    path = home / MANIFEST
+    if not path.exists():
+        return {}
+    prior = read_private(path)
+    if prior.get('schema') != 1 or prior.get('home') != str(home):
+        raise ValueError('Installer ownership receipt does not match this home.')
+    return {(item['path'], item['format'], item['key']): item
+            for item in prior.get('integrations', []) if item.get('owned', True)}
+
+
+def _lifecycle_file(path, before, body, prior):
+    after = body.encode()
+    if before is not None and before != after and (not prior or before != prior['value'].encode()):
+        raise ValueError(f'Modified or unowned lifecycle extension preserved: {path}')
+    receipt = {'path': str(path), 'format': 'file', 'key': 'maven-lifecycle',
+               'value': body, 'created': prior.get('created', False) if prior else before is None}
+    if before == after:
+        receipt['owned'] = False
+    return Change(path, before, after, receipt)
+
+
+def _hook_entries(home, harness):
+    # Provider schemas: code.claude.com/docs/en/hooks, developers.openai.com/codex/hooks,
+    # docs.github.com/en/copilot/reference/hooks-reference, geminicli.com/docs/hooks/reference.
+    result = {}
+    for action, event in (('startup', 'SessionStart'), ('shutdown', 'SessionEnd')):
+        command = shlex.join([str(home / 'venv/bin/maven-session-hook'), action,
+                              '--home', str(home), '--harness', harness])
+        if harness == 'copilot':
+            result[event[0].lower() + event[1:]] = [
+                {'type': 'command', 'bash': command, 'timeoutSec': 5 if action == 'startup' else 1}]
+        else:
+            timeout = (5000 if action == 'startup' else 1000) if harness == 'gemini' else (
+                5 if action == 'startup' else 1)
+            handler = {'type': 'command', 'command': command, 'timeout': timeout}
+            if harness == 'gemini':
+                handler['name'] = 'maven-' + action
+            result[event] = [{'hooks': [handler]}]
+    return result
+
+
+def _hook_map(document, path):
+    hooks = document.setdefault('hooks', {})
+    if not isinstance(hooks, dict) or any(not isinstance(value, list) for value in hooks.values()):
+        raise ValueError(f'Unsupported hooks configuration preserved: {path}')
+    return hooks
+
+
+def _lifecycle_hooks(home, harness, path, before, prior):
+    document = _json(before)
+    created_container = 'hooks' not in document
+    if harness == 'copilot':
+        if before is not None and document.get('version') != 1:
+            raise ValueError(f'Unsupported Copilot hook schema preserved: {path}')
+        document['version'] = 1
+    hooks = _hook_map(document, path)
+    desired = _hook_entries(home, harness)
+    if prior:
+        for event, entries in prior['value'].items():
+            current = hooks.get(event, [])
+            for entry in entries:
+                if current.count(entry) != 1:
+                    raise ValueError(f'Modified or duplicated MAVEN lifecycle hook preserved: {path}')
+                current.remove(entry)
+            if not current:
+                hooks.pop(event, None)
+    owned = {}
+    for event, entries in desired.items():
+        current = hooks.setdefault(event, [])
+        if any('maven-session-hook' in json.dumps(existing) for existing in current
+               if existing not in entries):
+            raise ValueError(f'Unowned or conflicting MAVEN lifecycle hook preserved: {path}')
+        for entry in entries:
+            if current.count(entry) > 1:
+                raise ValueError(f'Duplicated MAVEN lifecycle hook preserved: {path}')
+            if entry not in current:
+                current.append(entry)
+                owned.setdefault(event, []).append(entry)
+    receipt = {'path': str(path), 'format': 'json-hooks', 'key': 'maven-lifecycle',
+               'value': owned or desired, 'owned': bool(owned),
+               'created': prior.get('created', False) if prior else before is None,
+               'created_container': prior.get('created_container', False) if prior else created_container}
+    if harness == 'copilot' and before is None:
+        receipt['created_version'] = True
+    elif prior and prior.get('created_version'):
+        receipt['created_version'] = True
+    return Change(path, before, _encode(document) if owned else before, receipt)
 
 
 def _owned_text_blocks(home: Path) -> dict[str, dict]:
@@ -447,6 +576,32 @@ def removal_content(receipt: dict) -> bytes | None:
     before = _read(path)
     if before is None:
         return None
+    return _removal_bytes(receipt, before)
+
+
+def _removal_bytes(receipt, before):
+    """Apply one selective receipt to bytes, also used by grouped uninstall plans."""
+    path = Path(receipt['path'])
+    if receipt['format'] == 'file':
+        if before != receipt['value'].encode():
+            raise ValueError(f'Modified lifecycle extension preserved: {path}')
+        return b''
+    if receipt['format'] == 'json-hooks':
+        document = _json(before)
+        hooks = _hook_map(document, path)
+        for event, entries in receipt['value'].items():
+            current = hooks.get(event, [])
+            for entry in entries:
+                if current.count(entry) != 1:
+                    raise ValueError(f'Modified or missing MAVEN lifecycle hook preserved: {path}')
+                current.remove(entry)
+            if not current:
+                hooks.pop(event, None)
+        if not hooks and receipt.get('created_container'):
+            document.pop('hooks', None)
+        if receipt.get('created_version') and document == {'version': 1}:
+            document.pop('version')
+        return b'' if not document and receipt['created'] else _encode(document)
     if receipt['format'] in ('json-entry', 'json-setting'):
         document = _json(before)
         entries = document.get('mcpServers', {}) if receipt['format'] == 'json-entry' else document
@@ -471,6 +626,40 @@ def removal_content(receipt: dict) -> bytes | None:
     if 'server' in receipt and tomllib.loads(text).get('mcp_servers', {}).get('maven') != receipt['server']:
         raise ValueError(f'Modified MAVEN MCP table preserved: {path}')
     return text.replace(block, '', 1).encode()
+
+
+def grouped_removal_content(receipts):
+    """One snapshot/approval for several owned fragments in the same JSON file."""
+    if not receipts or len({item['path'] for item in receipts}) != 1:
+        raise ValueError('Grouped removal requires one integration file')
+    if any(not item.get('owned', True) for item in receipts):
+        raise ValueError('Referenced pre-existing integration is not installer-owned')
+    before = _read(Path(receipts[0]['path']))
+    if before is None:
+        return None
+    result = before
+    for receipt in receipts:
+        changed = _removal_bytes(receipt, result)
+        if changed is not None:
+            result = changed
+    if result in (b'{}\n', b'{}', b'') and any(item.get('created') for item in receipts):
+        return b''
+    return result
+
+
+def remove_integrations(receipts):
+    path = Path(receipts[0]['path'])
+    before = _read(path)
+    after = grouped_removal_content(receipts)
+    if after is None:
+        return {'removed': False, 'already_absent': True, 'path': str(path)}
+    if not after and any(item.get('created') for item in receipts):
+        if _read(path) != before:
+            raise ValueError(f'Integration changed during removal: {path}')
+        path.unlink()
+    else:
+        _replace(path, before, after)
+    return {'removed': True, 'path': str(path), 'unrelated_content_preserved': True}
 
 
 def remove_integration(receipt: dict) -> dict:

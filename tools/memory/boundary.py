@@ -385,6 +385,12 @@ class MemoryBoundary:
                                            or any(not isinstance(item, dict) for item in index)))
                 or any(peer.get('session_id') == self.session_id for peer in data['active_peers'])):
             raise BoundaryError('memory service returned no verified project context')
+        if index is not None:
+            # The service's historical "home" flag names this context, not every
+            # machine's Home selection or a project's retained maven-home tag.
+            index = [{**{key: value for key, value in item.items() if key != 'home'},
+                      'is_current_context': item.get('project_id') == self.project_id}
+                     for item in index]
         return {'latest_handover': handover, **{key: data[key] for key in lists}, 'project_index': index}
 
     def revisions(self, record_ids):

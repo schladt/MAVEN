@@ -73,6 +73,8 @@ class SessionService:
             'MAVEN_AWS_PROFILE', 'MAVEN_AWS_EXPECTED_PRINCIPAL', 'MAVEN_AWS_LOGIN_CACHE')}
 
     def _binding(self):
+        if load_project(self.root)['project_id'] != self.project_id:
+            raise BoundaryError('project binding changed; this session cannot operate on the new project')
         if not private_path(self.root, self.binding_path).exists():
             return None
         value = read_private(self.root, self.binding_path)
@@ -84,6 +86,19 @@ class SessionService:
             if selected is not None and selected != value.get(key):
                 raise BoundaryError('harness identity differs from the bound session')
         return value
+
+    @contextmanager
+    def _session_lock(self, *, shared=False):
+        # Keep the root stable before creating/opening any per-project runtime path.
+        # Folder switches take this gate exclusively, then the registry lock.
+        from tools.coordination import project_binding_lock, private_lock
+        with project_binding_lock(self.home, self.root):
+            with private_lock(self.home, 'runtime/registry.lock'):
+                self.registry._allow_work(self.root)
+                if load_project(self.root)['project_id'] != self.project_id:
+                    raise BoundaryError('project binding changed; start a new session for the selected project')
+            with session_lock(self.root, self.session_id, shared=shared):
+                yield
 
     def _publication_guard(self):
         path = self.runtime + '/approval.json'
@@ -146,7 +161,7 @@ class SessionService:
         return SessionSkills(self.client, self.root, self.project_id, self.session_id).start()['data']
 
     def initialize(self, *, resume=False):
-        with session_lock(self.root, self.session_id):
+        with self._session_lock():
             self._publication_guard()
             self._no_pending()
             if private_path(self.root, self.runtime + '/finish.json').exists():
@@ -186,7 +201,7 @@ class SessionService:
 
     def context(self):
         """Explicit reload of authority, session state and project context."""
-        with session_lock(self.root, self.session_id, shared=True):
+        with self._session_lock(shared=True):
             self._guard()
             memory = self._memory()
             memory.session()
@@ -198,7 +213,7 @@ class SessionService:
 
     def authority_ref(self):
         """Reference to the cached approved authority that governs delegated work."""
-        with session_lock(self.root, self.session_id, shared=True):
+        with self._session_lock(shared=True):
             self._ready(self._memory(), write=True)
             return {'authority_generation': self._authority['authority_generation'],
                     'slugs': [page['slug'] for page in self._authority['instructions']]}
@@ -206,7 +221,7 @@ class SessionService:
     def instructions(self):
         """Every active applicable instruction page; `loaded` marks the exact version in this session."""
         from .client import MemoryClientError
-        with session_lock(self.root, self.session_id, shared=True):
+        with self._session_lock(shared=True):
             self._ready(self._memory(), write=False)
             loaded = {(page['slug'], page['revision']) for page in self._authority['instructions']}
             for _ in range(3):
@@ -262,7 +277,7 @@ class SessionService:
                             last_verified=last, finish=finish, live_checked=False)
 
     def read_record(self, record_id, *, revision=None, scope='context', project_id=None):
-        with session_lock(self.root, self.session_id, shared=True):
+        with self._session_lock(shared=True):
             memory = self._memory()
             self._ready(memory, write=False)
             return self._observe(memory.read(record_id, revision, scope=scope, project_id=project_id))
@@ -286,7 +301,7 @@ class SessionService:
             body['include_archived'] = True
         if offset is not None:
             body['offset'] = offset
-        with session_lock(self.root, self.session_id, shared=True):
+        with self._session_lock(shared=True):
             memory = self._memory()
             self._ready(memory, write=False)
             page = memory.invoke('search', body)
@@ -309,7 +324,7 @@ class SessionService:
             record_id = str(uuid.uuid5(uuid.UUID(self.session_id), request_key))
         if expected_revision and record_id is None:
             raise BoundaryError('updating memory requires its exact record_id')
-        with session_lock(self.root, self.session_id):
+        with self._session_lock():
             memory = self._memory()
             self._ready(memory, write=True)
             with self._writer():
@@ -322,7 +337,7 @@ class SessionService:
 
     def claim(self, record_id, *, action, expected_revision, request_key=None,
               lease_seconds=None, fence=None, source=None, scope=None, reason=None):
-        with session_lock(self.root, self.session_id):
+        with self._session_lock():
             memory = self._memory()
             self._ready(memory, write=True)
             with self._writer():
@@ -354,7 +369,7 @@ class SessionService:
             raise BoundaryError('closing another session requires its exact current revision')
         if not isinstance(reason, str) or not reason.strip():
             raise BoundaryError('closing another session requires the owner reason')
-        with session_lock(self.root, self.session_id):
+        with self._session_lock():
             memory = self._memory()
             self._ready(memory, write=True)
             with self._writer():
@@ -373,7 +388,7 @@ class SessionService:
         checkpoint_id = session_uuid(checkpoint_id)
         if not isinstance(summary, str) or not summary.strip() or type(cutoff) is not int or cutoff < 0:
             raise BoundaryError('checkpoint requires a substantive summary and nonnegative integer cutoff')
-        with session_lock(self.root, self.session_id):
+        with self._session_lock():
             memory = self._memory()
             self._ready(memory, write=True)
             self._no_pending()
@@ -421,7 +436,7 @@ class SessionService:
     def finish(self, *, summary, checkpoint_ref):
         if not isinstance(summary, str) or not summary.strip():
             raise BoundaryError('a substantive session handover is required')
-        with session_lock(self.root, self.session_id):
+        with self._session_lock():
             self._guard(closed=True)
             memory = self._memory()
             # Closure needs the exact current session revision for its CAS.
@@ -470,7 +485,7 @@ class SessionService:
             return result
 
     def recover(self):
-        with session_lock(self.root, self.session_id):
+        with self._session_lock():
             if self._binding() is None:
                 raise BoundaryError('recover requires the original explicit session binding')
             self._publication_guard()

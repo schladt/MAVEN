@@ -140,6 +140,13 @@ complete current authority/context load, or a precise blocked reason. Clients wi
 reliable automatic startup use **“Initialize MAVEN”** as the foreground fallback.
 Installation/tool availability does not authorize capturing unrelated chats.
 
+Optional native lifecycle hooks start the same portable workflow: **checking →
+initializing → ready**, or a clear selection/recovery/sign-in blocker. Exact native
+conversation bindings resume with their pause state intact; new conversations get
+new sessions. Other sessions are peers, never candidates to adopt by recency.
+Stale or unfinished peers prompt **review recovery**, **start new and leave them
+alone**, or **Read Only**. Staleness is not proof that a writer stopped.
+
 - Meaningful decisions, tasks, plans and outcomes are reconciled automatically.
   Real harness-native background subagents do this where supported; otherwise the
   foreground assistant does. MCP itself does not spawn agents.
@@ -171,6 +178,20 @@ Installation/tool availability does not authorize capturing unrelated chats.
 - **“Wrap up”** closes this memory session after verified required writes, not other
   sessions or shared credentials. Summaries separate universal/project changes and
   pending work. Outages preserve private pending evidence, never a false saved claim.
+- With optional OMP lifecycle integration, ordinary exit offers **Wrap up and exit**,
+  **Exit without wrapping up**, or **Stay** when this conversation has an open MAVEN
+  session. Only verified closure permits automatic exit. Other harness shutdown
+  hooks are best-effort, not exit vetoes; forced termination cannot guarantee wrap-up.
+- Ask **“Review MAVEN recovery”** for read-only diagnosis before choosing a specific
+  repair. Original pending requests are preserved, not blindly retried.
+- Ask **“Switch this folder to an existing MAVEN project”** to review an explicit
+  rebinding after local sessions are finished. MAVEN preserves the old runtime and
+  leaves old cloud records and other machines untouched; cleanup is separate.
+
+Home is a per-machine selection of a cloud project plus a local folder. To share
+Home across machines, select the same cloud project ID, not merely the same name.
+The project index's `is_current_context` flag identifies the project being viewed,
+not every machine's Home selection.
 
 See [Project workflow](docs/workflow.md) for readiness, checkpoints, outage recovery
 and exact-candidate safety for explicitly selected Git publication.
@@ -235,10 +256,15 @@ scope selection, legacy installations, export, retained charges, and recovery.
 - For noninteractive native skill installation, close the affected harnesses and pass
   `--local-only --harness NAME --harness-stopped`. Without that confirmation, their
   files are not changed.
+- Native lifecycle adapters are enabled by default for selected harnesses and shown
+  in the local integration review. Use `--no-lifecycle-hooks` (or uncheck the TUI
+  option) for guidance-only startup and explicit wrap-up. No harness is mandatory.
 - Stage integrations without live configuration writes using `--stage-harnesses PATH`.
   Custom profiles use paired `--harness-config NAME=ABSOLUTE_FILE` and
   `--harness-context NAME=ABSOLUTE_FILE`, plus an explicit `--skill-dir PATH`.
   Review staged changes and conflicts before an owner-controlled stopped-harness cutover.
+  Custom profile overrides currently require `--no-lifecycle-hooks`; the installer
+  refuses to guess a native hook location or write to the default profile instead.
 - Behind a VPN or corporate TLS proxy, pass `--ca-bundle PATH` with a trusted PEM
   bundle supplied by your owner/administrator. A new private `activate` snippet retains
   this explicit selection; existing snippets are preserved and any required exports

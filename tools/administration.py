@@ -578,7 +578,7 @@ class AdminOperations:
             targets = {name: review[name] for name in
                        ('instance_id', 'identity', 'selection', 'instance', 'targets',
                         'machine_homes', 'scopes', 'region', 'mode', 'connection',
-                        'home_file', 'remove', 'consent', 'replaces')
+                        'home_file', 'remove', 'consent', 'replaces', 'switch')
                        if name in review}
             if key == 'starter_collection':
                 targets = {}
@@ -1400,11 +1400,18 @@ class AdminOperations:
         if step in ('start', 'project_selection'):
             self._question(state, 'project', 'Enable memory in an explicit project; Git is not required', [
                 Field('root', 'Absolute existing project directory', state['parameters'].get('root', '')),
-                Field('mode', 'Project selection', 'existing', kind='select', choices=(('Existing project', 'existing'), ('Create project', 'create'))),
+                Field('mode', 'Project selection', 'existing', kind='select', choices=(
+                    ('Existing project', 'existing'), ('Create project', 'create'),
+                    ('Switch this enabled folder to a different existing cloud project', 'switch'))),
                 Field('project_id', 'Existing project UUID (blank when creating)', required=False),
                 Field('name', 'New project name (blank when selecting)', required=False)], 'project_review')
         elif step == 'project_review':
             review = {'selection': state['answers']['project'], 'binding': self._project_binding()}
+            if review['selection']['mode'] == 'switch':
+                from tools.project_switch import prepare_switch
+                review['switch'] = prepare_switch(
+                    self.home, review['selection']['root'], review['selection']['project_id'],
+                    state['operation_id'], review['binding'])
             values = review['binding']['environment']
             from tools.setup_common import expected_account
             state['presentation'] = {'title': 'Standalone project enablement', 'purpose': 'Daily-use memory access',
@@ -1419,7 +1426,13 @@ class AdminOperations:
             review = state['approvals'][-1]['review']
             selected = review['selection']
             binding = self._project_binding()
-            source = self._approved(state, 'project', {'selection': selected, 'binding': binding})
+            source = self._approved(state, 'project', {**review, 'binding': binding})
+            if selected['mode'] == 'switch':
+                from tools.project_switch import apply_switch
+                result = apply_switch(self.home, review['switch'], binding, source)
+                self._receipt(state, step, result)
+                state.update(state='completed', outcome=result)
+                return
             if not Path(selected['root']).is_absolute():
                 raise SetupPending('Project root must be absolute.')
             result = setup_project(argparse.Namespace(
@@ -1437,7 +1450,7 @@ class AdminOperations:
         from tools.home import HomeError, validate_root
         from tools.project import load_project
         mode = answer.get('mode')
-        if mode not in ('enabled', 'existing', 'create'):
+        if mode not in ('enabled', 'existing', 'create', 'switch'):
             raise HomeError('Choose how the Home folder is selected.')
         root = Path(str(answer.get('root', '')).strip()).expanduser()
         if not root.is_absolute():
@@ -1461,8 +1474,15 @@ class AdminOperations:
             if project_id and project_id != current:
                 raise HomeError('This folder belongs to a different MAVEN project than the UUID entered.')
             project_id = current
+        elif mode == 'switch':
+            from tools.project import _uuid
+            if not enabled:
+                raise HomeError('Switch requires an already enabled MAVEN project folder.')
+            _uuid(project_id)
+            if load_project(root)['project_id'] == project_id:
+                raise HomeError('This folder already selects that project; use the enabled-folder option.')
         elif enabled:
-            raise HomeError('This folder is already an enabled MAVEN project; choose "Use an already enabled project folder".')
+            raise HomeError('This folder is already enabled; use its current project or explicitly choose Switch to a different existing project.')
         elif mode == 'existing':
             try:
                 project_id = str(UUID(project_id))
@@ -1564,6 +1584,7 @@ class AdminOperations:
             self._question(state, 'home', 'Choose the MAVEN Home folder', [
                 Field('mode', 'Home folder', mode, kind='select', choices=(
                     ('Use an already enabled project folder', 'enabled'),
+                    ('Switch this enabled folder to a different existing MAVEN project', 'switch'),
                     ('Enable an existing folder for an existing MAVEN project (another machine)', 'existing'),
                     ('Create a new project in a new or empty folder', 'create'))),
                 Field('root', 'Absolute Home folder, outside the MAVEN installation', root),
@@ -1594,6 +1615,11 @@ class AdminOperations:
                        'gets the maven-home tag; its data is unchanged.')
             review = {'action': 'enable', 'selection': selection, 'instance_id': instance, 'home_file': path,
                       'consent': consent, 'replaces': others, 'current_home': current, 'binding': binding}
+            if selection['mode'] == 'switch':
+                from tools.project_switch import prepare_switch
+                review['switch'] = prepare_switch(
+                    self.home, selection['root'], selection['project_id'], state['operation_id'],
+                    binding, home_selection=selection)
             values = binding['environment']
             from tools.setup_common import expected_account
             state['presentation'] = {'title': 'MAVEN Home', 'purpose': 'Daily-use memory access',
@@ -1623,6 +1649,9 @@ class AdminOperations:
                         if load_project(root)['project_id'] != project_id:
                             raise SetupPending('The reviewed folder now belongs to a different project; nothing was changed.')
                         result = {'status': 'unchanged', 'root': str(root)}
+                    elif selection['mode'] == 'switch':
+                        from tools.project_switch import apply_switch
+                        result = apply_switch(self.home, reviewed['switch'], reviewed['binding'], source)
                     else:
                         create = selection['mode'] == 'create'
                         if create and not root.exists():
@@ -1638,8 +1667,15 @@ class AdminOperations:
                         project_id = result['project']['project_id']
                     prior = {'project_id': project_id, 'setup': result}
                     self._receipt(state, 'home_project', prior)
-                record = save_home(self.home, root=root, project_id=project_id, instance_id=reviewed['instance_id'],
-                                   label=selection['label'], consent=source)
+                if selection['mode'] == 'switch':
+                    record = load_home(self.home)
+                    if (not record or 'invalid' in record or record['project_id'] != project_id
+                            or record['root'] != str(root) or record['label'] != selection['label']
+                            or record['instance_id'] != reviewed['instance_id'] or record['consent'] != source):
+                        raise SetupPending('Switched Home selection changed; recover the exact original switch.')
+                else:
+                    record = save_home(self.home, root=root, project_id=project_id, instance_id=reviewed['instance_id'],
+                                       label=selection['label'], consent=source)
             except HomeError as error:
                 raise SetupPending(str(error)) from None
             self._receipt(state, 'home_file', record)

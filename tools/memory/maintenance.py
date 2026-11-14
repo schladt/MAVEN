@@ -73,8 +73,20 @@ class Maintenance:
         return state
 
     @contextmanager
+    def _locked(self):
+        from tools.coordination import project_binding_lock
+        from tools.project import load_project
+        with project_binding_lock(self.service.home, self.root):
+            with private_lock(self.service.home, 'runtime/registry.lock'):
+                self.service.registry._allow_work(self.root)
+                if load_project(self.root)['project_id'] != self.project_id:
+                    raise MaintenanceError('project binding changed; old maintenance cannot enter the new runtime')
+            with private_lock(self.root, self.lock):
+                yield
+
+    @contextmanager
     def _transaction(self):
-        with private_lock(self.root, self.lock):
+        with self._locked():
             state = self._load()
             yield state
             save_private(self.root, self.path, state)
@@ -155,7 +167,7 @@ class Maintenance:
                     'ref_count': len(checkpoint.get('refs', checkpoint['explicit_refs']))}
 
     def status(self, operation_id=None, *, detail=False):
-        with private_lock(self.root, self.lock):
+        with self._locked():
             state = self._load()
             if operation_id:
                 item = self._get(state, operation_id)
@@ -530,7 +542,7 @@ class Maintenance:
     def _prevalidate(self, operation_id, source, change):
         """Reject malformed explicit input before anything is queued or sent."""
         validate_source(source)
-        with private_lock(self.root, self.lock):
+        with self._locked():
             state = self._load()
             self._normalize_changes({'operation_id': operation_id, 'source': dict(source)}, [change], 1, state)
 
@@ -744,7 +756,7 @@ class Maintenance:
         if worker_stopped is not True:
             raise MaintenanceError('checkpoint recovery requires its original worker to be stopped')
         checkpoint_id = session_uuid(checkpoint_id)
-        with private_lock(self.root, self.lock):
+        with self._locked():
             checkpoint = deepcopy(self._load()['checkpoints'].get(checkpoint_id))
             if checkpoint is None or checkpoint['state'] != 'applying':
                 raise MaintenanceError('checkpoint has no interrupted cloud operation')
@@ -789,7 +801,7 @@ class Maintenance:
         return groups
 
     def summary(self):
-        with private_lock(self.root, self.lock):
+        with self._locked():
             return {'status': 'ready', 'live_state_checked': False, 'memory_summary': self._summary(self._load())}
 
     def finish(self, checkpoint_id, *, recover_only=False):
