@@ -4,11 +4,13 @@ from __future__ import annotations
 from contextlib import closing
 import json
 
+from uuid import UUID
 from .common import UninstallError, canonical, checked_path, digest, file_digest, read_private
 
 
 MINIMUM_BARRIER_MIGRATION = 8
 PROJECT_MIGRATION = "011_project_lifecycle.sql"
+ARCHIVE_VISIBILITY_MIGRATION = "017_project_archive_visibility.sql"
 MAX_EVIDENCE = 1000
 
 
@@ -105,8 +107,9 @@ def _work(db, tx, project_id=None):
     return evidence
 
 
-def _project(db, tx, project_id, *, lifecycle):
-    raw = db.scalar("SELECT jsonb_build_object('project_id',r.id,'revision',r.revision,"
+def _project(db, tx, project_id, *, lifecycle, include_name=False):
+    name = "'name',m.data->>'name'," if include_name else ""
+    raw = db.scalar("SELECT jsonb_build_object(" + name + "'project_id',r.id,'revision',r.revision,"
                     "'content_hash',v.content_hash,'item_hash',encode(sha256(convert_to(to_jsonb(m)::text,"
                     "'UTF8')),'hex'))::text FROM maven.records r JOIN maven.memory_items m ON m.id=r.id "
                     "JOIN maven.record_versions v ON v.record_id=r.id AND v.revision=r.revision "
@@ -174,6 +177,39 @@ def plan_project(root, home, *, archive=False, reactivate=False):
                      if reactivate else [], requires=['writers-quiescent'])
 
 
+def plan_project_id(home, project_id, *, action, operation_id):
+    """Review one cloud project directly; never load or manufacture a local binding."""
+    if action not in ('archive', 'reactivate'):
+        raise UninstallError('project lifecycle action must be archive or reactivate')
+    try:
+        if str(UUID(project_id)) != project_id or str(UUID(operation_id)) != operation_id:
+            raise ValueError()
+    except (ValueError, TypeError, AttributeError):
+        raise UninstallError('exact project and administration operation UUIDs are required') from None
+    db, s3, details = _connection(home)
+    with closing(db.client), closing(s3):
+        from tools.memory.store import fetch_control
+        control, _ = fetch_control(s3, details['config'], allow_maintenance=True)
+        if control['state'] != 'ready':
+            raise UninstallError('project lifecycle requires a ready, non-retired instance')
+        with db.transaction() as tx:
+            state = _state(db, details['config'], tx)
+            if state['state'] != 'ready':
+                raise UninstallError('database is not ready')
+            schema = _schema(db, tx, project=True)
+            if action == 'archive' and ARCHIVE_VISIBILITY_MIGRATION not in schema:
+                raise UninstallError('direct archive requires reviewed migration '
+                                     + ARCHIVE_VISIBILITY_MIGRATION + '; no implicit migration is performed')
+            selected = _project(db, tx, project_id, lifecycle=True, include_name=True)
+            work = _work(db, tx, project_id)
+            if work['records'] or work['receipts']:
+                raise UninstallError('project has active sessions or unresolved work; close/recover it normally first')
+    details.update(project_id=project_id, project=selected, migrations=schema, work=work,
+                   target_mode='cloud-project-id', operation_id=operation_id)
+    return {'handler': 'lifecycle', 'kind': 'project-' + action,
+            'target': project_id, 'stage': 10, 'details': details}
+
+
 def plan_cloud(home, *, abandon=False):
     db, s3, details = _connection(home)
     with closing(db.client), closing(s3):
@@ -210,10 +246,15 @@ def _project_execute(action, progress, save, db, s3):
     from tools.memory.store import fetch_control
     details = action['details']
     project_id = details['project_id']
-    if digest(_binding(details['root'])) != details['binding_sha256']:
+    direct = details.get('target_mode') == 'cloud-project-id'
+    if not direct and digest(_binding(details['root'])) != details['binding_sha256']:
         raise UninstallError('local project binding changed; create a new plan')
+    if direct and action['target'] != project_id:
+        raise UninstallError('reviewed project target changed')
     changing = action['kind'] != 'project-verify'
     token = digest({'kind': action['kind'], 'details': details})
+    if progress.get('intent') not in (None, token):
+        raise UninstallError('journal belongs to a different project lifecycle action')
     progress['intent'] = token
     save()
     control, _ = fetch_control(s3, details['config'], allow_maintenance=True)
@@ -224,10 +265,19 @@ def _project_execute(action, progress, save, db, s3):
         if state['state'] != 'ready':
             raise UninstallError('database is not ready')
         _schema(db, tx, project=changing, expected=details['migrations'])
+        if (direct and action['kind'] == 'project-archive'
+                and ARCHIVE_VISIBILITY_MIGRATION not in details['migrations']):
+            raise UninstallError('direct archive requires reviewed migration ' + ARCHIVE_VISIBILITY_MIGRATION)
+        if changing and ARCHIVE_VISIBILITY_MIGRATION in details['migrations']:
+            # Governed writes lock authority before project work. Match that order before
+            # the lifecycle trigger advances the authority generation on a real transition.
+            db.execute("SELECT generation FROM maven.instruction_state WHERE singleton FOR UPDATE",
+                       transaction=tx)
         # An absent lifecycle row still has a lock, preventing first-session races.
         db.execute("SELECT pg_advisory_xact_lock(hashtextextended('project-work:' || :project,0))",
                    {'project': project_id}, tx)
-        selected = _project(db, tx, project_id, lifecycle=PROJECT_MIGRATION in details['migrations'])
+        selected = _project(db, tx, project_id, lifecycle=PROJECT_MIGRATION in details['migrations'],
+                            **({'include_name': True} if direct else {}))
         previous = details['project']
         row = selected['lifecycle']
         replayed = changing and row is not None and row['action_key'] == token
@@ -236,9 +286,14 @@ def _project_execute(action, progress, save, db, s3):
             if row['archived'] != wanted or row['generation'] != (
                     (previous['lifecycle'] or {}).get('generation', 0) + 1):
                 raise UninstallError('lifecycle replay identity is inconsistent')
+            if direct and ({key: value for key, value in selected.items() if key != 'lifecycle'}
+                           != {key: value for key, value in previous.items() if key != 'lifecycle'}):
+                raise UninstallError('project identity changed since the reviewed lifecycle action')
         elif selected != previous:
             raise UninstallError('project changed since planning; create a new plan')
         if not replayed:
+            if direct and (details['work']['records'] or details['work']['receipts']):
+                raise UninstallError('reviewed project has unresolved work')
             if _work(db, tx, project_id) != details['work']:
                 raise UninstallError('project acquired unfinished work; close/recover it before proceeding')
             if changing:
@@ -252,6 +307,10 @@ def _project_execute(action, progress, save, db, s3):
     result = {'status': {'project-verify': 'verified', 'project-archive': 'archived',
                          'project-reactivate': 'reactivated'}[action['kind']],
               'project_id': project_id, 'history_preserved': True}
+    if direct:
+        result.update(instance_id=details['instance_id'], operation_id=details['operation_id'],
+                      local_binding_changed=False, local_detach_performed=False,
+                      affects_all_machines=True, replayed=bool(replayed))
     progress['result'] = result
     save()
     return result

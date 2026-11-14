@@ -18,6 +18,8 @@ Optional native startup adapters trigger the shared `maven_startup` workflow. Th
 
 An already-bound folder may switch to an existing cloud project only through the explicit reviewed project/Home switch operation. Require local sessions/writers to be safely finished; preserve original runtime evidence outside the active new binding. Preserve unrelated files and Git configuration. Switching never deletes, merges or archives the old cloud project and never changes another machine's selection.
 
+Cloud project archival is a separate, explicit owner decision through `maven_admin` kind `project_lifecycle`, action `archive` or `reactivate`, and the exact project UUID. No local root, temporary binding or uninstall is required. Review the selected cloud identity, project state and all-machines impact; require actual approval and relevant writer quiescence, and preserve original operation receipts. Never auto-close unfinished sessions. Archived projects and their contents are excluded from default discovery, reads, Home's index and governing context. Explicit `include_archived` search/read is historical consultation only; reactivation requires its own review and never restores forgotten or erased content.
+
 
 ## Checkpoint and closure
 

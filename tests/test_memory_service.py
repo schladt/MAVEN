@@ -404,6 +404,18 @@ class HandlerTests(unittest.TestCase):
         self.assertNotIn("private-value", detail)
         self.factory.assert_not_called()
 
+    def test_archive_read_rejects_non_boolean_opt_in(self):
+        for value in (None, 0, 1, "true", [], {}):
+            self.factory.reset_mock()
+            result = service.handler(event({"record_id": RECORD, "include_archived": value}, "/v1/memory/read"), None)
+            self.assertEqual(result["statusCode"], 422)
+            self.factory.assert_not_called()
+
+    def test_archived_project_context_is_a_conflict(self):
+        with self.assertRaises(validation.MemoryError) as error:
+            store.route_result({"status": "project_archived"})
+        self.assertEqual((error.exception.status, error.exception.http_status), ("project_archived", 409))
+
     def test_new_memory_routes_are_client_role_only(self):
         self.factory.return_value.perform.return_value = ({"revisions": {}}, 3)
         for path, body in [("/v1/memory/project_context", {"project_id": RECORD, "session_id": KEY}),

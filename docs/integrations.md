@@ -76,6 +76,15 @@ it normally. No provider credentials were supplied: startup reported the missing
 provider instead of readiness. End-to-end model-driven cloud wrap-up was not exercised.
 Other harnesses' lifecycle behavior was checked offline, not in their live runtimes.
 
+The subsequent Home-startup/handler-timeout fix passed 21 Python startup/hook checks
+and 14 JavaScript lifecycle checks. Startup fixtures now use the production search
+header and record-read shapes, including existing Home peers and mismatched scope.
+Unresolved model-turn promises exercise all three startup events without holding
+their handlers open; stale callbacks and delivery errors are also covered.
+The real OMP 18.20.0 TUI also ran the rendered extension and local helper with a
+simulated 35-second startup turn; delivery completed without a handler timeout.
+This used a disposable profile, no model/provider request and no cloud changes.
+
 ### Optional capabilities and honest fallbacks
 
 | Capability | Required portable behavior | Optional enhancement / limitation |
@@ -112,7 +121,10 @@ initialization, or `maven_diagnose` for repair choices. An end event does not cl
 cloud session, prove writer death or mark unsaved work saved.
 
 OMP uses `session_start`/agent context and `session_before_shutdown` in a native
-extension. For an open exact MAVEN binding, the prompt offers wrap up and exit,
+extension. Startup delivery is deferred through a managed callback, so the startup
+event never waits for a model turn to finish within its 30-second handler budget.
+Callbacks discard stale work after shutdown, conversation changes or workspace changes;
+delivery failures remain visible. For an open exact MAVEN binding, the prompt offers wrap up and exit,
 exit without wrapping up, or stay. Wrap-up cancels immediate shutdown, lets the
 agent reconcile accepted work, then checks the exact finish receipt before exiting.
 Failure leaves the harness open. OMP 18.20.0+ documents this cancellable event; older

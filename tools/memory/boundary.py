@@ -99,10 +99,12 @@ class MemoryBoundary:
             raise BoundaryError('memory service returned no verified result')
         return result['data']
 
-    def read(self, record_id, revision=None, *, scope='project', project_id=None):
+    def read(self, record_id, revision=None, *, scope='project', project_id=None, include_archived=False):
         body = {'record_id': record_id}
         if revision is not None:
             body['revision'] = revision
+        if include_archived:
+            body['include_archived'] = True
         record = self.invoke('read', body)
         selected = self.project_id if project_id is None else project_id
         if scope not in ('project', 'universal', 'context', 'all'):

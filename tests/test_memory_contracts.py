@@ -76,7 +76,7 @@ class CloudContractTests(unittest.TestCase):
         names = [name for name, _, _ in bundle]
         first_new = names.index('012_agentic_memory.sql')
         self.assertEqual(names[first_new:], ['012_agentic_memory.sql', '013_performance.sql', '014_authority_guard.sql',
-                                             '015_home_context.sql', '016_cleanup.sql'])
+                                             '015_home_context.sql', '016_cleanup.sql', '017_project_archive_visibility.sql'])
         installed = {name: digest for name, digest, _ in bundle[:first_new]}
         old = {**store.control_document(CONFIG, 'ready'), 'schema_version': 1,
                'app_secret_arn': CONFIG['app_secret_arn'], 'app_secret_version': 'fixture-version'}

@@ -276,11 +276,12 @@ class SessionService:
                             else 'bound' if binding else 'uninitialized', pending_request=pending,
                             last_verified=last, finish=finish, live_checked=False)
 
-    def read_record(self, record_id, *, revision=None, scope='context', project_id=None):
+    def read_record(self, record_id, *, revision=None, scope='context', project_id=None, include_archived=False):
         with self._session_lock(shared=True):
             memory = self._memory()
             self._ready(memory, write=False)
-            return self._observe(memory.read(record_id, revision, scope=scope, project_id=project_id))
+            return self._observe(memory.read(record_id, revision, scope=scope, project_id=project_id,
+                                             include_archived=include_archived))
 
     def search(self, *, query='', kind=None, scope='context', project_id=None, after_id=None, limit=20,
                include_archived=False, offset=None):

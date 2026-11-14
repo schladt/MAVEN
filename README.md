@@ -168,6 +168,11 @@ alone**, or **Read Only**. Staleness is not proof that a writer stopped.
   default results. Universal memory holds only preferences, instructions and general
   lessons; customer- and project-specific detail never goes there. Standing policies
   you state can be offered as instructions for future sessions.
+- **“Archive this cloud project”** reviews its exact cloud ID without requiring a
+  local folder or uninstall. Archival blocks project work and hides the project and
+  its contents from normal discovery and reads, including Home's project list.
+  History is retained; ask explicitly to consult archived history or to reactivate
+  the project. Existing installations need the reviewed database and service update.
 - Outside an enabled project, each session asks **Start Home, Create Project, or Read
   Only?** every time; no answer means Read Only, which creates no session and captures
   nothing (ask **“use what MAVEN knows”** to consult read-only). The assistant prints

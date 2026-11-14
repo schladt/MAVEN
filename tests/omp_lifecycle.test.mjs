@@ -11,6 +11,16 @@ const { default: install } = await import('data:text/javascript;base64,' + Buffe
 const binding = { root: '/work/project', project_id: 'project', session_id: 'maven-session',
     harness: 'omp', harness_session: 'native-session', home: '/private/home with spaces' };
 
+function deferred() {
+    let resolve;
+    let reject;
+    const promise = new Promise((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, resolve, reject };
+}
+
 function consumer() {
     const handlers = new Map();
     const calls = [];
@@ -20,6 +30,8 @@ function consumer() {
     let choice = 'Stay';
     let inspectionError;
     let sendError;
+    let sendResult;
+    let startupInspection;
     const context = {
         agent: { kind: 'main' }, mode: 'tui', cwd: '/work/project',
         sessionManager: { getSessionId: () => native },
@@ -39,12 +51,14 @@ function consumer() {
         exec: async (command, args, options) => {
             calls.push(['exec', command, args, options]);
             if (inspectionError) throw inspectionError;
-            const output = args[0] === 'startup' ? { instruction: 'Call maven_startup with native-session' } : state;
+            const output = args[0] === 'startup' ? { instruction: `Call maven_startup with ${native}` } : state;
+            if (args[0] === 'startup') await startupInspection;
             return { code: 0, killed: false, stdout: JSON.stringify(output), stderr: '' };
         },
         sendUserMessage: async (...args) => {
             calls.push(['send', ...args]);
             if (sendError) throw sendError;
+            return sendResult;
         },
         sendMessage: (...args) => calls.push(['context', ...args]),
     };
@@ -55,6 +69,8 @@ function consumer() {
         native: (value) => { native = value; },
         failInspection: () => { inspectionError = new Error('offline'); },
         failSend: () => { sendError = new Error('prompt not admitted'); },
+        setSendResult: (value) => { sendResult = value; },
+        setStartupInspection: (value) => { startupInspection = value; },
         emit: async (event, values = {}) => handlers.get(event)?.({ type: event, signal: new AbortController().signal, ...values }, context),
         runTimers: async () => { for (const callback of timers.splice(0)) await callback(); },
     };
@@ -83,13 +99,112 @@ test('native session_start sends the instruction with the exact host identity, n
     assert.equal(execution[1], '/private/home with spaces/venv/bin/maven-session-hook');
     assert.deepEqual(execution[2], ['startup', '--home', '/private/home with spaces', '--harness', 'omp',
         '--cwd', '/work/project', '--harness-session', 'native-session']);
+    assert.equal(sends(host).length, 0, 'startup must return before admitting agent work');
+    await host.runTimers();
     assert.match(sends(host)[0][1], /maven_startup/);
     assert.deepEqual(sends(host)[0][2], { attribution: 'agent' });
     await host.emit('session_switch');
+    await host.runTimers();
     assert.equal(sends(host).length, 1);
     host.native('new-native');
     await host.emit('session_switch');
+    await host.runTimers();
     assert.equal(sends(host).length, 2);
+});
+
+test('startup events finish while the deferred model turn remains unresolved', async () => {
+    for (const event of ['session_start', 'session_switch', 'session_branch']) {
+        const host = consumer();
+        const turn = deferred();
+        host.setSendResult(turn.promise);
+        const completed = await Promise.race([
+            host.emit(event).then(() => true),
+            new Promise((resolve) => setImmediate(() => resolve(false))),
+        ]);
+        assert.equal(completed, true, `${event} must not await the model turn`);
+        assert.equal(sends(host).length, 0);
+        let settled = false;
+        const delivery = host.runTimers().then(() => { settled = true; });
+        assert.equal(sends(host).length, 1);
+        await Promise.resolve();
+        assert.equal(settled, false, 'the model turn is still pending after the handler returned');
+        turn.resolve();
+        await delivery;
+        assert.equal(settled, true);
+    }
+});
+
+test('deferred startup refuses shutdown, changed native identity, and changed workspace', async () => {
+    for (const change of ['shutdown', 'native', 'cwd']) {
+        const host = consumer();
+        await host.emit('session_start');
+        if (change === 'shutdown') await host.emit('session_shutdown');
+        if (change === 'native') host.native('other-native');
+        if (change === 'cwd') host.context.cwd = '/other/project';
+        // Exercise even a callback retained past the host's automatic shutdown cleanup.
+        await host.runTimers();
+        assert.equal(sends(host).length, 0, change);
+    }
+});
+
+test('switching away and back invalidates older deferred startup callbacks', async () => {
+    const host = consumer();
+    await host.emit('session_start');
+    host.native('other-native');
+    await host.emit('session_switch');
+    host.native('native-session');
+    await host.emit('session_branch');
+    await host.runTimers();
+    assert.equal(sends(host).length, 1, 'only the latest startup request may deliver');
+    assert.match(sends(host)[0][1], /native-session/);
+});
+
+test('inspection completing after switch or shutdown cannot schedule stale startup', async () => {
+    for (const mode of ['tui', 'print']) {
+        for (const change of ['switch', 'shutdown']) {
+            const host = consumer();
+            host.context.mode = mode;
+            const inspection = deferred();
+            host.setStartupInspection(inspection.promise);
+            const first = host.emit('session_start');
+            host.setStartupInspection(undefined);
+            if (change === 'switch') {
+                host.native('other-native');
+                await host.emit('session_switch');
+            } else {
+                await host.emit('session_shutdown');
+            }
+            inspection.resolve();
+            await first;
+            assert.equal(host.timers.length, change === 'switch' && mode === 'tui' ? 1 : 0);
+            await host.runTimers();
+            const deliveries = host.calls.filter(([name]) => name === 'send' || name === 'context');
+            assert.equal(deliveries.length, change === 'switch' ? 1 : 0);
+            if (change === 'switch') {
+                const instruction = mode === 'tui' ? deliveries[0][1] : deliveries[0][1].content;
+                assert.match(instruction, /other-native/);
+            }
+        }
+    }
+});
+
+test('deferred startup reports both prompt admission and later model-turn rejection', async () => {
+    for (const delayed of [false, true]) {
+        const host = consumer();
+        const turn = deferred();
+        if (delayed) host.setSendResult(turn.promise);
+        else host.failSend();
+        await host.emit('session_start');
+        const delivery = host.runTimers();
+        if (delayed) turn.reject(new Error('model turn failed'));
+        await delivery;
+        const warnings = host.calls.filter(([name]) => name === 'notify');
+        assert.equal(warnings.length, 1);
+        assert.match(warnings[0][1], /MAVEN startup unavailable:.*Readiness is not established/);
+        assert.match(warnings[0][1], delayed ? /model turn failed/ : /prompt not admitted/);
+        assert.equal(warnings[0][2], 'warning');
+        assert.equal(exits(host), 0);
+    }
 });
 
 test('subagents inherit delegation; noninteractive sessions receive context without an unsolicited turn', async () => {
@@ -97,9 +212,12 @@ test('subagents inherit delegation; noninteractive sessions receive context with
     child.context.agent.kind = 'sub';
     await child.emit('session_start');
     assert.deepEqual(child.calls, []);
+    assert.equal(child.timers.length, 0);
     const host = consumer();
     host.context.mode = 'print';
     await host.emit('session_start');
+    assert.equal(host.timers.length, 0);
+    await host.runTimers();
     assert.equal(sends(host).length, 0);
     const message = host.calls.find(([name]) => name === 'context');
     assert.match(message[1].content, /maven_startup/);

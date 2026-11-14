@@ -51,9 +51,11 @@ that current cloud authority has loaded. If hooks are unavailable or disabled,
 first-turn guidance runs the same workflow; if it is also unavailable, initialize
 explicitly rather than claiming automatic readiness.
 
-Startup reads up to 100 project-scoped session records and reports incomplete
-pagination explicitly. Old session-record updates are only a `possibly_stale`
-warning; initialized project context also includes peers' checkpoint activity.
+Startup lists up to 100 project-scoped session headers, reads each listed session's
+current record, and reports incomplete pagination explicitly. Search results do not
+contain session bodies; peer state, revision and the `recorded_at` timestamp come from
+the record read. Old record timestamps are only a `possibly_stale` warning; initialized
+project context also includes peers' checkpoint activity.
 An observed prior end event without a verified finish is unfinished-work evidence,
 not proof of worker death. Offer review recovery, start new leaving peers alone, or
 Read Only. Never automatically close a peer, steal its task claims, or replay writes.
@@ -80,6 +82,29 @@ Other machines are unchanged. If this folder was this machine's Home, the review
 switch updates that local selection too. Cloud cleanup is a separate owner decision.
 The Home index uses `is_current_context` to identify the viewed project; it does not
 claim that only one project is Home across every machine.
+
+### Archive or reactivate a cloud project
+
+Ask **“Archive cloud project …”**. The assistant resolves its exact ID and begins
+`maven_admin` kind `project_lifecycle` with
+`{"action": "archive", "project_id": "<cloud UUID>"}`. No local root, temporary
+binding or uninstall is involved. Review the account, region, instance, selected
+administration identity, project name/ID and state. Approve only that exact review
+and confirm affected writers are quiescent; unresolved cloud work blocks application.
+This affects the project on every machine but changes no local binding or Home setting.
+
+The project and its contents disappear from normal search/read, Home's project index,
+startup context and instruction discovery. Explicit archived-history requests use
+`include_archived=true` on `maven_search`/`maven_read`; results carry
+`project_archived` and remain reference data, never authority or permission to write.
+Forget/Erase and source visibility still apply. Existing conversations, exports and
+private recovery evidence are not erased by archival.
+
+Reactivation uses the same administration kind with `action="reactivate"` and a new
+exact review. It restores visibility and work eligibility, not forgotten/erased
+content or local attachment. Existing installations must first complete the reviewed
+database migration `017_project_archive_visibility.sql` and service update.
+
 
 
 ## Everyday memory
@@ -259,12 +284,15 @@ Say whether memory state came from this conversation or was re-read from MAVEN.
 Client/customer engagement details stay
 project-scoped even when the default prefers universal. Offer to turn standing owner
 policies into project or universal instructions through the instruction review flow.
-Mark obsolete records with tag `archived` (or `data.state` `archived`).
+Mark obsolete ordinary records with tag `archived` (or `data.state` `archived`);
+cloud projects use the separate lifecycle operation above, never a tag workaround.
 
 **Clean-up** is offered on the owner's request, never automatically. The read-only
 review lists stale open tasks, duplicates, archived and superseded records, oversized
-notes and universal records tagged `client:*`, each with a suggested action. Archive
-is a normal `maven_save` revision adding `archived`. **Forget** (hidden from search,
+notes and universal records tagged `client:*`, each with a suggested action.
+Ordinary record archival is a normal `maven_save` revision adding `archived`.
+Archived cloud projects and their contents are omitted from this default review.
+**Forget** (hidden from search,
 startup and every read; reversible with `restore`) and **Erase** (every revision,
 current content, owned source excerpts, fact values and receipt results rewritten to a
 content-free tombstone; irreversible) run only through an owner-approved `maven_admin`

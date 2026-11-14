@@ -6,11 +6,27 @@ from pathlib import Path
 import tempfile
 import unittest
 import uuid
+from unittest.mock import patch
 
 from test_mcp import MCPCloud, fixture_application
+from tools.home import save_home
 from tools.memory.boundary import BoundaryError, read_private, save_private
 from tools.memory.maintenance import MaintenanceError
 from tools.startup import inspect_shutdown, inspect_startup, record_shutdown
+
+class StartupCloud(MCPCloud):
+    """Production search headers and read timestamps, not full-record search fixtures."""
+
+    def invoke(self, route, body):
+        result = super().invoke(route, body)
+        if route == '/v1/memory/search':
+            result['data']['records'] = [
+                {**{key: record[key] for key in ('record_id', 'revision', 'kind', 'project_id', 'data_scope', 'tags')},
+                 'title': record['data'].get('title'), 'state': record['data'].get('state'), 'snippet': None}
+                for record in result['data']['records']]
+        elif route == '/v1/memory/read':
+            result['data']['recorded_at'] = result['data'].pop('updated_at', None)
+        return result
 
 
 class StartupTests(unittest.TestCase):
@@ -23,7 +39,7 @@ class StartupTests(unittest.TestCase):
         self.project_id = str(uuid.uuid4())
         save_private(self.root, '.maven/project.json', {
             'schema': 1, 'root': str(self.root), 'project_id': self.project_id})
-        self.cloud = MCPCloud()
+        self.cloud = StartupCloud()
 
     def application(self):
         app = fixture_application(self.cloud, home=self.home)
@@ -58,6 +74,48 @@ class StartupTests(unittest.TestCase):
         self.assertTrue(self.cloud.calls)
         self.assertTrue(all(route == '/v1/memory/search' and body['project_id'] == self.project_id
                             and body['scope'] == 'project' for route, body in self.cloud.calls))
+
+    def test_home_startup_with_existing_cloud_session_reads_summary_then_current_record(self):
+        self.home.mkdir(mode=0o700)
+        (self.home / '.env').write_text('MAVEN_MEMORY_INSTANCE_ID="instance-one"\n')
+        (self.home / '.env').chmod(0o600)
+        save_home(self.home, root=self.root, project_id=self.project_id, instance_id='instance-one',
+                  label='Home', consent={'origin': 'Owner conversation', 'excerpt': 'Use this project as Home.'})
+        identifier = str(uuid.uuid4())
+        timestamp = datetime.now(timezone.utc).isoformat()
+        self.cloud.records[identifier] = {
+            'record_id': identifier, 'revision': 3, 'kind': 'session', 'data_scope': 'owner',
+            'project_id': self.project_id, 'tags': [], 'updated_at': timestamp,
+            'data': {'state': 'active', 'summary': json.dumps({'machine': 'other-host', 'harness': 'codex'})}}
+        peer = deepcopy(self.cloud.records[identifier])
+        app = self.application()
+        result = app.startup(str(self.base), harness='omp', harness_session='home-conversation',
+                             home=True, action='continue')
+        self.assertEqual(result['status'], 'ready')
+        self.assertEqual(result['active']['mode'], 'home')
+        self.assertEqual(result['binding']['root'], str(self.root))
+        self.assertNotEqual(result['binding']['session_id'], identifier)
+        inspected = result['startup_review']['cloud_sessions']['sessions'][0]
+        self.assertEqual((inspected['revision'], inspected['machine'], inspected['last_record_update']),
+                         (3, 'other-host', timestamp))
+        self.assertEqual(self.cloud.records[identifier], peer)
+
+    def test_session_read_scope_mismatch_blocks_startup_without_creating_session(self):
+        existing = self.startup(self.application())['binding']
+        app = self.application()
+        invoke = self.cloud.invoke
+
+        def wrong_scope(route, body):
+            result = invoke(route, body)
+            if route == '/v1/memory/read' and body['record_id'] == existing['session_id']:
+                result['data']['project_id'] = str(uuid.uuid4())
+            return result
+
+        before = deepcopy(self.cloud.records)
+        with patch.object(self.cloud, 'invoke', side_effect=wrong_scope), self.assertRaises(BoundaryError):
+            self.startup(app, conversation='conversation-b')
+        self.assertIsNone(app.binding)
+        self.assertEqual(self.cloud.records, before)
 
     def test_exact_resume_preserves_pause_and_other_conversations_get_new_sessions(self):
         first = self.application()

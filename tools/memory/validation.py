@@ -408,10 +408,12 @@ def _memory(route, value):
         reject_secrets(value)
         _memory_data(value["kind"], value["data"], value)
     elif action == "read":
-        fields(value, {"record_id"}, {"revision"})
+        fields(value, {"record_id"}, {"revision", "include_archived"})
         uuid_string(value["record_id"], name="record_id")
         if "revision" in value:
             revision(value["revision"])
+        if "include_archived" in value and type(value["include_archived"]) is not bool:
+            invalid("include_archived must be a boolean")
     elif action == "search":
         fields(value, (), {"kind", "project_id", "scope", "query", "tag", "subject_id", "state", "after_id",
                            "limit", "include_archived", "offset"})

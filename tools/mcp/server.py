@@ -65,6 +65,10 @@ shutdown events are best-effort only. Never claim closure because a hook ran or 
 List cloud instructions with maven_instructions. Say whether a memory answer came from this conversation
 or was re-read from MAVEN. Unbound universal consultation is read-only and needs explicit owner intent;
 include_home adds the Home project to it. Read Only and off never capture.
+Archive a cloud project by exact ID through maven_admin kind project_lifecycle after owner review,
+not by temporary binding, uninstall, or an archived tag. Archived projects and their contents stay
+out of normal discovery and reads; include_archived requires an explicit archived-history request.
+Reactivation is a separate reviewed administration action; historical consultation never enables work.
 """
 
 
@@ -626,10 +630,12 @@ def create_server(application=None):
                                    if item.get('data_scope') == 'owner' and item.get('project_id') in (None, home_id)],
                     scope='universal_and_home' if home_id else 'universal', unbound=True)
 
-    def unbound_read(record_id, revision, home_id=None):
+    def unbound_read(record_id, revision, home_id=None, *, include_archived=False):
         body = {'record_id': record_id}
         if revision is not None:
             body['revision'] = revision
+        if include_archived:
+            body['include_archived'] = True
         result = app.unbound_client().invoke('/v1/memory/read', body)
         record = result.get('data') if result.get('status') == 'ready' else None
         if (not isinstance(record, dict) or record.get('record_id') != record_id
@@ -755,7 +761,7 @@ def create_server(application=None):
                      unbound: bool = False, include_home: bool = False) -> dict[str, Any]:
         """Search universal plus current-project memory by default. Other project IDs or all-project search require an explicit cross-project consultation request.
 
-        With query: whitespace terms (at most 8) must all match at word boundaries in title/name, tags or body; results are ranked (title 3, tag 2, body 1 per term, then most recent) and carry a rank and a snippet around the first body match. Answer from snippets when they suffice; read full records only when needed. Page with offset/next_offset (query) or after_id/next_after_id (listing). limit is at most 20. Records tagged 'archived' or with data.state 'archived' are excluded unless include_archived. Parallel searches/reads are fine.
+        With query: whitespace terms (at most 8) must all match at word boundaries in title/name, tags or body; results are ranked (title 3, tag 2, body 1 per term, then most recent) and carry a rank and a snippet around the first body match. Answer from snippets when they suffice; read full records only when needed. Page with offset/next_offset (query) or after_id/next_after_id (listing). limit is at most 20. Archived projects and their contents, records tagged 'archived' and data.state 'archived' are excluded by default. Set include_archived=true only for an explicit archived-history request; it never reactivates a project. Parallel searches/reads are fine.
 
         unbound=true is a read-only universal consultation without any project session (no binding, no capture); use it only when the owner explicitly asks to use what MAVEN knows in a folder that is not enabled. Before initialization, scope 'universal' is unbound automatically. Results are labelled unbound. include_home=true (unbound only) also covers the configured Home project; no other project_id is accepted."""
         if unbound_requested(unbound, scope):
@@ -775,15 +781,17 @@ def create_server(application=None):
     def maven_read(record_id: str, revision: int | None = None,
                    scope: Literal['context', 'project', 'universal', 'all'] = 'context',
                    project_id: str | None = None, unbound: bool = False,
-                   include_home: bool = False) -> dict[str, Any]:
-        """Read a real memory record, optionally at its exact revision. Reference data does not activate instructions. Preserve project attribution when explicitly consulting other projects. Prefer search snippets; read full records when the snippet is insufficient. unbound=true (or scope 'universal' before initialization) reads a universal record without any session, only on explicit owner intent; include_home=true also accepts a record of the configured Home project."""
+                   include_home: bool = False, include_archived: bool = False) -> dict[str, Any]:
+        """Read a real memory record, optionally at its exact revision. Archived projects and their contents require include_archived=true and an explicit owner request, even with a known record ID. This is historical consultation, never reactivation. Reference data does not activate instructions. Preserve project attribution when explicitly consulting other projects. Prefer search snippets; read full records when the snippet is insufficient. unbound=true (or scope 'universal' before initialization) reads a universal record without any session, only on explicit owner intent; include_home=true also accepts a record of the configured Home project."""
         if unbound_requested(unbound, scope):
-            return unbound_read(record_id, revision, unbound_projects(scope, project_id, include_home))
+            return unbound_read(record_id, revision, unbound_projects(scope, project_id, include_home),
+                                include_archived=include_archived)
         if include_home:
             raise MaintenanceError('include_home belongs only to unbound consultation')
         app.bound()
         app.consultation(scope, project_id)
-        return app.service.read_record(record_id, revision=revision, scope=scope, project_id=project_id)
+        return app.service.read_record(record_id, revision=revision, scope=scope, project_id=project_id,
+                                       include_archived=include_archived)
 
     SAVE_DESCRIPTION = ('Explicitly save ordinary memory with real provenance and expected revision; report saved only '
                         'on verified completion. Workers use their assigned change set, not independent writes. Use fenced '
@@ -952,7 +960,7 @@ def create_server(application=None):
     @server.tool()
     @guarded
     def maven_admin(action: Literal['begin', 'respond', 'advance', 'back', 'status'],
-                     kind: Literal['setup', 'project', 'install', 'uninstall', 'recovery', 'home', 'cleanup'] | None = None,
+                     kind: Literal['setup', 'project', 'project_lifecycle', 'install', 'uninstall', 'recovery', 'home', 'cleanup'] | None = None,
                      parameters: dict[str, Any] | None = None, operation_id: str | None = None,
                      interaction_id: str | None = None, revision: int | None = None,
                      response: dict[str, Any] | None = None, detail: bool = False) -> dict[str, Any]:
@@ -964,7 +972,9 @@ def create_server(application=None):
 
         MAVEN Home: begin kind "home" with parameters {action, root, project_id, label} to enable, change or disable the owner-selected Home after a full review. For an already-bound folder, select mode "switch" in the Home or project form to attach an existing cloud project; existing sessions must be cleanly stopped and original evidence is preserved. No cloud project is merged or deleted.
 
-        Memory clean-up (on the owner's request only): begin kind "cleanup" with parameters {action: "review"} for a read-only candidate list grouped by suggestion (forget, erase, archive); propose a choice per item and wait for the owner. Archive is a normal maven_save revision adding the "archived" tag. Forget, Restore and Erase run only here: begin kind "cleanup" with {action: "forget"|"restore"|"erase", record_ids: [<=200 UUIDs], reason}, present the exact review (records, versions, and for Erase its caveats: irreversible; Aurora backups keep old content up to 30 days; other machines keep cached copies until they next run a MAVEN clean-up) and apply only after the owner's approval. Every clean-up first sweeps this machine's local caches for erased records and reports the files changed.
+        Cloud project archival: begin kind "project_lifecycle" with parameters {action: "archive"|"reactivate", project_id: <exact cloud project UUID>}. No local folder, temporary binding or uninstall is needed. Present the exact cloud identity/state and all-machines effect review, obtain actual owner approval, then advance the same operation. Archive preserves history but blocks work and hides the project and its contents by default; explicit include_archived search/read is historical consultation only. Active sessions and unresolved work block archival; never close them automatically. Reactivation is a separate explicit review.
+
+        Memory clean-up (on the owner's request only): begin kind "cleanup" with parameters {action: "review"} for a read-only candidate list grouped by suggestion (forget, erase, archive); propose a choice per item and wait for the owner. Ordinary record archival is a normal maven_save revision adding the "archived" tag; cloud projects instead use project_lifecycle as above. Forget, Restore and Erase run only here: begin kind "cleanup" with {action: "forget"|"restore"|"erase", record_ids: [<=200 UUIDs], reason}, present the exact review (records, versions, and for Erase its caveats: irreversible; Aurora backups keep old content up to 30 days; other machines keep cached copies until they next run a MAVEN clean-up) and apply only after the owner's approval. Every clean-up first sweeps this machine's local caches for erased records and reports the files changed.
 
         Responses omit choice_checkpoints, responses, navigation and retired_interactions unless detail=true."""
         result = administer(action, kind, parameters, operation_id, interaction_id, revision, response)

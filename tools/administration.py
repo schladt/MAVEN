@@ -332,6 +332,7 @@ class AdminOperations:
             'recovery': {'operation_id', 'root', 'session_id', 'action'},
             'home': {'action', 'root', 'project_id', 'label'},
             'cleanup': {'action', 'record_ids', 'reason'},
+            'project_lifecycle': {'action', 'project_id'},
         }
         if kind not in allowed or not isinstance(parameters, dict) or set(parameters) - allowed[kind]:
             raise AdminInputError('Unsupported administration kind or parameters.')
@@ -347,6 +348,16 @@ class AdminOperations:
         if kind == 'home' and (parameters.get('action', 'enable') not in ('enable', 'disable')
                 or any(not isinstance(parameters.get(key, ''), str) for key in ('root', 'project_id', 'label'))):
             raise AdminInputError('Home action must be enable or disable; root, project_id and label are text.')
+        if kind == 'project_lifecycle':
+            if set(parameters) != {'action', 'project_id'} or parameters.get('action') not in ('archive', 'reactivate'):
+                raise AdminInputError('Project lifecycle requires action archive or reactivate and an exact project_id.')
+            project_id = parameters['project_id']
+            try:
+                valid = isinstance(project_id, str) and str(UUID(project_id)) == project_id
+            except ValueError:
+                valid = False
+            if not valid:
+                raise AdminInputError('Project lifecycle requires a canonical project UUID.')
         if kind == 'cleanup':
             if parameters.get('action') not in CLEANUP_ACTIONS:
                 raise AdminInputError('Clean-up action must be review, forget, restore or erase.')
@@ -562,6 +573,14 @@ class AdminOperations:
             'apply': 'Create billable Aurora database, network, IAM, API, storage, notification and logging resources. Aurora capacity, storage, snapshots, network traffic, API requests and logs incur charges. Interruption may leave an in-flight stack; resume the exact change set. Retained data can continue costing money after removal.',
             'schema': 'Run the exact SQL bundle under the existing separately assumed administration role. Initialization/migration changes database schema and may interrupt memory writers; preserve and reconcile uncertain requests. This does not approve authority activation.',
             'removal': 'Remove only the reviewed targets. Retire retains data and ongoing storage/snapshot costs; purge can permanently destroy data. Writers/harnesses must stop where the plan requires it. Interrupted removal resumes original receipts, never a new plan.',
+            'project_lifecycle': 'Change only the reviewed cloud project lifecycle across all machines. '
+                                 'Archive hides the project and its content from default discovery and blocks writes; '
+                                 'explicit archived-history consultation remains available. Reactivate restores '
+                                 'default visibility and cloud write eligibility, not erased or forgotten content. '
+                                 'History is retained. No local project is attached, detached or changed. '
+                                 'Confirm affected writers are quiescent; active sessions, claims and unfinished '
+                                 'cloud work block this operation and are never automatically closed or abandoned. '
+                                 'Resume this same operation after interruption.',
             'service_update': 'Execute this exact CloudFormation change set on the existing MAVEN service stack. '
                               'Listed resources are modified in place; no resource that holds memory data or '
                               'credentials is removed or replaced (that is refused before review). The service may '
@@ -661,7 +680,8 @@ class AdminOperations:
             if state['step'] in ('connection', 'plan', 'apply', 'initialize', 'migrate',
                                   'migration_bind', 'starter_submit', 'starter_activate',
                                   'update_service_apply', 'project_apply', 'removal_apply', 'recover',
-                                  'home_apply', 'home_disable', 'cleanup_apply', 'cleanup_sweep'):
+                                  'home_apply', 'home_disable', 'cleanup_apply', 'cleanup_sweep',
+                                  'project_lifecycle_apply'):
                 state['effect_sequence'] = state.get('effect_sequence', 0) + 1
             self._save(state)  # Persist the phase before any potentially uncertain effect.
             try:
@@ -1915,6 +1935,53 @@ class AdminOperations:
             atomic_private(path, ''.join(key + '=' + json.dumps(value) + '\n' for key, value in sorted(values.items())))
         self._preflight(state, values, 'removal')
         return True
+
+    def _project_lifecycle(self, state):
+        """Rootless, exact-reviewed cloud transition using the authoritative lifecycle transaction."""
+        from tools.uninstall import lifecycle
+        from tools.uninstall.common import UninstallError
+        try:
+            if state['step'] == 'start':
+                parameters = state['parameters']
+                action = lifecycle.plan_project_id(
+                    self.home, parameters['project_id'], action=parameters['action'],
+                    operation_id=state['operation_id'])
+                details = action['details']
+                project = details['project']
+                review = {
+                    'operation_id': state['operation_id'], 'action': parameters['action'],
+                    'instance_id': details['instance_id'], 'recovery_epoch': details['recovery_epoch'],
+                    'account': details['admin_identity']['account'], 'region': details['config']['region'],
+                    'identity': details['admin_identity'], 'project_id': details['project_id'],
+                    'project_name': project['name'],
+                    'current_state': 'archived' if (project['lifecycle'] or {}).get('archived') else 'active',
+                    'history_retained': True, 'affects_all_machines': True,
+                    'local_binding_changed': False, 'local_detach_performed': False,
+                    'effects': ('Hide project and project-owned content by default; explicit archived-history '
+                                'consultation only; block cloud writes.' if parameters['action'] == 'archive'
+                                else 'Restore default visibility and cloud write eligibility; forgotten or erased '
+                                     'content remains unavailable. Local attachment remains an explicit choice.'),
+                    'work': details['work'], 'lifecycle_action': action,
+                }
+                state['lifecycle_review'] = review
+                state['presentation'] = {'account': review['account'], 'region': review['region'],
+                                         'target': project['name'] + ' (' + details['project_id'] + ')'}
+                self._review(state, 'project_lifecycle', 'Review exact cloud project lifecycle change',
+                             review, 'project_lifecycle_apply',
+                             {'writers_quiescent': details['project_id']})
+            elif state['step'] == 'project_lifecycle_apply':
+                review = state['lifecycle_review']
+                self._approved(state, 'project_lifecycle', review)
+                progress = state.setdefault('lifecycle_progress', {})
+                result = lifecycle.execute(review['lifecycle_action'], progress, lambda: self._save(state))
+                self._receipt(state, 'project_lifecycle_apply', result)
+                state.update(state='completed', outcome=result, live_state_checked=True)
+        except UninstallError as error:
+            # Lifecycle errors are authored safe messages; provider errors have already been redacted.
+            state.update(state='uncertain' if state.get('lifecycle_progress', {}).get('outcome_unresolved')
+                         else 'blocked', error=str(error),
+                         recovery='Inspect status, resolve the prerequisite without abandoning work, then advance '
+                                  'this same operation. Its exact reviewed action and request identity are retained.')
 
     def _uninstall(self, state):
         from tools.uninstall import cli

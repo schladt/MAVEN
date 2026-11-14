@@ -141,6 +141,15 @@ class OwnerValidationTests(unittest.TestCase):
             with self.subTest(request=request), self.assertRaises(validation.MemoryError):
                 validation.validate("/v1/memory/search", request)
 
+    def test_exact_read_archive_opt_in_is_strictly_boolean(self):
+        for value in (True, False):
+            request = {"record_id": str(uuid4()), "revision": 1, "include_archived": value}
+            self.assertIs(validation.validate("/v1/memory/read", request), request)
+        for value in (None, 0, 1, "true", [], {}):
+            with self.subTest(value=value), self.assertRaises(validation.MemoryError) as error:
+                validation.validate("/v1/memory/read", {"record_id": str(uuid4()), "include_archived": value})
+            self.assertEqual(error.exception.metadata["detail"], "include_archived must be a boolean")
+
     def test_named_context_root_requires_a_valid_skill_slug(self):
         request = {"skill_slug": "fixture-skill", "workflow": "different-workflow", "operation": "start-work"}
         validation.validate("/v1/memory/context", request)
@@ -885,8 +894,8 @@ BEGIN
  PERFORM pg_temp.assert_equal((SELECT jsonb_agg(jsonb_build_object('name',x->'name','home',x->'home','archived',x->'archived',
      'active',x->'last_activity'<>'null'::jsonb) ORDER BY ordinality)
    FROM jsonb_array_elements(result->'project_index') WITH ORDINALITY t(x,ordinality) WHERE x->>'project_id' IN (project::text,other_project::text)),
-   '[{"name":"Context fixture","home":true,"archived":false,"active":true},{"name":"Other context","home":false,"archived":true,"active":false}]',
-   'index lists projects by activity with archive state');
+   '[{"name":"Context fixture","home":true,"archived":false,"active":true}]',
+   'index lists only active projects by activity');
  PERFORM pg_temp.assert_equal((SELECT jsonb_agg(DISTINCT k ORDER BY k) FROM jsonb_array_elements(result->'project_index') x, jsonb_object_keys(x) k),
    '["archived","home","last_activity","name","project_id"]','index carries identity only');
  IF jsonb_array_length(result->'project_index')>100 THEN RAISE EXCEPTION 'index unbounded'; END IF;
@@ -1244,6 +1253,155 @@ END $$;
 RESET ROLE;
 """
 
+SQL_PROJECT_ARCHIVE_VISIBILITY = r"""
+DO $$
+DECLARE
+ project uuid; active_project uuid; note uuid; active_note uuid; last_note uuid;
+ forgotten uuid; erased uuid; blocked uuid; archived_page uuid; request jsonb; result jsonb; first_page jsonb;
+ key_id uuid; generation_before bigint; target uuid; entry jsonb; index_value integer;
+BEGIN
+ project:=(pg_temp.write(pg_temp.request('entity','{"entity_type":"project","name":"A archived visibility project","aliases":[]}')
+   || '{"tags":["archive-visibility"]}') ->>'record_id')::uuid;
+ active_project:=(pg_temp.write(pg_temp.request('entity','{"entity_type":"project","name":"Z visible project","aliases":[]}')
+   || '{"tags":["archive-visibility"]}') ->>'record_id')::uuid;
+ request:=pg_temp.request('note','{"title":"Archiveprobe","body_markdown":"Original archive history","category":"reference"}')
+   || jsonb_build_object('project_id',project,'record_id','10000000-0000-0000-0000-000000000001','tags',jsonb_build_array('archive-visibility'));
+ key_id:=(request->>'request_key')::uuid;
+ note:=(pg_temp.write(request)->>'record_id')::uuid;
+ PERFORM pg_temp.write(request || jsonb_build_object('request_key',gen_random_uuid(),'expected_revision',1,
+   'data',jsonb_build_object('title','Archiveprobe','body_markdown',repeat('Archiveprobe ',1700),'category','reference')));
+ active_note:=(pg_temp.write(pg_temp.request('note','{"title":"Visible first","body_markdown":"Archiveprobe","category":"reference"}')
+   || jsonb_build_object('project_id',active_project,'record_id','20000000-0000-0000-0000-000000000001','tags',jsonb_build_array('archive-visibility')))
+   ->>'record_id')::uuid;
+ last_note:=(pg_temp.write(pg_temp.request('note','{"title":"Visible second","body_markdown":"Archiveprobe","category":"reference"}')
+   || jsonb_build_object('record_id','20000000-0000-0000-0000-000000000002','tags',jsonb_build_array('archive-visibility')))
+   ->>'record_id')::uuid;
+ forgotten:=(pg_temp.write(pg_temp.request('note','{"title":"Archiveprobe forgotten","body_markdown":"Hidden","category":"reference"}')
+   || jsonb_build_object('project_id',project,'tags',jsonb_build_array('archive-visibility')))->>'record_id')::uuid;
+ erased:=(pg_temp.write(pg_temp.request('note','{"title":"Archiveprobe erased","body_markdown":"Hidden","category":"reference"}')
+   || jsonb_build_object('project_id',project,'tags',jsonb_build_array('archive-visibility')))->>'record_id')::uuid;
+ blocked:=(pg_temp.write(pg_temp.request('note','{"title":"Archiveprobe source hidden","body_markdown":"Hidden","category":"reference"}')
+   || jsonb_build_object('project_id',project,'tags',jsonb_build_array('archive-visibility')))->>'record_id')::uuid;
+ PERFORM maven.forget_records(ARRAY[forgotten],false,'fixture-owner','Forget before archive',repeat('f',64));
+ PERFORM maven.erase_records(ARRAY[erased],'fixture-owner','Erase before archive',repeat('e',64));
+ UPDATE maven.records SET visibility_state='blocked'
+   WHERE id=(SELECT source_id FROM maven.record_sources WHERE record_id=blocked AND revision=1);
+ archived_page:=pg_temp.publish(jsonb_build_object('slug','zzzz-archive-procedure','page_kind','procedure',
+   'title','Archived procedure','body_markdown','Archived authority','scope',jsonb_build_object('project',project),'authority_state','active'));
+ PERFORM pg_temp.publish('{"slug":"zzzz-visible-procedure","page_kind":"procedure","title":"Visible procedure",
+   "body_markdown":"Visible authority","scope":{},"authority_state":"active"}');
+ SELECT generation INTO generation_before FROM maven.instruction_state WHERE singleton;
+ INSERT INTO maven.project_lifecycle(project_id,archived,generation,action_key,actor_id)
+   VALUES(project,true,1,repeat('a',64),'fixture-owner');
+ PERFORM pg_temp.assert_equal((SELECT to_jsonb(generation) FROM maven.instruction_state WHERE singleton),
+   to_jsonb(generation_before+1),'archive invalidates cached authority once');
+ UPDATE maven.project_lifecycle SET archived=true WHERE project_id=project;
+ PERFORM pg_temp.assert_equal((SELECT to_jsonb(generation) FROM maven.instruction_state WHERE singleton),
+   to_jsonb(generation_before+1),'unchanged archive does not invalidate again');
+ PERFORM pg_temp.assert_equal(to_jsonb(maven.memory_visible(note)),'true','archive is not Forget or Erase');
+ -- Both listing and ranked search exclude before pagination, not after selecting a page.
+ first_page:=maven.memory_request('/v1/memory/search','{"tag":"archive-visibility","kind":"note","limit":1}',NULL,NULL,'fixture-reader',4)->'result';
+ PERFORM pg_temp.assert_equal(first_page->'records'->0->'record_id',to_jsonb(active_note),'listing skips archived first record');
+ PERFORM pg_temp.assert_equal(first_page->'next_after_id',to_jsonb(active_note),'listing next cursor belongs to visible record');
+ result:=maven.memory_search(jsonb_build_object('tag','archive-visibility','kind','note','limit',1,'after_id',first_page->'next_after_id'));
+ PERFORM pg_temp.assert_equal(result->'records'->0->'record_id',to_jsonb(last_note),'listing second visible page');
+ PERFORM pg_temp.assert_equal(result->'next_after_id','null','listing ends without hidden-only page');
+ first_page:=maven.memory_search('{"tag":"archive-visibility","kind":"note","query":"Archiveprobe","limit":1}');
+ PERFORM pg_temp.assert_equal(first_page->'records'->0->'record_id',to_jsonb(active_note),'ranked page excludes highest archived score');
+ PERFORM pg_temp.assert_equal(first_page->'next_offset','1','ranked visible next offset');
+ result:=maven.memory_search('{"tag":"archive-visibility","kind":"note","query":"Archiveprobe","limit":1,"offset":1}');
+ PERFORM pg_temp.assert_equal(result->'records'->0->'record_id',to_jsonb(last_note),'ranked second visible page');
+ PERFORM pg_temp.assert_equal(result->'next_offset','null','ranked ends without hidden-only page');
+ FOREACH request IN ARRAY ARRAY[
+   '{"tag":"archive-visibility","kind":"note","scope":"all"}'::jsonb,
+   jsonb_build_object('tag','archive-visibility','kind','note','scope','context','project_id',project),
+   jsonb_build_object('tag','archive-visibility','kind','note','project_id',project),
+   jsonb_build_object('tag','archive-visibility','kind','note','scope','project','project_id',project)] LOOP
+   FOR entry IN SELECT value FROM jsonb_array_elements(maven.memory_search(request)->'records') LOOP
+     IF entry->'project_id'=to_jsonb(project) THEN RAISE EXCEPTION 'archived project leaked through scope'; END IF;
+   END LOOP;
+ END LOOP;
+ result:=maven.memory_search('{"tag":"archive-visibility","kind":"entity","scope":"universal"}');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(result->'records')),'1','archived project entity hidden despite null project_id');
+ PERFORM pg_temp.assert_equal(result->'records'->0->'record_id',to_jsonb(active_project),'active entity remains discoverable');
+ FOR request IN SELECT value FROM jsonb_array_elements('[{"include_archived":true},{"include_archived":true,"query":"Archiveprobe"}]') LOOP
+   result:=maven.memory_search(request || '{"tag":"archive-visibility","kind":"note"}');
+   PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(result->'records')),'3','explicit history retains visibility and source guards');
+   PERFORM pg_temp.assert_equal((SELECT value->'project_archived' FROM jsonb_array_elements(result->'records')
+     WHERE value->'record_id'=to_jsonb(note)),'true','archived search header labels history');
+ END LOOP;
+ -- Default current/historical exact reads deny both entity and owned content.
+ FOREACH target IN ARRAY ARRAY[project,note] LOOP
+   PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',target)),
+     '{"status":"record_unavailable"}','default exact archive read denied');
+   PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',target,'revision',1,'include_archived',false)),
+     '{"status":"record_unavailable"}','default historical archive read denied');
+   result:=maven.memory_request('/v1/memory/read',jsonb_build_object('record_id',target,'include_archived',true),
+     NULL,NULL,'fixture-reader',4)->'result';
+   PERFORM pg_temp.assert_equal(result->'record_id',to_jsonb(target),'explicit archived read succeeds');
+   PERFORM pg_temp.assert_equal(result->'operative','false','archived memory never activates authority');
+   PERFORM pg_temp.assert_equal(result->'project_archived','true','read identifies archived history');
+ END LOOP;
+ result:=maven.memory_read(jsonb_build_object('record_id',note,'revision',1,'include_archived',true));
+ PERFORM pg_temp.assert_equal(result->'data'->'body_markdown','"Original archive history"','archival preserves exact historical content');
+ FOREACH target IN ARRAY ARRAY[forgotten,erased,blocked] LOOP
+   PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',target,'revision',1,'include_archived',true)),
+     '{"status":"record_unavailable"}','archive opt-in never overrides cleanup or source visibility');
+ END LOOP;
+ PERFORM pg_temp.assert_equal(maven.memory_revisions(jsonb_build_object('record_ids',jsonb_build_array(project,note,active_note)))->'revisions',
+   jsonb_build_object(active_note::text,1),'revision lookup does not reveal archived headers');
+ PERFORM pg_temp.assert_equal(maven.memory_lookup(key_id),NULL,'receipt lookup does not rediscover archive');
+ IF EXISTS (SELECT 1 FROM jsonb_array_elements(maven.cleanup_candidates()->'candidates') c
+   WHERE c->'record_id'=to_jsonb(note) OR c->'project_id'=to_jsonb(project)) THEN
+   RAISE EXCEPTION 'cleanup discovery leaked archived project';
+ END IF;
+ FOREACH request IN ARRAY ARRAY[
+   jsonb_build_object('project_id',project),jsonb_build_object('project_id',project,'include_archived',true)] LOOP
+   PERFORM pg_temp.assert_equal(maven.memory_context(request),'{"status":"project_archived"}','governed authority cannot opt into archive');
+   PERFORM pg_temp.assert_equal(maven.memory_project_context(request || jsonb_build_object('session_id',gen_random_uuid())),
+     '{"status":"project_archived"}','startup cannot opt into archive');
+ END LOOP;
+ result:=maven.instruction_index('{"page_kind":"procedure","after_slug":"zzzz-","limit":1}');
+ PERFORM pg_temp.assert_equal(result->'pages'->0->'slug','"zzzz-visible-procedure"','authority index excludes archive before limit');
+ PERFORM pg_temp.assert_equal(result->'next_after_slug','null','authority index has no hidden-only cursor');
+ PERFORM pg_temp.assert_equal(maven.instruction_read('{"slug":"zzzz-archive-procedure","expected_revision":99}'),
+   '{"status":"page_unavailable"}','page read hides even archived revision metadata');
+ PERFORM pg_temp.assert_equal(maven.instruction_read('{"slug":"zzzz-archive-procedure","revision":1}'),
+   '{"status":"page_unavailable"}','raw page history cannot activate archived authority');
+ PERFORM pg_temp.assert_equal(maven.instruction_read(jsonb_build_object('proposal_id',
+   (SELECT p.proposal_id FROM maven.page_publications p WHERE p.page_id=archived_page AND p.revision=1))),
+   '{"status":"proposal_unavailable"}','raw archived proposal hidden');
+ BEGIN
+   PERFORM pg_temp.write(pg_temp.request('session','{"state":"active","summary":"Must not start"}') || jsonb_build_object('project_id',project));
+   RAISE EXCEPTION 'archived project accepted a new session';
+ EXCEPTION WHEN SQLSTATE '55000' THEN
+   IF SQLERRM<>'project_archived' THEN RAISE; END IF;
+ END;
+ -- More than one page of archived entries cannot crowd out active Home projects.
+ FOR index_value IN 1..101 LOOP
+   target:=(pg_temp.write(pg_temp.request('entity',jsonb_build_object('entity_type','project',
+     'name','A archived filler ' || index_value,'aliases','[]'::jsonb)))->>'record_id')::uuid;
+   INSERT INTO maven.project_lifecycle(project_id,archived,generation,action_key,actor_id)
+     VALUES(target,true,1,repeat('b',64),'fixture-owner');
+ END LOOP;
+ result:=maven.memory_project_index(active_project);
+ IF NOT EXISTS (SELECT 1 FROM jsonb_array_elements(result) p WHERE p->'project_id'=to_jsonb(active_project)) THEN
+   RAISE EXCEPTION 'Home applied archive exclusion after its limit';
+ END IF;
+ IF EXISTS (SELECT 1 FROM jsonb_array_elements(result) p WHERE maven.project_archived((p->>'project_id')::uuid)) THEN
+   RAISE EXCEPTION 'Home leaked archived project';
+ END IF;
+ SELECT generation INTO generation_before FROM maven.instruction_state WHERE singleton;
+ UPDATE maven.project_lifecycle SET archived=false,generation=generation+1 WHERE project_id=project;
+ PERFORM pg_temp.assert_equal((SELECT to_jsonb(generation) FROM maven.instruction_state WHERE singleton),
+   to_jsonb(generation_before+1),'reactivation invalidates cached authority');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',note))->'project_archived','false','reactivation restores default read');
+ PERFORM pg_temp.assert_equal(maven.instruction_read('{"slug":"zzzz-archive-procedure"}')->'operative','true','explicit reactivation restores authority');
+ PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',forgotten,'include_archived',true)),
+   '{"status":"record_unavailable"}','reactivation never restores forgotten memory');
+END $$;
+"""
+
 SQL_APPLICATION_STATE_LOCK = r"""
 CREATE ROLE maven_state_guard_fixture;
 GRANT USAGE ON SCHEMA maven TO maven_state_guard_fixture;
@@ -1300,6 +1458,8 @@ class OwnerPostgreSQLTests(unittest.TestCase):
             "SAVEPOINT performance; SET CONSTRAINTS ALL DEFERRED;", SQL_PERFORMANCE,
             "SET CONSTRAINTS ALL IMMEDIATE;", SQL_DISPATCH_ROLE,
             "ROLLBACK TO SAVEPOINT performance; RELEASE SAVEPOINT performance;",
+            "SAVEPOINT archive_visibility; SET CONSTRAINTS ALL DEFERRED;", SQL_PROJECT_ARCHIVE_VISIBILITY,
+            "SET CONSTRAINTS ALL IMMEDIATE; ROLLBACK TO SAVEPOINT archive_visibility; RELEASE SAVEPOINT archive_visibility;",
             "CREATE TEMP TABLE fixture_wire AS " + store.json_result_sql(read_expression) + ";",
             "CREATE TEMP SEQUENCE fixture_evaluation;",
             "CREATE TEMP TABLE fixture_once AS " + store.json_result_sql(once_expression) + ";",

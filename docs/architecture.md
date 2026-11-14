@@ -73,6 +73,12 @@ rate limits, login) reported as memory unavailable, from definitive rejections c
 a bounded `detail` that names the offending field or kind, never its value. Ranked search
 matches every query term at word boundaries in title, tags or body and returns snippets;
 records tagged `archived` or with `data.state` `archived` are excluded unless requested.
+Project lifecycle archival is separate from record tags. Migration `017` excludes
+archived project entities and owned records before search ranking/pagination, and
+from default exact reads, Home discovery, context and instruction routes. Explicit
+`include_archived` on memory search/read permits historical reference only; it never
+overrides Forget/Erase or enables project work. Archive/reactivate transitions advance
+authority generation so cached instruction context must be revalidated.
 
 Memory checkpoints record the session, explicit accepted-work cutoff, exact
 record/revision manifest and truthful handover. Included work must finish before saved

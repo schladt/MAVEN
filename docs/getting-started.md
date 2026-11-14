@@ -348,8 +348,9 @@ Set it up, change it or disable it with **“Set up or change MAVEN Home”** in
 installer, or ask the assistant (`maven_admin` kind `home`). Disabling leaves cloud
 data untouched. Home is the one explicit, owner-configured exception to MAVEN never
 choosing a root by itself. A Home session also starts with a short **project index**:
-every MAVEN project's name, archived state and last activity (up to 100), with no
-project details, so the assistant knows what exists and which project to open.
+up to 100 non-archived projects' names and last activity, with no project details,
+so the assistant knows what exists and which project to open. Archived projects
+appear only when you explicitly request archived-history discovery.
 
 To use the same Home knowledge on another machine, select the **same existing cloud
 project ID** during Home setup. Names are labels, not identity. For a folder already
@@ -785,21 +786,30 @@ cloud work before removing installed tools.
 
 ### Project memory and local originals
 
-`--archive-project` explicitly archives the cloud project, affecting **all**
-checkouts using that project, not only the selected folder. History stays readable;
-new project work is blocked. Clean closure/reconciliation is required for archival.
-Archive/reactivate requires explicit migration using current tooling:
+Ask **“Archive cloud project …”** or **“Reactivate cloud project …”** in your harness.
+The assistant resolves the exact project ID and uses `maven_admin` kind
+`project_lifecycle`, with `action` (`archive` or `reactivate`) and `project_id`.
+No local folder, temporary project binding or uninstall is required.
 
-```sh
-maven-memory install migrate --confirm-instance "$INSTANCE_ID"
-maven-uninstall plan --reactivate-project "$PROJECT_ROOT" \
-  --home "$MAVEN_HOME" --output "$PRIVATE_OPERATION_DIRECTORY"
-```
+The review identifies the AWS account, region, instance, administration identity,
+project name/ID, current state and all-machines impact. Actual stopped-writer
+confirmation and exact approval are required; active sessions, live claims and
+unresolved operations block the transition. Original receipts survive interruption.
+No folder, local binding, Home selection or cloud resource is removed.
 
-Review migration separately before running it; uninstall never migrates implicitly.
-Reactivation uses the current binding or one unambiguous, digest-verified preserved
-`detached-project-*.json` binding. It restores cloud eligibility, not local attachment;
-select the project again through `maven-project setup` when ready.
+Archival preserves history but hides the project and its contents from normal
+discovery, reads and Home's project list, and blocks new project work. Ask explicitly
+to consult archived history; reactivation is a separate reviewed action. Neither
+action restores forgotten/erased content or erases already-loaded conversations.
+
+Existing installations need **Update MAVEN**, including approved database migration
+`017_project_archive_visibility.sql` and service/validator deployment. Direct archive
+refuses to proceed without the migration; it never migrates implicitly.
+
+The existing uninstall options `--archive-project` and `--reactivate-project` remain
+available for their separately reviewed removal workflows and preserved plans.
+Reactivation restores cloud eligibility, not local attachment; select the project
+again through project setup when needed.
 
 Project removal preserves originals, receipts, and ignore protection by default.
 Machine removal deletes the whole installation folder as its final step, after

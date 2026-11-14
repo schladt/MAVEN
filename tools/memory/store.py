@@ -249,7 +249,8 @@ ROUTE_STATUSES = {"revision_conflict", "idempotency_conflict", "record_unavailab
                   "proposal_unavailable", "page_unavailable", "proposal_conflict",
                   "approval_invalid", "invalid_request", "claim_conflict", "setting_conflict",
                   "reference_unavailable", "session_unavailable", "client_incompatible",
-                  "context_incomplete", "dependency_unavailable", "dependency_conflict", "context_stale"}
+                  "context_incomplete", "dependency_unavailable", "dependency_conflict", "context_stale",
+                  "project_archived"}
 DISPATCH = ("maven.memory_request(:route, CAST(:request AS jsonb), :request_hash, :candidate_hash, "
             ":actor, CAST(:protocol AS integer))")
 

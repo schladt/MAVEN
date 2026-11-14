@@ -198,16 +198,25 @@ def project_sessions(client, project_id, *, maximum=100):
     sessions, cursor = [], None
     while len(sessions) < maximum:
         body = {'scope': 'project', 'project_id': project_id, 'kind': 'session',
-                'limit': min(20, maximum - len(sessions)), 'include_archived': True}
+                'limit': min(20, maximum - len(sessions))}
         if cursor:
             body['after_id'] = cursor
         response = client.invoke('/v1/memory/search', body)
         page = response.get('data')
         if response.get('status') != 'ready' or not isinstance(page, dict) or not isinstance(page.get('records'), list):
             raise BoundaryError('project session inspection returned no verified result')
-        for record in page['records']:
-            if record.get('project_id') != project_id or record.get('kind') != 'session' or record.get('data_scope') != 'owner':
+        for summary in page['records']:
+            if summary.get('project_id') != project_id or summary.get('kind') != 'session' or summary.get('data_scope') != 'owner':
                 raise BoundaryError('session inspection returned a different project or scope')
+            # Search returns headers, not session bodies or timestamps. Read the
+            # current record so peer state and its revision come from one result.
+            response = client.invoke('/v1/memory/read', {'record_id': summary['record_id']})
+            record = response.get('data')
+            if (response.get('status') != 'ready' or not isinstance(record, dict)
+                    or record.get('record_id') != summary['record_id']
+                    or record.get('project_id') != project_id or record.get('kind') != 'session'
+                    or record.get('data_scope') != 'owner' or not isinstance(record.get('data'), dict)):
+                raise BoundaryError('the listed cloud session could not be verified')
             data = record['data']
             try:
                 meta = json.loads(data.get('summary', '{}'))
@@ -215,7 +224,7 @@ def project_sessions(client, project_id, *, maximum=100):
                 meta = {}
             if not isinstance(meta, dict):
                 meta = {}
-            updated = record.get('updated_at')
+            updated = record.get('recorded_at')
             old = False
             if updated:
                 try:

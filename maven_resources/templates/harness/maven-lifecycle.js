@@ -7,6 +7,7 @@ const HOOK_COMMAND = __MAVEN_HOOK_JSON__;
 export default function mavenLifecycle(pi) {
     let conversation;
     let pending;
+    let startupRequest;
     let stopped = false;
 
     function identity(ctx) {
@@ -31,6 +32,10 @@ export default function mavenLifecycle(pi) {
         ctx.ui.notify(`MAVEN: ${String(error)}. Session kept open; no verified wrap-up.`, "warning");
     }
 
+    function startupUnavailable(ctx, error) {
+        ctx.ui.notify(`MAVEN startup unavailable: ${String(error)}. Readiness is not established.`, "warning");
+    }
+
     async function startup(_event, ctx) {
         try {
             if (ctx.agent?.kind === "sub") return;
@@ -42,17 +47,31 @@ export default function mavenLifecycle(pi) {
             conversation = native;
             pending = undefined;
             stopped = false;
+            const request = { native, cwd: ctx.cwd };
+            startupRequest = request;
+            const current = () => !stopped && startupRequest === request &&
+                identity(ctx) === request.native && ctx.cwd === request.cwd;
             const result = await inspect(ctx, "startup");
+            if (!current()) return;
             if (typeof result.instruction !== "string" || !result.instruction) throw new Error("Startup context unavailable");
             // Generated instructions are agent-attributed, never fabricated owner consent.
             if (ctx.mode === "tui") {
-                await pi.sendUserMessage(result.instruction, { attribution: "agent" });
+                // sendUserMessage waits for the model turn, not just prompt admission.
+                // Managed deferred work must not hold the host's startup event open.
+                ctx.setTimeout(async () => {
+                    try {
+                        if (!current()) return;
+                        await pi.sendUserMessage(result.instruction, { attribution: "agent" });
+                    } catch (error) {
+                        startupUnavailable(ctx, error);
+                    }
+                }, 0);
             } else {
                 pi.sendMessage({ customType: "maven-startup", content: result.instruction, display: false },
                     { deliverAs: "nextTurn", triggerTurn: false });
             }
         } catch (error) {
-            ctx.ui.notify(`MAVEN startup unavailable: ${String(error)}. Readiness is not established.`, "warning");
+            startupUnavailable(ctx, error);
         }
     }
 

@@ -499,6 +499,53 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.app.binding)
         self.assertFalse(any(route == '/v1/memory/write' for route, _ in self.cloud.calls))
 
+    async def test_archived_history_opt_in_does_not_escape_read_scope_or_persist(self):
+        _, home_project = self.configure_home()
+        await self.initialize()
+        other_project = str(uuid.uuid4())
+        identifiers = {}
+        for name, owner in (('project', None), ('home_note', home_project), ('other_note', other_project)):
+            identifier = identifiers[name] = other_project if name == 'project' else str(uuid.uuid4())
+            self.cloud.records[identifier] = {
+                'record_id': identifier, 'kind': 'entity' if name == 'project' else 'note',
+                'revision': 1, 'project_id': owner, 'tags': [],
+                'classification': 'Sensitive', 'data_scope': 'owner',
+                'data': {'entity_type': 'project', 'name': 'Retired project'} if name == 'project'
+                else {'title': name, 'body_markdown': 'Retained history', 'category': 'work'}}
+        original = self.cloud.invoke
+
+        def invoke(route, body):
+            # Service contract: archived project entities and their records require
+            # an explicit opt-in on every read, including exact revision requests.
+            if (route == '/v1/memory/read' and body['record_id'] in identifiers.values()
+                    and not body.get('include_archived')):
+                raise MemoryClientError('record_unavailable')
+            return original(route, body)
+
+        with patch.object(self.cloud, 'invoke', side_effect=invoke), \
+                patch.object(self.app, 'unbound_client', return_value=self.cloud):
+            for arguments in (
+                {'record_id': identifiers['other_note'], 'scope': 'all'},
+                {'record_id': identifiers['project'], 'unbound': True},
+                {'record_id': identifiers['home_note'], 'unbound': True, 'include_home': True},
+            ):
+                with self.subTest(arguments=arguments):
+                    denied, error = await self.call('maven_read', arguments)
+                    self.assertTrue(denied.is_error)
+                    self.assertEqual(error['error'], 'record_unavailable')
+                    accepted, record = await self.call('maven_read', dict(arguments, include_archived=True))
+                    self.assertFalse(accepted.is_error, record)
+                    self.assertEqual(record['record_id'], arguments['record_id'])
+                    self.assertEqual(record['data'], self.cloud.records[arguments['record_id']]['data'])
+                    denied_again, error = await self.call('maven_read', arguments)
+                    self.assertTrue(denied_again.is_error)
+                    self.assertEqual(error['error'], 'record_unavailable')
+            # The history opt-in is not permission to cross an unbound Home scope.
+            denied, _ = await self.call('maven_read', {
+                'record_id': identifiers['other_note'], 'unbound': True,
+                'include_home': True, 'include_archived': True})
+            self.assertTrue(denied.is_error)
+
     async def test_home_tool_schemas(self):
         tools = {tool.name: tool for tool in await self.server.list_tools()}
         self.assertIn('cwd', tools['maven_status'].input_schema['properties'])
