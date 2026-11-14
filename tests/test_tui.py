@@ -587,6 +587,30 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(result['state'], state)
                         await pilot.press('ctrl+q')
 
+    async def test_local_update_handoff_does_not_request_aws_sign_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, identifier = Path(directory), str(uuid4())
+            command = ['python3', '/checkout/install.py', '--home', str(home)]
+            reason = 'Install the selected checkout, then restart this process.'
+            controller = Mock()
+            controller.status.return_value = {
+                'operation_id': identifier, 'state': 'blocked', 'step': 'update_local_wait',
+                'pending_interaction': None,
+                'handoff': {'type': 'local_update', 'reason': reason,
+                            'command': command, 'environment': {}}}
+            with patch('tools.tui.administration.AdminOperations', return_value=controller):
+                app = WorkflowApp('Update MAVEN', ['update_local_wait'],
+                                  lambda ui: present(ui, home, operation_id=identifier))
+                async with app.run_test(size=(100, 34)) as pilot:
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, ReviewScreen)
+                    body = app.screen.query_one('#review-body', TextArea).text
+                    self.assertIn(reason, body)
+                    self.assertIn(' '.join(command), body)
+                    self.assertNotIn('sign-in', body.casefold())
+                    await pilot.press('ctrl+q')
+                    controller.advance.assert_not_called()
+
     async def test_destructive_action_requires_exact_six_character_or_short_identity(self):
         for identity in ('abcdef-long-target-identity', 'abc'):
             with self.subTest(identity=identity), tempfile.TemporaryDirectory() as directory:

@@ -21,6 +21,35 @@ from tools.harness import (
 
 
 class InstallerTests(unittest.TestCase):
+    def test_package_source_excludes_stale_build_outputs_and_preserves_checkout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            for name in ('pyproject.toml', 'README.md', 'LICENSE'):
+                (source / name).write_text('fixture')
+            for package in ('tools', 'maven_resources'):
+                (source / package).mkdir()
+                (source / package / '__init__.py').write_text('')
+            stale = source / 'build/lib/maven_resources/templates/skills/retired/SKILL.md'
+            stale.parent.mkdir(parents=True)
+            stale.write_text('retired instructions must not return')
+            metadata = source / 'maven_cloud_memory.egg-info'
+            metadata.mkdir()
+            (metadata / 'SOURCES.txt').write_text(str(stale.relative_to(source)))
+            current = source / 'maven_resources/templates/skills/current/SKILL.md'
+            current.parent.mkdir(parents=True)
+            current.write_text('current instructions')
+            with install._package_source(source) as first:
+                self.assertTrue((first / current.relative_to(source)).is_file())
+                self.assertFalse((first / 'build').exists())
+                self.assertFalse((first / metadata.name).exists())
+                self.assertFalse(any(first.rglob('retired')))
+            self.assertFalse(first.exists())
+            current.unlink()
+            with install._package_source(source) as second:
+                self.assertFalse((second / current.relative_to(source)).exists())
+            self.assertTrue(stale.is_file())
+            self.assertTrue((metadata / 'SOURCES.txt').is_file())
+
     def test_unrelated_venv_directory_and_existing_settings_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve()

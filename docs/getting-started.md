@@ -633,6 +633,12 @@ themselves. The guided update applies them as one resumable setup operation in m
 | Service | Deployed template vs the current template built from the live stack's parameters (maintenance access) | Reviewed `UPDATE` change set; removal/replacement of RDS, Secrets Manager, S3 or KMS resources is refused before review; reconnects from the updated outputs |
 | Instructions | Active page content hashes vs the bundled catalog | Optional; one collection approval proposes and activates new and changed pages at their current revisions |
 
+Local installation builds from a fresh temporary copy of the package sources and
+metadata. Existing checkout `build/` and `*.egg-info` directories are left untouched
+and cannot reintroduce files removed from the source. If setup is waiting at
+**Update local software**, complete the local installer handoff and restart setup
+with the same operation ID; that prerequisite is not an AWS sign-in request.
+
 Each stage that is already current passes without a question. A change set is created
 only to review it; execution needs approval. First inspect pending publication, setup
 and removal receipts. Resolve incompatible operations through their original supported

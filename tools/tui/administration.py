@@ -132,7 +132,10 @@ def _context(result, stage):
 def _instructions(result, home, identifier):
     stage = _stage_name(result.get('step', ''))
     handoff = result.get('handoff')
-    error = result.get('error') or ('AWS sign-in required.' if handoff else 'External prerequisite required.')
+    prerequisite = ('AWS sign-in required.' if handoff and handoff.get('type') == 'aws_login'
+                    else 'Local software update required.' if handoff and handoff.get('type') == 'local_update'
+                    else 'External prerequisite required.')
+    error = result.get('error') or prerequisite
     instructions = [f'Stopped at: {stage} (step "{result.get("step", "unknown")}")', f'Error: {error}']
     if error in _CODE_HELP:
         instructions.append(_CODE_HELP[error])

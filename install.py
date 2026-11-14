@@ -15,6 +15,7 @@ import ssl
 import stat
 import subprocess
 import sys
+import tempfile
 
 from uuid import UUID
 from tools.interaction import Field, OperationPaused, checkpoint, current, message, require, stage
@@ -504,6 +505,19 @@ def _install_command(command):
     return result
 
 
+@contextlib.contextmanager
+def _package_source(source):
+    """Build from current distribution inputs, never stale checkout build/egg-info output."""
+    with tempfile.TemporaryDirectory(prefix='maven-package-') as directory:
+        clean = Path(directory)
+        for name in ('pyproject.toml', 'README.md', 'LICENSE'):
+            shutil.copy2(source / name, clean / name)
+        for name in ('tools', 'maven_resources'):
+            shutil.copytree(source / name, clean / name,
+                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        yield clean
+
+
 def _install(args, handoff=None):
     installation_locks = contextlib.ExitStack()
     try:
@@ -645,8 +659,9 @@ def _install(args, handoff=None):
         pip_ready = subprocess.run([str(python), '-m', 'pip', '--version'], capture_output=True, text=True)
         if pip_ready.returncode:
             _install_command([str(python), '-m', 'ensurepip', '--upgrade'])
-        package = str(source) + ('[ui,mcp,google]' if args.google else '[ui,mcp]')
-        _install_command([str(python), '-m', 'pip', 'install', '--upgrade', package])
+        with _package_source(source) as package_source:
+            package = str(package_source) + ('[ui,mcp,google]' if args.google else '[ui,mcp]')
+            _install_command([str(python), '-m', 'pip', 'install', '--upgrade', package])
         # pip derives entry-point mode from its umask. Never leave 0775 launchers
         # for the harness reader, which correctly rejects group-writable files.
         for name in ('maven-mcp', 'maven-session-hook'):
