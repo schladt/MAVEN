@@ -51,6 +51,7 @@
       "slug": "maven-secrets",
       "page_kind": "skill",
       "title": "Optional owner-reviewed secret catalog and encrypted-file operations",
+      "description": "Store, list, look up and use owner secrets (SSM + encrypted files) by <domain>.<service> name via the Home catalog; values never enter chat, argv or memory. Load before handling any credential.",
       "requires": [
         "maven"
       ]

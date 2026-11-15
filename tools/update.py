@@ -232,13 +232,26 @@ def authority_changes(client) -> list[dict]:
             changes.append({'slug': candidate['slug'], 'title': candidate['title'], 'action': 'add',
                             'page_id': None, 'revision': 0, 'candidate': candidate, 'diff': ''})
         elif current.get('content_hash') != digest(candidate):
-            body = client.read_full({'slug': candidate['slug']})['data']['body_markdown']
-            diff = ''.join(difflib.unified_diff(body.splitlines(keepends=True),
+            published = client.read_full({'slug': candidate['slug'], 'expected_revision': current['revision']})['data']
+            # Omission is not an instruction to erase an owner's approved discovery description.
+            if candidate['page_kind'] == 'skill' and 'description' not in candidate and 'description' in published:
+                candidate = {**candidate, 'description': published['description']}
+            if digest(candidate) == current['content_hash']:
+                continue
+            diff = ''.join(difflib.unified_diff(published['body_markdown'].splitlines(keepends=True),
                                                 candidate['body_markdown'].splitlines(keepends=True),
                                                 f'active/{candidate["slug"]}.md', f'bundled/{candidate["slug"]}.md'))
+            metadata_keys = ('slug', 'page_kind', 'title', 'scope', 'requires', 'bundle', 'description')
+            before = {key: published[key] for key in metadata_keys if key in published}
+            before['authority_state'] = published['candidate_authority_state']
+            after = {key: value for key, value in candidate.items() if key != 'body_markdown'}
+            diff += ''.join(difflib.unified_diff(
+                (json.dumps(before, indent=2, sort_keys=True, ensure_ascii=False) + '\n').splitlines(keepends=True),
+                (json.dumps(after, indent=2, sort_keys=True, ensure_ascii=False) + '\n').splitlines(keepends=True),
+                f'active/{candidate["slug"]}.metadata.json', f'bundled/{candidate["slug"]}.metadata.json'))
             changes.append({'slug': candidate['slug'], 'title': candidate['title'], 'action': 'update',
                             'page_id': current['page_id'], 'revision': current['revision'],
-                            'candidate': candidate, 'diff': diff or '(metadata such as title or dependencies changed)'})
+                            'candidate': candidate, 'diff': diff})
     return changes
 
 

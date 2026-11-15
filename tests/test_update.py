@@ -1,6 +1,7 @@
 """Local update inspection and installer-owned skill upgrades in temporary homes."""
 import base64
 import hashlib
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -117,10 +118,69 @@ class CloudInspectionTests(unittest.TestCase):
         client.invoke.return_value = {'status': 'ready', 'data': {'authority_generation': 4, 'next_after_slug': None, 'pages': [
             {'slug': current['slug'], 'page_id': 'a', 'revision': 2, 'content_hash': digest(current)},
             {'slug': changed['slug'], 'page_id': 'b', 'revision': 5, 'content_hash': '0' * 64}]}}
-        client.read_full.return_value = {'data': {'body_markdown': 'older body\n'}}
+        client.read_full.return_value = {'data': {**changed, 'body_markdown': 'older body\n',
+                                                'candidate_authority_state': changed['authority_state']}}
         changes = {change['slug']: change for change in update.authority_changes(client)}
         self.assertNotIn(current['slug'], changes)
         self.assertEqual((changes[changed['slug']]['action'], changes[changed['slug']]['page_id'],
                           changes[changed['slug']]['revision']), ('update', 'b', 5))
         self.assertIn('-older body', changes[changed['slug']]['diff'])
         self.assertTrue(all(changes[candidate['slug']]['action'] == 'add' for candidate in candidates[2:]))
+
+    def test_bundled_secret_description_reaches_prepared_proposal(self):
+        from tools.memory.onboarding import prepare
+        expected = ('Store, list, look up and use owner secrets (SSM + encrypted files) by <domain>.<service> '
+                    'name via the Home catalog; values never enter chat, argv or memory. Load before handling any credential.')
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'drafts'
+            prepare(target, source_origin='owner fixture', source_excerpt='Prepare local review only')
+            proposal = json.loads((target / 'maven-secrets.json').read_text())
+        self.assertEqual(proposal['candidate']['description'], expected)
+
+    def test_omitted_description_is_preserved_without_spurious_update(self):
+        from tools.memory.onboarding import catalog
+        from tools.memory.validation import digest
+        candidate = next(page for page in catalog()[0] if page['slug'] == 'maven-memory')
+        for body_changed in (False, True):
+            with self.subTest(body_changed=body_changed):
+                published = {**candidate, 'description': 'Owner-approved discovery guidance.'}
+                if body_changed:
+                    published['body_markdown'] = 'Earlier approved instruction body.\n'
+                client = Mock()
+                client.invoke.return_value = {'status': 'ready', 'data': {
+                    'authority_generation': 4, 'next_after_slug': None, 'pages': [{
+                        'slug': candidate['slug'], 'page_id': '10000000-0000-4000-8000-000000000001',
+                        'revision': 5, 'content_hash': digest(published)}]}}
+                client.read_full.return_value = {'data': {**published, 'candidate_authority_state': 'active'}}
+                with patch('tools.memory.onboarding.catalog', return_value=([candidate], {})):
+                    changes = update.authority_changes(client)
+                client.read_full.assert_called_once_with({'slug': candidate['slug'], 'expected_revision': 5})
+                if not body_changed:
+                    self.assertEqual(changes, [])
+                else:
+                    self.assertEqual(changes[0]['candidate']['description'], published['description'])
+                    with tempfile.TemporaryDirectory() as directory:
+                        target = Path(directory) / 'review'
+                        update.prepare_authority_update(target, changes, {
+                            'origin': 'owner fixture', 'excerpt': 'Prepare reviewed update'})
+                        from tools.setup_starter import collection
+                        review = collection(target, {})
+                    self.assertEqual(review['pages'][0]['candidate']['description'], published['description'])
+
+    def test_explicit_description_change_has_exact_metadata_diff_with_unchanged_body(self):
+        from tools.memory.onboarding import catalog
+        from tools.memory.validation import digest
+        candidate = next(page for page in catalog()[0] if page['slug'] == 'maven-secrets')
+        published = {**candidate, 'description': 'Earlier owner description.'}
+        client = Mock()
+        client.invoke.return_value = {'status': 'ready', 'data': {
+            'authority_generation': 4, 'next_after_slug': None, 'pages': [{
+                'slug': candidate['slug'], 'page_id': '10000000-0000-4000-8000-000000000001',
+                'revision': 5, 'content_hash': digest(published)}]}}
+        client.read_full.return_value = {'data': {**published, 'candidate_authority_state': 'active'}}
+        with patch('tools.memory.onboarding.catalog', return_value=([candidate], {})):
+            change = update.authority_changes(client)[0]
+        self.assertEqual(change['candidate'], candidate)
+        self.assertIn('-  "description": "Earlier owner description."', change['diff'])
+        self.assertIn('+  "description": ' + json.dumps(candidate['description']), change['diff'])
+        self.assertIn('.metadata.json', change['diff'])

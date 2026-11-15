@@ -291,6 +291,13 @@ within their reviewed constraints; single-use grants pin invocation/digest and e
 and are consumed atomically across hosts. Missing/stale policy fails closed.
 Never rerun after uncertain consumption or execution.
 
+Reusing consumed authorization returns `invocation_consumed`, with guidance to
+prepare a new invocation and obtain any required fresh approval—not inspect session
+status or replay the old attempt. Other explicit authorization denials return
+`adapter_not_authorized`. The service does not distinguish grant expiry from binding
+mismatches in that response, so the client does not invent a `grant_expired` diagnosis.
+Both refusals stop before secret retrieval or program execution.
+
 Publication results distinguish `draft` (verified proposal receipt), `failed`
 (definitive rejection with a bounded error code), and `outcome_unknown` (no verified
 receipt). An unknown outcome is not a queued or existing draft: do not proceed to

@@ -263,6 +263,22 @@ class AdapterControllerTests(unittest.TestCase):
         controller.catalog.lookup.assert_not_called()
         controller.store.read_secret.assert_not_called()
 
+    def test_consumption_refusal_keeps_specific_code_without_reading_or_running(self):
+        for code, expected in (('claim_conflict', 'invocation_consumed'),
+                               ('not_authorized', 'adapter_not_authorized')):
+            for as_response in (False, True):
+                with self.subTest(code=code, as_response=as_response):
+                    client = Mock()
+                    refusal = {'status': code} if as_response else MemoryClientError(code)
+                    client.invoke.side_effect = [ready(policy()), refusal]
+                    controller = self.controller(client)
+                    with patch.object(adapters, 'run_adapter') as run:
+                        with self.assertRaisesRegex(contracts.AdapterError, '^' + expected + '$'):
+                            controller.execute(invocation=invocation(), grant='secret-grant-fixture', grant_revision=1)
+                    controller.catalog.lookup.assert_not_called()
+                    controller.store.read_secret.assert_not_called()
+                    run.assert_not_called()
+
     def test_consumed_invocation_cannot_retry_after_uncertain_network(self):
         request = invocation()
         seen = set()

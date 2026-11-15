@@ -29,6 +29,10 @@ _PUBLICATION_REJECTIONS = DEFINITIVE_MUTATION_ERRORS | {
     'proposal_conflict', 'approval_invalid', 'authentication_required',
     'client_incompatible', 'proposal_unavailable',
 }
+_CONSUMPTION_REFUSALS = {
+    'claim_conflict': 'invocation_consumed',
+    'not_authorized': 'adapter_not_authorized',
+}
 
 
 
@@ -221,6 +225,8 @@ class SecretAdapters:
                 code = getattr(error, 'code', None)
                 return SecretAdapters._publication_status(
                     route, request, error=code if code in _PUBLICATION_REJECTIONS else None)
+            if route == CONSUME_ROUTE and getattr(error, 'code', None) in _CONSUMPTION_REFUSALS:
+                _fail(_CONSUMPTION_REFUSALS[error.code])
             _fail('adapter_authority_unavailable')
         if (not isinstance(result, dict) or result.get('status') != 'ready'
                 or not isinstance(result.get('data'), dict)):
@@ -228,6 +234,8 @@ class SecretAdapters:
                 code = result.get('status') if isinstance(result, dict) else None
                 return SecretAdapters._publication_status(
                     route, request, error=code if code in _PUBLICATION_REJECTIONS else None)
+            if route == CONSUME_ROUTE and isinstance(result, dict) and result.get('status') in _CONSUMPTION_REFUSALS:
+                _fail(_CONSUMPTION_REFUSALS[result['status']])
             _fail('adapter_authority_unavailable')
         # A recovered publication receipt is useful. A recovered consumption can
         # never authorize launching the executable again.

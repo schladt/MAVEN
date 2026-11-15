@@ -102,6 +102,30 @@ class SecretMCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.cloud.records)
         self.assertFalse(self.session.parameters.versions)
 
+    async def test_consumed_and_unauthorized_grants_have_specific_safe_mcp_errors(self):
+        from tools.memory.client import MemoryClientError
+        from tools.memory.adapter_contracts import POLICY_ROUTE, CONSUME_ROUTE
+        from test_secret_adapters import invocation, policy, ready
+        await self.call('maven_start', choice='read_only', cwd=str(self.workspace))
+        request = {**invocation(), 'home_id': HOME_ID}
+        for code, expected in (('claim_conflict', 'invocation_consumed'),
+                               ('not_authorized', 'adapter_not_authorized')):
+            with self.subTest(code=code):
+                def invoke(route, body):
+                    if route == POLICY_ROUTE:
+                        return ready({**policy(), 'home_id': HOME_ID})
+                    self.assertEqual(route, CONSUME_ROUTE)
+                    raise MemoryClientError(code, detail='MCP-SYNTHETIC-PRIVATE-VALUE')
+                with patch.object(self.cloud, 'invoke', side_effect=invoke), \
+                        patch.object(self.store, 'read_secret') as read_secret, \
+                        patch('tools.secret_adapters.run_adapter') as run:
+                    _, result = await self.call('maven_secret_adapter', action='execute', parameters={
+                        'invocation': request, 'grant': 'secret-grant-fixture', 'grant_revision': 1})
+                self.assertEqual((result['status'], result['error']), ('blocked', expected))
+                self.assertIn('next_action', result)
+                read_secret.assert_not_called()
+                run.assert_not_called()
+
     async def test_pending_catalog_is_not_reported_as_saved_and_can_retry_from_read_only(self):
         await self.call('maven_start', choice='read_only', cwd=str(self.workspace))
         self.cloud.fail_before = 'temporarily_unavailable'

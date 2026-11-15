@@ -90,7 +90,17 @@ def register_secret_tools(server, app, guarded):
             if action not in ('policy', 'draft', 'review', 'approve', 'prepare', 'grant_document', 'execute'):
                 raise BoundaryError('invalid_adapter_action')
             return getattr(controller, action)(**parameters)
-        except (AdapterError, StoreError) as error:
+        except AdapterError as error:
+            actions = {
+                'invocation_consumed': 'This invocation has already consumed authorization. Do not replay it. '
+                                       'For another attempt, prepare a new invocation and obtain any required fresh owner approval.',
+                'adapter_not_authorized': 'Authorization was denied for this exact invocation. Check grant expiry, '
+                                          'approved bindings and selected-role permissions. Obtain fresh owner approval if required; do not retry automatically.',
+            }
+            if error.code in actions:
+                return {'status': 'blocked', 'error': error.code, 'next_action': actions[error.code]}
+            raise BoundaryError(str(error)) from None
+        except StoreError as error:
             raise BoundaryError(str(error)) from None
         except TypeError:
             raise BoundaryError('invalid_adapter_arguments') from None

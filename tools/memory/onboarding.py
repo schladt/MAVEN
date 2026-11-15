@@ -37,7 +37,7 @@ def catalog() -> tuple[list[dict], dict[str, str]]:
     pages = {}
     hashes = {'catalog.json': hashlib.sha256(catalog_path.read_bytes()).hexdigest()}
     for page in document['pages']:
-        fields(page, {'slug', 'page_kind', 'title', 'requires'})
+        fields(page, {'slug', 'page_kind', 'title', 'requires'}, {'description'})
         from .validation import slug
         slug(page['slug'])
         if page['slug'] in pages:

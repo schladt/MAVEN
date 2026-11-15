@@ -690,6 +690,13 @@ operation UUID. Nothing here activates/revokes authority or touches stored crede
 | Service | Deployed template vs the current template built from the live stack's parameters (maintenance access) | Reviewed `UPDATE` change set; removal/replacement of RDS, Secrets Manager, S3 or KMS resources is refused before review; reconnects from the updated outputs |
 | Instructions | Active page content hashes vs the bundled catalog | Optional; one collection approval proposes and activates new and changed pages at their current revisions |
 
+Instruction updates preserve an active skill's owner-approved `description` when
+the bundle omits that field, including when updating its body. An explicit bundled
+description is part of the reviewed replacement. **Technical details** shows exact
+before/after metadata differences as well as body changes, even when the body is
+unchanged. Approval still covers the whole proposed collection; leave the update
+unchecked to retain the active instructions.
+
 Local installation builds from a fresh temporary copy of the package sources and
 metadata. Existing checkout `build/` and `*.egg-info` directories are left untouched
 and cannot reintroduce files removed from the source. If setup is waiting at
