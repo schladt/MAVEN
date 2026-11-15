@@ -322,6 +322,29 @@ class InstructionClientBoundaries(unittest.TestCase):
         self.assertEqual(failure.exception.code, 'outcome_unknown')
         self.assertEqual(failure.exception.request_key, KEY)
 
+    def test_rejected_database_statement_is_not_reported_as_unknown_or_retried(self):
+        rejection = (500, {'status': 'database_statement_rejected', 'detail': 'SQLSTATE: 42725'})
+        for route in ('/v1/proposals/create', '/v1/proposals/resolve'):
+            with self.subTest(route=route), patch.object(self.client, '_post', return_value=rejection) as post:
+                with self.assertRaises(MemoryClientError) as caught:
+                    self.client.invoke(route, {'request_key': KEY})
+                self.assertEqual(caught.exception.code, 'database_statement_rejected')
+                self.assertEqual(caught.exception.detail, 'SQLSTATE: 42725')
+                self.assertEqual(caught.exception.request_key, KEY)
+                post.assert_called_once()
+
+    def test_sql_rejection_during_lookup_cannot_resolve_an_unknown_write(self):
+        with patch.object(self.client, '_post', side_effect=[
+                MemoryClientError('transport_unavailable'),
+                (500, {'status': 'database_statement_rejected', 'detail': 'SQLSTATE: 42725'})]) as post, \
+                patch('tools.memory.client.time.sleep'):
+            with self.assertRaises(MemoryClientError) as caught:
+                self.client.invoke('/v1/proposals/create', {'request_key': KEY})
+        self.assertEqual(caught.exception.code, 'outcome_unknown')
+        self.assertEqual(caught.exception.request_key, KEY)
+        self.assertEqual([call.args[0] for call in post.call_args_list],
+                         ['/v1/proposals/create', '/v1/operations/lookup'])
+
     def test_instruction_domain_errors_are_sanitized_and_preserved(self):
         for code in ('proposal_unavailable', 'page_unavailable', 'proposal_conflict', 'approval_invalid',
                      'revision_conflict', 'idempotency_conflict'):

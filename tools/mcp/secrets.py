@@ -67,7 +67,8 @@ def register_secret_tools(server, app, guarded):
         grant_document: invocation, mode (standing|single-use), expires_at.
         execute: invocation, grant, grant_revision. Drafts and grant documents are
         not approvals. Show the exact review and collect actual owner approval.
-        Publication pending: retry identical arguments, never invent new IDs.
+        Publication failed reports a definitive rejection; outcome_unknown is not a confirmed draft.
+        Preserve/reconcile the exact original request in either case; never invent new IDs.
         Execution is fail-closed and never replayed after ambiguous consumption.
         Configured Read Only/Home/project only; no memory session or capture starts.
         """

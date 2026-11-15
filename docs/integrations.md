@@ -291,6 +291,20 @@ within their reviewed constraints; single-use grants pin invocation/digest and e
 and are consumed atomically across hosts. Missing/stale policy fails closed.
 Never rerun after uncertain consumption or execution.
 
+Publication results distinguish `draft` (verified proposal receipt), `failed`
+(definitive rejection with a bounded error code), and `outcome_unknown` (no verified
+receipt). An unknown outcome is not a queued or existing draft: do not proceed to
+review/approval. Preserve the returned request and IDs for reconciliation or an
+identical retry after the cause is corrected. A `database_statement_rejected` error
+requires correcting the database/service implementation or its access rules; it is
+not automatically retried as a transient outage. A failed lookup after a lost write
+response still leaves the original write outcome unknown.
+
+Migration `021_secret_adapter_scope_guard.sql` repairs the adapter/grant proposal
+scope guard without rewriting deployed migration 020. Roll it out through installer
+**Update MAVEN**, including the matching service/client changes and a fresh MCP
+session; then retry the original adapter request unchanged.
+
 Raw stdout/stderr is withheld from the agent and transcript; only defined nonsecret
 results are returned. This is not a sandbox against misuse by a trusted executable.
 Approve the actual executable, inputs, destination and effects, not merely its name.

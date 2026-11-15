@@ -22,7 +22,8 @@ MIGRATION_FILES = ("001_foundation.sql", "002_fact_change.sql", "003_current_ver
                    "011_project_lifecycle.sql", "012_agentic_memory.sql", "013_performance.sql",
                    "014_authority_guard.sql", "015_home_context.sql", "016_cleanup.sql",
                    "017_project_archive_visibility.sql", "018_skill_discovery.sql",
-                   "019_secret_catalog.sql", "020_secret_adapter_grants.sql")
+                   "019_secret_catalog.sql", "020_secret_adapter_grants.sql",
+                   "021_secret_adapter_scope_guard.sql")
 CLEANUP_LIMIT = 200
 _CLEANUP_REFUSAL = re.compile(r"cleanup_refused:([a-z_]{1,40})")
 

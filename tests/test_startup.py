@@ -77,9 +77,11 @@ class StartupTests(unittest.TestCase):
                             skill_page('other', scope={'project': str(uuid.uuid4())}),
                             {**skill_page('synthetic'), 'data_scope': 'synthetic'}]
         app = self.application()
-        inspected = self.startup(app, action='inspect')
-        self.assertEqual([page['slug'] for page in inspected['available_skills']['pages']], ['calendar', 'local'])
-        self.assertTrue(all(not page['loaded'] for page in inspected['available_skills']['pages']))
+        with patch.object(self.cloud, 'invoke', wraps=self.cloud.invoke) as invoke:
+            inspected = self.startup(app, action='inspect')
+        self.assertEqual(inspected['active']['mode'], 'off')
+        self.assertNotIn('available_skills', inspected)
+        self.assertFalse(any(call.args[0] == '/v1/pages/index' for call in invoke.call_args_list))
         self.assertIsNone(app.binding)
         initialized = self.startup(app)
         self.assertEqual([page['slug'] for page in initialized['available_skills']['pages']], ['calendar', 'local'])
@@ -173,18 +175,58 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(self.cloud.records[original['session_id']], old_record)
         self.assertEqual(self.inspect_exit()['status'], 'open')
 
+    def test_closed_conversation_waits_for_access_choice_before_skill_discovery(self):
+        self.cloud.pages = [skill_page('calendar')]
+        original = self.application()
+        binding = self.startup(original)['binding']
+        checkpoint = original.maintenance.checkpoint(summary='Work complete.', refs=[])
+        original.maintenance.finish(checkpoint['checkpoint']['checkpoint_id'])
+        records = deepcopy(self.cloud.records)
+        restarted = self.application()
+        with patch.object(self.cloud, 'invoke', wraps=self.cloud.invoke) as invoke:
+            inspected = self.startup(restarted, action='inspect')
+        self.assertEqual(inspected['status'], 'closed')
+        self.assertEqual(inspected['active']['mode'], 'off')
+        self.assertNotIn('available_skills', inspected)
+        self.assertFalse(any(call.args[0] == '/v1/pages/index' for call in invoke.call_args_list))
+        with self.assertRaises(MaintenanceError):
+            restarted.context('calendar')
+        restarted.start('off', self.root, harness='omp', harness_session='conversation-a')
+        with patch.object(self.cloud, 'invoke', wraps=self.cloud.invoke) as invoke:
+            self.assertNotIn('available_skills', self.startup(restarted, action='inspect'))
+        invoke.assert_not_called()
+        restarted.start('read_only', self.root, harness='omp', harness_session='conversation-a')
+        readonly = self.startup(restarted, action='inspect')
+        self.assertEqual(readonly['active']['mode'], 'read_only')
+        self.assertEqual([page['slug'] for page in readonly['available_skills']['pages']], ['calendar'])
+        self.assertIsNone(restarted.binding)
+        self.assertEqual(self.cloud.records, records)
+        fresh = self.startup(self.application(), action='new')
+        self.assertNotEqual(fresh['binding']['session_id'], binding['session_id'])
+        self.assertEqual([page['slug'] for page in fresh['available_skills']['pages']], ['calendar'])
+        self.assertEqual(self.cloud.records[binding['session_id']], records[binding['session_id']])
+
     def test_shutdown_event_requires_choice_for_new_conversation_not_peer_takeover(self):
         first = self.application()
+        self.cloud.pages = [skill_page('calendar')]
         original = self.startup(first)['binding']
         record_shutdown(self.home, self.root, harness='omp', harness_session='conversation-a')
         self.assertEqual(self.inspect_exit()['status'], 'open')
         fresh = self.application()
+        with patch.object(self.cloud, 'invoke', wraps=self.cloud.invoke) as invoke:
+            inspected = self.startup(fresh, 'conversation-b', action='inspect')
+        self.assertEqual(inspected['status'], 'recovery')
+        self.assertTrue(inspected['choices'])
+        self.assertNotIn('available_skills', inspected)
+        self.assertFalse(any(call.args[0] == '/v1/pages/index' for call in invoke.call_args_list))
         result = self.startup(fresh, 'conversation-b')
         self.assertEqual(result['status'], 'decision_required')
+        self.assertNotIn('available_skills', result)
         self.assertIsNone(fresh.binding)
         old_record = deepcopy(self.cloud.records[original['session_id']])
         new = self.startup(fresh, 'conversation-b', action='new')
         self.assertNotEqual(new['binding']['session_id'], original['session_id'])
+        self.assertEqual([page['slug'] for page in new['available_skills']['pages']], ['calendar'])
         self.assertEqual(self.cloud.records[original['session_id']], old_record)
 
     def test_actual_resume_clears_old_end_event_without_changing_pause(self):

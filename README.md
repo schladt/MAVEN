@@ -66,6 +66,10 @@ with `maven_context(skill_slug=...)`, without starting capture. `maven_secrets` 
 metadata discovery and explicit private-file store-and-catalog; approved declarative
 adapters consume secrets without returning plaintext. See [secret usage and trust
 boundaries](docs/integrations.md#aws-secrets-and-encrypted-files).
+Startup inspection of an enabled folder or a previously closed session does not
+grant skill access: summaries remain absent while the active mode is off or a
+start/recovery choice is pending. Select Read Only or initialize/resume Home/project
+before discovery; inspection never silently reopens a completed session.
 
 After verified cloud setup, optionally review local integration for OMP, Claude Code,
 Codex, Copilot or Gemini. Running harnesses do not block the review; restart them

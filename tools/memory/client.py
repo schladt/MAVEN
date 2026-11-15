@@ -34,6 +34,7 @@ DEFINITIVE_MUTATION_ERRORS = frozenset({
     'revision_conflict', 'invalid_request', 'not_authorized', 'claim_conflict',
     'project_archived', 'idempotency_conflict', 'setting_conflict',
     'reference_unavailable', 'session_unavailable', 'context_stale',
+    'database_statement_rejected',
 })
 
 
@@ -242,7 +243,8 @@ class MemoryClient:
                 if uncertain and status == 404:
                     # Absence may race an in-flight commit. Preserve the key for explicit same-request retry.
                     raise MemoryClientError('outcome_unknown', request_key=request_key)
-                if request_key and ((status >= 500 and code not in ('warming', 'context_stale')) or status == 200):
+                if request_key and ((status >= 500 and code not in (
+                        'warming', 'context_stale', 'database_statement_rejected')) or status == 200):
                     uncertain = True
                 elif status not in (429, 503) or code not in ('warming', 'temporarily_unavailable', 'rate_limited'):
                     if uncertain:

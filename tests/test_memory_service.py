@@ -7,6 +7,8 @@ import json
 import unittest
 from unittest.mock import Mock, patch
 
+from botocore.exceptions import ClientError
+
 from tools.memory import admin, service, store, validation
 
 REAL_MAKE_STORE = service.make_store
@@ -422,6 +424,23 @@ class HandlerTests(unittest.TestCase):
             result = service.handler(request, None)
             self.assertEqual(result["statusCode"], status)
             self.assertEqual(json.loads(result["body"]), {"status": code, "request_key": KEY})
+
+    def test_sql_rejection_is_distinct_from_transport_failure_and_redacts_provider_text(self):
+        for sqlstate, code, status in (('42725', 'database_statement_rejected', 500),
+                                      ('57014', 'temporarily_unavailable', 503)):
+            with self.subTest(sqlstate=sqlstate):
+                self.factory.return_value.perform.side_effect = ClientError({'Error': {
+                    'Code': 'DatabaseErrorException',
+                    'Message': f'private SQL and values; SQLState: {sqlstate}'}}, 'ExecuteStatement')
+                result = service.handler(event(proposal(), '/v1/proposals/create'), None)
+                expected = {'status': code, 'request_key': KEY}
+                if code == 'database_statement_rejected':
+                    expected['detail'] = 'SQLSTATE: 42725'
+                self.assertEqual(result['statusCode'], status)
+                self.assertEqual(json.loads(result['body']), expected)
+        self.factory.return_value.perform.side_effect = RuntimeError('SQLState: 42725 private-value')
+        result = service.handler(event(proposal(), '/v1/proposals/create'), None)
+        self.assertEqual(json.loads(result['body']), {'status': 'temporarily_unavailable', 'request_key': KEY})
 
     def test_success_carries_generation_and_validation_detail_names_fields(self):
         self.factory.return_value.perform.return_value = ({"records": []}, 11)

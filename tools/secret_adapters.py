@@ -23,6 +23,12 @@ from .memory.adapter_contracts import (
     _slug, _source, _text, _uuid, invocation_digest, validate_adapter_candidate,
     validate_adapter_request, validate_definition, validate_grant, validate_invocation,
 )
+from .memory.client import DEFINITIVE_MUTATION_ERRORS
+
+_PUBLICATION_REJECTIONS = DEFINITIVE_MUTATION_ERRORS | {
+    'proposal_conflict', 'approval_invalid', 'authentication_required',
+    'client_incompatible', 'proposal_unavailable',
+}
 
 
 
@@ -190,33 +196,38 @@ class SecretAdapters:
         return str(uuid.uuid5(uuid.UUID(self.home_id), _canonical({'operation': operation, 'payload': payload})))
 
     @staticmethod
-    def _pending(route, request):
-        return {'status': 'pending', 'route': route, 'request_key': request['request_key'],
+    def _publication_status(route, request, *, error=None):
+        return {'status': 'failed' if error else 'outcome_unknown',
+                **({'error': error} if error else {}),
+                'route': route, 'request_key': request['request_key'],
                 'proposal_id': request['proposal_id'],
                 'request': _json(_canonical(request)),
-                'recovery': 'Repeat the original controller call with identical arguments; do not mint new IDs or approve a changed review.'}
+                'recovery': (
+                    'The service rejected this request; nothing was published by this attempt. '
+                    'Correct the reported cause, then retry the identical request.'
+                    if error else
+                    'Publication is not confirmed. Preserve and reconcile this original request; '
+                    'do not review or approve it as an existing draft, mint new IDs, or change the request.')}
 
     @staticmethod
     def _call(client, route, request):
         if client is None:
             _fail('adapter_authority_unavailable')
+        publication = route in ('/v1/proposals/create', '/v1/proposals/resolve')
         try:
             result = client.invoke(route, request)
         except Exception as error:
-            if route in ('/v1/proposals/create', '/v1/proposals/resolve'):
-                if getattr(error, 'code', None) in {
-                    'revision_conflict', 'invalid_request', 'not_authorized', 'idempotency_conflict',
-                    'proposal_conflict', 'approval_invalid', 'reference_unavailable', 'project_archived',
-                    'authentication_required', 'client_incompatible', 'proposal_unavailable',
-                }:
-                    _fail('adapter_publication_rejected')
-                return SecretAdapters._pending(route, request)
+            if publication:
+                code = getattr(error, 'code', None)
+                return SecretAdapters._publication_status(
+                    route, request, error=code if code in _PUBLICATION_REJECTIONS else None)
             _fail('adapter_authority_unavailable')
-        publication = route in ('/v1/proposals/create', '/v1/proposals/resolve')
         if (not isinstance(result, dict) or result.get('status') != 'ready'
                 or not isinstance(result.get('data'), dict)):
             if publication:
-                return SecretAdapters._pending(route, request)
+                code = result.get('status') if isinstance(result, dict) else None
+                return SecretAdapters._publication_status(
+                    route, request, error=code if code in _PUBLICATION_REJECTIONS else None)
             _fail('adapter_authority_unavailable')
         # A recovered publication receipt is useful. A recovered consumption can
         # never authorize launching the executable again.
@@ -235,7 +246,7 @@ class SecretAdapters:
         return data
 
     def draft(self, *, slug, title, document, owner_source, page_id=None, expected_revision=0, revoke=False):
-        """Persist an exact idempotent proposal; unknown writes return pending refs."""
+        """Persist an exact idempotent proposal; distinguish rejection from unknown outcome."""
         _slug(slug)
         _text(title, 160)
         _source(owner_source)
@@ -260,8 +271,10 @@ class SecretAdapters:
         candidate_hash = hashlib.sha256(_canonical(candidate).encode()).hexdigest()
         expected = {'proposal_id': proposal_id, 'page_id': page_id, 'expected_revision': expected_revision,
                     'candidate_hash': candidate_hash, 'request_key': request['request_key']}
-        if data.get('status') == 'pending' or any(data.get(key) != value for key, value in expected.items()):
-            return {**self._pending(route, request), 'page_id': page_id, 'candidate_hash': candidate_hash}
+        if data.get('status') in ('failed', 'outcome_unknown'):
+            return {**data, 'page_id': page_id, 'candidate_hash': candidate_hash}
+        if any(data.get(key) != value for key, value in expected.items()):
+            return {**self._publication_status(route, request), 'page_id': page_id, 'candidate_hash': candidate_hash}
         return {'status': 'draft', **expected, 'candidate': candidate}
 
     def _draft(self, proposal_id):
@@ -306,8 +319,10 @@ class SecretAdapters:
         data = self._call(self.approval_client, route, request)
         expected = {'proposal_id': proposal_id, 'page_id': page['page_id'],
                     'revision': expected_revision + 1, 'request_key': request['request_key']}
-        if data.get('status') == 'pending' or any(data.get(key) != value for key, value in expected.items()):
-            return {**self._pending(route, request), 'page_id': page['page_id'], 'candidate_hash': candidate_hash}
+        if data.get('status') in ('failed', 'outcome_unknown'):
+            return {**data, 'page_id': page['page_id'], 'candidate_hash': candidate_hash}
+        if any(data.get(key) != value for key, value in expected.items()):
+            return {**self._publication_status(route, request), 'page_id': page['page_id'], 'candidate_hash': candidate_hash}
         return data
 
     def prepare(self, *, adapter, secret_name, purpose, operation, destination, parameters):

@@ -139,7 +139,7 @@ cloud instructions. Schema rollout approval is not instruction activation approv
 
 With affected harness sessions stopped, installer update first replaces local
 software/harness files and completes any required reviewed environment migration.
-It then applies additive SQL **018 → 019 → 020**, deploys the matching service,
+It then applies additive SQL **018 → 019 → 020 → 021**, deploys the matching service,
 offers exact bundled-authority reviews, and verifies the required store/readiness.
 Keep new MCP sessions disabled until the complete update succeeds; file installation
 and feature activation are distinct. Start a fresh harness afterward to initialize

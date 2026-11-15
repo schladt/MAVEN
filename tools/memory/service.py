@@ -113,7 +113,7 @@ def handler(event, context):
         return response(error.http_status, result)
     except Exception as error:
         safe = safe_provider_error(error)
-        result = {"status": safe.status}
+        result = {"status": safe.status, **safe.metadata}
         if request_key is not None:
             result["request_key"] = request_key
         return response(safe.http_status, result)

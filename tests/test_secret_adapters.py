@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from tools import secret_adapters as adapters
 from tools.memory import adapter_contracts as contracts
+from tools.memory.client import MemoryClientError
 
 
 HOME = '0c7e20d8-1c43-4ca8-b9df-a3472cefa618'
@@ -371,13 +372,49 @@ class AdapterControllerTests(unittest.TestCase):
         self.assertEqual(request['expected_revision'], 3)
         self.assertEqual(request['candidate']['authority_state'], 'revoked')
 
+    def test_rejected_draft_reports_failure_and_preserves_request_for_corrected_service(self):
+        arguments = {'slug': 'secret-adapter-fixture', 'title': 'Fixture adapter',
+                     'document': definition(), 'owner_source': SOURCE}
+        for as_response in (False, True):
+            with self.subTest(as_response=as_response):
+                client = Mock()
+                if as_response:
+                    client.invoke.return_value = {'status': 'database_statement_rejected'}
+                else:
+                    client.invoke.side_effect = MemoryClientError('database_statement_rejected', detail='SQLSTATE: 42725')
+                controller = adapters.SecretAdapters(HOME, client=client)
+                failed = controller.draft(**arguments)
+                self.assertEqual((failed['status'], failed['error']), ('failed', 'database_statement_rejected'))
+                original = client.invoke.call_args.args[1]
+                self.assertEqual(failed['request'], original)
+                client.invoke.assert_called_once()
+                client.invoke.side_effect = self.create_receipt
+                recovered = controller.draft(**arguments)
+                self.assertEqual(recovered['status'], 'draft')
+                self.assertEqual(recovered['request_key'], failed['request_key'])
+                self.assertEqual(client.invoke.call_args.args[1], original)
+
+    def test_rejected_approval_is_not_a_pending_or_successful_publication(self):
+        client, approval = Mock(), Mock()
+        proposal, page_id = str(uuid4()), str(uuid4())
+        client.read_full.return_value = ready({
+            **candidate(), 'proposal_id': proposal, 'page_id': page_id, 'revision': 0,
+            'data_scope': 'owner', 'content_hash': 'b' * 64, 'candidate_authority_state': 'active'})
+        approval.invoke.side_effect = MemoryClientError('database_statement_rejected')
+        result = adapters.SecretAdapters(HOME, client=client, approval_client=approval).approve(
+            proposal_id=proposal, challenge_id=str(uuid4()), candidate_hash='b' * 64,
+            expected_revision=0, owner_source=SOURCE, approved=True)
+        self.assertEqual((result['status'], result['error']), ('failed', 'database_statement_rejected'))
+        self.assertEqual(result['request'], approval.invoke.call_args.args[1])
+        approval.invoke.assert_called_once()
+
     def test_unknown_draft_preserves_exact_request_across_controller_restart(self):
         client = Mock()
         client.invoke.side_effect = RuntimeError('lost write response')
         arguments = {'slug': 'secret-adapter-fixture', 'title': 'Fixture adapter',
                      'document': definition(), 'owner_source': SOURCE}
         pending = adapters.SecretAdapters(HOME, client=client).draft(**arguments)
-        self.assertEqual(pending['status'], 'pending')
+        self.assertEqual(pending['status'], 'outcome_unknown')
         original = client.invoke.call_args.args[1]
         self.assertEqual(pending['request'], original)
         self.assertEqual(pending['request_key'], original['request_key'])
@@ -401,7 +438,7 @@ class AdapterControllerTests(unittest.TestCase):
                      'expected_revision': 0, 'owner_source': SOURCE, 'approved': True}
         approval.invoke.side_effect = RuntimeError('lost publication response')
         pending = adapters.SecretAdapters(HOME, client=client, approval_client=approval).approve(**arguments)
-        self.assertEqual(pending['status'], 'pending')
+        self.assertEqual(pending['status'], 'outcome_unknown')
         original = approval.invoke.call_args.args[1]
         self.assertEqual(pending['request'], original)
         def recovered(route, request):
@@ -419,7 +456,7 @@ class AdapterControllerTests(unittest.TestCase):
             controller.approve(**{**arguments, 'candidate_hash': 'c' * 64})
         self.assertEqual(approval.invoke.call_count, before)
 
-    def test_recovered_receipt_for_wrong_request_stays_pending(self):
+    def test_recovered_receipt_for_wrong_request_remains_unknown(self):
         client = Mock()
         def wrong_receipt(route, request):
             response = self.create_receipt(route, request)
@@ -428,7 +465,7 @@ class AdapterControllerTests(unittest.TestCase):
         client.invoke.side_effect = wrong_receipt
         result = adapters.SecretAdapters(HOME, client=client).draft(
             slug='secret-adapter-fixture', title='Fixture adapter', document=definition(), owner_source=SOURCE)
-        self.assertEqual(result['status'], 'pending')
+        self.assertEqual(result['status'], 'outcome_unknown')
         self.assertEqual(result['request_key'], result['request']['request_key'])
 
 

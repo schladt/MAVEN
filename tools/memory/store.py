@@ -5,6 +5,7 @@ import binascii
 from contextlib import contextmanager
 import hashlib
 import json
+import re
 import time
 
 from .validation import (MEMORY_ROUTES, MemoryError, MUTATION_ROUTES, SCHEMA_VERSION, canonical, decode_json, digest,
@@ -62,6 +63,12 @@ def safe_provider_error(error):
     message = getattr(error, "response", {}).get("Error", {}).get("Message", "")
     if code == "DatabaseErrorException" and "project_archived" in message and "55000" in message:
         return MemoryError("project_archived", 409)
+    if code == "DatabaseErrorException":
+        sqlstate = re.search(r"\bSQLState:\s*(42[A-Z0-9]{3})\b", message)
+        if sqlstate:
+            # A SQL syntax/access-rule rejection is not an ambiguous transport failure.
+            # Return only the bounded SQLSTATE, never provider prose or statement text.
+            return MemoryError("database_statement_rejected", 500, detail="SQLSTATE: " + sqlstate.group(1))
     return MemoryError("warming" if code == "DatabaseResumingException"
                        else "temporarily_unavailable")
 

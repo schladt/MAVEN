@@ -399,17 +399,16 @@ class MavenApplication:
         elif not self.choice or self.choice['mode'] != 'read_only':
             raise MaintenanceError('select Read Only, Home or an enabled project before discovering or loading skills')
 
-    def available_skills(self, *, project_id=None):
-        """Fresh headers only; startup callers have already resolved the selected mode."""
+    def available_skills(self):
+        """Fresh headers for selected Read Only or initialized Home/project access only."""
         from tools.memory.skills import SessionSkills
         try:
+            self.require_skill_access()
             if self.initialized:
                 return self.service.skill_summaries()
-            if project_id is None:
-                self.require_skill_access()
             if self._unbound_client is None and not self.env.exists():
                 return {'status': 'not_configured', 'pages': []}
-            catalog = SessionSkills.catalog_pages(self.unbound_client(), project_id)
+            catalog = SessionSkills.catalog_pages(self.unbound_client())
             authority = self._unbound_authority or {}
             return SessionSkills.summaries(
                 catalog, authority.get('instructions', ()), authority.get('authority_generation'))
@@ -518,7 +517,9 @@ class MavenApplication:
         report['choices'] = ['review_recovery', 'start_new_without_taking_over', 'read_only'] if (
             report['issues'] or attention) else []
         if action == 'inspect':
-            return {**report, 'available_skills': self.available_skills(project_id=report['project_id'])}
+            # A discovered project or retained closed binding is not an active access mode.
+            # Read Only is handled above; Home/project summaries arrive after initialization.
+            return report
         if report['status'] == 'recovery' and binding:
             return {**report, 'recovery_initialize': {
                         'root': binding['root'], 'session_id': binding['session_id'], 'resume': True,

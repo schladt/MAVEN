@@ -80,6 +80,28 @@ class SecretMCPTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.session.parameters.versions)
         self.assertFalse(self.cloud.records)
 
+    async def test_adapter_draft_distinguishes_rejection_from_unknown_outcome(self):
+        from tools.memory.client import MemoryClientError
+        from test_secret_adapters import definition
+        await self.call('maven_start', choice='read_only', cwd=str(self.workspace))
+        parameters = {'slug': 'secret-adapter-fixture', 'title': 'Fixture adapter',
+                      'document': definition(), 'owner_source': SOURCE}
+        original = None
+        for code, status in (('database_statement_rejected', 'failed'), ('outcome_unknown', 'outcome_unknown')):
+            with self.subTest(code=code), patch.object(self.cloud, 'invoke', side_effect=MemoryClientError(code)) as invoke:
+                response, result = await self.call('maven_secret_adapter', action='draft', parameters=parameters)
+                self.assertEqual(response.is_error, status == 'failed', result)
+                self.assertEqual(result['status'], status)
+                if status == 'failed':
+                    self.assertEqual(result['error'], code)
+                original = original or result['request']
+                self.assertEqual(result['request'], original)
+                self.assertEqual(result['request_key'], original['request_key'])
+                invoke.assert_called_once()
+        self.assertIsNone(self.app.binding)
+        self.assertFalse(self.cloud.records)
+        self.assertFalse(self.session.parameters.versions)
+
     async def test_pending_catalog_is_not_reported_as_saved_and_can_retry_from_read_only(self):
         await self.call('maven_start', choice='read_only', cwd=str(self.workspace))
         self.cloud.fail_before = 'temporarily_unavailable'

@@ -80,7 +80,7 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual(names[first_new:], ['012_agentic_memory.sql', '013_performance.sql', '014_authority_guard.sql',
                                              '015_home_context.sql', '016_cleanup.sql', '017_project_archive_visibility.sql',
                                              '018_skill_discovery.sql', '019_secret_catalog.sql',
-                                             '020_secret_adapter_grants.sql'])
+                                             '020_secret_adapter_grants.sql', '021_secret_adapter_scope_guard.sql'])
         installed = {name: digest for name, digest, _ in bundle[:first_new]}
         old = {**store.control_document(CONFIG, 'ready'), 'schema_version': 1,
                'app_secret_arn': CONFIG['app_secret_arn'], 'app_secret_version': 'fixture-version'}
@@ -102,8 +102,8 @@ class CloudContractTests(unittest.TestCase):
 
     def test_failed_migration_reports_safe_location_and_verified_rollback(self):
         bundle = admin.migrations()
-        name, _, statements = bundle[-1]
-        installed = {name: sha for name, sha, _ in bundle[:-3]}
+        name, _, statements = next(item for item in bundle if item[0] == '020_secret_adapter_grants.sql')
+        installed = {name: sha for name, sha, _ in bundle[:17]}
         state = {**store.control_document(CONFIG, 'ready'),
                  'app_secret_arn': CONFIG['app_secret_arn'], 'app_secret_version': 'fixture-version'}
         for sqlstate, rollback_fails, expected in (

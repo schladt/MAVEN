@@ -655,7 +655,7 @@ themselves. The guided update applies them as one resumable setup operation in m
 For the secrets/Google cutover, use the installer update with affected harness
 sessions stopped. It installs local software/harness files first, then presents any
 required legacy environment migration before strict settings loading. The update
-operation applies additive **SQL018 → SQL019 → SQL020**, then the matching
+operation applies additive **SQL018 → SQL019 → SQL020 → SQL021**, then the matching
 service/IAM change set, optional owner-reviewed instruction changes, and required
 secrets-store/readiness checks. Installing files is not enabling a new MCP session:
 start a fresh harness only after the entire update completes and load current authority.
@@ -717,7 +717,7 @@ remain preserved. Already-applied migration hashes must still match the bundle's
 ordered prefix—resuming does not overwrite or reinterpret migration history.
 
 The current contract is schema 2 / client protocol 4; `012_agentic_memory.sql`
-established the memory-native foundation, with additive migrations through 020.
+established the memory-native foundation, with additive migrations through 021.
 Ordinary schema-1 use is rejected. Both `maven-memory migrate --confirm-instance
 "$INSTANCE_ID"` and `maven-memory install migrate --confirm-instance "$INSTANCE_ID"`
 accept a schema-1 binding solely for the separately approved administrator migration.

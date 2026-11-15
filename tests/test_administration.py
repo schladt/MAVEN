@@ -386,7 +386,7 @@ class AdministrationTests(unittest.TestCase):
             initialize.assert_not_called()
             question = result['pending_interaction']
             self.assertEqual(question['key'], 'schema')
-            self.assertIn('020_secret_adapter_grants.sql', question['review']['sql'])
+            self.assertIn('021_secret_adapter_scope_guard.sql', question['review']['sql'])
             self.assertEqual(result['operation_id'], identifier)
             self.assertEqual(result['approvals'], previous_approvals)
             result = self.respond(result)
