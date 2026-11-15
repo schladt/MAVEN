@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from tools.administration import AdminOperations
 from tools.memory.client import MemoryClientError
+from tools.memory.validation import MemoryError
 from tools.setup import Wizard, _present
 from tools.setup_common import (SetupPending, read_private, save_json, expected_account,
                                 check_login_identity, permission_preflight as inspect_permissions,
@@ -349,6 +350,50 @@ class AdministrationTests(unittest.TestCase):
         self.assertEqual(mocks['plan'].call_args.kwargs['change_type'], 'UPDATE')
         self.assertTrue(result['outcome']['instance_ready'])
         self.assertTrue(result['outcome']['secrets_ready'])
+
+    def test_migration_failure_keeps_diagnostics_and_clears_them_on_retry(self):
+        self.update_fixture([])
+        answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')}}
+        result = self.run_update(answers, stop_at='schema')
+        result = self.respond(result)
+        detail = 'Migration: 020_secret_adapter_grants.sql; statement: 10; SQLSTATE: 42601; rollback confirmed'
+        with patch('tools.memory.bootstrap.initialize',
+                   side_effect=MemoryError('migration_rejected', 422, detail=detail)):
+            result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['state'], 'blocked')
+        self.assertEqual(result['error'], 'migration_rejected')
+        self.assertEqual(result['error_detail'], detail)
+        restored = AdminOperations(self.home)
+        self.assertEqual(restored.status(result['operation_id'])['error_detail'], detail)
+        with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}):
+            result = restored.advance(result['operation_id'])
+        self.assertNotIn('error_detail', result)
+        self.assertNotIn('error', result)
+        self.assertNotEqual(result['step'], 'migrate')
+
+    def test_changed_sql_requires_new_review_on_the_original_operation(self):
+        from tools.memory.admin import MIGRATION_FILES
+        self.update_fixture([])
+        answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')}}
+        # Model an operation approved under an older bundle, then resumed by corrected software.
+        with patch('tools.memory.admin.MIGRATION_FILES', MIGRATION_FILES[:-1]):
+            original = self.run_update(answers, stop_at='schema')
+            original = self.respond(original)
+        identifier = original['operation_id']
+        previous_approvals = original['approvals']
+        with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}) as initialize:
+            result = AdminOperations(self.home).advance(identifier)
+            initialize.assert_not_called()
+            question = result['pending_interaction']
+            self.assertEqual(question['key'], 'schema')
+            self.assertIn('020_secret_adapter_grants.sql', question['review']['sql'])
+            self.assertEqual(result['operation_id'], identifier)
+            self.assertEqual(result['approvals'], previous_approvals)
+            result = self.respond(result)
+            result = self.controller.advance(identifier)
+        initialize.assert_called_once()
+        self.assertEqual(result['operation_id'], identifier)
+        self.assertNotEqual(result['step'], 'migrate')
 
     def test_update_refuses_service_change_that_replaces_data_resources(self):
         self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'DatabaseCluster',

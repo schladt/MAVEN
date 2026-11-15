@@ -115,6 +115,7 @@ def fetch_control(s3, config, *, allow_maintenance=False, allow_legacy=False):
 class DataAPI:
     def __init__(self, client, config, *, admin=False, deadline=None):
         self.client = client
+        self.rollback_confirmed = False
         self.base = {"resourceArn": config["cluster_arn"],
                      "secretArn": config["admin_secret_arn" if admin else "app_secret_arn"],
                      "database": config["database"]}
@@ -182,6 +183,8 @@ class DataAPI:
     @contextmanager
     def transaction(self, *, timeouts=True):
         """Explicit timeouts unless the application role's session defaults already bound statements."""
+        # Outcome of this transaction only; a prior rollback proves nothing about the next one.
+        self.rollback_confirmed = False
         self.budget()
         tx = self.client.begin_transaction(**self.base)["transactionId"]
         committed = False
@@ -200,6 +203,7 @@ class DataAPI:
                     if self.deadline is None or self.deadline - time.monotonic() >= 7:
                         self.client.rollback_transaction(resourceArn=self.base["resourceArn"],
                                                          secretArn=self.base["secretArn"], transactionId=tx)
+                        self.rollback_confirmed = True
                 except Exception:
                     pass  # Original failure is authoritative; SDK diagnostics stay private.
 

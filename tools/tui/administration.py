@@ -47,6 +47,12 @@ _CODE_HELP = {
     'DatabaseResumingException': 'AWS reported the Aurora database is still resuming from auto-pause.',
     'temporarily_unavailable': 'The database or MAVEN service did not answer in time. Resume re-checks '
                                'this same operation before repeating anything.',
+    'migration_rejected': 'The database rejected the migration SQL or its permissions. The transaction '
+                          'was rolled back. Correct the reported cause before resuming; this is not a service outage.',
+    'migration_failed': 'The migration transaction was rolled back. Inspect the diagnostic below and '
+                        'correct the cause before retrying this same operation.',
+    'migration_outcome_unknown': 'A migration statement failed, but rollback could not be confirmed. '
+                                 'Inspect the database state before resuming this same operation.',
     'selected_login_or_role_unavailable': 'The selected AWS login could not assume the MAVEN role this step '
                                           'needs. The sign-in may have expired, or the role in the saved '
                                           'settings may not exist or may not trust this user.',
@@ -139,6 +145,8 @@ def _instructions(result, home, identifier):
     instructions = [f'Stopped at: {stage} (step "{result.get("step", "unknown")}")', f'Error: {error}']
     if error in _CODE_HELP:
         instructions.append(_CODE_HELP[error])
+    if result.get('error_detail'):
+        instructions.append(result['error_detail'])
     # The sign-in screen offers its own choices; Resume applies only to the stopped-step screen.
     if not handoff and result.get('state') == 'uncertain':
         instructions.append('State: uncertain. The request may have reached AWS, so its outcome is not known. '

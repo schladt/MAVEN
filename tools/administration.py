@@ -686,6 +686,7 @@ class AdminOperations:
                 return self.status(operation_id)
             state.update(state='working', live_state_checked=False)
             state.pop('error', None)
+            state.pop('error_detail', None)
             state.pop('handoff', None)
             if state['step'] in ('connection', 'plan', 'apply', 'initialize', 'migrate',
                                   'migration_bind', 'starter_submit', 'starter_activate',
@@ -702,6 +703,10 @@ class AdminOperations:
                 code = _error_code(error)
                 state['state'] = 'uncertain' if any(word in code for word in ('unknown', 'uncertain', 'unavailable', 'timeout')) else 'blocked'
                 state['error'] = str(error) if isinstance(error, SetupPending) else code
+                from tools.memory.validation import MemoryError
+                if isinstance(error, MemoryError) and code in (
+                        'migration_rejected', 'migration_failed', 'migration_outcome_unknown'):
+                    state['error_detail'] = error.metadata.get('detail', '')
                 state['recovery'] = 'Inspect status, correct the prerequisite, then advance this same operation. Original request artifacts are retained.'
                 if state['error'] == 'selected_login_unavailable_or_expired':
                     try:
@@ -1102,7 +1107,9 @@ class AdminOperations:
                 from tools.memory.admin import MIGRATION_FILES
                 review = {'instance': _connection_config(wizard.values), 'environment': dict(wizard.values), 'upgrade': upgrade,
                           'sql': {name: files('tools.memory').joinpath('migrations', name).read_text(encoding='utf-8') for name in MIGRATION_FILES}}
-                if step.endswith('_review'):
+                # Corrected pending SQL needs a new exact review, not the old approval or a new operation.
+                changed_upgrade = upgrade and state['answers'].get('schema', {}).get('review_digest') != _digest(review)
+                if step.endswith('_review') or changed_upgrade:
                     self._preflight(state, wizard.values, 'sql')
                     self._review(state, 'schema', 'Review exact SQL ' + ('upgrade' if upgrade else 'initialization'), review, 'migrate' if upgrade else 'initialize')
                 else:

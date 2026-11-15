@@ -140,6 +140,22 @@ def _grant_instructions(db, tx):
     db.execute("ALTER ROLE maven_app SET lock_timeout = '1s'", transaction=tx)
 
 
+def _apply_migration(db, tx, name, sha, statements):
+    try:
+        for position, statement in enumerate(statements, 1):
+            db.execute(statement, transaction=tx)
+        position = "registration"
+        db.execute("INSERT INTO maven.schema_migrations(name, sha256) VALUES (:name, :sha)",
+                   {"name": name, "sha": sha}, tx)
+    except Exception as error:
+        provider = getattr(error, "response", {}).get("Error", {})
+        # Never return provider prose, SQL, or parameters: only the SQLSTATE token.
+        match = re.search(r"\bSQLState:\s*([A-Z0-9]{5})\b", provider.get("Message", ""))
+        sqlstate = match.group(1) if match else "unavailable"
+        status = "migration_rejected" if sqlstate.startswith("42") else "migration_failed"
+        raise MemoryError(status, detail=f"Migration: {name}; statement: {position}; SQLSTATE: {sqlstate}") from None
+
+
 def _install(db, config, secrets, control, *, upgrade=False):
     bundle = migrations()
     with db.transaction() as tx:
@@ -164,10 +180,7 @@ def _install(db, config, secrets, control, *, upgrade=False):
             _identity(_state(db, tx), config, allow_legacy=True)
             db.execute("UPDATE maven.service_state SET state = 'maintenance' WHERE singleton", transaction=tx)
             for name, sha, statements in bundle[len(installed):]:
-                for statement in statements:
-                    db.execute(statement, transaction=tx)
-                db.execute("INSERT INTO maven.schema_migrations(name, sha256) VALUES (:name, :sha)",
-                           {"name": name, "sha": sha}, tx)
+                _apply_migration(db, tx, name, sha, statements)
             _grant_instructions(db, tx)
             return
         if upgrade:
@@ -182,10 +195,7 @@ def _install(db, config, secrets, control, *, upgrade=False):
                    "sha256 text NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'), "
                    "installed_at timestamptz NOT NULL DEFAULT transaction_timestamp())", transaction=tx)
         for name, sha, statements in bundle:
-            for statement in statements:
-                db.execute(statement, transaction=tx)
-            db.execute("INSERT INTO maven.schema_migrations(name, sha256) VALUES (:name, :sha)",
-                       {"name": name, "sha": sha}, tx)
+            _apply_migration(db, tx, name, sha, statements)
         # No literal credential SQL leaves this process. Disable all Python logs
         # for the consumer; cluster logging settings are checked before retrieval.
         secret = secrets.get_secret_value(SecretId=config["app_secret_arn"])
@@ -248,6 +258,7 @@ def _run(config, session, *, upgrade=False):
     """Run only reviewed initialization or ordered migration under maintenance."""
     previous_logging = logging.root.manager.disable
     logging.disable(logging.CRITICAL)
+    db = None
     try:
         _config(config)
         kwargs = {"region_name": config["region"], "config": sdk_config()}
@@ -284,7 +295,12 @@ def _run(config, session, *, upgrade=False):
         return {"status": "ready", "instance_id": config["instance_id"],
                 "recovery_epoch": config["recovery_epoch"], "schema_version": SCHEMA_VERSION,
                 "data_scope": ROLLOUT_SCOPE}
-    except MemoryError:
+    except MemoryError as error:
+        if error.status in ("migration_rejected", "migration_failed"):
+            confirmed = db is not None and db.rollback_confirmed is True
+            status = error.status if confirmed else "migration_outcome_unknown"
+            detail = error.metadata["detail"] + ("; rollback confirmed" if confirmed else "; rollback unconfirmed")
+            raise MemoryError(status, 422 if confirmed else 503, detail=detail) from None
         raise
     except Exception as error:
         raise safe_provider_error(error) from None

@@ -299,6 +299,30 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                         controller.respond.assert_not_called()
                         await pilot.press('ctrl+q')
 
+    async def test_rejected_migration_shows_safe_diagnostics_without_auto_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identifier = str(uuid4())
+            controller = Mock(home=Path(directory))
+            controller.status.return_value = {
+                'operation_id': identifier, 'state': 'blocked', 'step': 'migrate',
+                'error': 'migration_rejected',
+                'error_detail': 'Migration: 020_secret_adapter_grants.sql; statement: 10; SQLSTATE: 42601; rollback confirmed',
+                'pending_interaction': None, 'next_actions': ['advance'], 'receipts': []}
+            with patch('tools.tui.administration.AdminOperations', return_value=controller):
+                app = WorkflowApp('Update MAVEN', ['Database upgrade'],
+                                  lambda ui: present(ui, Path(directory), operation_id=identifier))
+                async with app.run_test(size=(110, 38)) as pilot:
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, ReviewScreen)
+                    displayed = '\n'.join(widget.text for widget in app.screen.query(TextArea))
+                    self.assertIn('020_secret_adapter_grants.sql', displayed)
+                    self.assertIn('42601', displayed)
+                    self.assertIn('rollback confirmed', displayed)
+                    self.assertIn('not a service outage', displayed)
+                    controller.database_status.assert_not_called()
+                    controller.advance.assert_not_called()
+                    await pilot.press('ctrl+q')
+
     async def test_paused_database_is_awaited_then_the_same_step_retried(self):
         for statuses, retried in ((['warming', 'warming', 'awake'], True), (['not_authorized'], False)):
             with self.subTest(statuses=statuses), tempfile.TemporaryDirectory() as directory:

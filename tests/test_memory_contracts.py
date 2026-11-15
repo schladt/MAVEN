@@ -3,6 +3,8 @@ import json
 import unittest
 from unittest.mock import Mock, patch
 
+from botocore.exceptions import ClientError
+
 from tools.memory import admin, bootstrap, client, store, validation
 
 CONFIG = {
@@ -97,6 +99,65 @@ class CloudContractTests(unittest.TestCase):
         self.assertTrue(any('maven.memory_request(text,jsonb,text,text,text,integer) TO maven_app' in sql for sql in executed))
         self.assertIn("ALTER ROLE maven_app SET statement_timeout = '5s'", executed)
         self.assertIn("ALTER ROLE maven_app SET lock_timeout = '1s'", executed)
+
+    def test_failed_migration_reports_safe_location_and_verified_rollback(self):
+        bundle = admin.migrations()
+        name, _, statements = bundle[-1]
+        installed = {name: sha for name, sha, _ in bundle[:-3]}
+        state = {**store.control_document(CONFIG, 'ready'),
+                 'app_secret_arn': CONFIG['app_secret_arn'], 'app_secret_version': 'fixture-version'}
+        for sqlstate, rollback_fails, expected in (
+                ('42601', False, 'migration_rejected'),
+                ('57014', False, 'migration_failed'),
+                ('42601', True, 'migration_outcome_unknown')):
+            with self.subTest(sqlstate=sqlstate, rollback_fails=rollback_fails):
+                data = Mock()
+                data.get_caller_identity.return_value = {'Arn': CONFIG['admin_role_arn']}
+                data.begin_transaction.return_value = {'transactionId': 'tx'}
+                provider_error = ClientError({'Error': {
+                    'Code': 'DatabaseErrorException',
+                    'Message': f'private-provider-value SQLState: {sqlstate}'}}, 'ExecuteStatement')
+
+                def execute(**kwargs):
+                    if kwargs['sql'] == statements[9]:
+                        raise provider_error
+                    return {}
+
+                data.execute_statement.side_effect = execute
+                if rollback_fails:
+                    data.rollback_transaction.side_effect = TimeoutError('private-rollback-value')
+                session = Mock()
+                session.client.return_value = data
+                with patch.object(admin, '_config'), patch.object(admin, 'authorized_actor'), \
+                        patch.object(admin, '_check_logging'), \
+                        patch.object(admin, '_control', return_value=(store.control_document(CONFIG, 'maintenance'), 'etag')), \
+                        patch.object(store.DataAPI, 'scalar', side_effect=[
+                            True, True, json.dumps(installed), json.dumps(state)]):
+                    with self.assertRaises(validation.MemoryError) as caught:
+                        admin._run(CONFIG, session, upgrade=True)
+                error = caught.exception
+                self.assertEqual(error.status, expected)
+                self.assertEqual(error.http_status, 503 if rollback_fails else 422)
+                self.assertIn(f'Migration: {name}; statement: 10; SQLSTATE: {sqlstate}', error.metadata['detail'])
+                self.assertIn('rollback unconfirmed' if rollback_fails else 'rollback confirmed', error.metadata['detail'])
+                self.assertNotIn('private-', json.dumps(error.metadata))
+                data.rollback_transaction.assert_called_once()
+                data.commit_transaction.assert_not_called()
+                data.put_object.assert_not_called()  # Never clear maintenance after a failed migration.
+
+    def test_rollback_confirmation_does_not_survive_another_transaction(self):
+        data = Mock()
+        data.begin_transaction.return_value = {'transactionId': 'tx'}
+        db = store.DataAPI(data, CONFIG, admin=True)
+        with self.assertRaises(ValueError):
+            with db.transaction():
+                raise ValueError('rejected statement')
+        self.assertTrue(db.rollback_confirmed)
+        data.begin_transaction.side_effect = TimeoutError('no transaction obtained')
+        with self.assertRaises(TimeoutError):
+            with db.transaction():
+                self.fail('Transaction must not start')
+        self.assertFalse(db.rollback_confirmed)
 
     def test_explicit_scope_is_transported_without_rewriting_legacy_discovery(self):
         memory = client.MemoryClient(self.config(), Mock())

@@ -704,6 +704,18 @@ memory checkpoint or discard unknown outcomes. Historical record provenance rema
 intact. Reload active authority after instruction changes. Schema approval is not
 policy approval; installing templates is neither.
 
+If a migration statement fails, setup reports its filename, statement number and SQLSTATE
+without exposing provider messages, SQL parameters or credentials. A confirmed
+transaction rollback is a blocked step: none of that transaction's migrations
+committed. If rollback cannot be confirmed, the outcome remains uncertain and
+requires inspection before retrying. The external maintenance flag remains set;
+do not clear it manually to bypass an incomplete upgrade.
+
+After installing corrected migration code, resume the **same operation**. Changed
+SQL requires a fresh exact SQL review before execution; prior approvals and receipts
+remain preserved. Already-applied migration hashes must still match the bundle's
+ordered prefix—resuming does not overwrite or reinterpret migration history.
+
 The current contract is schema 2 / client protocol 4; `012_agentic_memory.sql`
 established the memory-native foundation, with additive migrations through 020.
 Ordinary schema-1 use is rejected. Both `maven-memory migrate --confirm-instance

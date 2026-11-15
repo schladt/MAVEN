@@ -111,8 +111,8 @@ BEGIN
     END IF;
     document:=(page_value.snapshot->>'body_markdown')::jsonb;
     IF jsonb_typeof(document) IS DISTINCT FROM 'object' OR document->'version' IS DISTINCT FROM '1'::jsonb
-       OR document->>'kind' IS DISTINCT FROM CASE WHEN page_value.slug LIKE 'secret-adapter-%'
-           THEN 'secret-adapter' ELSE 'secret-grant' END THEN
+       OR document->>'kind' IS DISTINCT FROM (CASE WHEN page_value.slug LIKE 'secret-adapter-%'
+           THEN 'secret-adapter' ELSE 'secret-grant' END) THEN
         RETURN jsonb_build_object('status','invalid_request');
     END IF;
     RETURN jsonb_build_object('home_id',home,'page_id',page_value.id,'slug',page_value.slug,
