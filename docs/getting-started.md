@@ -24,12 +24,39 @@ The full-screen Textual interface starts with your goal: **connect existing memo
 instance/account/region/profiles and offers **check or repair**, **update local
 software**, or **set up a separate instance**. Check/repair does not reinstall packages
 or automatically redeploy. A separate instance requires an unused private home.
-Software-only installation and optional Google/certificate settings are under
+Software-only installation and certificate settings are under
 **Advanced options**. The private installation home defaults to `~/.maven`.
 
 Python 3.11+ with `venv` is required. If UI dependencies are missing, a brief initial
 prompt requests consent to download them into a temporary private runtime; system
 Python is never modified.
+
+**Required secrets-store selection**
+
+Core setup includes a secrets-store stage before reporting ready. Import integration
+locators from an explicit private `.env` or approved record, enter the exact existing
+settings manually, or approve creation of the exact private S3 bucket and generated
+SSM wrapping key. Prefixes are namespaces, not resources to discover or adopt by name.
+The review pins account, region, daily/maintenance identities, resources and effects.
+Secret values and generated key plaintext never belong in reviews, journals or chat.
+
+Read-only verification checks the selected resources/access; it does **not** prove
+write permissions. Resume retains the original create operation and verifies its
+outcome, never regenerating an existing wrapping key. Keep keys separately protected
+from ciphertext. The store can be configured before selecting MAVEN Home; Home is
+required only for the secret catalog.
+SSM metadata listing requires `ssm:DescribeParameters` on `Resource: "*"`, because
+AWS cannot scope that action to a prefix. The proposed daily-use policy discloses
+this account-wide metadata permission; MAVEN filters its requests to the configured
+store. Value access and writes remain scoped to the exact store, and no policy is
+attached automatically.
+
+
+Check/Repair supports the same integration-only import and exact review. Updates
+preserve existing integration settings and keys. Missing settings require explicit
+repair, not silent replacement; start-over separately reviews retain/rebind choices.
+See [secret usage](integrations.md#aws-secrets-and-encrypted-files) for metadata-only
+discovery, private-file store-and-catalog and approved declarative consumers.
 
 Use Tab/Shift+Tab to move focus, arrows to select, Space to toggle checkboxes and
 Enter or the mouse to activate controls. Back revises unsubmitted choices; it never
@@ -382,8 +409,7 @@ project's detail. When unsure, the assistant chooses Home, not universal.
 `python3 install.py --local-only` installs local tools without invoking cloud setup.
 Use it for a package-only installation; downloads still require network access or an
 appropriate package cache, and it does not establish cloud readiness. `--home PATH`
-chooses another private home, `--google` installs
-optional client libraries without granting Google account access, and `--harness NAME`
+chooses another private home, and `--harness NAME`
 selects a harness (repeat for several). `--skill-dir PATH` explicitly selects a custom
 destination. Running harnesses do not block interactive skill installation: they load
 the change after a restart, and a harness that saves its own configuration while running
@@ -412,7 +438,7 @@ To stage selected integrations without live writes, use `--stage-harnesses PATH`
 For custom profiles, pair `--harness-config NAME=ABSOLUTE_FILE` with
 `--harness-context NAME=ABSOLUTE_FILE` and an explicit `--skill-dir PATH`. Actual
 integration changes still require stopped-harness approval. Normal installation
-includes `ui,mcp`; optional Google dependencies remain separate.
+includes `ui,mcp`; Google libraries and CLI are no longer part of core.
 
 Native startup/shutdown integration is enabled by default for selected harnesses.
 Uncheck **Install native MAVEN startup and shutdown integration** or pass
@@ -574,9 +600,9 @@ maven-memory starter prepare --output "$STARTER_DIRECTORY" \
 
 Supply genuine owner source evidence, not the literal example variable names. Read
 all proposed bodies. The catalog contains the core directive and memory, setup,
-connection, skill-loading, workflow, secrets, workspace and optional Google skills.
+connection, skill-loading, workflow, secrets and workspace skills.
 They are proposals only; even the generic root directive requires owner activation.
-Google authority does not enable Google access or make it a core prerequisite.
+The bundled secrets skill covers usage, not setup/import or scanning.
 
 For **each selected page in dependency order**, review its complete generated JSON
 and body, then submit the proposal and obtain the exact owner-approval challenge:
@@ -616,8 +642,8 @@ also require an explicit root and complete authority; retain the returned MAVEN
 session UUID, distinct from any optional harness identity.
 
 Review [Security and privacy](security.md) before sharing retrieved context with an
-external model. Configure [optional integrations](integrations.md) only when needed;
-neither Google nor a secrets-file bucket is required to start core memory work.
+external model. Review [integrations](integrations.md) for the required secrets store
+and optional workspace features. Google is not required or included in core.
 
 ## Existing-instance upgrade
 
@@ -625,6 +651,37 @@ Local code/templates do not update live AWS resources, schema or active authorit
 themselves. The guided update applies them as one resumable setup operation in mode
 `update` (`maven-setup --mode update`, **Update MAVEN** in `python3 install.py`, the
 `maven-update` skill, or `maven_admin` begin kind `setup` with `{"mode": "update"}`):
+
+For the secrets/Google cutover, use the installer update with affected harness
+sessions stopped. It installs local software/harness files first, then presents any
+required legacy environment migration before strict settings loading. The update
+operation applies additive **SQL018 → SQL019 → SQL020**, then the matching
+service/IAM change set, optional owner-reviewed instruction changes, and required
+secrets-store/readiness checks. Installing files is not enabling a new MCP session:
+start a fresh harness only after the entire update completes and load current authority.
+The installer does not restart existing MCP connections or refresh their contexts.
+
+Before any host receives the removed Google runtime, inspect live instruction
+dependencies and obtain separate owner approval to revoke its cloud skill.
+Removing a bundled template is not revocation. Stored Google credentials remain
+untouched SSM values; Magic Workspace is independent. Legacy environment migration
+cannot be postponed until after cloud setup because the new strict loader rejects
+the retired key. No separate manual SQL or CloudFormation rollout is required.
+
+For only the one-time local legacy-locator migration, use:
+
+```sh
+maven-setup --home "$MAVEN_HOME" --migrate-environment
+```
+
+This presents a separate exact review, not a deployment. The retired
+`MAVEN_GOOGLE_PARAMETER_PREFIX` is retained in a private receipt; every other setting
+is preserved. An imported `.env` remains untouched and produces a sanitized private
+snapshot. Guided setup presents the same prerequisite automatically. Through MCP,
+begin `maven_admin` kind `environment_migration` with `{}` for this home's `.env`,
+or `{"path": "<absolute private import path>"}`. If an existing operation returns
+`prerequisite_operation`, complete that exact review first, then advance the original
+operation UUID. Nothing here activates/revokes authority or touches stored credentials.
 
 | Stage | What it compares | What it does when different |
 | --- | --- | --- |
@@ -647,7 +704,8 @@ memory checkpoint or discard unknown outcomes. Historical record provenance rema
 intact. Reload active authority after instruction changes. Schema approval is not
 policy approval; installing templates is neither.
 
-The new contract is schema 2 / client protocol 3 with `012_agentic_memory.sql`.
+The current contract is schema 2 / client protocol 4; `012_agentic_memory.sql`
+established the memory-native foundation, with additive migrations through 020.
 Ordinary schema-1 use is rejected. Both `maven-memory migrate --confirm-instance
 "$INSTANCE_ID"` and `maven-memory install migrate --confirm-instance "$INSTANCE_ID"`
 accept a schema-1 binding solely for the separately approved administrator migration.

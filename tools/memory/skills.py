@@ -27,7 +27,7 @@ import zlib
 
 from .client import MemoryClientError
 
-from .validation import MemoryError, validate
+from .validation import MAX_SKILL_DESCRIPTION, MemoryError, reject_secrets, text, validate
 
 MAX_BUNDLE = 268435456
 MAX_MANIFEST = 4 * 1024 * 1024
@@ -37,7 +37,7 @@ HASH = re.compile(r'[0-9a-f]{64}\Z')
 SLUG = re.compile(r'(?=.{1,80}\Z)[a-z0-9]+(?:-[a-z0-9]+)*\Z')
 VERSION = re.compile(r'[A-Za-z0-9._-]{1,80}\Z')
 METADATA = ('page_id', 'slug', 'page_kind', 'title', 'scope', 'revision',
-            'content_hash', 'data_scope', 'requires', 'bundle')
+            'content_hash', 'data_scope', 'requires', 'bundle', 'description')
 
 
 def _fail(code='skill_bundle_invalid'):
@@ -433,6 +433,14 @@ def _metadata(page):
             or any(not isinstance(item, str) or not SLUG.fullmatch(item) for item in requires)
             or len(set(requires)) != len(requires)):
         _fail('invalid_service_response')
+    if 'description' in page:
+        try:
+            if page['page_kind'] != 'skill':
+                _fail('invalid_service_response')
+            text(page['description'], MAX_SKILL_DESCRIPTION, name='description')
+            reject_secrets(page['description'])
+        except MemoryError:
+            _fail('invalid_service_response')
     if 'bundle' in page:
         if page['page_kind'] != 'skill':
             _fail('invalid_service_response')
@@ -482,45 +490,66 @@ class SessionSkills:
             self.generation = data['authority_generation']
         self.session_id = session_id
 
+    @staticmethod
+    def catalog_pages(client, project_id=None):
+        """One fresh, generation-consistent catalog; no session or disk cache is required."""
+        catalog, after, generation = {}, None, None
+        while True:
+            request = {'page_kind': 'skill', 'limit': 10,
+                       'scope': 'universal' if project_id is None else 'context'}
+            if project_id is not None:
+                request['project_id'] = project_id
+            if after is not None:
+                request['after_slug'] = after
+            response = client.invoke('/v1/pages/index', request)
+            data = response.get('data', {})
+            if (response.get('status') != 'ready' or not isinstance(data, dict)
+                    or not isinstance(data.get('pages'), list)
+                    or type(data.get('authority_generation')) is not int):
+                _fail('invalid_service_response')
+            if generation is None:
+                generation = data['authority_generation']
+            elif generation != data['authority_generation']:
+                _fail('context_stale')
+            previous = after
+            for page in data['pages']:
+                slug = page.get('slug') if isinstance(page, dict) else None
+                if not isinstance(slug, str) or previous is not None and slug <= previous:
+                    _fail('invalid_service_response')
+                previous = slug
+                if page.get('data_scope') != 'owner':
+                    continue
+                page = _metadata(page)
+                if page['page_kind'] != 'skill':
+                    _fail('invalid_service_response')
+                if 'project' not in page['scope'] or page['scope']['project'] == project_id:
+                    catalog[slug] = page
+            next_after = data.get('next_after_slug')
+            if next_after is None:
+                break
+            if not data['pages'] or next_after != previous or after is not None and next_after <= after:
+                _fail('invalid_service_response')
+            after = next_after
+        return {'pages': list(catalog.values()), 'authority_generation': generation}
+
+    @staticmethod
+    def summaries(catalog, loaded=(), loaded_generation=None):
+        """Only approved generic headers, never bodies, bundle inventories or inferred descriptions."""
+        loaded = {(page['slug'], page['revision']) for page in loaded}
+        generation = catalog['authority_generation']
+        return {'status': 'ready', 'authority_generation': generation, 'pages': [
+            {**{key: page[key] for key in ('slug', 'page_kind', 'title', 'description', 'scope', 'revision')
+                if key in page},
+             'loaded': loaded_generation == generation and (page['slug'], page['revision']) in loaded}
+            for page in catalog['pages']]}
+
     def discover(self, refresh=False):
         if self.catalog is None or refresh:
-            catalog, after, generation = {}, None, None
-            while True:
-                request = {'page_kind': 'skill', 'limit': 10}
-                if after is not None:
-                    request['after_slug'] = after
-                response = self.client.invoke('/v1/pages/index', request)
-                data = response.get('data', {})
-                if (response.get('status') != 'ready' or not isinstance(data.get('pages'), list)
-                        or type(data.get('authority_generation')) is not int):
-                    _fail('invalid_service_response')
-                if generation is None:
-                    generation = data['authority_generation']
-                elif generation != data['authority_generation']:
-                    _fail('context_stale')
-                previous = after
-                for page in data['pages']:
-                    slug = page.get('slug') if isinstance(page, dict) else None
-                    if not isinstance(slug, str) or previous is not None and slug <= previous:
-                        _fail('invalid_service_response')
-                    previous = slug
-                    if page.get('data_scope') != 'owner':
-                        continue
-                    page = _metadata(page)
-                    if page['page_kind'] != 'skill':
-                        _fail('invalid_service_response')
-                    if page['scope'].get('project', self.project_id) == self.project_id:
-                        catalog[slug] = page
-                next_after = data.get('next_after_slug')
-                if next_after is None:
-                    break
-                if not data['pages'] or next_after != previous or after is not None and next_after <= after:
-                    _fail('invalid_service_response')
-                after = next_after
+            data = self.catalog_pages(self.client, self.project_id)
             _atomic_json(self.cache / 'registry.json', {
-                'project_id': self.project_id, 'session_id': self.session_id,
-                'authority_generation': generation, 'pages': list(catalog.values())})
-            self.catalog, self.generation = catalog, generation
+                'project_id': self.project_id, 'session_id': self.session_id, **data})
+            self.catalog = {page['slug']: page for page in data['pages']}
+            self.generation = data['authority_generation']
         return {'status': 'ready', 'data': {
             'pages': list(self.catalog.values()), 'authority_generation': self.generation}}
 
@@ -550,10 +579,11 @@ class SessionSkills:
             'path': str(destination), 'manifest': manifest}}
 
     def start(self):
-        self.discover()
+        self.discover(refresh=True)
         resources = [self.fetch(slug)['data'] for slug, page in self.catalog.items()
                      if page.get('bundle', {}).get('load_policy') == 'always']
-        return {'status': 'ready', 'data': {'resources': resources}}
+        return {'status': 'ready', 'data': {'resources': resources,
+                'available_skills': self.summaries(self.discover()['data'])}}
 
 
 

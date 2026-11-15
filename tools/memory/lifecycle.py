@@ -160,6 +160,50 @@ class SessionService:
         from .skills import SessionSkills
         return SessionSkills(self.client, self.root, self.project_id, self.session_id).start()['data']
 
+    def _loaded_skill_summaries(self, skills):
+        from .skills import SessionSkills
+        if 'available_skills' in skills:
+            skills['available_skills'] = SessionSkills.summaries(
+                skills['available_skills'], self._authority['instructions'],
+                self._authority['authority_generation'])
+        return skills
+
+    def skill_summaries(self):
+        from .skills import SessionSkills
+        with self._session_lock(shared=True):
+            self._guard()
+            self._memory()
+            catalog = SessionSkills.catalog_pages(self.client, self.project_id)
+            authority = self._authority or {}
+            return self._observe(SessionSkills.summaries(
+                catalog, authority.get('instructions', ()), authority.get('authority_generation')))
+
+    def load_skill(self, slug):
+        """Read an explicit skill with the real project/workflow authority, never ordinary memory."""
+        from .client import MemoryClientError
+        with self._session_lock(shared=True):
+            self._guard()
+            self._memory()
+            try:
+                result = self.client.load_instruction(slug, context={
+                    'project_id': self.project_id, 'workflow': 'maven-workflow',
+                    'instructions_only': True})
+            except MemoryClientError:
+                self.invalidate()
+                raise
+            context = result['context']
+            if not any(page.get('page_kind') == 'directive' for page in context['instructions']):
+                self.invalidate()
+                raise BoundaryError('required approved DB authority is missing')
+            # Preserve prior explicitly loaded skills only within the same verified generation.
+            loaded = ({page['slug']: page for page in self._authority['instructions']}
+                      if self._authority is not None and self._authority['authority_generation']
+                      == context['authority_generation'] else {})
+            loaded.update((page['slug'], page) for page in context['instructions'])
+            self._authority = {**context, 'instructions': list(loaded.values())}
+            self._stale = False
+            return self._report('ready', skill=result['data'], context=context)
+
     def initialize(self, *, resume=False):
         with self._session_lock():
             self._publication_guard()
@@ -197,7 +241,8 @@ class SessionService:
                 project = memory.project_context()
             self._authority, self._session_checked = authority, True
             self.registry.activate(self.root, self.session_id)
-            return self._report('ready', context={**authority, **project, 'skills': skills}, session=session)
+            return self._report('ready', context={**authority, **project,
+                                                 'skills': self._loaded_skill_summaries(skills)}, session=session)
 
     def context(self):
         """Explicit reload of authority, session state and project context."""
@@ -208,7 +253,8 @@ class SessionService:
             self._session_checked = True
             self._authority = memory.context()
             self._stale = False
-            context = {**self._authority, 'skills': self._skills(), **memory.project_context()}
+            context = {**self._authority, 'skills': self._loaded_skill_summaries(self._skills()),
+                       **memory.project_context()}
             return self._report('ready', context=context)
 
     def authority_ref(self):
@@ -247,7 +293,9 @@ class SessionService:
                         pages.append({'slug': page.get('slug'), 'page_kind': page.get('page_kind'),
                                       'title': page.get('title'), 'revision': page.get('revision'),
                                       'requires': page.get('requires', []),
-                                      'loaded': (page.get('slug'), page.get('revision')) in loaded})
+                                      **({'description': page['description']} if 'description' in page else {}),
+                                      'loaded': generation == self._authority['authority_generation']
+                                      and (page.get('slug'), page.get('revision')) in loaded})
                     after = data.get('next_after_slug')
                     if after is None:
                         break

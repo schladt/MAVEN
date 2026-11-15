@@ -8,7 +8,7 @@ import unittest
 import uuid
 from unittest.mock import patch
 
-from test_mcp import MCPCloud, fixture_application
+from test_mcp import MCPCloud, fixture_application, skill_page
 from tools.home import save_home
 from tools.memory.boundary import BoundaryError, read_private, save_private
 from tools.memory.maintenance import MaintenanceError
@@ -64,6 +64,28 @@ class StartupTests(unittest.TestCase):
         self.assertFalse((scratch / '.maven').exists())
         self.assertFalse(self.home.exists())
 
+    def test_native_hook_remains_local_even_with_enabled_skill_catalog(self):
+        self.cloud.pages = [skill_page('calendar')]
+        with patch('tools.memory.environment.configured_client', side_effect=AssertionError('hook read cloud')):
+            result = inspect_startup(self.home, self.root, harness='omp', harness_session='conversation-a')
+        self.assertEqual(result['status'], 'initialize')
+        self.assertNotIn('available_skills', result)
+        self.assertEqual(self.cloud.calls, [])
+
+    def test_selected_project_startup_returns_only_applicable_summaries(self):
+        self.cloud.pages = [skill_page('calendar'), skill_page('local', scope={'project': self.project_id}),
+                            skill_page('other', scope={'project': str(uuid.uuid4())}),
+                            {**skill_page('synthetic'), 'data_scope': 'synthetic'}]
+        app = self.application()
+        inspected = self.startup(app, action='inspect')
+        self.assertEqual([page['slug'] for page in inspected['available_skills']['pages']], ['calendar', 'local'])
+        self.assertTrue(all(not page['loaded'] for page in inspected['available_skills']['pages']))
+        self.assertIsNone(app.binding)
+        initialized = self.startup(app)
+        self.assertEqual([page['slug'] for page in initialized['available_skills']['pages']], ['calendar', 'local'])
+        self.assertTrue(all('description' in page and 'body_markdown' not in page
+                            for page in initialized['available_skills']['pages']))
+
     def test_inspection_reads_project_only_without_creating_a_session(self):
         app = self.application()
         result = self.startup(app, action='inspect')
@@ -81,6 +103,8 @@ class StartupTests(unittest.TestCase):
         (self.home / '.env').chmod(0o600)
         save_home(self.home, root=self.root, project_id=self.project_id, instance_id='instance-one',
                   label='Home', consent={'origin': 'Owner conversation', 'excerpt': 'Use this project as Home.'})
+        self.cloud.pages = [skill_page('home-skill', scope={'project': self.project_id}),
+                            skill_page('universal')]
         identifier = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat()
         self.cloud.records[identifier] = {
@@ -93,6 +117,8 @@ class StartupTests(unittest.TestCase):
                              home=True, action='continue')
         self.assertEqual(result['status'], 'ready')
         self.assertEqual(result['active']['mode'], 'home')
+        self.assertEqual([page['slug'] for page in result['available_skills']['pages']],
+                         ['home-skill', 'universal'])
         self.assertEqual(result['binding']['root'], str(self.root))
         self.assertNotEqual(result['binding']['session_id'], identifier)
         inspected = result['startup_review']['cloud_sessions']['sessions'][0]
@@ -231,6 +257,19 @@ class StartupTests(unittest.TestCase):
         self.assertEqual(self.startup(app)['status'], 'read_only')
         self.assertEqual(self.cloud.calls, [])
         self.assertIsNone(app.binding)
+
+    def test_explicit_project_selection_replaces_prior_sessionless_mode_for_discovery(self):
+        self.cloud.pages = [skill_page('calendar')]
+        for mode in ('read_only', 'off'):
+            with self.subTest(mode=mode):
+                app = self.application()
+                conversation = 'conversation-' + mode
+                app.start(mode, self.root, harness='omp', harness_session=conversation)
+                app.initialize(self.root, harness='omp', harness_session=conversation)
+                result = self.startup(app, conversation, action='inspect')
+                self.assertEqual(result['active']['mode'], 'project')
+                self.assertEqual(result['available_skills']['status'], 'ready')
+                self.assertEqual(result['available_skills']['pages'][0]['slug'], 'calendar')
 
     def test_changed_folder_binding_blocks_old_operations_before_new_runtime_is_created(self):
         app = self.application()

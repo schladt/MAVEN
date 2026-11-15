@@ -84,7 +84,7 @@ class InstallerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             user = Path(directory)
             home = user / 'not-created'
-            args = argparse.Namespace(home=home, google=False, harness=['omp'], skill_dir=[],
+            args = argparse.Namespace(home=home, harness=['omp'], skill_dir=[],
                                       ca_bundle=None, local_only=True, harness_stopped=False)
             ui = Mock()
             ui.review.return_value = False
@@ -100,7 +100,7 @@ class InstallerTests(unittest.TestCase):
     def test_declined_local_review_creates_no_installation(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory).resolve() / 'not-created'
-            args = argparse.Namespace(home=home, google=False, harness=[], skill_dir=[],
+            args = argparse.Namespace(home=home, harness=[], skill_dir=[],
                                       ca_bundle=None, local_only=True, harness_stopped=False)
             ui = Mock()
             ui.review.return_value = False
@@ -114,7 +114,7 @@ class InstallerTests(unittest.TestCase):
     def test_back_from_local_review_preserves_uncreated_home(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory) / 'not-created'
-            args = argparse.Namespace(home=home, google=False, harness=[], skill_dir=[],
+            args = argparse.Namespace(home=home, harness=[], skill_dir=[],
                                       ca_bundle=None, local_only=True, harness_stopped=False)
             ui = Mock()
             ui.review.return_value = None
@@ -675,17 +675,20 @@ class HarnessFinishTests(unittest.TestCase):
                   'MAVEN_MEMORY_ENDPOINT': 'https://original.example',
                   'MAVEN_MEMORY_RECOVERY_EPOCH': str(uuid4()),
                   'MAVEN_AWS_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/owner'}
+        values.update({'MAVEN_SECRETS_BUCKET': 'fixture-secrets', 'MAVEN_SECRETS_KEY_ID': '0123456789abcdef',
+                       'MAVEN_SECRETS_PARAMETER_PREFIX': '/fixture/values/',
+                       'MAVEN_SECRETS_FILE_KEY_PREFIX': '/fixture/keys/', 'MAVEN_SECRETS_OBJECT_PREFIX': 'files/'})
         environment = self.home / '.env'
         environment.write_text(''.join(key + '=' + json.dumps(value) + '\n' for key, value in values.items()))
         environment.chmod(0o600)
         identifier = str(uuid4())
-        outcome = {'home': str(self.home), 'instance_ready': True,
+        outcome = {'home': str(self.home), 'instance_ready': True, 'secrets_ready': True,
                    'instance_id': values['MAVEN_MEMORY_INSTANCE_ID'], 'account': values['MAVEN_ACCOUNT_ID'],
                    'region': values['MAVEN_AWS_REGION'], 'profile': values['MAVEN_AWS_PROFILE'],
                    'authority_generation': 3, 'project_configured': False}
         previous = {'kind': 'setup', 'state': 'completed', 'operation_id': identifier,
                     'step': 'verify', 'pending_interaction': None, 'outcome': outcome,
-                    'receipts': [{'step': 'verify', 'result': {'instance_ready': True}}]}
+                    'receipts': [{'step': 'verify', 'result': {'instance_ready': True, 'secrets_ready': True}}]}
         if legacy:
             previous['starter_binding'] = values
         else:
@@ -700,7 +703,7 @@ class HarnessFinishTests(unittest.TestCase):
             previous = self.completed(legacy=legacy)
             for explicit in (False, True):
                 with self.subTest(legacy=legacy, explicit=explicit):
-                    ui, controller = Mock(), Mock()
+                    ui, controller = Mock(), Mock(home=self.home)
                     controller.status.return_value = previous
                     args = argparse.Namespace(operation=previous['operation_id'] if explicit else None,
                                               fresh_operation=False, mode=None)
@@ -730,7 +733,7 @@ class HarnessFinishTests(unittest.TestCase):
             with self.subTest(key=key):
                 changed = dict(previous['outcome']['binding'], **{key: 'changed'})
                 (self.home / '.env').write_text(''.join(k + '=' + json.dumps(v) + '\n' for k, v in changed.items()))
-                controller = Mock()
+                controller = Mock(home=self.home)
                 controller.status.return_value = previous
                 with patch('tools.administration.AdminOperations', return_value=controller), \
                         patch('tools.tui.administration.present') as present, \
@@ -762,6 +765,35 @@ class HarnessFinishTests(unittest.TestCase):
             install._options(args)
         self.assertTrue(args.setup_fresh)
         self.assertIsNone(args.setup_operation)
+
+    def test_installer_exposes_separate_read_only_secrets_repair(self):
+        self.completed()
+        args, ui = argparse.Namespace(home=self.home), Mock()
+        ui.choose.return_value = 'repair-secrets'
+        with using(ui):
+            install._options(args)
+        self.assertTrue(args.repair_secrets)
+        self.assertTrue(args.check_existing)
+        self.assertFalse(args.setup_fresh)
+        self.assertIn('repair-secrets', [value for _, value in ui.choose.call_args.args[1]])
+        command = install._handoff_command({'home': self.home, 'repair_secrets': True})
+        self.assertIn('--repair-secrets', command)
+        self.assertNotIn('--mode', command)
+        ui.form.assert_not_called()
+
+    def test_old_memory_only_readiness_routes_required_new_stage_without_reusing_receipt(self):
+        from tools.setup import _present
+        previous = self.completed()
+        previous['outcome'].pop('secrets_ready')
+        controller = Mock(home=self.home)
+        controller.status.return_value = previous
+        with patch('tools.administration.AdminOperations', return_value=controller), \
+                patch('tools.tui.administration.present', return_value=0) as present, \
+                patch('tools.tui.harness.finish_setup') as finish:
+            _present(Mock(), argparse.Namespace(operation=previous['operation_id'],
+                     fresh_operation=False, mode=None), self.home)
+        finish.assert_not_called()
+        self.assertIsNone(present.call_args.kwargs['operation_id'])
 
     def test_menu_home_entry_dispatches_home_operation_and_offers_turn_off_when_set(self):
         self.completed()

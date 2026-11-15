@@ -177,6 +177,39 @@ class InstructionValidationTests(unittest.TestCase):
         body["candidate"]["body_markdown"] = "a" * validation.MAX_BODY_BYTES
         self.assertIs(validation.validate_create(body), body)
 
+    def test_skill_description_is_optional_bounded_reviewed_candidate_content(self):
+        body = proposal()
+        body["candidate"]["page_kind"] = "skill"
+        original = validation.digest(body["candidate"])
+        validation.validate_create(body)
+        self.assertNotIn("description", body["candidate"])
+        self.assertEqual(validation.digest(body["candidate"]), original)
+        body["candidate"]["description"] = "Use for approved calendar operations."
+        validation.validate_create(body)
+        self.assertNotEqual(validation.digest(body["candidate"]), original)
+        for invalid in ("", " ", "x" * 501, None, True, [], "\x00",
+                        "Bearer " + "a" * 32):
+            body["candidate"]["description"] = invalid
+            with self.subTest(value=invalid), self.assertRaises(validation.MemoryError):
+                validation.validate_create(body)
+        body["candidate"]["description"] = "x" * 500
+        validation.validate_create(body)
+        for kind in ("directive", "procedure"):
+            body["candidate"]["page_kind"] = kind
+            with self.subTest(kind=kind), self.assertRaises(validation.MemoryError):
+                validation.validate_create(body)
+
+    def test_catalog_scope_is_explicit_and_instruction_only_flag_is_boolean(self):
+        for request in ({}, {"scope": "universal"}, {"scope": "context", "project_id": INSTANCE}):
+            self.assertIs(validation.validate_index(request), request)
+        for request in ({"scope": "all"}, {"project_id": INSTANCE}, {"scope": "context"},
+                        {"scope": "universal", "project_id": INSTANCE}, {"scope": "context", "project_id": "bad"}):
+            with self.subTest(request=request), self.assertRaises(validation.MemoryError):
+                validation.validate_index(request)
+        validation.validate("/v1/memory/context", {"skill_slug": "example", "instructions_only": True})
+        with self.assertRaises(validation.MemoryError):
+            validation.validate("/v1/memory/context", {"instructions_only": "true"})
+
     def test_bundle_metadata_is_exact_skill_only_and_hash_bound(self):
         body = proposal()
         body["candidate"]["page_kind"] = "skill"

@@ -5,6 +5,8 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import ANY, MagicMock, patch
@@ -389,7 +391,8 @@ class InstructionClientBoundaries(unittest.TestCase):
 
     @staticmethod
     def context(*pages, generation=1):
-        keys = ('page_id', 'slug', 'page_kind', 'title', 'scope', 'revision', 'content_hash', 'data_scope', 'requires', 'bundle')
+        keys = ('page_id', 'slug', 'page_kind', 'title', 'scope', 'revision', 'content_hash', 'data_scope',
+                'requires', 'bundle', 'description')
         return {'status': 'ready', 'data': {'authority_generation': generation, 'minimum_client_protocol': CLIENT_PROTOCOL,
                 'pages': [{key: page['data'][key] for key in keys if key in page['data']} for page in pages],
                 'tasks': [], 'next_task_after_id': None}}
@@ -487,7 +490,7 @@ class InstructionClientBoundaries(unittest.TestCase):
         from tools.memory.validation import digest
         candidate = {'slug': slug, 'page_kind': extra.get('page_kind', 'skill'), 'title': 'Synthetic skill',
                      'scope': {}, 'authority_state': 'active', 'body_markdown': body}
-        candidate.update({key: extra[key] for key in ('requires', 'bundle') if key in extra})
+        candidate.update({key: extra[key] for key in ('requires', 'bundle', 'description') if key in extra})
         return self.page(body, slug=slug, data_scope='owner', content_hash=digest(candidate), **extra)
 
     def inline(self, *pages, generation=1):
@@ -496,6 +499,112 @@ class InstructionClientBoundaries(unittest.TestCase):
             metadata.update(body_markdown=page['data']['body_markdown'], body_sha256=page['data']['body_sha256'])
         context['data']['bodies_inline'] = True
         return context
+
+    def test_description_survives_review_and_inline_load_but_tampering_fails(self):
+        page = self.owner_page('example', 'Complete body', description='Use for approved calendar work.')
+        with patch.object(self.client, 'invoke', return_value=page):
+            self.assertEqual(self.client.read_full({'slug': 'example'})['data']['description'],
+                             page['data']['description'])
+        draft = {**page, 'data': {**page['data'], 'revision': 0, 'authority_state': 'draft', 'operative': False}}
+        with patch.object(self.client, 'invoke', return_value=draft):
+            self.assertEqual(self.client.read_full({'proposal_id': KEY})['data']['description'],
+                             page['data']['description'])
+        for replacement in ('Changed description', None):
+            changed = {**page, 'data': {**page['data'], 'description': replacement}}
+            with self.subTest(replacement=replacement), patch.object(self.client, 'invoke', return_value=changed):
+                with self.assertRaisesRegex(MemoryClientError, 'invalid_service_response'):
+                    self.client.read_full({'slug': 'example'})
+            with patch.object(self.client, 'invoke', return_value=self.inline(changed)):
+                with self.assertRaisesRegex(MemoryClientError, 'invalid_service_response'):
+                    self.client.load_instruction('example')
+        with patch.object(self.client, 'invoke', return_value=self.inline(page)):
+            self.assertEqual(self.client.load_instruction('example')['data']['description'],
+                             page['data']['description'])
+
+    def test_chunked_context_description_presence_is_exact(self):
+        page = self.owner_page('example', 'Complete body', description='Approved description')
+        catalog = self.context(page)
+        del catalog['data']['pages'][0]['description']
+        with patch.object(self.client, 'invoke', return_value=catalog), \
+                patch.object(self.client, 'read_full', return_value=page):
+            with self.assertRaisesRegex(MemoryClientError, 'context_stale'):
+                self.client.load_instruction('example')
+
+    def test_named_load_preserves_bound_selectors_and_instruction_only_mode(self):
+        page = self.owner_page('example', 'Complete body')
+        selectors = {'project_id': KEY, 'workflow': 'maven-workflow', 'instructions_only': True}
+        capability = {'status': 'ready', 'data': {'authority_generation': 1, 'capabilities': ['instructions_only']}}
+        context = self.inline(page)
+        context['data']['instructions_only'] = True
+        with patch.object(self.client, 'invoke', side_effect=[capability, context]) as invoke:
+            self.client.load_instruction('example', context=selectors)
+        self.assertEqual(invoke.call_args.args[:2], ('/v1/memory/context', {
+            **selectors, 'skill_slug': 'example', 'operation': 'example'}))
+        self.assertNotIn('skill_slug', selectors)
+
+    def test_instruction_only_load_refuses_legacy_service_before_context_request(self):
+        for capabilities in (None, [], 'instructions_only'):
+            metadata = {'authority_generation': 1}
+            if capabilities is not None:
+                metadata['capabilities'] = capabilities
+            with patch.object(self.client, 'invoke', return_value={'status': 'ready', 'data': metadata}) as invoke:
+                with self.assertRaisesRegex(MemoryClientError, 'client_incompatible'):
+                    self.client.load_instruction('example', context={'instructions_only': True})
+            self.assertEqual(invoke.call_count, 1)
+            self.assertEqual(invoke.call_args.args[:2], ('/v1/pages/index', {
+                'page_kind': 'skill', 'limit': 1, 'scope': 'universal'}))
+
+    def test_instruction_only_context_requires_explicit_acknowledgment_and_no_tasks(self):
+        capability = {'status': 'ready', 'data': {'authority_generation': 1, 'capabilities': ['instructions_only']}}
+        for acknowledgement, tasks in ((None, []), (False, []), (True, [{'title': 'ordinary task'}])):
+            context = self.inline(self.owner_page('example', 'Approved body'))
+            context['data'].update(instructions_only=acknowledgement, tasks=tasks)
+            with patch.object(self.client, 'invoke', side_effect=[capability, context]):
+                with self.assertRaisesRegex(MemoryClientError, 'invalid_service_response'):
+                    self.client.load_instruction('example', context={'instructions_only': True})
+
+    def test_catalog_pages_all_results_at_one_generation_and_filters_scope(self):
+        from tools.memory.skills import SessionSkills
+        first = [self.owner_page('skill-' + str(index).zfill(2), 'Complete body',
+                                 description='Generic approved purpose')['data'] for index in range(10)]
+        last = [self.owner_page('skill-10', 'Complete body')['data']]
+        last += [{**self.owner_page('skill-11', 'Private body')['data'], 'scope': {'project': KEY}}]
+        responses = [
+            {'status': 'ready', 'data': {'pages': first, 'authority_generation': 4, 'next_after_slug': 'skill-09'}},
+            {'status': 'ready', 'data': {'pages': last, 'authority_generation': 4, 'next_after_slug': None}},
+        ]
+        with patch.object(self.client, 'invoke', side_effect=responses) as invoke:
+            catalog = SessionSkills.catalog_pages(self.client)
+        self.assertEqual(len(catalog['pages']), 11)
+        self.assertEqual(invoke.call_args_list[0].args, ('/v1/pages/index', {
+            'page_kind': 'skill', 'limit': 10, 'scope': 'universal'}))
+        self.assertEqual(invoke.call_args_list[1].args[1]['after_slug'], 'skill-09')
+        summary = SessionSkills.summaries(catalog, [first[0]], 4)
+        self.assertTrue(summary['pages'][0]['loaded'])
+        self.assertFalse(SessionSkills.summaries(catalog, [first[0]], 3)['pages'][0]['loaded'])
+        self.assertFalse({'body_markdown', 'bundle', 'content_hash', 'provenance'} & summary['pages'][0].keys())
+        self.assertEqual(summary['pages'][0]['description'], 'Generic approved purpose')
+        responses[1]['data']['authority_generation'] = 5
+        with patch.object(self.client, 'invoke', side_effect=responses):
+            with self.assertRaisesRegex(MemoryClientError, 'context_stale'):
+                SessionSkills.catalog_pages(self.client)
+
+    def test_catalog_rejects_repeated_cursor_and_cached_discovery_failure(self):
+        from tools.memory.skills import SessionSkills
+        page = self.owner_page('example', 'Complete body')['data']
+        response = {'status': 'ready', 'data': {'pages': [page], 'authority_generation': 1,
+                                              'next_after_slug': 'example'}}
+        with patch.object(self.client, 'invoke', return_value=response):
+            with self.assertRaisesRegex(MemoryClientError, 'invalid_service_response'):
+                SessionSkills.catalog_pages(self.client)
+        with tempfile.TemporaryDirectory() as directory:
+            skills = SessionSkills(self.client, Path(directory), KEY, CONFIG['instance_id'])
+            response['data']['next_after_slug'] = None
+            with patch.object(self.client, 'invoke', return_value=response):
+                skills.discover()
+            with patch.object(self.client, 'invoke', side_effect=MemoryClientError('selected_login_unavailable_or_expired')):
+                with self.assertRaisesRegex(MemoryClientError, 'selected_login_unavailable_or_expired'):
+                    skills.discover(refresh=True)
 
     def test_inline_context_loads_in_one_request_with_verified_bodies(self):
         dependency = self.owner_page('dependency', 'Dependency body', page_kind='procedure')
@@ -904,6 +1013,29 @@ class InstallationBoundaries(unittest.TestCase):
             self.assertEqual(next(item['ParameterValue'] for item in parameters
                                   if item['ParameterKey'] == 'AvailabilityZones'), 'us-east-1b,us-east-1c')
             self.assertEqual(manifest['deployment_inputs']['AvailabilityZones'], 'us-east-1b,us-east-1c')
+            template_bytes = (package / 'template.json').read_bytes()
+            self.assertLessEqual(len(template_bytes), 51200)
+            template = json.loads(template_bytes)
+            parameter_values = {item['ParameterKey']: item['ParameterValue'] for item in parameters}
+            separator, references = template['Resources']['MemoryFunction']['Properties']['Code']['ZipFile']['Fn::Join']
+            fragments = [parameter_values[item['Ref']] for item in references]
+            self.assertTrue(all(0 < len(fragment.encode()) <= 4096 for fragment in fragments))
+            runtime = separator.join(fragments)
+            self.assertEqual(hashlib.sha256(runtime.encode()).hexdigest(), manifest['runtime_sha256'])
+            probe = """
+from tools.memory.validation import MemoryError, validate
+validate('/v1/memory/secret_lookup', {'project_id': '10000000-0000-4000-8000-000000000001', 'name': 'owner.api'})
+try:
+    validate('/v1/memory/secret_lookup', {'project_id': '10000000-0000-4000-8000-000000000001', 'name': '../wrapping-key'})
+except MemoryError:
+    print('bundled secret boundary enforced')
+else:
+    raise AssertionError('bundled runtime accepted an unrelated secret path')
+"""
+            executed = subprocess.run([sys.executable, '-I', '-c', runtime + probe],
+                                      cwd=directory, capture_output=True, text=True, timeout=15)
+            self.assertEqual(executed.returncode, 0, executed.stderr)
+            self.assertEqual(executed.stdout.strip(), 'bundled secret boundary enforced')
             for index, invalid in enumerate(('us-east-1b, us-east-1b', 'us-east-1b, ',
                                              'us-east-1b, ,us-east-1c')):
                 with self.subTest(zones=invalid):

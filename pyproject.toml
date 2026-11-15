@@ -17,7 +17,6 @@ dependencies = [
 
 [project.optional-dependencies]
 ui = ["textual>=2.1,<3", "packaging>=24,<27"]
-google = ["google-auth-oauthlib>=1.2,<2", "google-api-python-client>=2,<3"]
 mcp = ["mcp>=2.3,<3"]
 
 [project.scripts]
@@ -25,7 +24,7 @@ maven-setup = "tools.setup:main"
 maven-memory = "tools.memory.cli:main"
 maven-workspace = "tools.workspace:main"
 maven-secrets = "tools.aws.secrets:main"
-maven-google = "tools.google.cli:main"
+maven-secret-catalog = "tools.secret_catalog:main"
 maven-project = "tools.project:main"
 maven-start-work = "tools.workflow:start_main"
 maven-checkpoint = "tools.workflow:checkpoint_main"

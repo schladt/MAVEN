@@ -41,15 +41,17 @@ def _cloud_context(home, outcome):
 
 def _verified(home, outcome):
     if not (isinstance(outcome, dict) and outcome.get('instance_ready') is True
+            and outcome.get('secrets_ready') is True
             and outcome.get('home') == str(home) and isinstance(outcome.get('binding'), dict)
             and all(outcome.get(key) for key in ('instance_id', 'account', 'region', 'profile'))):
         return False
     from tools.memory.environment import load_environment
     from tools.memory.client import MemoryClientError
     from tools.setup_common import expected_account, SetupPending
+    from tools.secret_setup import configured as secrets_configured
     try:
         values = load_environment(home / '.env')
-        return (values == outcome['binding']
+        return (secrets_configured(values) and values == outcome['binding']
                 and outcome['account'] == expected_account(values)
                 and outcome['instance_id'] == values.get('MAVEN_MEMORY_INSTANCE_ID')
                 and outcome['region'] == values.get('MAVEN_AWS_REGION', 'us-east-1')

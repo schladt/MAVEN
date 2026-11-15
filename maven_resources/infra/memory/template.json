@@ -712,6 +712,18 @@
                       "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/project_context"
                     },
                     {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_lookup"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_catalog"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_adapter_policy"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_adapter_consume"
+                    },
+                    {
                       "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/revisions"
                     }
                   ]
@@ -1132,6 +1144,90 @@
         "Principal": "apigateway.amazonaws.com",
         "SourceAccount": {"Ref": "AWS::AccountId"},
         "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/project_context"}
+      }
+    },
+    "SecretLookupRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/secret_lookup",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "SecretLookupInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_lookup"}
+      }
+    },
+    "SecretCatalogRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/secret_catalog",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "SecretCatalogInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_catalog"}
+      }
+    },
+    "SecretAdapterPolicyRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/secret_adapter_policy",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "SecretAdapterPolicyInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_adapter_policy"}
+      }
+    },
+    "SecretAdapterConsumeRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/memory/secret_adapter_consume",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "SecretAdapterConsumeInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_adapter_consume"}
       }
     },
     "MemoryRevisionsRoute": {

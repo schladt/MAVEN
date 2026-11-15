@@ -123,6 +123,7 @@ class GuidedSetupTests(unittest.TestCase):
             wizard.save()
             with patch.object(wizard, 'existing'), \
                     patch.object(wizard, 'verify_authority', return_value=7) as authority, \
+                    patch.object(wizard, 'secrets_readiness', return_value={'secrets_ready': True}), \
                     patch('tools.project_setup.setup_project') as project, \
                     patch('tools.setup.confirm') as confirm, redirect_stdout(io.StringIO()):
                 self.assertEqual(wizard.run(), 0)
@@ -132,6 +133,16 @@ class GuidedSetupTests(unittest.TestCase):
             state = read_private(wizard.state_path)
             self.assertEqual(state['project'], saved)
             self.assertNotIn('ready_project', state)
+
+    def test_legacy_setup_cannot_declare_ready_without_required_secrets_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wizard = self.wizard(directory)
+            wizard.settings({'MAVEN_MEMORY_INSTANCE_ID': str(uuid4())})
+            with patch.object(wizard, 'existing'), \
+                    patch.object(wizard, 'verify_authority', return_value=7), redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(SetupPending, 'Required secrets setup'):
+                    wizard.run()
+            self.assertNotIn('instance_ready', read_private(wizard.state_path))
 
     def test_pause_before_request_keeps_original_submitted_keys(self):
         with tempfile.TemporaryDirectory() as directory:

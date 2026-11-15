@@ -244,13 +244,13 @@ WHERE o.request_key = CAST(:request_key AS uuid) AND maven.instruction_visible(o
 # Ordinary memory, page and proposal routes are one maven.memory_request statement.
 DISPATCHED_ROUTES = MEMORY_ROUTES | {"/v1/proposals/create", "/v1/proposals/resolve",
                                      "/v1/proposals/challenge", "/v1/pages/index", "/v1/pages/read"}
-WRITE_ROUTES = MUTATION_ROUTES | {"/v1/proposals/challenge"}
+WRITE_ROUTES = MUTATION_ROUTES | {"/v1/proposals/challenge", "/v1/memory/secret_adapter_consume"}
 ROUTE_STATUSES = {"revision_conflict", "idempotency_conflict", "record_unavailable",
                   "proposal_unavailable", "page_unavailable", "proposal_conflict",
                   "approval_invalid", "invalid_request", "claim_conflict", "setting_conflict",
                   "reference_unavailable", "session_unavailable", "client_incompatible",
                   "context_incomplete", "dependency_unavailable", "dependency_conflict", "context_stale",
-                  "project_archived"}
+                  "project_archived", "not_authorized"}
 DISPATCH = ("maven.memory_request(:route, CAST(:request AS jsonb), :request_hash, :candidate_hash, "
             ":actor, CAST(:protocol AS integer))")
 
@@ -263,7 +263,7 @@ def route_result(result):
         code = result["status"]
         if code not in ROUTE_STATUSES:
             raise MemoryError("temporarily_unavailable")
-        status = 404 if code.endswith("_unavailable") else 422 if code == "invalid_request" else 409
+        status = 403 if code == "not_authorized" else 404 if code.endswith("_unavailable") else 422 if code == "invalid_request" else 409
         raise MemoryError(code, status, **{k: v for k, v in result.items() if k == "current_revision"})
     return result
 

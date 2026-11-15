@@ -180,7 +180,9 @@ class Wizard:
                 source = Path(ask('Absolute path to the existing owner-private .env (0600)')).expanduser()
                 if not source.is_absolute():
                     raise SetupPending('Select an absolute path to the existing private settings.')
-                imported = load_environment(source)
+                from tools.environment_migrations import present as migrate, load_import
+                migrate(require(), self.home, source)
+                imported = load_import(self.home, source)
                 # Connection locators are portable; another machine's cache paths are not.
                 imported.pop('MAVEN_AWS_LOGIN_CACHE', None)
                 imported.pop('MAVEN_DEPLOY_LOGIN_CACHE', None)
@@ -451,6 +453,18 @@ class Wizard:
     def verify_authority(self, project_id=None):
         return verify_authority(self.env, project_id, values=self.values)
 
+    def secrets_readiness(self):
+        """Legacy setup consumes the same separately journaled administration stage."""
+        from tools.administration import AdminOperations
+        from tools.secret_setup import integration_settings
+        identifier = self.state.get('secrets_operation')
+        result = AdminOperations(self.home).status(identifier) if identifier else {}
+        outcome = result.get('outcome', {})
+        if (result.get('state') != 'completed' or outcome.get('secrets_ready') is not True
+                or outcome.get('settings') != integration_settings(self.values)):
+            raise SetupPending('Required secrets setup is unfinished. Resume maven-setup for this home; its exact secrets administration stage must complete before readiness.')
+        return outcome
+
     def run(self):
         stage('Instance selection')
         checkpoint()
@@ -477,6 +491,7 @@ class Wizard:
         stage('Verify readiness')
         checkpoint()
         generation = self.verify_authority()
+        self.secrets_readiness()
         self.state['instance_ready'] = True
         self.state['authority_generation'] = generation
         self.save()
@@ -499,12 +514,20 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, default=Path(os.environ.get('MAVEN_HOME', str(Path.home() / '.maven'))))
     parser.add_argument('--operation', help='Resume the exact persisted administration operation UUID')
+    parser.add_argument('--migrate-environment', action='store_true',
+                        help='Review only the one-time local environment migration; no cloud operations')
+    parser.add_argument('--repair-secrets', action='store_true',
+                        help='Review portable integration import or secrets-store repair without changing memory')
     parser.add_argument('--mode', choices=('existing', 'new', 'update'),
                         help='Connect an existing instance, review new provisioning, or update an existing installation '
                              '(local software, database schema, service stack and instructions)')
     parser.add_argument('--fresh-operation', action='store_true', help='Review a new administration operation after verified completion; unresolved operations are never discarded')
     parser.add_argument('--restart-operation', help='Review abandonment of this unfinished setup UUID and start over without deleting cloud resources')
     args = parser.parse_args(argv)
+    if args.migrate_environment and (args.operation or args.mode or args.repair_secrets or args.fresh_operation or args.restart_operation):
+        parser.error('--migrate-environment reviews local migration only; resume its UUID through administration')
+    if args.repair_secrets and (args.mode or args.fresh_operation or args.restart_operation):
+        parser.error('--repair-secrets is a separate administration operation; use --operation only to resume its exact UUID')
     if args.operation and args.fresh_operation:
         parser.error('--operation resumes exact evidence and cannot be combined with --fresh-operation')
     if args.restart_operation and (args.operation or args.fresh_operation or args.mode):
@@ -514,13 +537,28 @@ def main(argv=None):
     from tools.tui import run_workflow
     return run_workflow('MAVEN instance setup', [
         'Instance selection', 'AWS identities', 'Deployment review', 'Initialize',
-        'Starter authority', 'Verify readiness',
+        'Starter authority', 'Secrets store', 'Verify readiness',
     ], lambda ui: _present(ui, args, home))
 
 
 def _present(ui, args, home):
     from tools.tui.administration import present
     from tools.administration import AdminOperations
+    from tools.environment_migrations import present as migrate
+    migration_result = migrate(ui, home)
+    if migration_result:
+        return migration_result
+    if getattr(args, 'migrate_environment', False):
+        return 0
+    if getattr(args, 'repair_secrets', False):
+        identifier = args.operation
+        if not identifier:
+            saved = Wizard(home).state.get('secrets_operation')
+            if saved and AdminOperations(home).status(saved)['state'] != 'completed':
+                identifier = saved
+        if identifier and AdminOperations(home).status(identifier)['kind'] not in ('repair', 'secrets_setup'):
+            raise SetupPending('Select the exact secrets Repair administration operation.')
+        return present(ui, home, operation_id=identifier, kind='repair')
     if getattr(args, 'restart_operation', None):
         from tools.setup_restart import review_restart, restart
         from tools.administration import _digest
@@ -554,13 +592,22 @@ def _present(ui, args, home):
         if identifier is None and any(key in saved for key in ('mode', 'prepared', 'submitted_requests', 'project')):
             if args.fresh_operation:
                 raise SetupPending('Legacy setup evidence is unresolved. Resume it without --fresh-operation; no receipts were discarded.')
+            wizard = Wizard(home)
+            secret_operation = wizard.state.get('secrets_operation')
+            if not secret_operation:
+                secret_operation = AdminOperations(home).begin('secrets_setup', {})['operation_id']
+                wizard.state['secrets_operation'] = secret_operation
+                wizard.save()
+            result = present(ui, home, operation_id=secret_operation, kind='secrets_setup')
+            if result != 0:
+                return result
             result = _run(args, home)
             if result == 0:
                 from tools.tui.harness import finish_setup
                 wizard = Wizard(home)
                 return finish_setup(ui, home, {'home': str(home), 'account': expected_account(wizard.values),
                     'region': wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'), 'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
-                    'profile': wizard.values.get('MAVEN_AWS_PROFILE'), 'instance_ready': True,
+                    'profile': wizard.values.get('MAVEN_AWS_PROFILE'), 'instance_ready': True, 'secrets_ready': True,
                     'authority_generation': wizard.state['authority_generation'], 'project_configured': False,
                     'binding': dict(wizard.values)})
             return result
@@ -575,6 +622,9 @@ def _present(ui, args, home):
     if args.mode == 'update' and not args.operation and (not previous or verified):
         # A completed setup is archived; the update is a new reviewed operation. An unfinished
         # operation is resumed below and must itself be an update.
+        identifier = None
+    elif verified and previous.get('outcome', {}).get('secrets_ready') is not True:
+        # Old readiness is retained as history, not treated as the new core contract.
         identifier = None
     elif verified and not args.fresh_operation:
         from tools.tui.harness import completed_setup_outcome, finish_setup

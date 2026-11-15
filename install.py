@@ -136,7 +136,6 @@ def _activation(home: Path, ca_bundle: Path | None) -> list[str]:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, help='Private instance home (default MAVEN_HOME or ~/.maven)')
-    parser.add_argument('--google', action='store_true', help='Include optional Google client dependencies')
     parser.add_argument('--harness', choices=tuple(HARNESS_PATHS), action='append', default=[],
                         help='Install documented stdio MCP configuration, startup guidance and skills; repeatable')
     parser.add_argument('--skill-dir', type=Path, action='append', default=[],
@@ -216,10 +215,11 @@ def main(argv=None) -> int:
                 if args.local_only:
                     from tools.tui.harness import show_completion
                     show_completion(ui, home, handoff['integration'])
-                    handoff.clear()
+                    handoff.update(home=home, migrate_environment=True)
+                    ui.close_when_finished()
                     return 0
                 handoff.update(mode=args.setup_mode, operation=args.setup_operation,
-                               fresh_operation=args.setup_fresh)
+                               fresh_operation=args.setup_fresh, repair_secrets=getattr(args, 'repair_secrets', False))
                 ui.close_when_finished()
                 return 0
 
@@ -252,6 +252,10 @@ def _handoff_command(handoff):
     if handoff.get('restart_operation'):
         return [str(python) if python.is_file() else sys.executable, '-m', 'tools.setup',
                 '--home', str(home), '--restart-operation', handoff['restart_operation']]
+    if handoff.get('repair_secrets'):
+        return [str(python), '-m', 'tools.setup', '--home', str(home), '--repair-secrets']
+    if handoff.get('migrate_environment'):
+        return [str(python), '-m', 'tools.setup', '--home', str(home), '--migrate-environment']
     command = [str(python), '-m', 'tools.setup', '--home', str(home), '--mode', handoff['mode']]
     if handoff.get('operation'):
         command.extend(['--operation', handoff['operation']])
@@ -333,8 +337,6 @@ def _saved_installation(home):
 
 def _advanced_options(args):
     selected = require().form('Advanced software options', [
-        Field('google', 'Include optional Google integrations', args.google, kind='bool',
-              help='Adds Google client dependencies. Does not sign in to Google or send any data.'),
         Field('ca', 'Trusted PEM certificate bundle', str(args.ca_bundle or ''), required=False,
               help='Only for a corporate/private certificate authority. Leave blank to keep normal TLS verification.'),
         Field('skill_dirs', 'Custom skill folders, one absolute path per line',
@@ -348,7 +350,6 @@ def _advanced_options(args):
     ], description='These affect local software only. No AWS account, login or cloud resources are changed.',
        back=True)
     if selected is not None:
-        args.google = selected['google']
         args.ca_bundle = Path(selected['ca']) if selected['ca'] else None
         args.skill_dir = [Path(line.strip()) for line in selected['skill_dirs'].splitlines() if line.strip()]
         args.stage_harnesses = Path(selected['stage_harnesses']) if selected['stage_harnesses'] else None
@@ -360,6 +361,7 @@ def _options(args):
     args.uninstall = False
     args.restart_operation = None
     args.home_action = None
+    args.repair_secrets = False
     while True:
         stage('Choose a task')
         home = (args.home or Path(os.environ.get('MAVEN_HOME', '~/.maven'))).expanduser().absolute()
@@ -373,6 +375,8 @@ def _options(args):
                   if completed else []),
                 ('Resume unfinished setup — keep the original requests and approvals' if pending else
                  'Check or repair this connection — verify the saved instance; no automatic redeployment', 'existing'),
+                *([('Repair secrets / integrations — import or verify exact portable locators; read-only checks', 'repair-secrets')]
+                  if not pending else []),
                 *([('Abandon unfinished setup and start over — preserve receipts and cloud resources', 'restart')]
                   if pending else []),
                 *([('Update MAVEN — local software and harness skills, then cloud service, database schema '
@@ -393,6 +397,11 @@ def _options(args):
             ], description='Choose your goal. The wizard explains each step before asking you to decide.\n'
                            'Maintenance access manages infrastructure; daily-use access operates memory.\n'
                            'They may be separate identities in the same AWS account. Neither is assumed yet.')
+        if task == 'repair-secrets':
+            args.home, args.local_only, args.check_existing = home, False, True
+            args.setup_mode, args.setup_operation, args.setup_fresh = 'existing', None, False
+            args.repair_secrets = True
+            return
         if task == 'harness':
             args.home, args.local_only, args.check_existing = home, False, True
             args.setup_mode, args.setup_operation, args.setup_fresh = 'existing', None, False
@@ -461,7 +470,7 @@ def _options(args):
         ], description=('Use an unused folder for this separate installation. Existing files will not be replaced.'
                         if separate else 'Keep the suggested folder unless you need a separate installation. '
                         'Existing settings and recovery receipts are preserved.'),
-           details='Google dependencies, certificate bundles and custom staging paths are under Advanced options.',
+           details='Certificate bundles and custom staging paths are under Advanced options.',
            back=True)
         if selected is None:
             continue
@@ -582,7 +591,7 @@ def _install(args, handoff=None):
             body = '\n'.join([
                 f'Private home: {home}', f'Runtime: {home / "venv"}',
                 f'Settings: {home / ".env"} (existing settings preserved)',
-                f'Package source: {source}', f'Extras: ui, mcp{", google" if args.google else ""}',
+                f'Package source: {source}', 'Extras: ui, mcp',
                 f'Trusted CA: {ca_bundle or "current TLS configuration"}',
                 f'Next: {"local tools only; no AWS/project setup" if args.local_only else "installed maven-setup for explicit cloud selection"}',
                 'Shell profiles: unchanged',
@@ -660,7 +669,7 @@ def _install(args, handoff=None):
         if pip_ready.returncode:
             _install_command([str(python), '-m', 'ensurepip', '--upgrade'])
         with _package_source(source) as package_source:
-            package = str(package_source) + ('[ui,mcp,google]' if args.google else '[ui,mcp]')
+            package = str(package_source) + '[ui,mcp]'
             _install_command([str(python), '-m', 'pip', 'install', '--upgrade', package])
         # pip derives entry-point mode from its umask. Never leave 0775 launchers
         # for the harness reader, which correctly rejects group-writable files.

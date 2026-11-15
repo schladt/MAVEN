@@ -15,6 +15,35 @@ from tools.tui.administration import present
 
 
 class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_real_environment_migration_requires_terminal_approval(self):
+        from tools.administration import AdminOperations
+        from tools.memory.environment import load_environment
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / 'home'
+            home.mkdir(mode=0o700)
+            environment = home / '.env'
+            original = 'MAVEN_AWS_REGION="us-east-1"\nMAVEN_GOOGLE_PARAMETER_PREFIX="/synthetic/google/"\n'
+            environment.write_text(original)
+            environment.chmod(0o600)
+            controller = AdminOperations(home)
+            operation = controller.begin('environment_migration', {})
+            identifier = operation['operation_id']
+            app = WorkflowApp('Local environment migration', [],
+                              lambda ui: present(ui, home, operation_id=identifier))
+            async with app.run_test(size=(110, 38)) as pilot:
+                await pilot.pause()
+                self.assertIsInstance(app.screen, ReviewScreen)
+                self.assertEqual(environment.read_text(), original)
+                self.assertFalse(controller.status(identifier)['approvals'])
+                await pilot.click('#accept')
+                await pilot.pause()
+                completed = controller.status(identifier)
+                self.assertEqual(completed['state'], 'completed')
+                self.assertEqual(load_environment(environment), {'MAVEN_AWS_REGION': 'us-east-1'})
+                self.assertEqual(len(completed['approvals']), 1)
+                self.assertEqual(completed['outcome']['preserved_locator'], '/synthetic/google/')
+                await pilot.press('ctrl+q')
+
     async def test_activity_tracks_work_input_and_completion_on_ui_thread(self):
         for size in ((80, 24), (130, 45)):
             with self.subTest(size=size):
@@ -244,7 +273,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 'handoff': {'type': 'aws_login', 'reason': 'Sign in privately.', 'command': command,
                             'environment': environment},
             }
-            controller = Mock()
+            controller = Mock(home=Path(directory))
             controller.status.return_value = blocked
             controller.advance.return_value = {
                 'operation_id': identifier, 'state': 'completed', 'step': 'done',
@@ -274,7 +303,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
         for statuses, retried in ((['warming', 'warming', 'awake'], True), (['not_authorized'], False)):
             with self.subTest(statuses=statuses), tempfile.TemporaryDirectory() as directory:
                 identifier = str(uuid4())
-                controller = Mock()
+                controller = Mock(home=Path(directory))
                 controller.status.return_value = {
                     'operation_id': identifier, 'state': 'blocked', 'step': 'migrate', 'error': 'warming',
                     'pending_interaction': None, 'next_actions': ['advance'], 'receipts': []}
@@ -310,7 +339,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     'handoff': {'type': 'aws_login', 'reason': 'Authenticate selected access.',
                                 'command': ['aws', 'login', '--profile', 'owner'], 'environment': {}},
                 }
-                controller = Mock()
+                controller = Mock(home=Path(directory))
                 controller.status.return_value = state
                 controller.back.return_value = {
                     'operation_id': identifier, 'state': 'awaiting_input', 'step': 'identity',
@@ -350,7 +379,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     'handoff': {'type': 'aws_login', 'reason': 'Authenticate selected access.',
                                 'command': ['aws', 'login', '--profile', 'owner'], 'environment': {}},
                 }
-                controller = Mock()
+                controller = Mock(home=Path(directory))
                 controller.status.return_value = state
                 with patch('tools.tui.administration.AdminOperations', return_value=controller):
                     app = WorkflowApp('Sign in', [], lambda ui: present(ui, Path(directory), operation_id=identifier))
@@ -380,7 +409,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                             'review_digest': 'exact-review-digest', 'interaction_id': 'exact-interaction', 'revision': 7}
                 state = {'operation_id': identifier, 'state': 'awaiting_decision', 'step': 'connect_review',
                          'pending_interaction': question, 'next_actions': ['respond', 'back']}
-                controller = Mock()
+                controller = Mock(home=Path(directory))
                 controller.status.return_value = state
                 controller.back.return_value = {
                     'operation_id': identifier, 'state': 'awaiting_input', 'step': 'identity',
@@ -413,7 +442,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                         'details': 'No cloud resources will be created.'}
             state = {'operation_id': identifier, 'state': 'awaiting_decision', 'step': 'connect_review',
                      'pending_interaction': question, 'next_actions': ['respond', 'back']}
-            controller = Mock()
+            controller = Mock(home=Path(directory))
             controller.status.return_value = state
             controller.respond.return_value = {
                 'operation_id': identifier, 'state': 'completed', 'step': 'done',
@@ -450,7 +479,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 'review_digest': 'exact-review-digest', 'interaction_id': 'exact-interaction', 'revision': 7,
                 'confirmations': {'purge': 'exact-instance'},
             }
-            controller = Mock()
+            controller = Mock(home=Path(directory))
             controller.status.return_value = {
                 'operation_id': identifier, 'state': 'awaiting_decision', 'step': 'removal_plan',
                 'pending_interaction': question, 'next_actions': ['respond'],
@@ -486,7 +515,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                                     'help': 'Choose everyday access.'}]}
             state = {'operation_id': identifier, 'state': 'awaiting_input', 'step': 'identity',
                      'pending_interaction': question, 'next_actions': ['respond', 'back']}
-            controller = Mock()
+            controller = Mock(home=Path(directory))
             controller.status.return_value = state
             controller.back.return_value = state
             with patch('tools.tui.administration.AdminOperations', return_value=controller):
@@ -505,13 +534,46 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(state['operation_id'], identifier)
                     self.assertIs(state['pending_interaction'], question)
 
+    async def test_secrets_repair_uses_bound_review_without_claiming_memory_readiness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identifier = str(uuid4())
+            review = {'settings': {'MAVEN_SECRETS_BUCKET': 'exact-private-store'},
+                      'policy_principal': 'arn:aws:iam::123456789012:user/daily',
+                      'permission_checks': 'Read only; no canary writes. Write access remains unverified.',
+                      'retention': 'Independent store is retained when memory service is removed.'}
+            question = {'kind': 'review', 'key': 'secrets_review', 'title': 'Review exact secrets binding',
+                        'review': review, 'review_digest': 'a' * 64,
+                        'interaction_id': str(uuid4()), 'revision': 3, 'confirmations': {}}
+            controller = Mock(home=Path(directory))
+            controller.status.return_value = {'operation_id': identifier, 'kind': 'repair',
+                'state': 'awaiting_decision', 'step': 'secrets_prepare',
+                'pending_interaction': question, 'next_actions': ['respond']}
+            controller.respond.return_value = {'operation_id': identifier, 'kind': 'repair',
+                'state': 'completed', 'step': 'secrets_apply', 'pending_interaction': None,
+                'outcome': {'secrets_ready': True, 'write_access_verified': False}}
+            with patch('tools.tui.administration.AdminOperations', return_value=controller), \
+                    patch('tools.tui.harness.finish_setup') as finish:
+                app = WorkflowApp('Secrets Repair', [], lambda ui: present(ui, Path(directory), operation_id=identifier))
+                async with app.run_test(size=(100, 34)) as pilot:
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, ReviewScreen)
+                    controller.respond.assert_not_called()
+                    await pilot.click('#accept')
+                    await pilot.pause()
+                    response = controller.respond.call_args.args[3]
+                    self.assertEqual(response['review_digest'], question['review_digest'])
+                    self.assertIn(question['review_digest'], response['source']['excerpt'])
+                    finish.assert_not_called()
+                    controller.advance.assert_not_called()
+                    await pilot.press('ctrl+q')
+
     async def test_completed_setup_finishes_harness_without_project_forms(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             identifier = str(uuid4())
             outcome = {'instance_ready': True, 'home': str(home), 'account': '123456789012',
                        'region': 'us-east-1', 'instance_id': 'exact-instance', 'profile': 'owner'}
-            controller = Mock()
+            controller = Mock(home=Path(directory))
             controller.status.return_value = {
                 'operation_id': identifier, 'kind': 'setup', 'state': 'awaiting_input', 'step': 'optional_project',
                 'pending_interaction': {'kind': 'form', 'key': 'optional_project', 'title': 'Obsolete project prompt'},
@@ -549,7 +611,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     'handoff': {'reason': reason, 'command': command,
                                 'environment': {'AWS_LOGIN_CACHE_DIRECTORY': cache}},
                 }
-                controller = Mock()
+                controller = Mock(home=Path(directory))
                 controller.status.return_value = result
                 controller.advance.return_value = {
                     'operation_id': identifier, 'state': 'completed', 'step': 'done',
@@ -592,7 +654,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
             home, identifier = Path(directory), str(uuid4())
             command = ['python3', '/checkout/install.py', '--home', str(home)]
             reason = 'Install the selected checkout, then restart this process.'
-            controller = Mock()
+            controller = Mock(home=Path(directory))
             controller.status.return_value = {
                 'operation_id': identifier, 'state': 'blocked', 'step': 'update_local_wait',
                 'pending_interaction': None,

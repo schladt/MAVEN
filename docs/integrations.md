@@ -46,6 +46,7 @@ The subsequent post-review run covered `test_maven_google`, `test_mcp`,
 simulated transport, credential renewal with mocked STS/controlled time, real stdio
 MCP, isolated Git subprocess input, session/assignment recovery, setup ownership and
 the actual Textual prerequisite modal. This was a targeted run, not the full suite.
+This is a historical verification record, not support for the now-removed Google runtime.
 
 OMP 18.18.2 was exercised with native project MCP configuration, the packaged startup
 guidance, and simulated storage in a disposable non-Git directory. It visibly
@@ -176,7 +177,7 @@ First-time project enablement is explicit. Startup guidance does not authorize
 unrelated capture and is not active cloud authority. Follow [getting started](getting-started.md)
 for existing-instance schema rollout and separately approved policy activation.
 
-## Optional AWS, workspace and Google services
+## Configured AWS and workspace services
 
 These integrations use the selected instance's private `.env`, not the installed
 source directory. Configure `MAVEN_AWS_PROFILE`, its expected AWS identity and
@@ -185,14 +186,20 @@ be explicitly authenticated. No helper discovers another account or logs in for 
 
 ## AWS secrets and encrypted files
 
-Small values require `MAVEN_SECRETS_PARAMETER_PREFIX`. The owner provisions IAM access
-to only the selected SSM namespace and the required KMS key permissions. Values are
-SSM Standard `SecureString` parameters encrypted with `alias/aws/ssm` and limited to
-4 KB of UTF-8. Names are short lowercase segments; do not encode sensitive facts in
-resource names.
+The core setup includes a reviewed secrets-store stage: explicitly import existing
+settings, enter selected locators, or approve creation of a private bucket and
+generated wrapping key. It never adopts resources by name. Repair and update preserve
+the selected store and existing keys; read-only verification does not prove write
+permissions. A configured store does not require a Home selection; catalog operations do.
+
+Small values use `MAVEN_SECRETS_PARAMETER_PREFIX`: SSM Standard `SecureString`
+parameters encrypted with `alias/aws/ssm`, limited to 4 KB of UTF-8. Grant only the
+selected namespace and necessary KMS permissions. Names are nonsecret lowercase
+segments; dotted domains organize metadata, not access control.
 
 ```sh
 maven-secrets put service-token             # hidden terminal prompt
+maven-secrets list --domain example.service --limit 20  # metadata only
 maven-secrets check service-token           # hidden comparison prompt
 maven-secrets replace service-token         # intentional existing-value update
 maven-secrets reveal service-token --tty    # explicit terminal-only disclosure
@@ -212,14 +219,14 @@ Encrypted-file operations additionally require:
   key parameter stores the base64 representation of a securely generated 32-byte
   wrapping key as a `SecureString`.
 
-Provision and review these resources and least-privilege permissions separately; the
-helper does not create buckets or keys. Protect and back up keys, configure bucket
-public-access blocking and appropriate retention, and approve storage/API costs.
-Allow only necessary object/multipart operations and SSM key reads. Do not grant
-blanket account access to work around a denied operation.
+The setup controller owns reviewed provisioning; the low-level helper does not
+create buckets or keys. Protect and back up keys, review public-access blocking,
+retention and costs, and grant only necessary object/multipart operations and SSM
+key reads. Never broaden account access to work around a denial.
 
 ```sh
 maven-secrets file put "$PRIVATE_SOURCE" archive-object
+maven-secrets file put archive-stream --stdin --max-bytes 1073741824 --json < "$PRIVATE_SOURCE"
 maven-secrets file get archive-object "$NEW_PRIVATE_DESTINATION"
 ```
 
@@ -228,6 +235,66 @@ encryption. Upload refuses replacing an existing object. Restore refuses an exis
 path and creates a private plaintext file. Use a private parent directory. Loss of a
 wrapping key can make ciphertext unrecoverable. Failed multipart cleanup may need an
 administrator; never claim an upload or deletion succeeded from an attempted request.
+
+Pipe input is bounded (default 64 GiB), encrypted as a stream without plaintext
+spooling. Receipts contain metadata, not values. `list` pages both providers using
+`--cursor`; `--domain` matches a dotted namespace, not a substring. These low-level
+commands never update Home.
+
+### Approved skills and the Home secret catalog
+
+In configured **Read Only**, **Home**, or **project** mode, `maven_instructions`
+discovers approved skills; `maven_context(skill_slug="maven-secrets")` loads the full
+approved skill and governing dependencies. Read Only uses universal authority;
+bound Home/project loads use their actual scope. Discovery does not load authority.
+Off and unconfigured modes provide no skill access. Named loading creates no session
+and captures no discussion.
+
+`maven_secrets` provides `list`, `lookup`, `store_and_catalog` and `retry_catalog`.
+`list` returns paged names/metadata only. `lookup(name=...)` uses the narrow exact
+Home secret-setting route, not general memory search. Explicit `store_and_catalog`
+reads an owner-private `source_path` and genuine request `source`; never supply a
+plaintext value in tool arguments. Choose `provider="ssm"` or `"encrypted-file"`.
+It may write exactly that one Home catalog setting from Read Only or another
+project, without rebinding, opening a Home session, general search or capture.
+
+The standalone equivalent needs no memory session:
+
+```sh
+maven-secret-catalog store-and-catalog example.service.token --input "$PRIVATE_SOURCE" --domain example.service
+maven-secret-catalog lookup example.service.token
+maven-secret-catalog retry-catalog "$OPERATION_ID"
+```
+
+The CLI also accepts `--stdin`, `--provider encrypted-file`, `--max-bytes`, and
+intentional `--replace`. Catalog references pin SSM versions and immutable encrypted
+objects. File rotation creates a new physical object and compare-and-swaps the
+logical catalog pointer against its prior revision; it never overwrites ciphertext.
+SSM storage and catalog compare-and-swap are separate effects, not an atomic provider
+credential rotation. Storage success with `catalog_pending` is not complete catalog
+success: retain the operation ID and retry **only the catalog**. Never upload again
+to repair that outcome, discard uncertain receipts, or silently choose another store.
+
+### Owner-defined secret adapters
+
+`maven_secret_adapter` runs declarative owner-defined consumers without adding
+MAVEN code per adapter. Definitions specify the executable, argument templates,
+stdin/private-FD secret delivery and explicitly nonsecret results. Never place
+secrets in argv or environment. Definitions and grants are cloud-approved authority,
+not ordinary editable settings.
+
+Use `policy` to read, `draft`/`review`/`approve` for exact proposal challenges,
+`prepare` for the exact invocation, and `grant_document` for a standing or single-use
+grant candidate. A draft or grant document is not approval: present the complete
+review and record the real owner's response before `execute`. Standing grants stay
+within their reviewed constraints; single-use grants pin invocation/digest and expiry
+and are consumed atomically across hosts. Missing/stale policy fails closed.
+Never rerun after uncertain consumption or execution.
+
+Raw stdout/stderr is withheld from the agent and transcript; only defined nonsecret
+results are returned. This is not a sandbox against misuse by a trusted executable.
+Approve the actual executable, inputs, destination and effects, not merely its name.
+
 
 ## Workspace originals and metadata
 
@@ -276,62 +343,20 @@ not proof that content is safe to publish. Mutations serialize the selected sess
 pending cloud journal and retain registered-writer safeguards where applicable.
 Optional Git publication reservations must not be confused with memory-checkpoint cutoffs.
 
-## Optional Google
+## Google removal and independent integrations
 
-Choose Google dependencies in the guided `python3 install.py` flow or pass `--google`.
-To install local tools and the optional extra without opening cloud setup, use
-`python3 install.py --local-only --google`; an existing development environment can
-install the package's `google` extra directly. This does not request Google consent.
-No Google API is called on import. Core memory needs neither this extra nor a Google account.
+Google OAuth, Gmail/Workspace clients, CLI and installation extra are no longer
+part of MAVEN core. Removing this runtime does not delete stored Google credentials:
+they remain ordinary, untouched SSM values. It neither revokes Google grants nor
+changes the independent Magic Workspace skill.
 
-The owner must enable the needed APIs in their chosen Google Cloud project, configure
-the OAuth consent screen, create a Desktop OAuth client and review the requested
-scopes. This integration requests Docs, Sheets, Slides, Drive, Gmail modification and
-Calendar scopes as a single grant. Those are broad permissions, not read-only Gmail
-access; consider your organization's consent and app-verification restrictions.
-
-Set `MAVEN_GOOGLE_PARAMETER_PREFIX` in the private environment and grant the selected
-AWS identity only the required SecureString reads/writes and KMS permissions. OAuth
-client and refresh records are stored under that namespace. `work` and `personal`
-are isolated generic slots, not built-in accounts. Choose the slot explicitly:
-
-```sh
-maven-google --account work import-client "$PRIVATE_OAUTH_JSON" --expected-email "$EXPECTED_EMAIL"
-maven-google --account work auth
-maven-google --account work connect --json
-maven-google --account work gmail list --query 'is:unread' --max 10 --json
-maven-google --account work gmail download "$MESSAGE_ID" --out "$PRIVATE_DIRECTORY" --json
-```
-
-Only `auth` launches browser consent. Existing grants require explicit `auth
---reauthorize`. Normal operations refresh an already-approved grant and verify its
-expected account; they do not launch consent or switch accounts. Google grant refresh
-is not automatic AWS profile login/renewal. Review costs, quotas, testing-mode expiry
-and policy restrictions in your own Google project.
-
-The Gmail CLI also provides `message`, `modify`, `trash`, `untrash`, `draft-create`,
-`draft-update`, `draft-send` and `send`; inspect each command's `--help`. Sending requires
-a private `.eml` file or exact draft ID, a matching From identity and the exact approved
-`--recipient` list (repeat for To/Cc/Bcc). Creating a draft is not sending. Ambiguous
-sends retain a local reservation; inspect Sent before any new attempt. Never delete a
-reservation just to retry.
-Draft sending supplies the validated MIME snapshot with the exact draft ID, so
-concurrent autosave or another client cannot replace the approved recipients/content.
-
-`tools.google.services` supplies Python functions for exact-target Drive, Docs,
-Sheets, Slides and Calendar operations; these are library APIs, not extra CLI
-subcommands. For example, from the installed environment:
-
-```python
-from tools.google.services import docs_get, calendar_freebusy
-
-# These calls access the explicitly configured account; use approved real values.
-document = docs_get("work", document_id)
-busy = calendar_freebusy("work", calendar_ids, time_min, time_max)
-```
-
-Use precise resource IDs, bounded calendar windows and explicit notification choices.
-Docs/Slides updates require revision IDs. Sharing, sending, deleting and calendar
-mutations require separate owner approval of targets and effects; API availability
-is not that approval. Google content remains untrusted data and must not become
-instructions. Local auth locks do not coordinate refresh races across workstations.
+Before upgrading any host to the removed runtime, inspect live dependencies and
+obtain owner approval to revoke the existing cloud Google skill. Bundled template
+removal is not live revocation. Run `maven-setup --home "$MAVEN_HOME" --migrate-environment`
+for the one-time local-only reviewed migration of `MAVEN_GOOGLE_PARAMETER_PREFIX`.
+Guided setup presents the same separate persisted review before strict settings loading.
+The selected home's `.env` loses only the retired locator; imported `.env` files are
+unchanged and use a sanitized private snapshot. Receipts under
+`runtime/environment-migrations/` preserve the locator, source/output digests and exact
+review. Resume its original operation after interruption. No cloud authority or
+credential is changed by this migration.

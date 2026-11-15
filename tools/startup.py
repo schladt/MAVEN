@@ -1,6 +1,7 @@
 """Local conversation identity and read-only lifecycle diagnosis for every harness.
 
-Hooks never open cloud sessions. Native conversation IDs identify exact bindings;
+Hooks never read cloud catalogs or open cloud sessions; maven_startup discovers skills
+only after mode selection. Native conversation IDs identify exact bindings;
 workspace paths, timestamps and process IDs never select a session to resume.
 """
 from __future__ import annotations

@@ -45,10 +45,14 @@
 # MAVEN_INSTANCE_ID=
 # MAVEN_RECOVERY_EPOCH=
 
-# Optional integration locators, never secret values:
+# Required independent secrets-store binding, configured by reviewed setup / Repair.
+# All five locators are required before core readiness. Never put secret values here.
+# Prefixes are namespaces, not separately provisioned resources. The wrapping key
+# is FILE_KEY_PREFIX + KEY_ID: a base64 32-byte SecureString, never regenerated on repair.
+# The private bucket and wrapping parameter are retained independently of memory.
 # MAVEN_SECRETS_BUCKET=
 # MAVEN_SECRETS_KEY_ID=
 # MAVEN_SECRETS_PARAMETER_PREFIX=
 # MAVEN_SECRETS_FILE_KEY_PREFIX=
 # MAVEN_SECRETS_OBJECT_PREFIX=
-# MAVEN_GOOGLE_PARAMETER_PREFIX=
+

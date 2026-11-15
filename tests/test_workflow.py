@@ -388,6 +388,28 @@ class MemoryLifecycleTests(unittest.TestCase):
         self.source = {'origin': 'Owner conversation', 'excerpt': 'Preserve this relevant finding.'}
         self.note = {'title': 'Finding', 'body_markdown': 'Verified local behavior.', 'category': 'work'}
 
+    def test_named_skill_refresh_discards_old_generation_and_failure_cannot_reuse_authority(self):
+        self.service.initialize()
+        initial = self.service._authority
+        skill = {'slug': 'calendar', 'revision': 1, 'page_kind': 'skill'}
+        result = {'status': 'ready', 'data': skill, 'context': {
+            'authority_generation': 2,
+            'instructions': [{'slug': 'core', 'revision': 2, 'page_kind': 'directive'}, skill]}}
+        with patch.object(self.cloud, 'load_instruction', create=True, return_value=result) as load:
+            loaded = self.service.load_skill('calendar')
+        self.assertEqual(loaded['context']['authority_generation'], 2)
+        self.assertNotEqual(initial, self.service._authority)
+        self.assertEqual(self.service._authority['instructions'][0]['revision'], 2)
+        load.assert_called_once_with('calendar', context={
+            'project_id': self.project, 'workflow': 'maven-workflow', 'instructions_only': True})
+        before = len(self.cloud.calls)
+        for code in ('page_unavailable', 'dependency_unavailable', 'selected_login_unavailable_or_expired'):
+            with patch.object(self.cloud, 'load_instruction', create=True, side_effect=MemoryClientError(code)):
+                with self.assertRaises(MemoryClientError):
+                    self.service.load_skill('calendar')
+            self.assertIsNone(self.service._authority)
+        self.assertEqual(len(self.cloud.calls), before)
+
     def test_full_lifecycle_without_git_and_immutable_historical_checkpoint(self):
         initialized = self.service.initialize()
         self.assertEqual(initialized['status'], 'ready')

@@ -54,10 +54,18 @@ virtual environment, private `.env`, or project `.maven` directory.
 The full-screen Textual installer starts with a task: connect existing memory,
 create a new instance, or **Uninstall**. For an existing installation it shows saved, **unverified**
 account/instance settings and offers check/repair, local software update, or a
-separate installation. Software-only installation and optional Google/certificate
-settings live under **Advanced options**. The private home defaults to `~/.maven`.
+separate installation. Software-only installation and certificate settings live under
+**Advanced options**. The private home defaults to `~/.maven`.
 If UI dependencies are missing, a bootstrap prompt requests permission to download
 them into a temporary private runtime; system Python is never modified.
+
+Core setup requires an explicitly reviewed secrets store (import/select existing
+settings or approve creation); repairs and updates preserve existing keys. Approved
+skills are discoverable in configured Read Only/Home/project mode and load by name
+with `maven_context(skill_slug=...)`, without starting capture. `maven_secrets` offers
+metadata discovery and explicit private-file store-and-catalog; approved declarative
+adapters consume secrets without returning plaintext. See [secret usage and trust
+boundaries](docs/integrations.md#aws-secrets-and-encrypted-files).
 
 After verified cloud setup, optionally review local integration for OMP, Claude Code,
 Codex, Copilot or Gemini. Running harnesses do not block the review; restart them
@@ -255,9 +263,9 @@ scope selection, legacy installations, export, retained charges, and recovery.
 ## Options and safety
 
 - `python3 install.py --local-only` installs local tools without running cloud setup.
-- `--home PATH`, `--harness NAME` (repeatable), `--skill-dir PATH`, and `--google`
-  select installation options. Google is optional and requires separate consent;
-  core memory does not need a Google account.
+- `--home PATH`, `--harness NAME` (repeatable), and `--skill-dir PATH` select
+  installation options. Google is removed from core; stored credentials and the
+  independent Magic Workspace integration remain untouched.
 - For noninteractive native skill installation, close the affected harnesses and pass
   `--local-only --harness NAME --harness-stopped`. Without that confirmation, their
   files are not changed.
@@ -289,15 +297,24 @@ Ask your assistant to **"Update MAVEN"** (the `maven-update` skill), or run
 `python3 install.py` and choose **Update MAVEN**. One resumable operation brings an
 installation to its checkout's version, reviewing each part only where it differs:
 
+For code updates, prepare a commit-ready candidate first. Stop the affected MAVEN
+session before committing and installing it. Complete the installer update before
+starting a new harness session; that session checks the updated instance and loads
+current authority. The installer does not restart existing MCP connections for you.
+
 1. **Local software and harness skills** — the installer runs in a separate terminal
-   because it replaces the running software; restart harnesses afterward. Skills you
+   because it replaces the running software; keep harness sessions stopped until the
+   complete update finishes. Skills you
    edited, or that another installation shares, are preserved.
+   Required legacy environment migrations are reviewed before strict settings loading.
 2. **Database schema** — pending ordered migrations, under maintenance mode.
 3. **Service stack** — a CloudFormation change set built from the live stack's own
    deployment inputs. A change that would remove or replace the database, a secret,
    a bucket or a key is refused before review.
 4. **Instructions** — bundled pages that are new or differ from the active ones, with
    exact differences; updating replaces your edits to those pages, so it is optional.
+5. **Secrets store and readiness** — repair/verify the required binding, then finish
+   the instance check and any local harness integration.
 
 To get the newest published MAVEN, update the checkout first (`git pull --ff-only`).
 Local installation alone is not live rollout, and templates never replace active

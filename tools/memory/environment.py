@@ -22,7 +22,7 @@ EXTRA_KEYS = {
     'MAVEN_AWS_PROFILE', 'MAVEN_AWS_EXPECTED_PRINCIPAL', 'MAVEN_AWS_LOGIN_CACHE',
     'MAVEN_DEPLOY_PROFILE', 'MAVEN_DEPLOY_EXPECTED_PRINCIPAL', 'MAVEN_DEPLOY_LOGIN_CACHE',
     'MAVEN_AWS_REGION',
-    'MAVEN_SECRETS_BUCKET', 'MAVEN_SECRETS_KEY_ID', 'MAVEN_GOOGLE_PARAMETER_PREFIX',
+    'MAVEN_SECRETS_BUCKET', 'MAVEN_SECRETS_KEY_ID',
     'MAVEN_SECRETS_PARAMETER_PREFIX', 'MAVEN_SECRETS_FILE_KEY_PREFIX', 'MAVEN_SECRETS_OBJECT_PREFIX',
     'MAVEN_STACK_NAME', 'MAVEN_NOTIFICATION_EMAIL', 'MAVEN_ENGINE_VERSION',
     'MAVEN_INSTANCE_NAME', 'MAVEN_ACCOUNT_ID', 'MAVEN_CALLER_PRINCIPAL_ARN',
@@ -33,6 +33,11 @@ ENV_KEYS = EXTRA_KEYS | {'MAVEN_MEMORY_' + key.upper() for key in CONFIG_KEYS | 
 
 def load_environment(path: Path = DEFAULT_ENV) -> dict[str, str]:
     """Read a bounded owner-only regular file. No expansion, exports or credentials."""
+    return _load_environment(path, ENV_KEYS)
+
+
+def _load_environment(path, allowed_keys, *, with_raw=False):
+    """Internal bounded parser; migration alone supplies its retired locator key."""
     try:
         fd = os.open(Path(path).expanduser(), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
         with os.fdopen(fd, 'rb') as stream:
@@ -49,7 +54,7 @@ def load_environment(path: Path = DEFAULT_ENV) -> dict[str, str]:
             if not line or line.startswith('#'):
                 continue
             key, separator, value = line.partition('=')
-            if not separator or key not in ENV_KEYS or key in result:
+            if not separator or key not in allowed_keys or key in result:
                 raise ValueError('key')
             value = value.strip()
             if value.startswith('"'):
@@ -63,7 +68,7 @@ def load_environment(path: Path = DEFAULT_ENV) -> dict[str, str]:
             if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
                 raise ValueError('value')
             result[key] = value
-        return result
+        return (result, raw) if with_raw else result
     except OSError:
         raise MemoryClientError('configuration_unavailable') from None
     except (UnicodeError, ValueError, RecursionError):

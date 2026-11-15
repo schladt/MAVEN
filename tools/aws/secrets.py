@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import nullcontext
 import binascii
 import getpass
 import hmac
-import math
+import json
 import os
 from pathlib import Path
 import re
@@ -105,14 +106,15 @@ def file_config() -> tuple[str, str]:
     return bucket, key_id
 
 
-def file_keyring(ssm, key_id: str):
+def file_keyring(ssm, key_id: str, *, values=None):
     from aws_cryptographic_material_providers.mpl import AwsCryptographicMaterialProviders
     from aws_cryptographic_material_providers.mpl.config import MaterialProvidersConfig
     from aws_cryptographic_material_providers.mpl.models import AesWrappingAlg, CreateRawAesKeyringInput
 
     try:
         wrapping_key = base64.b64decode(
-            stored_value(ssm, _prefix("MAVEN_SECRETS_FILE_KEY_PREFIX") + key_id), validate=True,
+            stored_value(ssm, (prefix(values, "MAVEN_SECRETS_FILE_KEY_PREFIX") if values is not None
+                               else _prefix("MAVEN_SECRETS_FILE_KEY_PREFIX")) + key_id), validate=True,
         )
     except (ValueError, binascii.Error):
         raise StoreError("file wrapping key is invalid") from None
@@ -129,64 +131,22 @@ def file_keyring(ssm, key_id: str):
 
 
 def upload_file(args, session, bucket: str, key_id: str) -> None:
-    import aws_encryption_sdk
-    from aws_encryption_sdk import CommitmentPolicy
-
-    keyring = file_keyring(session.client("ssm"), key_id)
-    s3 = session.client("s3")
-    object_key = _prefix("MAVEN_SECRETS_OBJECT_PREFIX", parameter=False) + args.name
-    context = {"maven-object": args.name, "maven-key-id": key_id}
-    client = aws_encryption_sdk.EncryptionSDKClient(
-        commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT,
-    )
-    with open(args.source, "rb") as source:
-        source_size = os.fstat(source.fileno()).st_size
-        if source_size > 5 * 1024 ** 4:
-            raise StoreError("source exceeds the S3 object size limit")
-        # Leave room for encryption overhead without exceeding S3's 10,000-part limit.
-        part_size = max(8 * 1024 ** 2, math.ceil((source_size * 1.01 + 1024 ** 2) / 9500))
-        with client.stream(
-            mode="e", source=source, source_length=source_size,
-            keyring=keyring, encryption_context=context,
-        ) as encryptor:
-            upload = s3.create_multipart_upload(
-                Bucket=bucket, Key=object_key, Metadata={"maven-key-id": key_id},
-                ServerSideEncryption="AES256",
-            )
-            upload_id = upload["UploadId"]
-            parts = []
-            try:
-                while True:
-                    chunk = encryptor.read(part_size)
-                    if not chunk:
-                        break
-                    if len(chunk) < part_size:
-                        part = bytearray(chunk)
-                        while len(part) < part_size:
-                            extra = encryptor.read(part_size - len(part))
-                            if not extra:
-                                break
-                            part.extend(extra)
-                        chunk = bytes(part)
-                    if len(parts) >= 10000:
-                        raise StoreError("source exceeds the S3 multipart limit")
-                    number = len(parts) + 1
-                    result = s3.upload_part(
-                        Bucket=bucket, Key=object_key, UploadId=upload_id,
-                        PartNumber=number, Body=chunk,
-                    )
-                    parts.append({"PartNumber": number, "ETag": result["ETag"]})
-                s3.complete_multipart_upload(
-                    Bucket=bucket, Key=object_key, UploadId=upload_id,
-                    MultipartUpload={"Parts": parts}, IfNoneMatch="*",
-                )
-            except BaseException:
-                try:
-                    s3.abort_multipart_upload(Bucket=bucket, Key=object_key, UploadId=upload_id)
-                except (BotoCoreError, ClientError):
-                    print("Warning: incomplete S3 multipart upload may need administrator cleanup.", file=sys.stderr)
-                raise
-    print("Encrypted file stored.")
+    from tools.aws.secret_store import DEFAULT_STREAM_LIMIT, MAX_FILE_BYTES, SecretStore
+    from_stdin = getattr(args, "stdin", False)
+    if from_stdin and (args.source is not None or sys.stdin.isatty()):
+        raise StoreError("--stdin requires a binary pipe and no source path")
+    if not from_stdin and args.source is None:
+        raise StoreError("provide an existing source file or --stdin")
+    selected = SecretStore(load_settings(), session=session)
+    if selected.binding["bucket"] != bucket or selected.values["MAVEN_SECRETS_KEY_ID"] != key_id:
+        raise StoreError("file store configuration changed")
+    maximum = args.max_bytes if args.max_bytes is not None else (
+        DEFAULT_STREAM_LIMIT if from_stdin else MAX_FILE_BYTES)
+    context = nullcontext(sys.stdin.buffer) if from_stdin else open(args.source, "rb")
+    with context as stream:
+        size = None if from_stdin else os.fstat(stream.fileno()).st_size
+        receipt = selected.put_file(args.name, stream, source_size=size, max_bytes=maximum)
+    print(json.dumps(receipt) if args.json else "Encrypted file stored.")
 
 
 def restore_file(args, session, bucket: str) -> None:
@@ -258,16 +218,27 @@ def main(argv=None) -> int:
             command.add_argument("--tty", action="store_true", required=True, help="show value only on your terminal")
         elif action == "use-stdin":
             command.add_argument("command", nargs=argparse.REMAINDER, help="-- trusted program [args]")
+    listing = commands.add_parser("list", help="list names/metadata only; never decrypt values")
+    listing.add_argument("--domain", help="exact dotted domain prefix")
+    listing.add_argument("--cursor", help="continuation from the preceding page")
+    listing.add_argument("--limit", type=int, default=20, help="page size per provider (1-50)")
     files = commands.add_parser("file", help="encrypt and store or restore a private file")
     file_commands = files.add_subparsers(dest="file_action", required=True)
     put_file = file_commands.add_parser("put")
-    put_file.add_argument("source", help="existing local plaintext file")
+    put_file.add_argument("source", nargs="?", help="existing local plaintext file; omit with --stdin")
     put_file.add_argument("name", help="short, non-sensitive object name")
+    put_file.add_argument("--stdin", action="store_true", help="encrypt a bounded binary pipe without plaintext spooling")
+    put_file.add_argument("--max-bytes", type=int, help="maximum plaintext bytes (pipe default: 64 GiB)")
+    put_file.add_argument("--json", action="store_true", help="return a non-secret storage receipt")
     get_file = file_commands.add_parser("get")
     get_file.add_argument("name", help="short, non-sensitive object name")
     get_file.add_argument("destination", help="new local output path; never overwritten")
     args = parser.parse_args(argv)
     try:
+        if args.action == "list":
+            from tools.aws.secret_store import SecretStore
+            print(json.dumps(SecretStore(load_settings()).list(args.domain, args.cursor, args.limit)))
+            return 0
         if args.action == "file":
             file_action(args)
             return 0
@@ -330,6 +301,9 @@ def main(argv=None) -> int:
         return 2
     except StoreError as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+    except MemoryClientError as exc:
+        print("Secret store unavailable: " + exc.code, file=sys.stderr)
         return 2
     except OSError:
         print("Local file access failed; check the path and permissions.", file=sys.stderr)

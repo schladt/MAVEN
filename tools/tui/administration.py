@@ -229,6 +229,16 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
     wake_retries = 0
     while True:
         ui.checkpoint()
+        from tools.environment_migrations import prerequisite
+        pending = prerequisite(controller, result)
+        if pending:
+            result = {**result, 'prerequisite_operation': pending['operation_id']}
+        if result.get('prerequisite_operation'):
+            outcome = present(ui, home, operation_id=result['prerequisite_operation'])
+            if outcome:
+                return outcome
+            result = controller.status(identifier)
+            continue
         presentation = result.get('presentation') or {}
         stage = _stage_name(result['step'])
         ui.stage(stage)

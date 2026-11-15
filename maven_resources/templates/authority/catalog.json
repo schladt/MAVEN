@@ -50,7 +50,7 @@
     {
       "slug": "maven-secrets",
       "page_kind": "skill",
-      "title": "Explicit secret and encrypted-file handling",
+      "title": "Optional owner-reviewed secret catalog and encrypted-file operations",
       "requires": [
         "maven"
       ]
@@ -61,14 +61,6 @@
       "title": "Governed local workspace originals and metadata",
       "requires": [
         "maven-workflow"
-      ]
-    },
-    {
-      "slug": "maven-google",
-      "page_kind": "skill",
-      "title": "Optional explicit-account Google operations",
-      "requires": [
-        "maven-secrets"
       ]
     }
   ]

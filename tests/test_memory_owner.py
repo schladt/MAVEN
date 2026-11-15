@@ -1402,6 +1402,89 @@ BEGIN
 END $$;
 """
 
+SQL_SKILL_DISCOVERY = r"""
+DO $$
+DECLARE candidate jsonb; request jsonb; result jsonb; challenge jsonb; first_page jsonb;
+ proposal uuid:=gen_random_uuid(); page uuid:=gen_random_uuid(); project uuid; hash text; bad jsonb; i integer;
+BEGIN
+ candidate:='{"slug":"sd-00","page_kind":"skill","title":"Calendar skill",
+   "description":"Use for approved calendar work.","body_markdown":"Complete owner-approved instruction",
+   "scope":{},"authority_state":"active"}';
+ hash:=encode(sha256(convert_to(candidate::text,'UTF8')),'hex');
+ request:=jsonb_build_object('request_key',gen_random_uuid(),'proposal_id',proposal,'page_id',page,
+   'expected_revision',0,'classification','Sensitive','data_scope','owner','candidate',candidate,
+   'source',jsonb_build_object('origin','fixture','excerpt','Exact reviewed description'),'change_reason','Skill discovery');
+ PERFORM maven.instruction_write('create',request,repeat('a',64),hash,'fixture-owner');
+ PERFORM pg_temp.assert_equal(maven.instruction_read(jsonb_build_object('proposal_id',proposal))->'description',
+   candidate->'description','draft review includes exact description');
+ challenge:=maven.instruction_challenge(proposal,'fixture-approver');
+ request:=jsonb_build_object('request_key',gen_random_uuid(),'proposal_id',proposal,'challenge_id',challenge->'challenge_id',
+   'candidate_hash',encode(sha256(convert_to((candidate-'description')::text,'UTF8')),'hex'),'expected_revision',0,
+   'approval_source',jsonb_build_object('origin','fixture approval','excerpt','Approve exact description and body'));
+ PERFORM pg_temp.assert_equal(maven.instruction_write('resolve',request,repeat('b',64),NULL,'fixture-approver')->'status',
+   '"approval_invalid"','description participates in exact approval hash');
+ request:=request || jsonb_build_object('candidate_hash',hash);
+ PERFORM maven.instruction_write('resolve',request,repeat('c',64),NULL,'fixture-approver');
+ result:=maven.instruction_read('{"slug":"sd-00"}');
+ PERFORM pg_temp.assert_equal(result->'description',candidate->'description','published description readback exact');
+ PERFORM pg_temp.assert_equal(result->'content_hash',to_jsonb(hash),'description candidate hash unchanged');
+ FOR bad IN SELECT value FROM jsonb_array_elements(jsonb_build_array(null,true,42,'',' ',repeat('x',501),jsonb_build_array())) LOOP
+   BEGIN
+     PERFORM pg_temp.publish(candidate || jsonb_build_object('slug','sd-invalid','description',bad));
+     RAISE EXCEPTION 'invalid description accepted';
+   EXCEPTION WHEN invalid_parameter_value THEN NULL;
+   END;
+ END LOOP;
+ BEGIN
+   PERFORM pg_temp.publish(candidate || '{"slug":"sd-invalid","page_kind":"procedure"}');
+   RAISE EXCEPTION 'procedure description accepted';
+ EXCEPTION WHEN invalid_parameter_value THEN NULL;
+ END;
+ FOR i IN 1..11 LOOP
+   PERFORM pg_temp.publish(candidate || jsonb_build_object('slug','sd-' || lpad(i::text,2,'0')));
+ END LOOP;
+ PERFORM pg_temp.publish(candidate || '{"slug":"sd-synthetic"}','synthetic');
+ project:=(pg_temp.write(pg_temp.request('entity','{"entity_type":"project","name":"Discovery project","aliases":[]}'))->>'record_id')::uuid;
+ PERFORM pg_temp.publish(candidate || jsonb_build_object('slug','sd-project','scope',jsonb_build_object('project',project)));
+ first_page:=maven.instruction_index('{"page_kind":"skill","scope":"universal","after_slug":"sd","limit":10}');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(first_page->'pages')),'10','catalog first page full');
+ PERFORM pg_temp.assert_equal(first_page->'capabilities','["instructions_only"]','capability advertised before context request');
+ PERFORM pg_temp.assert_equal(first_page->'next_after_slug','"sd-09"','catalog cursor follows visible headers');
+ PERFORM pg_temp.assert_equal(first_page->'pages'->0->'description',candidate->'description','catalog carries approved description');
+ result:=maven.instruction_index(jsonb_build_object('page_kind','skill','scope','universal','after_slug',first_page->'next_after_slug'));
+ PERFORM pg_temp.assert_equal((SELECT jsonb_agg(p->>'slug') FROM jsonb_array_elements(result->'pages') p),
+   '["sd-10","sd-11"]','universal catalog excludes scoped and synthetic headers');
+ PERFORM pg_temp.assert_equal(result->'next_after_slug','null','catalog complete');
+ PERFORM pg_temp.assert_equal(result->'authority_generation',first_page->'authority_generation','catalog generation stable');
+ PERFORM pg_temp.assert_equal(maven.memory_context('{"skill_slug":"sd-project","instructions_only":true}')->'status',
+   '"page_unavailable"','unbound named load cannot reach project authority');
+ result:=maven.memory_context('{"skill_slug":"sd-00","instructions_only":true}');
+ PERFORM pg_temp.assert_equal((SELECT p->'description' FROM jsonb_array_elements(result->'pages') p WHERE p->>'slug'='sd-00'),
+   candidate->'description','inline authority retains approved description');
+ PERFORM pg_temp.assert_equal(result->'instructions_only','true','instruction-only context explicitly acknowledged');
+ PERFORM pg_temp.write(pg_temp.request('task','{"title":"Ordinary task","description":"Do not disclose during skill load","state":"open"}'));
+ PERFORM pg_temp.assert_equal(maven.memory_context('{"skill_slug":"sd-00","instructions_only":true}')->'tasks',
+   '[]','named instruction-only load excludes ordinary memory');
+ PERFORM pg_temp.assert_equal(to_jsonb(jsonb_array_length(maven.memory_context('{"skill_slug":"sd-00"}')->'tasks')>0),
+   'true','ordinary project context contract unchanged');
+ UPDATE maven.pages SET authority_state='revoked' WHERE slug='sd-11';
+ UPDATE maven.records SET visibility_state='blocked' WHERE id=(
+   SELECT p.source_id FROM maven.instruction_proposals p WHERE p.candidate->>'slug'='sd-10');
+ PERFORM pg_temp.assert_equal(maven.instruction_index('{"page_kind":"skill","scope":"universal","after_slug":"sd-09"}')->'pages',
+   '[]','revoked and source-hidden summaries never surface');
+ INSERT INTO maven.project_lifecycle(project_id,archived,generation,action_key,actor_id)
+   VALUES(project,true,1,repeat('a',64),'fixture-owner');
+ PERFORM pg_temp.assert_equal(maven.instruction_index(jsonb_build_object(
+   'page_kind','skill','scope','context','project_id',project,'after_slug','sd-09'))->'pages',
+   '[]','scoped discovery preserves migration 017 archival visibility');
+ PERFORM pg_temp.assert_equal(maven.memory_context(jsonb_build_object(
+   'skill_slug','sd-project','project_id',project,'instructions_only',true))->'status',
+   '"project_archived"','named load preserves project work barrier');
+ PERFORM pg_temp.assert_equal(maven.instruction_read('{"slug":"fixture-legacy-skill"}')->'description',
+   NULL,'legacy candidates never gain a description');
+END $$;
+"""
+
 SQL_APPLICATION_STATE_LOCK = r"""
 CREATE ROLE maven_state_guard_fixture;
 GRANT USAGE ON SCHEMA maven TO maven_state_guard_fixture;
@@ -1449,6 +1532,8 @@ class OwnerPostgreSQLTests(unittest.TestCase):
             "SELECT set_config('maven.client_protocol','4',true);", SQL_HELPERS,
             "SAVEPOINT native_checkpoints;", SQL_NATIVE_CHECKPOINTS,
             "ROLLBACK TO SAVEPOINT native_checkpoints; RELEASE SAVEPOINT native_checkpoints;",
+            "SAVEPOINT skill_discovery;", SQL_SKILL_DISCOVERY,
+            "ROLLBACK TO SAVEPOINT skill_discovery; RELEASE SAVEPOINT skill_discovery;",
             "SAVEPOINT skill_bundles;", SQL_SKILL_BUNDLES,
             "ROLLBACK TO SAVEPOINT skill_bundles; RELEASE SAVEPOINT skill_bundles;",
             "SAVEPOINT named_skill_context;", SQL_NAMED_SKILL_CONTEXT,

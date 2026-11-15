@@ -93,6 +93,27 @@ selection, review revisions/digests, safe next actions and verified record recei
 applicable. Local acceptance is not cloud completion. Inspection is separate from
 reconciliation that may replay an external write. Cancellation is not rollback.
 
+## Secrets and approved consumers
+
+Configured Read Only/Home/project modes can discover current approved skills and
+load a named skill with its dependencies, without initializing or capturing.
+Read Only resolves universal authority; bound requests retain their project scope.
+Off/unconfigured access fails closed.
+
+The explicit store holds SSM SecureStrings and streamed encrypted S3 files; memory
+holds nonsecret catalog references, never values. Narrow Home lookup/catalog routes
+allow only an exact secret setting, including an explicitly requested write from
+Read Only or another project without rebinding or general Home search. Storage and
+catalog commit are separate: pinned storage receipts survive catalog failure, and
+retry only reconciles the catalog. File rotation creates immutable objects and
+compare-and-swaps the logical pointer; SSM references pin versions.
+
+Owner-defined declarative adapters and grants are approved cloud authority, not
+catalog settings. Single-use consumption is atomic across hosts; standing grants
+retain reviewed constraints. Secret delivery uses stdin/private FDs, with raw output
+withheld and fail-closed policy checks. The trusted executable remains a security
+boundary: this runner is not a sandbox against its misuse.
+
 ## Rollout and authority
 
 Local package installation does not deploy service/schema changes or activate policy.
@@ -102,9 +123,9 @@ Historical Git checkpoints retain their shape/provenance. Recover incompatible p
 publication/setup/removal operations through their original supported implementation
 before cutover; never reinterpret old receipts.
 
-The memory-native contract uses schema version **2**, transport/minimum client
-protocol **3**, and forward migration `012_agentic_memory.sql`. Ordinary clients
-reject schema 1. A separately reviewed upgrade accepts the old schema only for that
+The current contract retains schema version **2** and client protocol **4**.
+The memory-native foundation is migration `012_agentic_memory.sql`.
+Ordinary clients reject schema 1. A separately reviewed upgrade accepts the old schema only for that
 upgrade path; SQL migration alone does not deploy the matching service. Reconnect
 using actual reviewed schema-2 stack outputs afterward; no installed configuration
 is silently rewritten. New checkpoints use `prepared` → `saved` or `aborted`,
@@ -116,7 +137,18 @@ challenges. Activate through the existing owner-approval process and reload comp
 current authority. Packaged templates and catalog changes never auto-update active
 cloud instructions. Schema rollout approval is not instruction activation approval.
 
+With affected harness sessions stopped, installer update first replaces local
+software/harness files and completes any required reviewed environment migration.
+It then applies additive SQL **018 → 019 → 020**, deploys the matching service,
+offers exact bundled-authority reviews, and verifies the required store/readiness.
+Keep new MCP sessions disabled until the complete update succeeds; file installation
+and feature activation are distinct. Start a fresh harness afterward to initialize
+against current authority; the installer does not restart existing MCP connections.
+Before hosts receive the removed Google runtime, check live instruction dependencies
+and separately revoke its cloud skill with owner approval. Existing Google
+credentials are not deleted; Magic Workspace remains independent.
+
 Local implementation or simulated-cloud checks are not live AWS/SQL/harness proof.
 See [integration capabilities](integrations.md#harness-capability-matrix) and
 [workflow](workflow.md) for the user-visible contract. Core recovery remains independent
-of MCP/UI/model dependencies; Google remains optional.
+of MCP/UI/model dependencies; Google is no longer a core runtime.

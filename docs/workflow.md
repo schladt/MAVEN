@@ -15,6 +15,19 @@ The assistant prints the active line (`MAVEN: Home (<label>)`, `MAVEN: project <
 `MAVEN: read-only`) at start and on any change. See
 [MAVEN Home and the start choice](getting-started.md#maven-home-and-the-start-choice).
 
+Configured Read Only, Home and project modes support approved skill discovery through
+`maven_instructions` and full named loading via `maven_context(skill_slug=...)`.
+Read Only loads universal authority; bound loads retain the actual project scope.
+Neither discovery nor named loading enables capture or starts a session. Off and
+unconfigured modes deny access. Do not confuse available skills with loaded authority.
+
+Secret lookup is a narrow exact Home catalog read, not cross-project memory search.
+On an explicit owner store-and-catalog request, `maven_secrets` may write exactly that
+one Home secret setting from Read Only or a project without rebinding or capturing
+discussion. Values enter through private files, never tool arguments. Distinguish
+stored from catalog-complete, and retry a pending catalog with its original operation
+ID without uploading again. See [secret usage](integrations.md#aws-secrets-and-encrypted-files).
+
 For an enabled project, supported harness guidance initializes subsequent sessions:
 
 ```text

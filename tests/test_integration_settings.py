@@ -1,8 +1,5 @@
 """Offline private-settings boundaries for reusable external integrations."""
 
-import builtins
-from contextlib import redirect_stdout
-from io import StringIO
 from pathlib import Path
 import tempfile
 import unittest
@@ -78,20 +75,6 @@ class IntegrationSettingsTests(unittest.TestCase):
             with self.subTest(key=key), patch.object(secrets, "load_settings", return_value=dict(VALUES, **{key: value})):
                 with self.assertRaises(secrets.StoreError):
                     secrets.file_config()
-
-    def test_google_help_does_not_import_optional_runtime(self):
-        from tools.google import cli
-        original = builtins.__import__
-
-        def deny_runtime(name, globals=None, locals=None, fromlist=(), level=0):
-            if name == "tools.google" and "client" in (fromlist or ()):
-                raise AssertionError("help imported optional Google runtime")
-            return original(name, globals, locals, fromlist, level)
-
-        with patch("builtins.__import__", side_effect=deny_runtime), redirect_stdout(StringIO()):
-            with self.assertRaises(SystemExit) as result:
-                cli.main(["--help"])
-        self.assertEqual(result.exception.code, 0)
 
 
 if __name__ == "__main__":

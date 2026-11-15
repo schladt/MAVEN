@@ -22,6 +22,8 @@ _RUNTIME_FILES = {
     "tools": "tools/__init__.py",
     "tools.memory": "tools/memory/__init__.py",
     "tools.memory.validation": "tools/memory/validation.py",
+    "tools.memory.secrets_contract": "tools/memory/secrets_contract.py",
+    "tools.memory.adapter_contracts": "tools/memory/adapter_contracts.py",
     "tools.memory.store": "tools/memory/store.py",
     "tools.memory.service": "tools/memory/service.py",
 }
@@ -32,6 +34,10 @@ _LOCAL_REVIEW_FILES = (
     "tools/memory/skills.py",
     "tools/aws/settings.py",
     "tools/aws/secrets.py",
+    "tools/aws/secret_store.py",
+    "tools/secret_catalog.py",
+    "tools/secret_adapters.py",
+    "tools/secret_setup.py",
     "tools/memory/deployment.py",
     "tools/memory/environment.py",
     "tools/memory/bootstrap.py",
@@ -225,8 +231,17 @@ def build(
     source_hashes.update(_review_hashes())
     template_source = _TEMPLATE.read_bytes()
     template = json.loads(template_source)
-    template["Resources"]["MemoryFunction"]["Properties"]["Code"] = {"ZipFile": code}
+    # Runtime fragments are parameter values, outside the 51,200-byte template
+    # body limit. Every fragment remains pinned in the reviewed package hashes.
+    runtime = {f"RuntimeCode{index // 4096 + 1:03d}": code[index:index + 4096]
+               for index in range(0, len(code), 4096)}
+    template["Resources"]["MemoryFunction"]["Properties"]["Code"] = {
+        "ZipFile": {"Fn::Join": ["", [{"Ref": name} for name in runtime]]}}
     del template["Parameters"]["RuntimeCode"]
+    for name in runtime:
+        template["Parameters"][name] = {
+            "Type": "String", "MinLength": 1, "MaxLength": 4096,
+            "Description": "Generated MAVEN runtime fragment; supplied by the exact reviewed package."}
     values = {
         "InstanceName": instance_name,
         "EngineVersion": engine_version,
@@ -234,6 +249,7 @@ def build(
         "InstanceId": instance_id,
         "RecoveryEpoch": recovery_epoch,
     }
+    values.update(runtime)
     if availability_zones is not None:
         values["AvailabilityZones"] = ",".join(availability_zones)
     if account_id is not None:
@@ -280,7 +296,7 @@ def build(
         "target_guard": template["Metadata"]["TargetGuard"],
         "data_scope": "owner_memory",
         "proposed_stack_name": instance_name,
-        "deployment_inputs": values,
+        "deployment_inputs": {key: value for key, value in values.items() if key not in runtime},
         "parameter_definitions": template["Parameters"],
         "capabilities_required": ["CAPABILITY_IAM"],
         "resources": {
@@ -298,7 +314,7 @@ def build(
             "delegates_to": "tools.memory.service.handler",
             "runtime": "python3.15",
             "architecture": "arm64",
-            "method": "inline ZipFile; stdlib import loader for exact zlib/base85-compressed runtime sources",
+            "method": "inline ZipFile joined from bounded parameters; stdlib import loader for exact zlib/base85-compressed runtime sources",
             "template_bytes": len(template_text.encode()),
             "requires_existing_artifact_bucket": False,
             "dependencies": "stdlib plus boto3/botocore supplied by AWS Lambda Python runtime; no native PostgreSQL adapter",
@@ -307,7 +323,7 @@ def build(
         "network": {
             "database": "one private Aurora writer; two AZ subnets, local-only route tables, no TCP ingress",
             "lambda": "outside VPC; AWS-managed outbound networking is not an internet-egress sandbox",
-            "api": "public HTTPS endpoint; exactly thirteen POST routes requiring AWS_IAM and route-specific selected-role runtime authorization",
+            "api": "public HTTPS endpoint; POST routes require AWS_IAM and route-specific selected-role runtime authorization",
             "absent": ["NAT", "internet gateway", "RDS Proxy", "reader", "VPC endpoints", "bastion", "custom domain", "Lambda VPC attachment"],
         },
         "cost_controls": {

@@ -6,7 +6,7 @@ import unittest
 import uuid
 from unittest.mock import patch
 
-from tools.memory.boundary import save_private
+from tools.memory.boundary import read_private, save_private
 from tools.memory.client import MemoryClientError
 from tools.memory.lifecycle import SessionService
 from tools.memory.maintenance import Maintenance, MaintenanceError
@@ -313,6 +313,8 @@ class MaintenanceTests(unittest.TestCase):
             self.memory.save('note', self.note, source=self.source, operation_id=operation, request_key=key)
         self.assertIn(key, self.cloud.requests)
         self.memory.recover(operation, worker_stopped=True)
+        self.assertEqual(self.memory.status(operation)['state'], 'completed')
+        self.assertEqual(self.memory.status()['pending_count'], 0)
         saved = self.memory.save('note', self.note, source=self.source, operation_id=operation, request_key=key)
         self.assertEqual(saved['status'], 'saved')
         note_ref = self.memory.status(operation, detail=True)['assignment']['effects'][0]['record']
@@ -320,6 +322,376 @@ class MaintenanceTests(unittest.TestCase):
         with self.assertRaises(MaintenanceError):
             self.memory.save('note', dict(self.note, title='Different intent'), source=self.source,
                               operation_id=operation, request_key=key)
+
+    def test_explicit_single_action_recovery_verifies_completion_and_unblocks_new_records(self):
+        for kind, data in (
+                ('task', {'title': 'Actual task', 'description': 'Task evidence. ' * 100, 'state': 'open'}),
+                ('decision', {'title': 'Actual decision', 'body_markdown': 'Decision evidence. ' * 195,
+                              'state': 'accepted'})):
+            with self.subTest(kind=kind):
+                operation, key = identifier(), identifier()
+                before = len(self.cloud.requests)
+                self.cloud.lose_next = True
+                with self.assertRaises(MemoryClientError) as error:
+                    self.memory.save(kind, data, source=self.source, expected_revision=0,
+                                     operation_id=operation, request_key=key)
+                self.assertEqual(error.exception.code, 'outcome_unknown')
+                item = self.memory.status(operation, detail=True)['assignment']
+                original = deepcopy(item['effects'][0]['request'])
+                self.assertEqual(item['completion_intent'], {
+                    'worker': 'explicit-save', 'summary': item['intent'], 'changes_digest': item['changes_digest']})
+                self.assertEqual(item['effects'][0]['state'], 'uncertain')
+                self.assertNotIn(operation, self.cloud.records)
+                with self.assertRaises(MaintenanceError):
+                    self.memory.recover(operation, worker_stopped=False)
+                recovered = Maintenance(self.service).recover(operation, worker_stopped=True)
+                self.assertEqual((recovered['status'], recovered['cloud_saved']), ('completed', True))
+                self.assertEqual(recovered['assignment']['completion'], {'record_id': operation, 'revision': 1})
+                self.assertEqual(self.cloud.records[original['record_id']]['data'], data)
+                self.assertEqual(self.cloud.records[original['record_id']]['revision'], 1)
+                self.assertEqual(len(self.cloud.requests), before + 2)
+                self.assertEqual(self.memory.status(operation, detail=True)['assignment']['effects'][0]['request'], original)
+                self.assertEqual(self.memory.status()['pending_count'], 0)
+                self.assertEqual(self.memory.recover(operation, worker_stopped=True), recovered)
+                self.assertEqual(len(self.cloud.requests), before + 2)
+                self.assertEqual(self.memory.save('note', self.note, source=self.source)['status'], 'saved')
+
+    def test_explicit_recovery_finishes_crashes_after_effect_receipt_without_reapplying(self):
+        for crash_state in ('claimed', 'applied'):
+            with self.subTest(crash_state=crash_state):
+                operation = identifier()
+                with patch.object(self.memory, 'complete', side_effect=SystemExit('worker stopped')):
+                    with self.assertRaises(SystemExit):
+                        self.memory.save('note', self.note, source=self.source, operation_id=operation)
+                with self.memory._transaction() as state:
+                    state['assignments'][operation]['state'] = crash_state
+                original = self.memory.status(operation, detail=True)['assignment']['effects'][0]
+                calls = len(self.cloud.calls)
+                result = Maintenance(self.service).recover(operation, worker_stopped=True)
+                writes = [body for route, body in self.cloud.calls[calls:] if route == '/v1/memory/write']
+                self.assertEqual([body['record_id'] for body in writes], [operation])
+                self.assertEqual(result['status'], 'completed')
+                self.assertIn(original['record'], result['assignment']['saved_refs'])
+                self.assertEqual(self.cloud.records[original['record']['record_id']]['revision'], 1)
+
+    def test_legacy_explicit_save_recovery_requires_original_worker_and_input_digests(self):
+        for caller_ids in (False, True):
+            for saved_effect in (False, True):
+                with self.subTest(caller_ids=caller_ids, saved_effect=saved_effect):
+                    operation = identifier()
+                    arguments = {'record_id': identifier(), 'request_key': identifier()} if caller_ids else {}
+                    if saved_effect:
+                        with patch.object(self.memory, 'complete', side_effect=SystemExit('worker stopped')):
+                            with self.assertRaises(SystemExit):
+                                self.memory.save('note', self.note, source=self.source, operation_id=operation, **arguments)
+                    else:
+                        self.cloud.lose_next = True
+                        with self.assertRaises(MemoryClientError):
+                            self.memory.save('note', self.note, source=self.source, operation_id=operation, **arguments)
+                    with self.memory._transaction() as state:
+                        item = state['assignments'][operation]
+                        item.pop('completion_intent')
+                        if saved_effect:
+                            item['state'] = 'claimed'  # Old recover stopped after verifying the effect.
+                    result = Maintenance(self.service).recover(operation, worker_stopped=True)
+                    self.assertEqual(result['status'], 'completed')
+                    item = self.memory.status(operation, detail=True)['assignment']
+                    self.assertEqual(item['completion_intent']['summary'], item['intent'])
+                    self.assertEqual(self.cloud.records[item['effects'][0]['record']['record_id']]['revision'], 1)
+                    self.assertEqual(self.memory.status()['pending_count'], 0)
+
+    def test_general_or_modified_explicit_plans_are_not_automatically_completed(self):
+        for invalid_field, value in (('worker', 'semantic-worker'), ('context', 'Not an explicit input digest'),
+                                     ('changes_digest', 'different-plan'), ('plan_revision', 2)):
+            with self.subTest(invalid_field=invalid_field):
+                operation = identifier()
+                self.cloud.lose_next = True
+                with self.assertRaises(MemoryClientError):
+                    self.memory.save('note', self.note, source=self.source, record_id=identifier(), operation_id=operation)
+                with self.memory._transaction() as state:
+                    item = state['assignments'][operation]
+                    item.pop('completion_intent')
+                    item[invalid_field] = value
+                result = self.memory.recover(operation, worker_stopped=True)
+                self.assertEqual(result['status'], 'claimed')
+                self.assertNotIn(operation, self.cloud.records)
+                self.assertNotIn('completion', result['assignment'])
+                with self.assertRaises(MaintenanceError):
+                    self.memory.recover(operation, worker_stopped=True)
+        operation, token = self.assign(workstream='semantic-multiple', automatic=False)
+        self.cloud.lose_next = True
+        with self.assertRaises(MemoryClientError):
+            self.memory.apply(operation, worker_token=token, changes=[
+                {'kind': 'note', 'data': self.note}, {'kind': 'note', 'data': dict(self.note, title='Second effect')}])
+        result = self.memory.recover(operation, worker_stopped=True)
+        self.assertEqual(result['status'], 'claimed')
+        self.assertEqual(result['assignment']['pending_effects'], 1)
+        self.assertNotIn(operation, self.cloud.records)
+
+    def test_explicit_recovery_keeps_uncertain_completion_fenced_until_its_receipt_is_verified(self):
+        operation = identifier()
+        self.cloud.lose_next = True
+        with self.assertRaises(MemoryClientError):
+            self.memory.save('note', self.note, source=self.source, operation_id=operation)
+        original = self.memory.status(operation, detail=True)['assignment']['effects'][0]['request']
+        self.cloud.lose_next = True  # The effect replay is known; lose only the new completion response.
+        with self.assertRaises(MemoryClientError) as error:
+            self.memory.recover(operation, worker_stopped=True)
+        self.assertEqual(error.exception.code, 'outcome_unknown')
+        item = self.memory.status(operation, detail=True)['assignment']
+        completion = deepcopy(item['completion_request'])
+        self.assertEqual((item['state'], item['effects'][0]['state']), ('uncertain', 'saved'))
+        self.assertNotIn('completion', item)
+        self.assertEqual(self.memory.status()['pending_count'], 1)
+        successor = self.memory.enqueue('Next record', source=self.source, automatic=False,
+                                        workstream='record:new')['assignment']['operation_id']
+        with self.assertRaises(MaintenanceError):
+            self.memory.claim(successor, worker='next-worker')
+        recovered = Maintenance(self.service).recover(operation, worker_stopped=True)
+        self.assertEqual(recovered['status'], 'completed')
+        item = self.memory.status(operation, detail=True)['assignment']
+        self.assertEqual(item['completion_request'], completion)
+        self.assertEqual(item['effects'][0]['request'], original)
+        self.assertEqual(self.cloud.records[operation]['revision'], 1)
+        self.assertEqual(self.cloud.records[original['record_id']]['revision'], 1)
+        self.assertEqual(self.memory.claim(successor, worker='next-worker')['status'], 'ready')
+
+    def test_explicit_recovery_cancels_only_definitively_rejected_original_effect(self):
+        operation = identifier()
+        invoke = self.cloud.invoke
+
+        def reject(route, body):
+            if route == '/v1/memory/write' and body['kind'] == 'note':
+                raise MemoryClientError(rejection, request_key=body['request_key'])
+            return invoke(route, body)
+
+        rejection = 'outcome_unknown'
+        with patch.object(self.cloud, 'invoke', side_effect=reject):
+            with self.assertRaises(MemoryClientError):
+                self.memory.save('note', self.note, source=self.source, operation_id=operation)
+            original = self.memory.status(operation, detail=True)['assignment']['effects'][0]['request']
+            rejection = 'reference_unavailable'
+            with self.assertRaises(MemoryClientError):
+                self.memory.recover(operation, worker_stopped=True)
+        item = self.memory.status(operation, detail=True)['assignment']
+        self.assertEqual((item['state'], item['effects'][0]['state']), ('cancelled', 'failed'))
+        self.assertNotIn(original['record_id'], self.cloud.records)
+        self.assertNotIn(operation, self.cloud.records)
+        self.assertEqual(self.memory.status()['pending_count'], 0)
+        self.assertEqual(self.memory.save('note', self.note, source=self.source)['status'], 'saved')
+
+    def test_explicit_completion_definitive_rejection_retries_original_completion_only(self):
+        operation = identifier()
+        invoke = self.cloud.invoke
+
+        def reject_completion(route, body):
+            if route == '/v1/memory/write' and body['record_id'] == operation:
+                raise MemoryClientError('context_stale', request_key=body['request_key'])
+            return invoke(route, body)
+
+        with patch.object(self.cloud, 'invoke', side_effect=reject_completion):
+            with self.assertRaises(MemoryClientError):
+                self.memory.save('note', self.note, source=self.source, operation_id=operation)
+        item = self.memory.status(operation, detail=True)['assignment']
+        self.assertEqual((item['state'], item['effects'][0]['state']), ('blocked', 'saved'))
+        self.assertNotIn('completion_request', item)
+        self.assertNotIn(operation, self.cloud.records)
+        result = self.memory.recover(operation, worker_stopped=True)
+        self.assertEqual(result['status'], 'completed')
+        self.assertEqual(self.cloud.records[item['effects'][0]['record']['record_id']]['revision'], 1)
+        self.assertEqual(self.cloud.records[operation]['data']['summary'], item['intent'])
+
+    def test_explicit_completion_intent_precedes_submission_and_survives_process_loss(self):
+        operation = identifier()
+
+        def stop_before_submit(request):
+            item = self.memory.status(operation, detail=True)['assignment']
+            self.assertEqual(item['completion_intent']['changes_digest'], item['changes_digest'])
+            self.assertEqual(item['effects'][0]['request'], request)
+            self.assertNotIn(request['record_id'], self.cloud.records)
+            raise SystemExit('worker stopped before network submission')
+
+        with patch.object(self.memory, '_execute', side_effect=stop_before_submit):
+            with self.assertRaises(SystemExit):
+                self.memory.save('note', self.note, source=self.source, operation_id=operation)
+        item = self.memory.status(operation, detail=True)['assignment']
+        original = deepcopy(item['effects'][0]['request'])
+        self.assertEqual(item['state'], 'applying')
+        self.assertFalse((self.root / self.memory.runtime / 'pending-memory.json').exists())
+        recovered = Maintenance(self.service).recover(operation, worker_stopped=True)
+        self.assertEqual(recovered['status'], 'completed')
+        self.assertEqual(self.cloud.records[original['record_id']]['revision'], 1)
+        self.assertIn(original['request_key'], self.cloud.requests)
+
+    def test_explicit_task_recovery_finishes_only_after_verified_claim_and_completion(self):
+        task = self.service.save('task', {'title': 'Owned task', 'description': '', 'state': 'open'},
+                                 source=self.source)
+        operation = identifier()
+        self.cloud.lose_next = True
+        with self.assertRaises(MemoryClientError):
+            self.memory.claim_task(task['record_id'], action='claim', expected_revision=1,
+                                   source=self.source, lease_seconds=60, operation_id=operation)
+        original = self.memory.status(operation, detail=True)['assignment']['effects'][0]['request']
+        recovered = self.memory.recover(operation, worker_stopped=True)
+        self.assertEqual(recovered['status'], 'completed')
+        receipt = recovered['assignment']['task_effects'][0]
+        self.assertEqual(receipt['record'], {'record_id': task['record_id'], 'revision': 2})
+        self.assertEqual(receipt['task_state'], 'in_progress')
+        self.assertEqual(receipt['claim']['session_id'], self.session)
+        self.assertEqual(receipt['claim']['fence'], 2)
+        self.assertEqual(self.cloud.records[task['record_id']]['revision'], 2)
+        self.assertIn(original['request_key'], self.cloud.requests)
+        self.assertEqual(recovered['assignment']['completion'], {'record_id': operation, 'revision': 1})
+
+    def test_checkpoint_context_rejection_retries_same_eight_refs_and_cutoff_after_reload(self):
+        self.cloud.generation = 16
+        self.service.context()
+        for count in (1, 2, 2):
+            operation, token = self.assign()
+            self.finish_assignment(operation, token, [
+                {'kind': 'note', 'data': dict(self.note, title=f'Part {index}')} for index in range(count)])
+        checkpoint_id = identifier()
+        self.cloud.generation = 17
+        with self.assertRaises(MemoryClientError) as error:
+            self.memory.checkpoint(summary='Original boundary', checkpoint_id=checkpoint_id)
+        self.assertEqual(error.exception.code, 'context_stale')
+        checkpoint = self.memory.status(detail=True)['checkpoints'][0]
+        self.assertEqual((checkpoint['state'], checkpoint['error'], checkpoint['cutoff'], len(checkpoint['refs'])),
+                         ('blocked', 'context_stale', 3, 8))
+        self.assertNotIn(checkpoint_id, self.cloud.records)
+        self.assertFalse((self.root / self.memory.runtime / 'pending-memory.json').exists())
+        manifest_path = self.memory.runtime + '/checkpoints/' + checkpoint_id + '.json'
+        original_manifest = read_private(self.root, manifest_path)['manifest']
+        original_request = next(body for route, body in self.cloud.calls
+                                if route == '/v1/memory/write' and body['record_id'] == checkpoint_id)
+        self.assertEqual(original_request['authority_generation'], 16)
+        later = self.memory.enqueue('After the original cutoff', source=self.source)['assignment']['operation_id']
+        self.service.context()
+        result = Maintenance(self.service).advance_checkpoint(checkpoint_id)
+        self.assertEqual(result['status'], 'checkpointed')
+        self.assertEqual(result['checkpoint']['checkpoint_id'], checkpoint_id)
+        self.assertEqual(result['checkpoint']['cutoff'], 3)
+        self.assertEqual(result['checkpoint']['refs'], checkpoint['refs'])
+        self.assertNotIn(later, result['checkpoint']['assignments'])
+        self.assertNotIn('error', result['checkpoint'])
+        self.assertEqual(read_private(self.root, manifest_path)['manifest'], original_manifest)
+        prepares = [body for route, body in self.cloud.calls if route == '/v1/memory/write'
+                    and body['record_id'] == checkpoint_id and body['data']['state'] == 'prepared']
+        self.assertEqual([body['authority_generation'] for body in prepares], [16, 17])
+        self.assertEqual({body['request_key'] for body in prepares}, {original_request['request_key']})
+        self.assertEqual(self.cloud.records[checkpoint_id]['revision'], 2)
+
+    def test_checkpoint_rejection_preserves_prepared_record_and_saved_manifest_segments(self):
+        refs = []
+        for index in range(100):
+            record = self.service.save('note', dict(self.note, title=f'Reference {index}'), source=self.source)
+            refs.append({'record_id': record['record_id'], 'revision': record['revision']})
+        checkpoint_id = identifier()
+        segment_id = str(uuid.uuid5(uuid.UUID(checkpoint_id), 'manifest:0'))
+        invoke = self.cloud.invoke
+
+        def reject_finalization(route, body):
+            if (route == '/v1/memory/write' and body['record_id'] == checkpoint_id
+                    and body['data']['state'] == 'saved'):
+                raise MemoryClientError('context_stale', request_key=body['request_key'])
+            return invoke(route, body)
+
+        with patch.object(self.cloud, 'invoke', side_effect=reject_finalization):
+            with self.assertRaises(MemoryClientError):
+                self.memory.checkpoint(summary='Preserve every segment', refs=refs, checkpoint_id=checkpoint_id)
+        self.assertEqual(self.cloud.records[segment_id]['revision'], 2)
+        self.assertEqual(self.cloud.records[segment_id]['data']['state'], 'saved')
+        self.assertEqual(self.cloud.records[checkpoint_id]['revision'], 1)
+        self.assertEqual(self.cloud.records[checkpoint_id]['data']['state'], 'prepared')
+        self.assertEqual(self.memory.status(detail=True)['checkpoints'][0]['state'], 'blocked')
+        directory = self.memory.runtime + '/checkpoints/'
+        manifests = {key: read_private(self.root, directory + key + '.json')['manifest']
+                     for key in (checkpoint_id, segment_id)}
+        calls = len(self.cloud.calls)
+        result = self.memory.recover_checkpoint(checkpoint_id, worker_stopped=True)
+        self.assertEqual(result['status'], 'checkpointed')
+        self.assertEqual(result['checkpoint']['refs'], refs)
+        self.assertEqual(self.cloud.records[segment_id]['revision'], 2)
+        self.assertEqual(self.cloud.records[checkpoint_id]['revision'], 2)
+        writes = [body for route, body in self.cloud.calls[calls:] if route == '/v1/memory/write']
+        self.assertEqual([(body['record_id'], body['expected_revision']) for body in writes], [(checkpoint_id, 1)])
+        for key, manifest in manifests.items():
+            self.assertEqual(read_private(self.root, directory + key + '.json')['manifest'], manifest)
+
+    def test_checkpoint_unknown_outcomes_and_recovery_read_errors_remain_fenced(self):
+        for lost_state, failed_route in (('prepared', '/v1/operations/lookup'), ('saved', '/v1/memory/read')):
+            with self.subTest(lost_state=lost_state, failed_route=failed_route):
+                checkpoint_id = identifier()
+                invoke = self.cloud.invoke
+
+                def lose_checkpoint(route, body):
+                    if (route == '/v1/memory/write' and body['record_id'] == checkpoint_id
+                            and body['data']['state'] == lost_state):
+                        self.cloud.lose_next = True
+                    return invoke(route, body)
+
+                with patch.object(self.cloud, 'invoke', side_effect=lose_checkpoint):
+                    with self.assertRaises(MemoryClientError):
+                        self.memory.checkpoint(summary='Original unknown boundary', checkpoint_id=checkpoint_id)
+                pending_path = self.memory.runtime + '/pending-memory.json'
+                pending = read_private(self.root, pending_path)
+                calls = len(self.cloud.calls)
+                result = self.memory.advance_checkpoint(checkpoint_id)
+                self.assertEqual((result['status'], result['checkpoint']['state']), ('uncertain', 'applying'))
+                self.assertEqual(len(self.cloud.calls), calls)
+                with self.assertRaises(MaintenanceError):
+                    self.memory.recover_checkpoint(checkpoint_id, worker_stopped=False)
+
+                def reject_recovery(route, body):
+                    if route == failed_route and (route.endswith('/lookup') or body['record_id'] == checkpoint_id):
+                        raise MemoryClientError('context_stale')
+                    return invoke(route, body)
+
+                with patch.object(self.cloud, 'invoke', side_effect=reject_recovery):
+                    with self.assertRaises(MemoryClientError):
+                        self.memory.recover_checkpoint(checkpoint_id, worker_stopped=True)
+                self.assertEqual(self.memory.advance_checkpoint(checkpoint_id)['status'], 'uncertain')
+                self.assertEqual(read_private(self.root, pending_path), pending)
+                recovered = Maintenance(self.service).recover_checkpoint(checkpoint_id, worker_stopped=True)
+                self.assertEqual(recovered['status'], 'checkpointed')
+                self.assertEqual(recovered['checkpoint']['checkpoint_id'], checkpoint_id)
+                self.assertEqual(self.cloud.records[checkpoint_id]['revision'], 2)
+                self.assertIn(pending['body']['request_key'], self.cloud.requests)
+                self.assertFalse((self.root / pending_path).exists())
+
+    def test_checkpoint_unknown_then_definitive_replay_rejection_keeps_original_boundary_retryable(self):
+        checkpoint_id = identifier()
+        invoke = self.cloud.invoke
+
+        def reject(route, body):
+            if route == '/v1/memory/write' and body['record_id'] == checkpoint_id:
+                raise MemoryClientError(rejection, request_key=body['request_key'])
+            return invoke(route, body)
+
+        rejection = 'outcome_unknown'
+        with patch.object(self.cloud, 'invoke', side_effect=reject):
+            with self.assertRaises(MemoryClientError):
+                self.memory.checkpoint(summary='Exact original cutoff', checkpoint_id=checkpoint_id)
+            checkpoint = self.memory.status(detail=True)['checkpoints'][0]
+            self.assertEqual(checkpoint['state'], 'applying')
+            rejection = 'context_stale'
+            with self.assertRaises(MemoryClientError):
+                self.memory.recover_checkpoint(checkpoint_id, worker_stopped=True)
+        rejected = self.memory.status(detail=True)['checkpoints'][0]
+        self.assertEqual((rejected['state'], rejected['error']), ('blocked', 'context_stale'))
+        self.assertEqual(rejected['refs'], checkpoint['refs'])
+        self.assertEqual(rejected['cutoff'], checkpoint['cutoff'])
+        self.assertNotIn(checkpoint_id, self.cloud.records)
+        self.assertFalse((self.root / self.memory.runtime / 'pending-memory.json').exists())
+        # Old versions left even definitive rejections applying. Their original
+        # boundary must remain recoverable, not be replaced by a new checkpoint.
+        with self.memory._transaction() as state:
+            state['checkpoints'][checkpoint_id]['state'] = 'applying'
+        recovered = self.memory.recover_checkpoint(checkpoint_id, worker_stopped=True)
+        self.assertEqual(recovered['status'], 'checkpointed')
+        self.assertEqual(recovered['checkpoint']['checkpoint_id'], checkpoint_id)
+        self.assertEqual(recovered['checkpoint']['refs'], checkpoint['refs'])
+        self.assertEqual(self.cloud.records[checkpoint_id]['revision'], 2)
 
     def test_closure_barrier_prevents_new_acceptance_between_validation_and_cloud_close(self):
         saved = self.memory.checkpoint(summary='No outstanding work')

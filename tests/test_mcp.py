@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import json
+import hashlib
 from pathlib import Path
 import subprocess
 import sys
@@ -16,7 +17,7 @@ from mcp.client.stdio import stdio_client
 from tools.coordination import SessionBusy, private_lock
 from tools.mcp import server as mcp_server
 from tools.mcp.server import MavenApplication, create_server, main
-from tools.memory.client import MemoryClientError
+from tools.memory.client import MemoryClient, MemoryClientError
 from tools.memory.boundary import BoundaryError, read_private, save_private
 from tools.memory.lifecycle import SessionService
 from test_workflow import MemoryCloud
@@ -26,14 +27,37 @@ SOURCE = {'origin': 'Owner conversation', 'excerpt': 'Preserve the verified find
 NOTE = {'kind': 'note', 'data': {'title': 'Finding', 'body_markdown': 'Verified locally.', 'category': 'work'}}
 
 
+def skill_page(slug, **changes):
+    from tools.memory.validation import digest
+    candidate = {'slug': slug, 'page_kind': 'skill', 'title': slug, 'scope': {},
+                 'authority_state': 'active', 'body_markdown': 'Complete approved ' + slug,
+                 'description': 'Use for approved ' + slug + ' operations.'}
+    candidate.update(changes)
+    return {**candidate, 'page_id': str(uuid.uuid5(uuid.NAMESPACE_URL, slug)), 'revision': 1,
+            'data_scope': 'owner', 'content_hash': digest(candidate),
+            'body_sha256': hashlib.sha256(candidate['body_markdown'].encode()).hexdigest()}
+
+
 class MCPCloud(MemoryCloud):
     """Answers the protocol-4 routes (search ranking fields, project_context, revisions, generations)."""
     pages = []
 
     def invoke(self, route, body):
         if route == '/v1/pages/index':
-            return {'status': 'ready', 'authority_generation': 1,
-                    'data': {'pages': list(self.pages), 'authority_generation': 1, 'next_after_slug': None}}
+            self.last_generation = self.generation
+            pages = sorted((page for page in self.pages
+                            if (body.get('page_kind') is None or page['page_kind'] == body['page_kind'])
+                            and page['slug'] > body.get('after_slug', '')
+                            and (body.get('scope') is None or page.get('data_scope') == 'owner'
+                                 and ('project' not in page.get('scope', {})
+                                      or body.get('scope') == 'context'
+                                      and page['scope']['project'] == body['project_id']))),
+                           key=lambda page: page['slug'])
+            limit = body.get('limit', 10)
+            return {'status': 'ready', 'authority_generation': self.generation,
+                    'data': {'pages': pages[:limit], 'authority_generation': self.generation,
+                             'capabilities': ['instructions_only'],
+                             'next_after_slug': pages[limit - 1]['slug'] if len(pages) > limit else None}}
         if route == '/v1/memory/project_context':
             return {'status': 'ready', 'authority_generation': 1, 'data': {
                 'latest_handover': None, 'active_peers': [], 'tasks': [], 'blockers': [],
@@ -334,6 +358,7 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(denied.is_error)
             escaped, _ = await self.call('maven_search', {'scope': 'all', 'unbound': True})
             self.assertTrue(escaped.is_error)
+            await self.call('maven_start', {'choice': 'read_only', 'cwd': str(self.root)})
             _, listed = await self.call('maven_instructions')
         self.assertEqual([(page['slug'], page['loaded']) for page in listed['pages']], [('core', False)])
         self.assertIsNone(self.app.service)
@@ -341,6 +366,117 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(route == '/v1/memory/write' for route, _ in self.cloud.calls))
         bound_only, _ = await self.call('maven_search', {'scope': 'context'})
         self.assertTrue(bound_only.is_error)
+
+    async def test_named_read_only_skill_load_uses_configured_client_without_session_or_memory(self):
+        from test_memory_client import CONFIG
+        from tools.memory.validation import CLIENT_PROTOCOL
+        client = MemoryClient(CONFIG, None)
+        self.addCleanup(client.close)
+        root = skill_page('calendar', requires=['helper'])
+        helper = skill_page('helper', page_kind='procedure')
+        del helper['description']  # Procedures have no skill description; bind its exact candidate.
+        from tools.memory.validation import digest
+        helper['content_hash'] = digest({key: helper[key] for key in (
+            'slug', 'page_kind', 'title', 'scope', 'authority_state', 'body_markdown')})
+        self.cloud.pages = [root, skill_page('project-only', scope={'project': self.project})]
+        calls = []
+
+        def invoke(route, body, **kwargs):
+            calls.append((route, body))
+            if route == '/v1/pages/index':
+                return self.cloud.invoke(route, body)
+            self.assertEqual(route, '/v1/memory/context')
+            self.assertEqual(body, {'skill_slug': 'calendar', 'workflow': 'calendar',
+                                    'operation': 'calendar', 'instructions_only': True})
+            return {'status': 'ready', 'data': {
+                'pages': [root, helper], 'bodies_inline': True, 'authority_generation': 1,
+                'minimum_client_protocol': CLIENT_PROTOCOL, 'instructions_only': True,
+                'tasks': [], 'next_task_after_id': None}}
+
+        await self.call('maven_start', {'choice': 'read_only', 'cwd': str(self.root)})
+        (self.home / '.env').write_text('configured fixture\n')
+        with patch('tools.memory.environment.configured_client', return_value=client) as configure, \
+                patch.object(client, 'invoke', side_effect=invoke):
+            _, startup = await self.call('maven_startup', {'cwd': str(self.root)})
+            self.assertEqual([page['slug'] for page in startup['available_skills']['pages']], ['calendar'])
+            self.assertFalse(startup['available_skills']['pages'][0]['loaded'])
+            result, loaded = await self.call('maven_context', {'skill_slug': 'calendar'})
+            self.assertFalse(result.is_error, loaded)
+            self.assertEqual([page['slug'] for page in loaded['context']['instructions']], ['helper', 'calendar'])
+            self.assertEqual(loaded['skill']['body_markdown'], root['body_markdown'])
+            _, refreshed = await self.call('maven_startup', {'cwd': str(self.root)})
+            self.assertTrue(refreshed['available_skills']['pages'][0]['loaded'])
+            before = len(calls)
+            await self.call('maven_status', {'cwd': str(self.root)})
+            self.assertEqual(len(calls), before)
+        configure.assert_called_once_with(self.app.env)
+        self.assertTrue(loaded['unbound'])
+        self.assertEqual(loaded['active']['mode'], 'read_only')
+        self.assertNotIn('session_id', loaded)
+        self.assertIsNone(self.app.binding)
+        self.assertIsNone(self.app.service)
+        self.assertFalse((self.root / '.maven/runtime').exists())
+        self.assertFalse(any(route.startswith('/v1/memory/') and route != '/v1/memory/context'
+                             for route, _ in calls))
+
+    async def test_skill_discovery_and_explicit_names_obey_mode_gates_and_cloud_failures(self):
+        self.cloud.pages = [skill_page('calendar')]
+        with patch.object(self.app, 'unbound_client', return_value=self.cloud) as client:
+            for choice in (None, 'off'):
+                if choice:
+                    await self.call('maven_start', {'choice': choice, 'cwd': str(self.root)})
+                denied, _ = await self.call('maven_context', {'skill_slug': 'calendar'})
+                self.assertTrue(denied.is_error)
+                denied, _ = await self.call('maven_instructions')
+                self.assertTrue(denied.is_error)
+            _, off = await self.call('maven_startup', {'cwd': str(self.root)})
+            self.assertNotIn('available_skills', off)
+            client.assert_not_called()
+        _, selection = await self.call('maven_start', {'choice': 'read_only', 'cwd': str(self.root)})
+        _, missing = await self.call('maven_startup', selection['discovery_request'])
+        self.assertEqual(missing['available_skills'], {'status': 'not_configured', 'pages': []})
+        self.app._unbound_client = self.cloud
+        _, ready = await self.call('maven_startup', {'cwd': str(self.root)})
+        self.assertEqual(ready['available_skills']['status'], 'ready')
+        for code in ('selected_login_unavailable_or_expired', 'transport_unavailable'):
+            with patch.object(self.cloud, 'invoke', side_effect=MemoryClientError(code)):
+                _, unavailable = await self.call('maven_startup', {'cwd': str(self.root)})
+            self.assertEqual(unavailable['available_skills']['status'], 'unavailable')
+            self.assertEqual(unavailable['available_skills']['error'], code)
+            self.assertEqual(unavailable['available_skills']['pages'], [])
+        self.assertIsNone(self.app.binding)
+
+    async def test_named_bound_load_retains_actual_scope_and_reports_current_loaded_versions(self):
+        await self.initialize()
+        pages = [skill_page('calendar'), skill_page('mail')]
+        self.cloud.pages = pages
+        selectors = []
+
+        def load(slug, *, context):
+            selectors.append(context)
+            page = next(page for page in pages if page['slug'] == slug)
+            return {'status': 'ready', 'data': page, 'context': {
+                'authority_generation': self.cloud.generation,
+                'instructions': [{'slug': 'core', 'revision': 1, 'page_kind': 'directive'}, page]}}
+
+        with patch.object(self.cloud, 'load_instruction', create=True, side_effect=load):
+            for slug in ('calendar', 'mail'):
+                result, loaded = await self.call('maven_context', {'skill_slug': slug})
+                self.assertFalse(result.is_error, loaded)
+                self.assertEqual(loaded['project_id'], self.project)
+            _, listed = await self.call('maven_instructions')
+            self.assertTrue(all(page['loaded'] for page in listed['pages']))
+            self.cloud.generation = 2
+            pages[0]['revision'] = 2
+            await self.call('maven_context', {'skill_slug': 'calendar'})
+            _, listed = await self.call('maven_instructions')
+        self.assertEqual([(page['slug'], page['revision'], page['loaded']) for page in listed['pages']],
+                         [('calendar', 2, True), ('mail', 1, False)])
+        self.assertTrue(all(context == {'project_id': self.project, 'workflow': 'maven-workflow',
+                                        'instructions_only': True} for context in selectors))
+        with patch.object(self.app.service, 'context', return_value={'status': 'ready'}) as ordinary:
+            await self.call('maven_context')
+        ordinary.assert_called_once_with()
 
     async def test_status_resumes_only_exact_native_conversation_not_newest_peer(self):
         _, first = await self.call('maven_initialize', {

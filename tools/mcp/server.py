@@ -64,7 +64,14 @@ Optional OMP exit protection can request wrap-up, checkpoint and finish before v
 shutdown events are best-effort only. Never claim closure because a hook ran or a process stopped.
 List cloud instructions with maven_instructions. Say whether a memory answer came from this conversation
 or was re-read from MAVEN. Unbound universal consultation is read-only and needs explicit owner intent;
-include_home adds the Home project to it. Read Only and off never capture.
+include_home adds the Home project to it. Read Only and off never start automatic capture.
+Configured Read Only/Home/project receive approved skill summaries; off/unconfigured do not.
+Load a named skill with maven_context(skill_slug=...); Read Only loads instructions only, no session.
+maven_secrets permits narrow Home secret-catalog lookup. An explicit store_and_catalog command may
+write exactly that secret's Home setting from Read Only/project without starting Home or other capture.
+Never put credential values in tool arguments/results. Use private inputs and approved declarative
+consumers through maven_secret_adapter; show exact owner reviews, never infer approvals or replay
+an uncertain execution. Return only status and declared non-secret results, never raw program output.
 Archive a cloud project by exact ID through maven_admin kind project_lifecycle after owner review,
 not by temporary binding, uninstall, or an archived tag. Archived projects and their contents stay
 out of normal discovery and reads; include_archived requires an explicit archived-history request.
@@ -175,6 +182,7 @@ class MavenApplication:
         self._resume_initialization = False
         self._lock = threading.RLock()
         self._unbound_client = None
+        self._unbound_authority = None
         self._warm_stop = threading.Event()
         self._warm_thread = None
 
@@ -299,6 +307,7 @@ class MavenApplication:
                 raise MaintenanceError('this MCP process is already bound; its active session stays selected')
             record_choice(self.home, cwd, choice, harness=harness, harness_session=harness_session)
             self.choice = active(choice)
+            self._unbound_authority = None
             write_active(self.home, self.choice, harness_session=harness_session, folder=cwd)
             return dict(self.choice)
 
@@ -320,6 +329,8 @@ class MavenApplication:
         return {'status': 'ready', 'binding': dict(self.binding), 'memory': result, 'active': current,
                 'automatic_updates': state['automatic_updates'], 'pending_count': state['pending_count'],
                 'assignment_id': self.assignment_id,
+                **({'available_skills': result['context']['skills']['available_skills']}
+                   if 'available_skills' in result.get('context', {}).get('skills', {}) else {}),
                 'message': f'MAVEN: ready — {selected} loaded; automatic memory updates ' +
                            ('enabled.' if state['automatic_updates'] else 'paused.')}
 
@@ -382,6 +393,53 @@ class MavenApplication:
                 self._unbound_client = configured_client(self.env)
             return self._unbound_client
 
+    def require_skill_access(self):
+        if self.binding is not None:
+            self.bound()
+        elif not self.choice or self.choice['mode'] != 'read_only':
+            raise MaintenanceError('select Read Only, Home or an enabled project before discovering or loading skills')
+
+    def available_skills(self, *, project_id=None):
+        """Fresh headers only; startup callers have already resolved the selected mode."""
+        from tools.memory.skills import SessionSkills
+        try:
+            if self.initialized:
+                return self.service.skill_summaries()
+            if project_id is None:
+                self.require_skill_access()
+            if self._unbound_client is None and not self.env.exists():
+                return {'status': 'not_configured', 'pages': []}
+            catalog = SessionSkills.catalog_pages(self.unbound_client(), project_id)
+            authority = self._unbound_authority or {}
+            return SessionSkills.summaries(
+                catalog, authority.get('instructions', ()), authority.get('authority_generation'))
+        except (MemoryClientError, BoundaryError, OSError, ValueError) as error:
+            self._unbound_authority = None
+            return {'status': 'unavailable', 'pages': [],
+                    'error': error.code if isinstance(error, MemoryClientError) else 'discovery_unavailable',
+                    'message': 'Skill discovery unavailable; no cached authority was substituted.',
+                    'sign_in': self.sign_in()}
+
+    def context(self, skill_slug=None):
+        if skill_slug is None:
+            return self.bound().context()
+        self.require_skill_access()
+        if self.initialized:
+            return self.service.load_skill(skill_slug)
+        try:
+            result = self.unbound_client().load_instruction(skill_slug, context={'instructions_only': True})
+        except MemoryClientError:
+            self._unbound_authority = None
+            raise
+        context = result['context']
+        loaded = ({page['slug']: page for page in self._unbound_authority['instructions']}
+                  if self._unbound_authority is not None and self._unbound_authority['authority_generation']
+                  == context['authority_generation'] else {})
+        loaded.update((page['slug'], page) for page in context['instructions'])
+        self._unbound_authority = {**context, 'instructions': list(loaded.values())}
+        return {'status': 'ready', 'unbound': True, 'active': self.active(),
+                'skill': result['data'], 'context': context}
+
     def sign_in(self):
         """Exact daily-use sign-in into MAVEN's private login cache; None when not configured."""
         from tools.memory.environment import load_environment, sign_in
@@ -413,8 +471,9 @@ class MavenApplication:
         self.primary()
         if action not in ('inspect', 'continue', 'new'):
             raise MaintenanceError('startup action must be inspect, continue or new')
-        if self.choice and self.choice['mode'] in ('read_only', 'off') and not home:
+        if self.binding is None and self.choice and self.choice['mode'] in ('read_only', 'off') and not home:
             return {'status': self.choice['mode'], 'active': self.active(), 'live_state_checked': False,
+                    **({'available_skills': self.available_skills()} if self.choice['mode'] == 'read_only' else {}),
                     'message': 'This conversation chose no capture. Select Home or a project explicitly before initializing.'}
         if self.binding:
             if (harness != self.binding['harness'] or harness_session != self.binding['harness_session']):
@@ -424,7 +483,8 @@ class MavenApplication:
             if action == 'continue':
                 return self.initialize(self.binding['root'], harness=harness, harness_session=harness_session,
                                        session_id=self.binding['session_id'], resume=True, cwd=cwd)
-            return self.diagnose(cwd, harness=harness, harness_session=harness_session)
+            return {**self.diagnose(cwd, harness=harness, harness_session=harness_session),
+                    'available_skills': self.available_skills()}
         folder = self._selected_root(None, True) if home else Path(cwd)
         report = inspect_startup(self.home, folder, harness=harness, harness_session=harness_session)
         report['active'] = self.active()
@@ -458,7 +518,7 @@ class MavenApplication:
         report['choices'] = ['review_recovery', 'start_new_without_taking_over', 'read_only'] if (
             report['issues'] or attention) else []
         if action == 'inspect':
-            return report
+            return {**report, 'available_skills': self.available_skills(project_id=report['project_id'])}
         if report['status'] == 'recovery' and binding:
             return {**report, 'recovery_initialize': {
                         'root': binding['root'], 'session_id': binding['session_id'], 'resume': True,
@@ -645,6 +705,7 @@ def create_server(application=None):
         return {**record, 'unbound': True}
 
     def unbound_instructions():
+        app.require_skill_access()
         client, pages, after, generation = app.unbound_client(), [], None, None
         while True:
             request = {'limit': 10} if after is None else {'limit': 10, 'after_slug': after}
@@ -660,7 +721,12 @@ def create_server(application=None):
                         and 'project' not in (page.get('scope') or {})):
                     pages.append({'slug': page.get('slug'), 'page_kind': page.get('page_kind'),
                                   'title': page.get('title'), 'revision': page.get('revision'),
-                                  'requires': page.get('requires', []), 'loaded': False})
+                                  'requires': page.get('requires', []),
+                                  **({'description': page['description']} if 'description' in page else {}),
+                                  'loaded': bool(app._unbound_authority
+                                      and generation == app._unbound_authority['authority_generation']
+                                      and any((loaded['slug'], loaded['revision']) == (page.get('slug'), page.get('revision'))
+                                              for loaded in app._unbound_authority['instructions']))})
             after = data.get('next_after_slug')
             if after is None or not data['pages']:
                 break
@@ -684,8 +750,15 @@ def create_server(application=None):
     def maven_start(choice: Literal['read_only', 'off'], cwd: str | None = None, harness: str = 'mcp',
                     harness_session: str | None = None) -> dict[str, Any]:
         """Record the owner's sessionless start choice for the workspace cwd: read_only (consult only on request, no capture) or off. Local only: no cloud call, no session. Refused once this process is bound. Returns active; print its line."""
-        return {'status': 'recorded', 'active': app.start(choice, Path(cwd) if cwd else Path.cwd(),
-                                                          harness=harness, harness_session=harness_session)}
+        workspace = Path(cwd) if cwd else Path.cwd()
+        result = {'status': 'recorded', 'active': app.start(choice, workspace,
+                              harness=harness, harness_session=harness_session)}
+        if choice == 'read_only':
+            result.update(
+                next_action='Immediately call maven_startup with discovery_request to load approved skill summaries; no session or capture.',
+                discovery_request={'cwd': str(workspace), 'harness': harness,
+                                   'harness_session': harness_session, 'action': 'inspect'})
+        return result
 
     @server.tool()
     @guarded
@@ -706,9 +779,9 @@ def create_server(application=None):
 
     @server.tool(annotations=read_hint)
     @guarded
-    def maven_context() -> dict[str, Any]:
-        """Reload complete approved instructions, handover, tasks and relevant memory before governed work; not an instruction cache fallback."""
-        return app.bound().context()
+    def maven_context(skill_slug: str | None = None) -> dict[str, Any]:
+        """Without arguments, reload complete bound project context. With skill_slug, load that approved skill and governing dependencies in the actual project scope, or universal authority in Read Only. Named loads never initialize or capture; discovery alone does not load authority."""
+        return app.context(skill_slug)
 
     @server.tool(annotations=read_hint)
     @guarded
@@ -745,7 +818,7 @@ def create_server(application=None):
     @server.tool(annotations=read_hint)
     @guarded
     def maven_instructions() -> dict[str, Any]:
-        """List the active cloud instructions (directives, skills, procedures): slug, kind, title, revision, requires and whether each is loaded in this session. Read-only. Use this to answer "what instructions/skills does MAVEN have"; use maven_context to load bodies. Before initialization it lists universal instructions from the home environment with loaded false."""
+        """List active cloud instructions (directives, skills, procedures), revisions and whether loaded at the current generation. Before initialization, explicit Read Only lists universal instructions without binding or capture. Use maven_context(skill_slug=...) for full named skill loading; startup summaries never activate instructions."""
         if app.initialized:
             return app.service.instructions()
         return unbound_instructions()
@@ -960,7 +1033,7 @@ def create_server(application=None):
     @server.tool()
     @guarded
     def maven_admin(action: Literal['begin', 'respond', 'advance', 'back', 'status'],
-                     kind: Literal['setup', 'project', 'project_lifecycle', 'install', 'uninstall', 'recovery', 'home', 'cleanup'] | None = None,
+                     kind: Literal['setup', 'secrets_setup', 'repair', 'environment_migration', 'project', 'project_lifecycle', 'install', 'uninstall', 'recovery', 'home', 'cleanup'] | None = None,
                      parameters: dict[str, Any] | None = None, operation_id: str | None = None,
                      interaction_id: str | None = None, revision: int | None = None,
                      response: dict[str, Any] | None = None, detail: bool = False) -> dict[str, Any]:
@@ -969,6 +1042,16 @@ def create_server(application=None):
         respond: pass the pending_interaction's interaction_id and revision. A form response is an object with exactly its field names. A review response is {approved: bool, review_digest: <the review's digest>, source: {origin, excerpt} describing the owner's actual answer, confirmations: <the review's confirmations, usually {}>}. Invalid input returns error invalid_request with a message naming the problem.
 
         Updating an existing installation: begin kind "setup" with parameters {mode: "update"} (optional absolute "checkout"). It checks local software and harness skills, then the database schema, service stack and bundled instructions, asking for review only where something differs.
+
+        Secret store: begin kind "secrets_setup" (or "repair") to connect/import exact
+        reviewed locators or create a reviewed store. Existing objects are never adopted
+        by matching names. Read-only access checks do not prove write permissions.
+
+        Legacy environment migration: begin kind "environment_migration"; optional
+        parameters {path: absolute source .env}. Review removal of the retired Google
+        locator; credentials remain untouched. Imported source files are never modified.
+        If another operation returns prerequisite_operation, respond/advance that child
+        UUID through its exact review, then advance the original parent operation.
 
         MAVEN Home: begin kind "home" with parameters {action, root, project_id, label} to enable, change or disable the owner-selected Home after a full review. For an already-bound folder, select mode "switch" in the Home or project form to attach an existing cloud project; existing sessions must be cleanly stopped and original evidence is preserved. No cloud project is merged or deleted.
 
@@ -1115,6 +1198,8 @@ def create_server(application=None):
         result['exit_code'] = completed.returncode
         return result
 
+    from .secrets import register_secret_tools
+    register_secret_tools(server, app, guarded)
     return server
 
 

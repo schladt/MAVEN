@@ -162,7 +162,7 @@ class Maintenance:
     @staticmethod
     def _checkpoint_overview(checkpoint):
         return {key: deepcopy(checkpoint[key]) for key in
-                ('checkpoint_id', 'state', 'cutoff', 'created_at', 'completed_at', 'receipt') if key in checkpoint} | {
+                ('checkpoint_id', 'state', 'cutoff', 'created_at', 'completed_at', 'receipt', 'error') if key in checkpoint} | {
                     'assignment_count': len(checkpoint['assignments']),
                     'ref_count': len(checkpoint.get('refs', checkpoint['explicit_refs']))}
 
@@ -484,6 +484,8 @@ class Maintenance:
                 raise MaintenanceError('explicit no_changes evidence is required for an empty reconciliation')
             if item.get('completion_request') and item['summary'] != summary:
                 raise MaintenanceError('completion summary is already bound to its request')
+            if item.get('completion_intent') and item['completion_intent']['summary'] != summary:
+                raise MaintenanceError('completion summary is already bound to the explicit action')
             item['summary'] = summary
             item['state'] = 'completing'
             request = item.setdefault('completion_request', {
@@ -506,24 +508,80 @@ class Maintenance:
             item.pop('error', None)
             return {'status': 'completed', 'cloud_saved': True, 'assignment': self._brief(item)}
 
+    @staticmethod
+    def _explicit_summary(item):
+        """Only a recorded single-action contract authorizes completion without a worker plan."""
+        if (item.get('automatic') is not False or not item.get('worker_token') or item.get('superseded_by')
+                or item.get('worker') not in ('explicit-save', 'explicit-task')
+                or item.get('plan_revision') != 1 or len(item.get('effects', [])) != 1):
+            return None
+        intent = item.get('completion_intent')
+        if intent is not None:
+            if intent == {'worker': item['worker'], 'summary': item['intent'],
+                          'changes_digest': item.get('changes_digest')}:
+                return intent['summary']
+            return None
+        # Older explicit saves recorded the worker, original input digest and exact
+        # one-effect plan, but not completion intent. A worker name alone is not proof.
+        request = item['effects'][0]['request']
+        if (item['worker'] != 'explicit-save' or 'task_action' in request
+                or request.get('reason') != item['intent'] or request.get('source') != item['source']):
+            return None
+        generated_id = str(uuid.uuid5(uuid.UUID(item['operation_id']), 'record:1:0'))
+        generated_key = str(uuid.uuid5(uuid.UUID(item['operation_id']),
+                                      digest({key: value for key, value in request.items() if key != 'request_key'})))
+        for record_id in (request['record_id'], None):
+            if record_id is None and request['record_id'] != generated_id:
+                continue
+            for request_key in (request['request_key'], None):
+                if request_key is None and request['request_key'] != generated_key:
+                    continue
+                original = {key: request[key] for key in ('kind', 'data', 'scope', 'expected_revision', 'tags')}
+                original.update(record_id=record_id, request_key=request_key)
+                change = {key: value for key, value in original.items() if value is not None}
+                change['reason'] = item['intent']
+                if (item.get('context') == 'Explicit save digest: ' + digest(original)
+                        and item.get('changes_digest') == digest([change])
+                        and item['workstream'] == 'record:' + (record_id or 'new')):
+                    return item['intent']
+        return None
+
     def recover(self, operation_id, *, worker_stopped):
         if worker_stopped is not True:
             raise MaintenanceError('recovery requires the actual worker to be stopped')
         with self._transaction() as state:
             item = self._get(state, operation_id)
-            if item['state'] not in ('uncertain', 'applying', 'completing'):
+            if item['state'] == 'completed':
+                return {'status': 'completed', 'cloud_saved': True, 'assignment': self._brief(item)}
+            summary = self._explicit_summary(item)
+            finishing = summary is not None and item['state'] in ('claimed', 'applied', 'blocked')
+            if item['state'] not in ('uncertain', 'applying', 'completing') and not finishing:
                 raise MaintenanceError('assignment has no interrupted effect to recover')
-            effect = next((effect for effect in item['effects'] if effect['state'] in ('uncertain', 'applying')), None)
+            effect = next((effect for effect in item['effects']
+                           if effect['state'] in ('uncertain', 'applying')
+                           or finishing and effect['state'] == 'pending'), None)
             request = deepcopy(effect['request'] if effect else item.get('completion_request'))
-            if not request:
+            if not request and not (finishing and item['effects'][0]['state'] == 'saved'):
                 raise MaintenanceError('original request is unavailable')
-        # The service reconciles its journal first. If interruption happened before
-        # submission, the persisted assignment still supplies exactly the original key.
+            if summary is not None:
+                item.setdefault('completion_intent', {
+                    'worker': item['worker'], 'summary': summary, 'changes_digest': item['changes_digest']})
+            token = item.get('worker_token')
+            if effect is not None:
+                effect['state'] = 'applying'
+                item['state'] = 'applying'
+        if request is None:
+            # The effect receipt survived, but the process stopped before complete.
+            return self.complete(operation_id, worker_token=token, summary=summary)
+        # Reconcile the original journal and key, never resubmit the caller's input
+        # as a new operation. General semantic assignments still need worker reasoning.
         try:
             self.service.recover()
             record = self._execute(request)
         except Exception as error:
             self._record_failure(operation_id, request, error, completion=effect is None, recovering=True)
+            if summary is not None:
+                self._cancel_rejected(operation_id, error)
             raise
         with self._transaction() as state:
             item = self._get(state, operation_id)
@@ -537,7 +595,11 @@ class Maintenance:
                     item['scopes'].append(request['scope'])
                 item['state'] = 'superseded' if item.get('superseded_by') else 'claimed'
             item.pop('error', None)
-            return {'status': item['state'], 'cloud_saved': True, 'assignment': self._brief(item)}
+            summary = self._explicit_summary(item) if effect is not None else None
+            result = {'status': item['state'], 'cloud_saved': True, 'assignment': self._brief(item)}
+        if summary is not None:
+            return self.complete(operation_id, worker_token=token, summary=summary)
+        return result
 
     def _prevalidate(self, operation_id, source, change):
         """Reject malformed explicit input before anything is queued or sent."""
@@ -566,6 +628,13 @@ class Maintenance:
     def _explicit(self, operation_id, worker, change, summary):
         try:
             token = self.claim(operation_id, worker=worker)['assignment']['worker_token']
+            with self._transaction() as state:
+                item = self._get(state, operation_id)
+                self._worker(item, token)
+                intent = {'worker': worker, 'summary': summary, 'changes_digest': digest([change])}
+                if item.get('completion_intent', intent) != intent:
+                    raise MaintenanceError('explicit completion is bound to the original single action')
+                item['completion_intent'] = intent
             self.apply(operation_id, worker_token=token, changes=[change])
             return self.complete(operation_id, worker_token=token, summary=summary)
         except Exception as error:
@@ -738,17 +807,22 @@ class Maintenance:
                 return {'status': 'pending', 'cloud_saved': False, 'checkpoint': deepcopy(checkpoint),
                         'pending_assignments': pending,
                         'next_action': 'Complete the included assignments, then advance this exact checkpoint.'}
-            refs = unique_refs(([checkpoint['base']] if checkpoint.get('base') else []) +
-                               checkpoint['explicit_refs'] + [ref for identifier in checkpoint['assignments']
-                               for ref in self._refs(state['assignments'][identifier])])
-            checkpoint['refs'] = refs
+            if 'refs' not in checkpoint:
+                checkpoint['refs'] = unique_refs(([checkpoint['base']] if checkpoint.get('base') else []) +
+                    checkpoint['explicit_refs'] + [ref for identifier in checkpoint['assignments']
+                    for ref in self._refs(state['assignments'][identifier])])
             checkpoint['state'] = 'applying'
             request = {'checkpoint_id': checkpoint_id, 'summary': checkpoint['summary'],
-                       'refs': refs, 'cutoff': checkpoint['cutoff']}
-        result = self._persist_checkpoint(**request)
+                       'refs': deepcopy(checkpoint['refs']), 'cutoff': checkpoint['cutoff']}
+        try:
+            result = self._persist_checkpoint(**request)
+        except Exception as error:
+            self._checkpoint_failure(checkpoint_id, error)
+            raise
         with self._transaction() as state:
             checkpoint = state['checkpoints'][checkpoint_id]
             checkpoint.update(state='saved', receipt=result['checkpoint'], completed_at=now())
+            checkpoint.pop('error', None)
             return {'status': 'checkpointed', 'cloud_saved': True, 'checkpoint': deepcopy(checkpoint),
                     'memory_summary': self._summary(state, cutoff=checkpoint['cutoff'])}
 
@@ -756,18 +830,44 @@ class Maintenance:
         if worker_stopped is not True:
             raise MaintenanceError('checkpoint recovery requires its original worker to be stopped')
         checkpoint_id = session_uuid(checkpoint_id)
-        with self._locked():
-            checkpoint = deepcopy(self._load()['checkpoints'].get(checkpoint_id))
-            if checkpoint is None or checkpoint['state'] != 'applying':
+        with self._transaction() as state:
+            checkpoint = deepcopy(state['checkpoints'].get(checkpoint_id))
+            if checkpoint is None or checkpoint['state'] not in ('applying', 'blocked'):
                 raise MaintenanceError('checkpoint has no interrupted cloud operation')
-        self.service.recover()
-        result = self._persist_checkpoint(checkpoint_id=checkpoint_id, summary=checkpoint['summary'],
-                                          refs=checkpoint['refs'], cutoff=checkpoint['cutoff'])
+            state['checkpoints'][checkpoint_id]['state'] = 'applying'
+        pending_path = self.runtime + '/pending-memory.json'
+        pending = read_private(self.root, pending_path) if private_path(self.root, pending_path).exists() else None
+        try:
+            self.service.recover()
+        except Exception as error:
+            self._checkpoint_failure(checkpoint_id, error, recovering=pending)
+            raise
+        try:
+            result = self._persist_checkpoint(checkpoint_id=checkpoint_id, summary=checkpoint['summary'],
+                                              refs=checkpoint['refs'], cutoff=checkpoint['cutoff'])
+        except Exception as error:
+            self._checkpoint_failure(checkpoint_id, error)
+            raise
         with self._transaction() as state:
             saved = state['checkpoints'][checkpoint_id]
             saved.update(state='saved', receipt=result['checkpoint'], completed_at=now())
+            saved.pop('error', None)
             return {'status': 'checkpointed', 'cloud_saved': True, 'checkpoint': deepcopy(saved),
                     'memory_summary': self._summary(state, cutoff=saved['cutoff'])}
+
+    def _checkpoint_failure(self, checkpoint_id, error, *, recovering=None):
+        code = getattr(error, 'code', 'operation_interrupted')
+        definitive = (code in DEFINITIVE_MUTATION_ERRORS and
+                      not private_path(self.root, self.runtime + '/pending-memory.json').exists())
+        if definitive and recovering is not None:
+            failed_path = self.runtime + '/failed-memory-write.json'
+            failed = read_private(self.root, failed_path) if private_path(self.root, failed_path).exists() else {}
+            definitive = (failed.get('status') == code and failed.get('request', {}).get('body') == recovering['body'])
+        with self._transaction() as state:
+            checkpoint = state['checkpoints'][checkpoint_id]
+            # A rejection permits retrying this same immutable boundary. Unknown
+            # outcomes remain fenced behind explicit, quiescent recovery.
+            checkpoint.update(state='blocked' if definitive else 'applying', error=code)
 
     def _persist_checkpoint(self, *, checkpoint_id, summary, refs, cutoff):
         # Each cloud record is bounded. A deterministic chain retains every pinned

@@ -41,6 +41,15 @@ class AdministrationTests(unittest.TestCase):
             'limitations': ['Fixture result; not live AWS evidence.'], 'remediation': 'Inspect IAM permissions.'})
         self.preflight = preflight.start()
         self.addCleanup(preflight.stop)
+        identity = {'Arn': 'arn:aws:iam::123456789012:user/owner', 'Account': '123456789012'}
+        for target, value in (
+                ('inspect_login_identity', identity),
+                ('identities', ({'daily': identity, 'maintenance': identity}, {'daily': Mock(), 'maintenance': Mock()})),
+                ('inspect_store', {'bucket': 'fixture-secrets', 'wrapping_parameter': {'Name': '/fixture/keys/0123456789abcdef'}}),
+                ('verify_use', {'status': 'read_access_verified', 'write_access_verified': False})):
+            fixture = patch('tools.secret_setup.' + target, return_value=value)
+            fixture.start()
+            self.addCleanup(fixture.stop)
 
     def respond(self, result, values=None):
         question = result['pending_interaction']
@@ -50,6 +59,16 @@ class AdministrationTests(unittest.TestCase):
         elif question['key'] == 'selection':
             names = {field['name'] for field in question['fields']}
             values = {key: value for key, value in values.items() if key in names}
+        elif question['key'] == 'secrets_source':
+            values = {'mode': 'manual'}
+        elif question['key'] == 'secrets_details':
+            values = {'MAVEN_SECRETS_BUCKET': 'fixture-secrets', 'MAVEN_SECRETS_KEY_ID': '0123456789abcdef',
+                      'MAVEN_SECRETS_PARAMETER_PREFIX': '/fixture/values/',
+                      'MAVEN_SECRETS_FILE_KEY_PREFIX': '/fixture/keys/', 'MAVEN_SECRETS_OBJECT_PREFIX': 'files/'}
+        elif question['key'] == 'secrets_identity':
+            values = {'account': '123456789012', 'region': 'us-east-1',
+                      'daily_profile': 'owner', 'daily_cache': str(self.home / 'runtime/login'),
+                      'maintenance_profile': 'maintainer', 'maintenance_cache': str(self.home / 'runtime/deploy-login')}
         return self.controller.respond(result['operation_id'], question['interaction_id'], question['revision'], values)
 
     def advance_to_question(self, result):
@@ -122,11 +141,10 @@ class AdministrationTests(unittest.TestCase):
             'content_hash': digest(by_id[target['proposal_id']]['candidate'])}}
         return client, uploaded, active
 
-    def test_one_collection_approval_installs_nine_pages_and_survives_resume(self):
+    def test_one_collection_approval_installs_reviewed_pages_and_survives_resume(self):
         result = self.starter_review()
         question = result['pending_interaction']
         pages = question['review']['pages']
-        self.assertEqual(len(pages), 9)
         self.assertEqual(question['key'], 'starter_collection')
         client, uploaded, active = self.starter_client(pages)
         with patch('tools.memory.environment.configured_client', return_value=client):
@@ -146,7 +164,7 @@ class AdministrationTests(unittest.TestCase):
         self.assertEqual([item['proposal_id'] for item in active], uploaded)
         self.assertTrue(all(item['approval_source'] == self.source for item in active))
         self.assertEqual(len(result['approvals']), 1)
-        self.assertEqual(result['starter_progress']['completed'], 9)
+        self.assertEqual(result['starter_progress']['completed'], len(pages))
 
     def test_collection_approval_rejects_changes_to_a_later_page_before_any_submission(self):
         from tools.memory.validation import digest
@@ -194,7 +212,7 @@ class AdministrationTests(unittest.TestCase):
                 self.assertNotIn(result['state'], ('blocked', 'uncertain'), result.get('error'))
         self.assertEqual(result['step'], 'verify')
         self.assertEqual(uploaded, [page['proposal_id'] for page in pages[5:]])
-        self.assertEqual(len(active), 4)
+        self.assertEqual([item['proposal_id'] for item in active], uploaded)
         self.assertEqual(len(result['approvals']), 1)
 
 
@@ -227,6 +245,8 @@ class AdministrationTests(unittest.TestCase):
             self.assertEqual(result['outcome']['home'], str(self.home))
             self.assertEqual(result['outcome']['account'], identity['Account'])
             self.assertTrue(result['outcome']['instance_ready'])
+            self.assertTrue(result['outcome']['secrets_ready'])
+            self.assertTrue(any(receipt['step'] == 'secrets_verify' for receipt in result['receipts']))
             self.assertFalse(result['outcome']['project_configured'])
             self.assertNotIn('optional_project', result['answers'])
             self.assertNotIn('deploy_identity', result['answers'])
@@ -328,6 +348,7 @@ class AdministrationTests(unittest.TestCase):
         mocks['plan'].assert_called_once()
         self.assertEqual(mocks['plan'].call_args.kwargs['change_type'], 'UPDATE')
         self.assertTrue(result['outcome']['instance_ready'])
+        self.assertTrue(result['outcome']['secrets_ready'])
 
     def test_update_refuses_service_change_that_replaces_data_resources(self):
         self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'DatabaseCluster',
@@ -894,7 +915,7 @@ class AdministrationTests(unittest.TestCase):
             self.controller.back(result['operation_id'])
         self.assertEqual(self.controller._path(result['operation_id']).read_bytes(), before)
 
-    def test_old_optional_project_checkpoint_finishes_without_project_mutation(self):
+    def test_old_optional_project_checkpoint_requires_store_without_project_mutation(self):
         result = self.controller.begin('setup', {})
         state = self.controller._load(result['operation_id'])
         old = {'interaction_id': str(uuid4()), 'revision': state['revision'] + 1,
@@ -909,9 +930,8 @@ class AdministrationTests(unittest.TestCase):
                 patch('tools.project_setup.setup_project') as project:
             result = self.controller.advance(result['operation_id'])
         project.assert_not_called()
-        self.assertEqual(result['state'], 'completed')
-        self.assertTrue(result['outcome']['instance_ready'])
-        self.assertFalse(result['outcome']['project_configured'])
+        self.assertEqual((result['state'], result['step']), ('pending', 'secrets_start'))
+        self.assertFalse(result.get('outcome', {}).get('instance_ready'))
         self.assertEqual(result['retired_interactions'], [old])
 
     def test_new_reviewed_operation_never_discards_unfinished_setup(self):
@@ -1033,7 +1053,10 @@ class AdministrationTests(unittest.TestCase):
         result = self.controller.begin('setup', {'mode': 'existing'})
         wizard = Wizard(self.home)
         wizard.settings({'MAVEN_AWS_REGION': 'us-east-1', 'MAVEN_MEMORY_INSTANCE_ID': str(uuid4()),
-                         'MAVEN_AWS_PROFILE': 'owner', 'MAVEN_ACCOUNT_ID': '123456789012'})
+                         'MAVEN_AWS_PROFILE': 'owner', 'MAVEN_ACCOUNT_ID': '123456789012',
+                         'MAVEN_SECRETS_BUCKET': 'fixture-secrets', 'MAVEN_SECRETS_KEY_ID': '0123456789abcdef',
+                         'MAVEN_SECRETS_PARAMETER_PREFIX': '/fixture/values/',
+                         'MAVEN_SECRETS_FILE_KEY_PREFIX': '/fixture/keys/', 'MAVEN_SECRETS_OBJECT_PREFIX': 'files/'})
         state = self.controller._load(result['operation_id'])
         self.controller._complete_setup(state, wizard, 9)
         state['receipts'].append({'step': 'verify', 'result': {'instance_ready': True}})

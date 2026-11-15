@@ -323,6 +323,9 @@ class AdminOperations:
     def begin(self, kind, parameters):
         allowed = {
             'setup': {'mode', 'source', 'checkout'},
+            'secrets_setup': set(),
+            'environment_migration': {'path'},
+            'repair': set(),
             'project': {'root'},
             'install': {'source', 'harness', 'profile'},
             'uninstall': {'project', 'reactivate_project', 'project_home', 'home', 'machine',
@@ -476,8 +479,8 @@ class AdminOperations:
                     if answer['mode'] == 'new' and answer['connection']:
                         raise AdminInputError('New provisioning cannot select an existing connection.')
                     if answer['connection'].startswith('/'):
-                        from tools.memory.environment import load_environment
-                        _connection_config(load_environment(Path(answer['connection'])))
+                        from tools.environment_migrations import preview
+                        _connection_config(preview(Path(answer['connection'])))
                 if key == 'cleanup_selection':
                     _cleanup_ids(re.split(r'[\s,]+', response['record_ids'].strip()))
                     _cleanup_reason(response['reason'])
@@ -658,6 +661,13 @@ class AdminOperations:
 
     def advance(self, operation_id):
         self._prepare()
+        from tools.environment_migrations import prerequisite
+        original = self._load(operation_id)
+        pending = prerequisite(self, original)
+        if pending:
+            return {**self.status(operation_id), 'prerequisite_operation': pending['operation_id'],
+                    'prerequisite': pending, 'next_actions': ['advance_prerequisite'],
+                    'notice': 'Complete the separate persisted migration review, then advance this original operation. Its interactions and approvals are unchanged.'}
         with setup_lock(self.directory):
             state = self._load(operation_id)
             if (state['kind'] == 'setup' and
@@ -726,10 +736,15 @@ class AdminOperations:
                         raise SetupPending('Archived setup evidence differs; preserve both states and reconcile the original operation.')
                 else:
                     save_json(archive, wizard.state)
+                state['previous_setup_operation'] = owner
+                self._save(state)
                 wizard.state = {'schema': 1, 'administration_operation': state['operation_id'],
                                 'administration_artifacts': state['operation_id']}
             else:
-                if (wizard.state != {'schema': 1}
+                secret_owner = wizard.state.get('secrets_operation')
+                if secret_owner and self._load(secret_owner)['state'] != 'completed':
+                    raise SetupPending('Resume original secrets operation ' + secret_owner + ' before starting memory setup.')
+                if (set(wizard.state) - {'schema', 'secrets_operation'}
                         or any(path.name not in ('state.json', 'lock') for path in wizard.directory.iterdir())):
                     raise SetupPending('Existing legacy setup evidence has no verified terminal operation. Resume the original maven-setup terminal flow; do not replace its receipts.')
                 wizard.state['administration_operation'] = state['operation_id']
@@ -743,6 +758,18 @@ class AdminOperations:
             wizard.directory = wizard.directory / artifacts
             private_directory(wizard.directory)
         return wizard
+
+    def _environment_migration(self, state):
+        from tools.environment_migrations import advance
+        advance(self, state)
+
+    def _secrets_setup(self, state):
+        from tools.secret_setup import standalone
+        standalone(self, state)
+
+    def _repair(self, state):
+        from tools.secret_setup import standalone
+        standalone(self, state)
 
     def _preflight(self, state, values, task):
         from tools.setup_common import permission_preflight
@@ -763,7 +790,7 @@ class AdminOperations:
             'region': wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'),
             'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
             'profile': wizard.values.get('MAVEN_AWS_PROFILE'),
-            'instance_ready': True, 'authority_generation': generation, 'project_configured': False,
+            'instance_ready': True, 'secrets_ready': True, 'authority_generation': generation, 'project_configured': False,
             'binding': dict(wizard.values)})
 
 
@@ -775,6 +802,10 @@ class AdminOperations:
         private_directory(setup_directory)
         with setup_lock(setup_directory):
             wizard = self._wizard(state)
+            if state['step'].startswith('secrets_'):
+                from tools.secret_setup import advance
+                advance(self, state, wizard)
+                return
             step, answers = state['step'], state['answers']
             from tools.setup_common import expected_account
             deploy = (step.startswith('deploy_identity') or
@@ -843,7 +874,8 @@ class AdminOperations:
                 review = dict(selection)
                 connection = selection['connection']
                 if selection['mode'] == 'existing' and connection.startswith('/'):
-                    imported = load_environment(Path(connection))
+                    from tools.environment_migrations import load_import
+                    imported = load_import(self.home, Path(connection))
                     imported.pop('MAVEN_AWS_LOGIN_CACHE', None)
                     imported.pop('MAVEN_DEPLOY_LOGIN_CACHE', None)
                     _connection_config(imported)
@@ -856,7 +888,8 @@ class AdminOperations:
                 self._approved(state, 'connection', review)
                 updates = {'MAVEN_AWS_REGION': answers['selection']['region']}
                 if 'imported_settings' in review:
-                    imported = load_environment(Path(review['connection']))
+                    from tools.environment_migrations import load_import
+                    imported = load_import(self.home, Path(review['connection']))
                     imported.pop('MAVEN_AWS_LOGIN_CACHE', None)
                     imported.pop('MAVEN_DEPLOY_LOGIN_CACHE', None)
                     if imported != review['imported_settings']:
@@ -1123,8 +1156,14 @@ class AdminOperations:
             elif step.startswith('starter'):
                 self._starter(state, wizard)
             elif step == 'verify':
+                from tools.secret_setup import integration_settings
+                verified = state.get('secrets_ready')
+                if not verified or verified['settings'] != integration_settings(wizard.values):
+                    state['step'] = 'secrets_start'
+                    return
                 generation = wizard.verify_authority()
-                self._receipt(state, step, {'authority_generation': generation, 'instance_ready': True})
+                self._receipt(state, step, {'authority_generation': generation, 'instance_ready': True,
+                                            'secrets_ready': True})
                 self._complete_setup(state, wizard, generation)
             elif step == 'optional_project' or step.startswith('project_'):
                 if step == 'project_apply' or any(receipt['step'].startswith('project_') for receipt in state['receipts']):

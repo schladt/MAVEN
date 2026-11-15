@@ -331,10 +331,9 @@ class MemoryClient:
         try:
             candidate = {key: first[key] for key in ('slug', 'page_kind', 'title', 'scope')}
             candidate.update(body_markdown=full_body, authority_state=first['candidate_authority_state'])
-            if 'requires' in first:
-                candidate['requires'] = first['requires']
-            if 'bundle' in first:
-                candidate['bundle'] = first['bundle']
+            for key in ('requires', 'bundle', 'description'):
+                if key in first:
+                    candidate[key] = first[key]
             if candidate_digest(candidate) != first['content_hash']:
                 raise MemoryClientError('invalid_service_response')
         except (KeyError, ValueError, TypeError):
@@ -409,8 +408,27 @@ class MemoryClient:
                 raise MemoryClientError('temporarily_unavailable')
             return value
 
+        if request.get('instructions_only') is True:
+            # Old SQL ignores unknown selectors. Prove support before requesting
+            # context, so the request cannot accidentally retrieve ordinary tasks.
+            discovery = {'page_kind': 'skill', 'limit': 1,
+                         'scope': 'context' if 'project_id' in request else 'universal'}
+            if 'project_id' in request:
+                discovery['project_id'] = request['project_id']
+            capability = self.invoke('/v1/pages/index', discovery, budget=remaining())
+            metadata = capability.get('data', {})
+            if (capability.get('status') != 'ready' or not isinstance(metadata, dict)
+                    or type(metadata.get('authority_generation')) is not int):
+                raise MemoryClientError('invalid_service_response')
+            capabilities = metadata.get('capabilities', [])
+            if not isinstance(capabilities, list) or 'instructions_only' not in capabilities:
+                raise MemoryClientError('client_incompatible',
+                                        detail='Instruction-only loading requires skill discovery migration 018')
         response = self.invoke('/v1/memory/context', request, budget=remaining())
         context = response['data']
+        if request.get('instructions_only') is True and (
+                context.get('instructions_only') is not True or context.get('tasks') != []):
+            raise MemoryClientError('invalid_service_response')
         generation = context.get('authority_generation')
         pages = context.get('pages')
         if (type(generation) is not int or generation < 0 or not isinstance(pages, list)
@@ -470,12 +488,14 @@ class MemoryClient:
                     or page.get('page_kind') not in ('directive', 'skill', 'procedure')):
                 raise MemoryClientError('instruction_not_loadable')
             if (any(page.get(key) != value for key, value in metadata.items())
-                    or ('bundle' in page) != ('bundle' in metadata)):
+                    or any((key in page) != (key in metadata) for key in ('bundle', 'description'))):
                 raise MemoryClientError('context_stale')
             instructions.append(page)
         current = self.invoke('/v1/memory/context', request, budget=remaining())['data']
         if (current.get('authority_generation') != generation or current.get('pages') != pages
-                or current.get('minimum_client_protocol') != context['minimum_client_protocol']):
+                or current.get('minimum_client_protocol') != context['minimum_client_protocol']
+                or request.get('instructions_only') is True and (
+                    current.get('instructions_only') is not True or current.get('tasks') != [])):
             raise MemoryClientError('context_stale')
         return {**response, 'data': {**current, 'instructions': instructions}}
 
@@ -498,7 +518,7 @@ class MemoryClient:
         try:
             candidate = {key: page[key] for key in ('slug', 'page_kind', 'title', 'scope')}
             candidate.update(body_markdown=body, authority_state='active')
-            for key in ('requires', 'bundle'):
+            for key in ('requires', 'bundle', 'description'):
                 if key in page:
                     candidate[key] = page[key]
             if candidate_digest(candidate) != page['content_hash']:

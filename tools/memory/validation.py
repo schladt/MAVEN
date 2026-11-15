@@ -9,6 +9,7 @@ from uuid import UUID
 MAX_REQUEST_BYTES = 8192
 MAX_PROPOSAL_REQUEST_BYTES = 1048576
 MAX_BODY_BYTES = 131072
+MAX_SKILL_DESCRIPTION = 500
 MAX_MEMORY_REQUEST_BYTES = 196608
 MAX_SEARCH_TERMS = 8
 MAX_SEARCH_OFFSET = 1000
@@ -17,10 +18,11 @@ MAX_DETAIL = 200
 MEMORY_KINDS = {"entity", "fact", "relationship", "task", "decision", "risk",
                 "note", "session", "operation", "setting", "checkpoint"}
 MEMORY_ROUTES = {"/v1/memory/" + action for action in ("write", "read", "search", "context", "claim",
-                                                       "project_context", "revisions")}
+                                                       "project_context", "revisions", "secret_lookup", "secret_catalog",
+                                                       "secret_adapter_policy", "secret_adapter_consume")}
 APPROVAL_ROUTES = {"/v1/proposals/challenge", "/v1/proposals/resolve"}
 MUTATION_ROUTES = {"/v1/records/change", "/v1/proposals/create", "/v1/proposals/resolve",
-                   "/v1/memory/write", "/v1/memory/claim"}
+                   "/v1/memory/write", "/v1/memory/claim", "/v1/memory/secret_catalog"}
 ROUTES = {"/v1/records/change", "/v1/records/query", "/v1/operations/lookup",
           "/v1/proposals/create", "/v1/pages/index", "/v1/pages/read"} | APPROVAL_ROUTES | MEMORY_ROUTES
 
@@ -55,7 +57,7 @@ _STATES = {"task": {"open", "in_progress", "blocked", "completed", "cancelled"},
 
 
 def request_limit(route):
-    if route == "/v1/memory/write":
+    if route in ("/v1/memory/write", "/v1/memory/secret_catalog", "/v1/memory/secret_adapter_consume"):
         return MAX_MEMORY_REQUEST_BYTES
     return MAX_PROPOSAL_REQUEST_BYTES if route == "/v1/proposals/create" else MAX_REQUEST_BYTES
 
@@ -220,7 +222,7 @@ def _instruction(route, value):
             invalid("data_scope must be owner or synthetic")
         candidate = value["candidate"]
         fields(candidate, {"slug", "page_kind", "title", "body_markdown", "scope", "authority_state"},
-               {"requires", "bundle"}, name="candidate")
+               {"requires", "bundle", "description"}, name="candidate")
         if "requires" in candidate:
             string_list(candidate["requires"], 32, 80, validator=slug, name="candidate.requires")
             if candidate["slug"] in candidate["requires"]:
@@ -228,6 +230,10 @@ def _instruction(route, value):
         reject_secrets(value)
         slug(candidate["slug"], name="candidate.slug")
         page_kind(candidate["page_kind"])
+        if "description" in candidate:
+            if candidate["page_kind"] != "skill":
+                invalid("candidate.description is only allowed for skill pages")
+            text(candidate["description"], MAX_SKILL_DESCRIPTION, name="candidate.description")
         if "bundle" in candidate:
             if candidate["page_kind"] != "skill":
                 invalid("candidate.bundle is only allowed for skill pages")
@@ -243,6 +249,11 @@ def _instruction(route, value):
             invalid("candidate.authority_state must be active or revoked")
         source(value["source"])
         text(value["change_reason"], 240, name="change_reason")
+        from .adapter_contracts import AdapterError, validate_adapter_candidate
+        try:
+            validate_adapter_candidate(candidate)
+        except AdapterError:
+            invalid("adapter authority candidate does not satisfy its declarative policy contract")
     elif route == "/v1/proposals/challenge":
         fields(value, {"proposal_id"})
         uuid_string(value["proposal_id"], name="proposal_id")
@@ -257,7 +268,16 @@ def _instruction(route, value):
         nonnegative_integer(value["expected_revision"], name="expected_revision")
         source(value["approval_source"], approval=True, name="approval_source")
     elif route == "/v1/pages/index":
-        fields(value, (), {"page_kind", "after_slug", "limit"})
+        fields(value, (), {"page_kind", "after_slug", "limit", "scope", "project_id"})
+        if "scope" in value:
+            if value["scope"] not in ("universal", "context"):
+                invalid("scope must be universal or context")
+            if (value["scope"] == "context") != ("project_id" in value):
+                invalid("context scope requires project_id; universal scope excludes it")
+        elif "project_id" in value:
+            invalid("project_id requires context scope")
+        if "project_id" in value:
+            uuid_string(value["project_id"], name="project_id")
         if "page_kind" in value:
             page_kind(value["page_kind"])
         if "after_slug" in value:
@@ -351,12 +371,7 @@ def _memory_data(kind, data, request):
         if (data["scope"] == "project") != ("project_id" in request):
             invalid("project settings require project_id and global settings forbid it")
         if "secret_ref" in data:
-            fields(data["secret_ref"], {"provider", "name"}, name="data.secret_ref")
-            if data["secret_ref"]["provider"] not in ("ssm", "secretsmanager"):
-                invalid("data.secret_ref.provider must be ssm or secretsmanager")
-            text(data["secret_ref"]["name"], 512, name="data.secret_ref.name")
-            if not re.fullmatch(r"[A-Za-z0-9_./:@+=-]+", data["secret_ref"]["name"]):
-                invalid("data.secret_ref.name contains unsupported characters")
+            validate_secret_ref(data["secret_ref"])
     if kind == "checkpoint":
         if not git_checkpoint:
             nonnegative_integer(data["cutoff"], name="data.cutoff")
@@ -382,6 +397,11 @@ def _memory_data(kind, data, request):
 def _memory_kind(value):
     if not isinstance(value, str) or value not in MEMORY_KINDS:
         invalid(f"kind must be one of {', '.join(sorted(MEMORY_KINDS))}")
+
+
+def validate_secret_ref(value):
+    from .secrets_contract import validate_secret_ref as check
+    return check(value)
 
 
 def _memory(route, value):
@@ -446,7 +466,9 @@ def _memory(route, value):
         if "query" in value and "after_id" in value:
             invalid("after_id pages listings without query; use offset with query")
     elif action == "context":
-        fields(value, (), {"project_id", "workflow", "operation", "skill_slug"})
+        fields(value, (), {"project_id", "workflow", "operation", "skill_slug", "instructions_only"})
+        if "instructions_only" in value and type(value["instructions_only"]) is not bool:
+            invalid("instructions_only must be a boolean")
         if "project_id" in value:
             uuid_string(value["project_id"], name="project_id")
         for key in ("workflow", "operation"):
@@ -502,7 +524,16 @@ def validate(route, value):
             invalid(f"request exceeds {maximum} bytes")
     except UnicodeError:
         invalid("request is not valid UTF-8")
-    if route in MEMORY_ROUTES:
+    if route in ("/v1/memory/secret_lookup", "/v1/memory/secret_catalog"):
+        from .secrets_contract import validate_secret_request
+        validate_secret_request(route, value)
+    elif route in ("/v1/memory/secret_adapter_policy", "/v1/memory/secret_adapter_consume"):
+        from .adapter_contracts import AdapterError, validate_adapter_request
+        try:
+            validate_adapter_request(route, value)
+        except AdapterError:
+            invalid("adapter request does not satisfy its declarative policy contract")
+    elif route in MEMORY_ROUTES:
         _memory(route, value)
     elif route == "/v1/operations/lookup":
         fields(value, {"request_key"})
