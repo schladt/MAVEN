@@ -17,6 +17,7 @@ from botocore.awsrequest import AWSRequest
 from botocore.config import Config
 from botocore.credentials import RefreshableCredentials
 from botocore.exceptions import BotoCoreError, ClientError
+from botocore import exceptions as aws_exceptions
 from botocore.session import Session as BotocoreSession
 import requests
 
@@ -48,6 +49,66 @@ class MemoryClientError(Exception):
         self.code = code
         self.request_key = request_key
         self.detail = detail
+
+
+AUTHENTICATION_CODES = frozenset({'authentication_required', 'selected_login_unavailable_or_expired'})
+
+
+def authority_scope(project_id=None):
+    """The applicable startup authority selector shared by setup and runtime."""
+    return {'workflow': 'maven-workflow', **({'project_id': project_id} if project_id else {})}
+
+
+def aws_error(error: Exception, *, default: str = 'aws_service_unavailable') -> MemoryClientError:
+    """Normalize typed SDK failures without exposing provider messages or credentials."""
+    if isinstance(error, MemoryClientError):
+        return error
+    if isinstance(error, (aws_exceptions.NoCredentialsError, aws_exceptions.PartialCredentialsError,
+                          aws_exceptions.LoginRefreshRequired, aws_exceptions.LoginTokenLoadError)):
+        return MemoryClientError('selected_login_unavailable_or_expired')
+    if isinstance(error, aws_exceptions.LoginInsufficientPermissions):
+        return MemoryClientError('not_authorized')
+    if isinstance(error, (aws_exceptions.ProfileNotFound, aws_exceptions.ConfigParseError,
+                          aws_exceptions.ConfigNotFound)):
+        return MemoryClientError('selected_login_configuration_unavailable')
+    if isinstance(error, (aws_exceptions.ConnectionError, aws_exceptions.HTTPClientError)):
+        return MemoryClientError('transport_unavailable')
+    if isinstance(error, ClientError):
+        code = error.response.get('Error', {}).get('Code')
+        if code in ('ExpiredToken', 'ExpiredTokenException', 'InvalidClientTokenId',
+                    'UnrecognizedClientException', 'RequestExpired'):
+            return MemoryClientError('selected_login_unavailable_or_expired')
+        if code in ('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation', 'ForbiddenException'):
+            return MemoryClientError('not_authorized')
+        if code == 'DatabaseResumingException':
+            return MemoryClientError('warming')
+    return MemoryClientError(default)
+
+
+def wait_for_read_only(probe, *, budget=60.0, interval=2.0, checkpoint=None, on_warming=None):
+    """Retry ONLY a known read-only probe reporting typed Aurora warming.
+
+    The budget bounds time between requests, not credential refresh or a streaming
+    transport deadline. Callers must not pass mutations or whole workflows here.
+    Cancellation propagates unchanged; no authentication or network error is retried.
+    """
+    deadline = time.monotonic() + max(0.0, budget)
+    while True:
+        if checkpoint is not None:
+            checkpoint()
+        try:
+            return probe()
+        except MemoryClientError as error:
+            if error.code != 'warming':
+                raise
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            if on_warming is not None:
+                on_warming()
+            time.sleep(min(remaining, max(0.01, interval)))
+            if time.monotonic() >= deadline:
+                raise
 
 
 def _detail(result: dict) -> str | None:
@@ -151,8 +212,10 @@ def selected_session(config: dict, *, admin: bool = False, approval: bool = Fals
                 if any(not isinstance(value, str) or not value for value in metadata.values()):
                     raise ValueError('credentials')
                 return metadata
-            except (BotoCoreError, ClientError, KeyError, OSError, TypeError, ValueError, AttributeError):
-                raise MemoryClientError('selected_login_or_role_unavailable') from None
+            except (BotoCoreError, ClientError) as error:
+                raise aws_error(error) from None
+            except (KeyError, OSError, TypeError, ValueError, AttributeError):
+                raise MemoryClientError('invalid_role_credentials') from None
 
         initial = refresh()
         credentials = RefreshableCredentials(
@@ -164,8 +227,10 @@ def selected_session(config: dict, *, admin: bool = False, approval: bool = Fals
         sdk_session = BotocoreSession()
         sdk_session._credentials = credentials
         return boto3.Session(botocore_session=sdk_session, region_name=region)
-    except (BotoCoreError, ClientError, KeyError, OSError, TypeError, ValueError):
-        raise MemoryClientError('selected_login_or_role_unavailable') from None
+    except (BotoCoreError, ClientError) as error:
+        raise aws_error(error) from None
+    except (KeyError, OSError, TypeError, ValueError):
+        raise MemoryClientError('invalid_configuration') from None
 
 
 class MemoryClient:
@@ -210,10 +275,16 @@ class MemoryClient:
                 if not isinstance(result, dict) or not isinstance(result.get('status'), str):
                     raise MemoryClientError('service_response_unavailable')
                 return response.status_code, result
-        except (requests.RequestException, BotoCoreError, AttributeError):
+        except (BotoCoreError, ClientError) as error:
+            raise aws_error(error) from None
+        except (requests.RequestException, AttributeError):
             raise MemoryClientError('transport_unavailable') from None
 
     def invoke(self, route: str, body: dict, *, budget: float = 90.0) -> dict:
+        """Use a between-request budget; never replay an ambiguous mutation.
+
+        SDK refresh and requests' inactivity timeouts are not a wall-clock deadline.
+        """
         if route not in ROUTES:
             raise MemoryClientError('unsupported_operation')
         deadline = time.monotonic() + budget
@@ -224,10 +295,19 @@ class MemoryClient:
             current_route = '/v1/operations/lookup' if uncertain else route
             current_body = {'request_key': request_key} if uncertain else body
             try:
-                status, result = self._post(current_route, current_body, deadline-time.monotonic())
+                def post():
+                    response = self._post(current_route, current_body, deadline-time.monotonic())
+                    if (current_route not in MUTATION_ROUTES and response[0] == 503
+                            and response[1].get('status') == 'warming'):
+                        raise MemoryClientError('warming')
+                    return response
+                status, result = (wait_for_read_only(post, budget=max(0.0, deadline-time.monotonic()))
+                                  if current_route not in MUTATION_ROUTES else post())
             except MemoryClientError as error:
                 if error.code not in ('transport_unavailable', 'service_response_unavailable'):
-                    raise MemoryClientError(error.code, request_key=request_key) from None
+                    raise MemoryClientError('outcome_unknown' if uncertain else error.code,
+                                            request_key=request_key,
+                                            detail=None if uncertain else error.detail) from None
                 if request_key:
                     uncertain = True
                 else:

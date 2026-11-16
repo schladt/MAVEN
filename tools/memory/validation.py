@@ -267,6 +267,7 @@ def _instruction(route, value):
             invalid("candidate_hash must be 64 lowercase hex characters")
         nonnegative_integer(value["expected_revision"], name="expected_revision")
         source(value["approval_source"], approval=True, name="approval_source")
+        reject_secrets(value)
     elif route == "/v1/pages/index":
         fields(value, (), {"page_kind", "after_slug", "limit", "scope", "project_id"})
         if "scope" in value:
@@ -567,6 +568,7 @@ def validate(route, value):
             invalid("fact.value does not match fact.value_type")
         source(value["source"], approval=False)
         text(value["change_reason"], 240, name="change_reason")
+        reject_secrets(value)
     else:
         _instruction(route, value)
     return value

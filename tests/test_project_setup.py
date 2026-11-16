@@ -28,8 +28,9 @@ class ProjectSetupTests(unittest.TestCase):
         config = {'instance_id': str(uuid4()), 'recovery_epoch': str(uuid4()),
                   'region': 'us-east-1', 'endpoint': 'https://example.execute-api.us-east-1.amazonaws.com'}
         client = Mock()
-        client.invoke.return_value = {'data': {'kind': 'entity', 'data_scope': 'owner',
-                                               'data': {'entity_type': 'project'}}}
+        client.invoke.side_effect = lambda route, body: {'status': 'ready', 'data': {
+            'record_id': body.get('record_id'), 'kind': 'entity', 'data_scope': 'owner',
+            'project_id': None, 'tags': [], 'data': {'entity_type': 'project'}}}
         stack.enter_context(patch('tools.memory.environment.load_environment', return_value={}))
         stack.enter_context(patch('tools.memory.environment.memory_config', return_value=config))
         stack.enter_context(patch('tools.memory.environment.configured_client', return_value=client))
@@ -84,9 +85,9 @@ class ProjectSetupTests(unittest.TestCase):
                 setup_project(args)
             client.invoke.assert_not_called()
             config['instance_id'] = original
-            client.invoke.side_effect = None
-            client.invoke.return_value = {'data': {'kind': 'entity', 'data_scope': 'owner',
-                                                   'data': {'entity_type': 'project'}}}
+            client.invoke.side_effect = lambda route, body: {'status': 'ready', 'data': {
+                'record_id': body.get('record_id'), 'kind': 'entity', 'data_scope': 'owner',
+                'project_id': None, 'tags': [], 'data': {'entity_type': 'project'}}}
             setup_project(args)
             calls = client.invoke.call_args_list
             self.assertEqual(calls[0].args, ('/v1/operations/lookup', {'request_key': saved['selection']['request_key']}))

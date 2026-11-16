@@ -281,10 +281,14 @@ def _initialize_bound(args) -> dict:
                 'source': {'origin': args.source_origin, 'excerpt': args.source_excerpt},
                 'change_reason': 'Initialize owner-selected project',
             })
-        record = client.invoke('/v1/memory/read', {'record_id': project['project_id']})['data']
-        if (record.get('kind') != 'entity' or record.get('data_scope') != 'owner'
-                or record.get('data', {}).get('entity_type') != 'project'):
-            raise ProjectError('selected cloud record is not an owner project entity')
+        response = client.invoke('/v1/memory/read', {'record_id': project['project_id']})
+        record = response.get('data', {})
+        if (response.get('status') != 'ready' or record.get('record_id') != project['project_id']
+                or record.get('kind') != 'entity' or record.get('data_scope') != 'owner'
+                or record.get('project_id') is not None
+                or record.get('data', {}).get('entity_type') != 'project'
+                or 'archived' in record.get('tags', []) or record.get('data', {}).get('state') == 'archived'):
+            raise ProjectError('selected cloud record is not the exact active universal owner project entity')
     finally:
         client.close()
     _private_directory(directory, create=True)

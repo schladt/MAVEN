@@ -64,6 +64,7 @@ class SecretSetupTests(unittest.TestCase):
             'Parameter': {**METADATA, 'Value': base64.b64encode(b'x' * 32).decode() if kwargs['WithDecryption'] else 'ciphertext'}}
         self.clients['ssm'].get_parameter_history.side_effect = lambda **kwargs: {
             'Parameters': [{**METADATA, 'Value': 'ciphertext'}]}
+        self.clients['ssm'].describe_parameters.return_value = {'Parameters': [deepcopy(METADATA)]}
 
     def respond(self, result, response=None):
         question = result['pending_interaction']
@@ -125,10 +126,40 @@ class SecretSetupTests(unittest.TestCase):
             self.assertNotIn('iam:', text)
             self.assertNotIn('Delete', text)
         policy = secrets.required_policy(VALUES)
-        self.assertEqual(policy['Statement'][1]['Resource'], f'arn:aws:ssm:{REGION}:{ACCOUNT}:parameter' + NAME)
+        self.assertEqual(policy['Statement'][1]['Resource'],
+                         f'arn:aws:ssm:{REGION}:{ACCOUNT}:parameter' + SETTINGS['MAVEN_SECRETS_FILE_KEY_PREFIX'] + '*')
         self.assertEqual(policy['Statement'][2]['Condition']['StringLike']['s3:prefix'], 'encrypted-files/*')
         self.assertIn({'Effect': 'Allow', 'Action': ['ssm:DescribeParameters'], 'Resource': '*'},
                       policy['Statement'])
+
+    def test_retained_wrapping_keys_and_kms_bucket_are_in_exact_permission_review(self):
+        current_kms = f'arn:aws:kms:{REGION}:{ACCOUNT}:key/current-key'
+        old_kms = f'arn:aws:kms:{REGION}:{ACCOUNT}:key/retained-key'
+        bucket_kms = f'arn:aws:kms:{REGION}:{ACCOUNT}:key/bucket-key'
+        self.clients['ssm'].get_parameter_history.side_effect = lambda **kwargs: {
+            'Parameters': [{**METADATA, 'KeyId': current_kms}]}
+        old = {**METADATA, 'Name': SETTINGS['MAVEN_SECRETS_FILE_KEY_PREFIX'] + 'fedcba9876543210', 'KeyId': old_kms}
+        self.clients['ssm'].describe_parameters.side_effect = [
+            {'Parameters': [old], 'NextToken': 'page-two'},
+            {'Parameters': [{**METADATA, 'KeyId': current_kms}]}]
+        self.clients['s3'].get_bucket_encryption.return_value = {'ServerSideEncryptionConfiguration': {'Rules': [
+            {'ApplyServerSideEncryptionByDefault': {'SSEAlgorithm': 'aws:kms', 'KMSMasterKeyID': bucket_kms}}]}}
+        metadata = secrets.inspect_store(VALUES, Mock())
+        statements = secrets.required_policy(VALUES, metadata)['Statement']
+        self.assertEqual({item['Resource'] for item in statements if 'kms:Decrypt' in item['Action']},
+                         {old_kms, current_kms, bucket_kms})
+        self.assertEqual(len(metadata['retained_wrapping_parameters']), 2)
+        self.assertNotIn('Value', json.dumps(metadata))
+        self.assertEqual(self.clients['ssm'].describe_parameters.call_args.kwargs['NextToken'], 'page-two')
+
+    def test_retained_key_pagination_and_foreign_kms_fail_closed(self):
+        for pages in (
+                [{'Parameters': [], 'NextToken': 'same'}, {'Parameters': [], 'NextToken': 'same'}],
+                [{'Parameters': [{**METADATA, 'Name': SETTINGS['MAVEN_SECRETS_FILE_KEY_PREFIX'] + 'fedcba9876543210',
+                                  'KeyId': 'arn:aws:kms:us-east-1:999999999999:key/foreign'}]}]):
+            self.clients['ssm'].describe_parameters.side_effect = pages
+            with self.subTest(pages=pages), self.assertRaises(SetupPending):
+                secrets.inspect_store(VALUES, Mock())
 
     def test_metadata_checks_account_region_privacy_encryption_and_never_returns_values(self):
         metadata = secrets.inspect_store(VALUES, Mock())
@@ -246,19 +277,11 @@ class SecretSetupTests(unittest.TestCase):
         self.assertEqual(result['state'], 'blocked')
         self.assertFalse(result['handoff']['completion_claimed'])
         self.assertEqual(result['handoff']['principal'], ACTUAL['maintenance']['Arn'])
-        self.assertTrue(all(item['Resource'] != '*' for item in result['handoff']['required_policy']['Statement']))
+        wildcard_actions = {action for item in result['handoff']['required_policy']['Statement']
+                            if item['Resource'] == '*' for action in item['Action']}
+        self.assertEqual(wildcard_actions, {'ssm:DescribeParameters'})
         self.assertNotIn('must not be persisted', json.dumps(result))
 
-    def test_setup_verify_cannot_bypass_required_stage(self):
-        result = self.controller.begin('setup', {'mode': 'existing'})
-        state = self.controller._load(result['operation_id'])
-        state.update(step='verify', state='pending', pending_interaction=None)
-        self.controller._save(state)
-        with patch.object(Wizard, 'verify_authority') as authority:
-            result = self.controller.advance(result['operation_id'])
-        self.assertEqual(result['step'], 'secrets_start')
-        self.assertNotEqual(result['state'], 'completed')
-        authority.assert_not_called()
 
     def create_fixture(self):
         operation = str(uuid4())

@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shlex
 import tempfile
 import unittest
 import tomllib
@@ -21,6 +22,126 @@ from tools.harness import (
 
 
 class InstallerTests(unittest.TestCase):
+    def test_installed_handoff_ignores_checkout_cwd_and_pythonpath(self):
+        import venv
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home, checkout = root / 'home', root / 'checkout'
+            venv.EnvBuilder(with_pip=False).create(home / 'venv')
+            site = home / f'venv/lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages'
+            package = site / 'tools'
+            package.mkdir()
+            (package / '__init__.py').write_text('')
+            (package / 'setup.py').write_text('import json,sys\nprint(json.dumps([__file__,sys.prefix]))\n')
+            dist = site / 'maven_cloud_memory-0.1.0.dist-info'
+            dist.mkdir()
+            (dist / 'METADATA').write_text('Name: maven-cloud-memory\nVersion: 0.1.0\n')
+            (dist / 'RECORD').write_text('tools/__init__.py,,\ntools/setup.py,,\n')
+            spoof = checkout / 'tools'
+            spoof.mkdir(parents=True)
+            (spoof / '__init__.py').write_text('')
+            (spoof / 'setup.py').write_text('raise SystemExit("checkout was loaded")\n')
+            result = subprocess.run(install._handoff_command({'home': home, 'mode': 'existing'}),
+                                    cwd=checkout, env=dict(os.environ, PYTHONPATH=str(checkout)),
+                                    capture_output=True, text=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            origin, prefix = json.loads(result.stdout)
+            self.assertEqual(Path(origin), package / 'setup.py')
+            self.assertEqual(Path(prefix), home / 'venv')
+
+    def test_missing_runtime_requires_explicit_emergency_checkout_review(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            with self.assertRaisesRegex(ValueError, 'explicitly review'):
+                install._handoff_command({'home': home, 'uninstall': True})
+            command = install._handoff_command({
+                'home': home, 'uninstall': True, 'emergency_source': str(Path(install.__file__).resolve().parent)})
+            self.assertEqual(command[:3], [sys.executable, '-I', '-c'])
+            self.assertEqual(command[-1], 'tools.uninstall')
+            with self.assertRaisesRegex(ValueError, 'does not match'):
+                install._handoff_command({'home': home, 'uninstall': True, 'emergency_source': directory})
+
+    def test_runtime_intent_survives_each_completed_phase_without_adopting_other_files(self):
+        from tools.uninstall.common import read_private
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home, source = root / 'home', root / 'checkout'
+            home.mkdir(mode=0o700)
+            source.mkdir()
+            (source / 'pyproject.toml').write_text('[project]\nname="fixture"\n')
+            preserved = {
+                home / '.env': b'MAVEN_AWS_PROFILE=original\nMAVEN_AWS_LOGIN_CACHE=/original/cache\n',
+                root / '.profile': b'owner shell profile\n',
+                root / 'custom-config.json': b'{"owner":"unchanged"}\n',
+                root / 'custom-context': b'owner context\n',
+                root / 'aws/config': b'[profile original]\nregion=us-east-1\n',
+                root / 'original-cache/token.json': b'{"fixture":"opaque synthetic cache; preserve"}\n',
+            }
+            for path, body in preserved.items():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(body)
+                path.chmod(0o600)
+            original = install._runtime_intent(home, source, True)
+            self.assertFalse((home / 'venv').exists())
+            self.assertIsNone(read_private(original[0])['inventory'])
+            with install._runtime_effect(original, home, 'venv creation'):
+                (home / 'venv').mkdir()
+                (home / 'venv/pyvenv.cfg').write_text('fixture\n')
+            for phase in ('package installation', 'final ownership receipt'):
+                resumed = install._runtime_intent(home, source, False)
+                self.assertEqual(resumed[0], original[0])
+                self.assertTrue(resumed[1]['owned'])
+                with install._runtime_effect(resumed, home, phase):
+                    (home / 'venv/package.py').write_text(phase)
+            for path, body in preserved.items():
+                self.assertEqual(path.read_bytes(), body)
+            (home / 'venv/owner-added').write_text('unrelated')
+            with self.assertRaisesRegex(ValueError, 'exact guided reconciliation'):
+                install._runtime_intent(home, source, False)
+
+    def test_uncertain_runtime_requires_review_and_continues_same_intent(self):
+        from tools.uninstall.common import read_private
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve() / 'home'
+            source = home.parent / 'checkout'
+            home.mkdir(mode=0o700)
+            source.mkdir()
+            (source / 'pyproject.toml').write_text('[project]\nname="fixture"\n')
+            intent = install._runtime_intent(home, source, True)
+            with self.assertRaises(OSError):
+                with install._runtime_effect(intent, home, 'venv creation'):
+                    (home / 'venv').mkdir()
+                    (home / 'venv/pyvenv.cfg').write_text('fixture\n')
+                    raise OSError('killed after mutation')
+            with self.assertRaisesRegex(ValueError, 'exact guided reconciliation'):
+                install._runtime_intent(home, source, False)
+            ui = Mock(review=Mock(return_value=True))
+            with using(ui):
+                resumed = install._runtime_intent(home, source, False)
+            self.assertEqual(resumed[0], intent[0])
+            self.assertEqual(len(read_private(intent[0])['reconciliations']), 1)
+            with install._runtime_effect(resumed, home, 'package installation'):
+                (home / 'venv/package.py').write_text('installed\n')
+            self.assertEqual(install._runtime_intent(home, source, False)[0], intent[0])
+            (source / 'pyproject.toml').write_text('[project]\nname="changed"\n')
+            with self.assertRaisesRegex(ValueError, 'inputs changed'):
+                install._runtime_intent(home, source, False)
+
+    def test_activation_crash_reconciles_only_original_exact_file(self):
+        from tools.uninstall import local
+        from tools.uninstall.common import read_private
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve() / 'home'
+            home.mkdir(mode=0o700)
+            with patch.object(Path, 'home', return_value=home.parent):
+                with patch.object(local, 'record_installation', side_effect=OSError('crash')):
+                    with self.assertRaises(OSError):
+                        install._activation(home, None)
+                before = (home / 'activate').read_bytes()
+                install._activation(home, None)
+                self.assertEqual((home / 'activate').read_bytes(), before)
+                self.assertIn(str(home / 'activate'), read_private(home / local.MANIFEST)['owned'])
+
     def test_package_source_excludes_stale_build_outputs_and_preserves_checkout(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory)
@@ -253,6 +374,11 @@ with using(object()):
                 (path / 'pyvenv.cfg').write_text('test runtime; never executed\n')
                 (path / 'bin/python').write_text('test interpreter; never executed\n')
             def install_package(command):
+                dist = home / 'venv/lib/python3.14/site-packages/maven_cloud_memory-0.1.0.dist-info'
+                dist.mkdir(parents=True, exist_ok=True)
+                (dist / 'RECORD').write_text('')
+                (dist / 'METADATA').write_text('Name: maven-cloud-memory\nVersion: 0.1.0\n')
+                (dist / 'entry_points.txt').write_text('[console_scripts]\n')
                 for name in ('maven-mcp', 'maven-session-hook'):
                     launcher = home / 'venv/bin' / name
                     launcher.write_text('#!/test-only/python\n')
@@ -374,12 +500,18 @@ with using(object()):
             owner = root / 'owner'
             owner.write_text('{}')
             target.symlink_to(owner)
-            with self.assertRaises(ValueError):
-                integration_plan(root / 'instance', ['claude'], user_home=root)
+            changes = integration_plan(root / 'instance', ['claude', 'omp'], user_home=root)
+            self.assertTrue(any(change.receipt.get('conflict') for change in changes))
+            for change in changes:
+                apply_integration(change)
+            self.assertEqual(owner.read_text(), '{}')
+            self.assertTrue((root / HARNESS_PATHS['omp'][0]).exists())
             target.unlink()
             target.write_text('{"mcpServers":{"maven":{"command":"owner"}}}')
-            with self.assertRaises(ValueError):
-                integration_plan(root / 'instance', ['claude'], user_home=root)
+            changes = integration_plan(root / 'instance', ['claude'], user_home=root)
+            self.assertTrue(any(change.receipt.get('conflict') for change in changes))
+            for change in changes:
+                apply_integration(change)
             self.assertEqual(json.loads(target.read_text())['mcpServers']['maven']['command'], 'owner')
 
     def test_claude_statusline_is_optional_owned_and_selectively_removable(self):
@@ -396,7 +528,8 @@ with using(object()):
             change = next(change for change in changes if change.path == settings)
             receipts = [apply_integration(item) for item in changes]
             self.assertEqual(json.loads(settings.read_text()), dict(original, statusLine={
-                'type': 'command', 'command': str(root / 'instance/venv/bin/maven-statusline')}))
+                'type': 'command', 'command': shlex.join([
+                    'env', 'MAVEN_HOME=' + str(root / 'instance'), str(root / 'instance/venv/bin/maven-statusline')])}))
             self.assertIsNot(change.receipt.get('owned'), False)
             again = integration_plan(root / 'instance', ['claude'], user_home=root, statusline=True)
             repeat = next(item for item in again if item.path == settings)
@@ -458,8 +591,8 @@ with using(object()):
             with self.assertRaises(ValueError):
                 integration_plan(root / 'instance', ['omp'], user_home=root, statusline=True)
             custom = {'claude': (root / 'custom/claude.json', root / 'custom/CLAUDE.md')}
-            with self.assertRaises(ValueError):
-                integration_plan(root / 'instance', ['claude'], user_home=root, paths=custom, statusline=True)
+            changes = integration_plan(root / 'instance', ['claude'], user_home=root, paths=custom, statusline=True)
+            self.assertTrue(any(change.receipt.get('conflict') for change in changes))
             self.assertFalse((root / '.claude/settings.json').exists())
 
     def test_live_user_home_cannot_bypass_shutdown_as_staging(self):
@@ -508,8 +641,8 @@ with using(object()):
             settings.parent.mkdir()
             settings.write_text('{"context":{"fileName":"CUSTOM.md"}}')
             settings.chmod(0o600)
-            with self.assertRaises(ValueError):
-                integration_plan(root / 'instance', ['gemini'], user_home=root)
+            changes = integration_plan(root / 'instance', ['gemini'], user_home=root)
+            self.assertTrue(any(change.receipt.get('conflict') for change in changes))
             selected = integration_plan(root / 'instance', ['gemini'], user_home=root,
                                         paths={'gemini': (settings, settings.parent / 'CUSTOM.md')})
             self.assertEqual(selected[1].path.name, 'CUSTOM.md')
@@ -527,6 +660,7 @@ class HarnessFinishTests(unittest.TestCase):
         self.launcher.parent.mkdir(parents=True)
         self.launcher.write_text('#!/test-only/python\nprint("launcher")\n')
         self.launcher.chmod(0o775)
+        (self.launcher.parent / 'python').write_text('fixture interpreter; never executed\n')
         self.user_patch = patch.object(Path, 'home', return_value=self.user)
         self.user_patch.start()
         self.addCleanup(self.user_patch.stop)
@@ -699,6 +833,9 @@ class HarnessFinishTests(unittest.TestCase):
 
     def test_completed_default_and_explicit_resume_reuse_bound_readiness_offline(self):
         from tools.setup import _present
+        # Import the presenter before mocking its dependency; do not leak a mocked
+        # module-level AdminOperations into subsequent real presenter tests.
+        import tools.tui.administration
         for legacy in (False, True):
             previous = self.completed(legacy=legacy)
             for explicit in (False, True):
@@ -781,7 +918,7 @@ class HarnessFinishTests(unittest.TestCase):
         self.assertNotIn('--mode', command)
         ui.form.assert_not_called()
 
-    def test_old_memory_only_readiness_routes_required_new_stage_without_reusing_receipt(self):
+    def test_memory_only_readiness_reuses_its_receipt_without_optional_secrets_stage(self):
         from tools.setup import _present
         previous = self.completed()
         previous['outcome'].pop('secrets_ready')
@@ -792,8 +929,8 @@ class HarnessFinishTests(unittest.TestCase):
                 patch('tools.tui.harness.finish_setup') as finish:
             _present(Mock(), argparse.Namespace(operation=previous['operation_id'],
                      fresh_operation=False, mode=None), self.home)
-        finish.assert_not_called()
-        self.assertIsNone(present.call_args.kwargs['operation_id'])
+        finish.assert_called_once()
+        present.assert_not_called()
 
     def test_menu_home_entry_dispatches_home_operation_and_offers_turn_off_when_set(self):
         self.completed()
@@ -805,7 +942,7 @@ class HarnessFinishTests(unittest.TestCase):
         self.assertEqual(args.home_action, 'enable')
         self.assertFalse(args.uninstall)
         command = install._handoff_command({'home': self.home, 'home_action': args.home_action})
-        self.assertEqual(command[1:], ['-m', 'tools.tui.administration', '--home', str(self.home),
+        self.assertEqual(command[-5:], ['tools.tui.administration', '--home', str(self.home),
                                        '--action', 'enable'])
         (self.home / 'home.json').write_text('{}')
         ui.choose.side_effect = ['home', 'disable']

@@ -49,6 +49,13 @@ def conversation_binding(home, *, harness, harness_session):
     return dict(binding)
 
 
+def verified_finish(receipt, binding):
+    """Only exact root/project/session evidence proves closure; legacy markers do not."""
+    return bool(isinstance(receipt, dict) and receipt.get('status') == 'closed'
+                and all(receipt.get(key) == binding[key]
+                        for key in ('root', 'project_id', 'session_id')))
+
+
 def _session_state(binding):
     root = Path(binding['root'])
     prefix = f'.maven/runtime/sessions/{session_uuid(binding["session_id"])}'
@@ -68,9 +75,9 @@ def _session_state(binding):
     checkpoints = maintenance.get('checkpoints', {})
     pending_count = sum(item.get('state') not in ('completed', 'superseded', 'cancelled')
                         for item in assignments.values())
-    closed = bool(finish and finish.get('status') == 'closed')
-    if closed and any(finish.get(key) != binding[key] for key in ('root', 'project_id', 'session_id')):
-        raise BoundaryError('closure receipt belongs to another session')
+    closed = verified_finish(finish, binding)
+    if finish and finish.get('status') == 'closed' and not closed:
+        raise BoundaryError('closure receipt lacks exact root/project/session proof; preserve it for explicit recovery')
     issues = []
     if pending:
         issues.append({'kind': 'uncertain_write', 'request_key': pending.get('body', {}).get('request_key'),
@@ -91,15 +98,182 @@ def _session_state(binding):
             'issues': issues}
 
 
-def bind_conversation(home, binding):
-    """Atomically reserve an exact native conversation before any session cloud write."""
+def failed_start_evidence(home, binding, *, recovery=None):
+    """Read conservative local proof; callers hold the project/registry gates for cutover."""
+    home = Path(home).resolve()
+    root = Path(binding['root'])
+    if binding.get('home') != str(home) or binding.get('env') != str(home / '.env'):
+        raise BoundaryError('failed initialization belongs to another memory instance')
+    state = _session_state(binding)
+    prefix = f'.maven/runtime/sessions/{binding["session_id"]}'
+    persisted = read_private(root, prefix + '/mcp-binding.json')
+    fenced = bool(recovery and persisted == {
+        **recovery['persisted_binding'], 'superseded_by': recovery['replacement_binding']['session_id']})
+    if recovery:
+        if persisted != recovery['persisted_binding'] and not fenced:
+            raise BoundaryError('failed-start original binding changed during recovery')
+        persisted = recovery['persisted_binding']
+    if (persisted.get('initialized') is not False or persisted.get('resume_required', False) is not False
+            or persisted.get('superseded_by') or state['status'] != 'open'):
+        raise BoundaryError('only a never-initialized, never-resumed binding can be replaced')
+    allowed = {'mcp-binding.json', 'lifecycle.json', 'command.lock', 'maintenance.lock',
+               'maintenance.json', 'failed-memory-write.json'}
+    if recovery:
+        allowed.add('failed-start-recovery.json')
+    for path in private_path(root, prefix).iterdir():
+        if path.name == 'skills' and not path.is_symlink() and path.is_dir():
+            if any(child.name != 'registry.json' or child.is_symlink() or not child.is_file()
+                   for child in path.iterdir()):
+                raise BoundaryError('skill execution evidence prohibits failed-start replacement')
+            catalog = _optional(root, prefix + '/skills/registry.json')
+            if catalog is not None and (
+                    any(catalog.get(key) != binding[key] for key in ('project_id', 'session_id'))
+                    or not isinstance(catalog.get('pages'), list)
+                    or type(catalog.get('authority_generation')) is not int):
+                raise BoundaryError('failed initialization skill catalog is invalid')
+        elif path.name not in allowed or path.is_symlink() or not path.is_file():
+            raise BoundaryError('retained session work or receipts prohibit failed-start replacement')
+    maintenance = _optional(root, prefix + '/maintenance.json')
+    if maintenance is not None and (
+            maintenance.get('schema') != 1 or maintenance.get('assignments') != {}
+            or maintenance.get('checkpoints') != {} or maintenance.get('closure')
+            or maintenance.get('catch_up') or maintenance.get('paused') or maintenance.get('sequence') != 0):
+        raise BoundaryError('maintenance or checkpoint evidence prohibits failed-start replacement')
+    failed = _optional(root, prefix + '/failed-memory-write.json')
+    if failed is not None:
+        from tools.memory.client import DEFINITIVE_MUTATION_ERRORS
+        request = failed.get('request', {})
+        body = request.get('body', {})
+        if (failed.get('status') not in DEFINITIVE_MUTATION_ERRORS or request.get('route') != 'write'
+                or request.get('session_id') != binding['session_id']
+                or request.get('digest') != digest({key: value for key, value in request.items() if key != 'digest'})
+                or body.get('kind') != 'session' or body.get('record_id') != binding['session_id']
+                or body.get('project_id') != binding['project_id'] or body.get('expected_revision') != 0):
+            raise BoundaryError('retained failed request is not a definitive initial-session rejection')
+    lifecycle = _optional(root, prefix + '/lifecycle.json')
+    if lifecycle is not None and (lifecycle.get('schema') != 1 or any(
+            lifecycle.get(key) != binding[key] for key in (
+                'root', 'session_id', 'project_id', 'env', 'harness', 'harness_session'))):
+        raise BoundaryError('failed initialization lifecycle evidence differs from its binding')
+    registry = _optional(home, 'runtime/sessions.json')
+    entry = None
+    if registry is not None:
+        if (registry.get('schema') != 1 or not isinstance(registry.get('sessions'), dict)
+                or not isinstance(registry.get('reservations'), dict)):
+            raise BoundaryError('session registry is malformed; preserve it for recovery')
+        entry = registry['sessions'].get(binding['session_id'])
+        if str(root) in registry['reservations']:
+            raise BoundaryError('a repository reservation prohibits failed-start replacement')
+        if entry is not None and (
+                any(entry.get(key) != binding[key] for key in ('root', 'project_id', 'harness', 'harness_session'))
+                or entry.get('state') != 'starting' or entry.get('writers') != []
+                or entry.get('memory_only') is not True):
+            raise BoundaryError('the failed session has active or uncertain local use')
+    if lifecycle is not None and entry is None and not fenced:
+        raise BoundaryError('the original lifecycle registration is missing; inspect recovery')
+    native_path = _conversation_path(binding['harness'], binding['harness_session'])
+    native = _optional(home, native_path) if native_path else None
+    selected = conversation_binding(home, harness=binding['harness'], harness_session=binding['harness_session'])
+    if native_path and selected != binding and not (
+            fenced and selected == recovery['replacement_binding']):
+        raise BoundaryError('the original native conversation reservation changed')
+    return {'persisted_binding': persisted, 'registry': registry, 'registry_entry': entry,
+            'conversation_record': native}
+
+
+def replace_failed_start(home, binding, replacement, evidence):
+    """Persist the original decision before cutover; every following step is resumable."""
+    root = Path(binding['root'])
+    prefix = f'.maven/runtime/sessions/{binding["session_id"]}'
+    receipt = {
+        'schema': 1, 'binding': binding, 'replacement_binding': replacement,
+        'persisted_binding': evidence['persisted_binding'], 'registry_entry': evidence['registry_entry'],
+        'conversation_record': evidence['conversation_record'],
+        'cloud_session_check': {'record_id': binding['session_id'], 'include_archived': True,
+                                'status': 'record_unavailable'}}
+    existing = _optional(root, prefix + '/failed-start-recovery.json')
+    if existing is not None and existing != receipt:
+        raise BoundaryError('failed-start replacement intent changed; resume the original transition')
+    if existing is None:
+        save_private(root, prefix + '/failed-start-recovery.json', receipt)
+    return resume_failed_start(home, binding)
+
+
+def resume_failed_start(home, binding):
+    """Complete only the persisted local cutover; caller owns root and registry gates."""
+    root = Path(binding['root'])
+    prefix = f'.maven/runtime/sessions/{session_uuid(binding["session_id"])}'
+    receipt = read_private(root, prefix + '/failed-start-recovery.json')
+    replacement = receipt.get('replacement_binding', {})
+    snapshot = receipt.get('persisted_binding', {})
+    identifier = session_uuid(replacement.get('session_id'))
+    if (receipt.get('schema') != 1 or receipt.get('binding') != binding
+            or identifier == binding['session_id']
+            or binding.get('home') != str(Path(home).resolve())
+            or binding.get('env') != str(Path(home).resolve() / '.env')
+            or load_project(root)['project_id'] != binding['project_id']
+            or any(replacement.get(key) != binding.get(key)
+                   for key in ('root', 'project_id', 'home', 'env', 'harness'))
+            or any(snapshot.get(key) != value for key, value in binding.items())
+            or snapshot.get('initialized') is not False or snapshot.get('resume_required', False) is not False
+            or receipt.get('cloud_session_check') != {
+                'record_id': binding['session_id'], 'include_archived': True, 'status': 'record_unavailable'}):
+        raise BoundaryError('failed-start recovery identity or original proof differs')
+    fenced = {**snapshot, 'superseded_by': identifier}
+    current = read_private(root, prefix + '/mcp-binding.json')
+    if current not in (snapshot, fenced):
+        raise BoundaryError('failed-start binding changed after its replacement decision')
+    failed_start_evidence(home, binding, recovery=receipt)
+    registry = _optional(home, 'runtime/sessions.json')
+    entry = registry['sessions'].get(binding['session_id']) if registry else None
+    expected = receipt.get('registry_entry')
+    if expected is not None and (
+            any(expected.get(key) != binding[key] for key in ('root', 'project_id', 'harness', 'harness_session'))
+            or expected.get('state') != 'starting' or expected.get('writers') != []
+            or expected.get('memory_only') is not True):
+        raise BoundaryError('original replacement registration does not prove a quiescent failed start')
+    if (registry and str(root) in registry['reservations']
+            or entry != expected and not (current == fenced and entry is None)):
+        raise BoundaryError('failed-start registration changed after its replacement decision')
+    native_path = _conversation_path(binding['harness'], binding['harness_session'])
+    native = _optional(home, native_path) if native_path else None
+    if native != receipt.get('conversation_record') and not (
+            native and native.get('binding') == replacement and current == fenced):
+        raise BoundaryError('failed-start native reservation changed after its replacement decision')
+    replacement_path = f'.maven/runtime/sessions/{identifier}/mcp-binding.json'
+    successor = _optional(root, replacement_path)
+    if successor is not None and any(successor.get(key) != value for key, value in replacement.items()):
+        raise BoundaryError('replacement binding differs from the original transition')
+    if current != fenced:
+        save_private(root, prefix + '/mcp-binding.json', fenced)
+    if entry is not None:
+        del registry['sessions'][binding['session_id']]
+        save_private(home, 'runtime/sessions.json', registry)
+    if successor is None:
+        save_private(root, replacement_path, {**replacement, 'initialized': False, 'resume_required': False})
+    bind_conversation(home, replacement)
+    return replacement
+
+
+def bind_conversation(home, binding, *, persisted=None):
+    """Check native exclusivity before publishing a new local binding or cloud write."""
     path = _conversation_path(binding['harness'], binding['harness_session'])
+    local_path = f'.maven/runtime/sessions/{binding["session_id"]}/mcp-binding.json'
     if path is None:
+        if persisted is not None:
+            save_private(binding['root'], local_path, persisted)
         return
     with private_lock(home, path + '.lock'):
         previous = conversation_binding(home, harness=binding['harness'], harness_session=binding['harness_session'])
         if previous and previous != binding and _session_state(previous)['status'] != 'closed':
-            raise BoundaryError('this conversation already has an unfinished session; resume its exact binding')
+            prefix = f'.maven/runtime/sessions/{previous["session_id"]}'
+            previous_binding = read_private(previous['root'], prefix + '/mcp-binding.json')
+            recovery = _optional(previous['root'], prefix + '/failed-start-recovery.json')
+            if (previous_binding.get('superseded_by') != binding['session_id'] or not recovery
+                    or recovery.get('binding') != previous or recovery.get('replacement_binding') != binding):
+                raise BoundaryError('this conversation already has an unfinished session; resume its exact binding')
+        if persisted is not None:
+            save_private(binding['root'], local_path, persisted)
         # An actual initialization/resume supersedes the prior end-event hint.
         save_private(home, path, {'schema': 1, 'binding': binding})
 
@@ -177,6 +351,12 @@ def inspect_startup(home, cwd, *, harness=None, harness_session=None):
                   'local_sessions': sessions, 'issues': [], 'message': 'MAVEN: checking project ' + root.name + '…'}
         if binding:
             state = _session_state(binding)
+            retired = _optional(root, f'.maven/runtime/sessions/{binding["session_id"]}/failed-start-recovery.json')
+            if retired:
+                result.update(status='recovery', binding=binding,
+                              replacement_binding=retired.get('replacement_binding'),
+                              issues=[{'kind': 'failed_start_replaced', 'action': 'inspect_exact_replacement'}])
+                return result
             result.update(binding=binding, issues=state['issues'], paused=state['paused'],
                           pending_count=state['pending_count'], resume_required=state['initialized'])
             result['status'] = 'closed' if state['status'] == 'closed' else 'recovery' if state['issues'] else 'resume'

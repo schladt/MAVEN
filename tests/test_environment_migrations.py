@@ -101,8 +101,34 @@ class EnvironmentMigrationTests(unittest.TestCase):
         self.put(source, self.legacy.replace(b'daily', b'changed'))
         with self.assertRaises(SetupPending):
             load_import(self.home, source)
-        with self.assertRaises(SetupPending):
-            ensure(self.controller, source)
+        replacement = ensure(self.controller, source)
+        self.assertNotEqual(replacement['operation_id'], result['operation_id'])
+        self.assertEqual(self.controller.status(result['operation_id'])['outcome'], result['outcome'])
+        self.complete(replacement)
+        self.assertEqual(load_import(self.home, source)['MAVEN_AWS_PROFILE'], 'changed')
+        self.assertEqual(Path(result['outcome']['source_snapshot']).read_bytes(), self.legacy)
+        self.assertEqual(source.read_bytes(), self.legacy.replace(b'daily', b'changed'))
+
+    def test_repeated_import_recovers_new_original_record_before_pointer_update(self):
+        from tools import environment_migrations as migrations
+        source = Path(self.temporary.name) / 'import.env'
+        self.put(source, self.legacy)
+        old = self.complete(ensure(self.controller, source))
+        self.put(source, self.legacy.replace(b'daily', b'next'))
+        save = migrations.save_json
+        def interrupt_pointer(path, value):
+            if path == migrations._pointer(self.home, source):
+                raise OSError('crash before pointer')
+            return save(path, value)
+        with patch.object(migrations, 'save_json', side_effect=interrupt_pointer):
+            with self.assertRaises(OSError):
+                ensure(self.controller, source)
+        records = [read_private(path) for path in self.controller.directory.glob('*.json')]
+        pending = [record for record in records if record['state'] != 'completed']
+        self.assertEqual(len(pending), 1)
+        resumed = ensure(self.controller, source)
+        self.assertEqual(resumed['operation_id'], pending[0]['operation_id'])
+        self.assertNotEqual(resumed['operation_id'], old['operation_id'])
 
     def test_changed_import_snapshot_is_fenced(self):
         source = Path(self.temporary.name) / 'import.env'
@@ -164,9 +190,12 @@ class EnvironmentMigrationTests(unittest.TestCase):
 
     def test_installer_migration_handoff_has_no_cloud_setup(self):
         from install import _handoff_command
-        self.assertEqual(_handoff_command({'home': self.home, 'migrate_environment': True}),
-            [str(self.home / 'venv/bin/python'), '-m', 'tools.setup',
-             '--home', str(self.home), '--migrate-environment'])
+        python = self.home / 'venv/bin/python'
+        python.parent.mkdir(parents=True)
+        python.touch()
+        command = _handoff_command({'home': self.home, 'migrate_environment': True})
+        self.assertEqual(command[:3], [str(python), '-I', '-c'])
+        self.assertEqual(command[-4:], ['tools.setup', '--home', str(self.home), '--migrate-environment'])
 
     def test_tui_presents_prerequisite_then_resumes_parent(self):
         from tools.tui.administration import present

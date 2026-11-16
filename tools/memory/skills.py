@@ -357,9 +357,9 @@ def _download(client, bundle):
     body = None
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
+        body = response['Body']
         if response.get('ContentLength') != bundle['size_bytes']:
             _fail()
-        body = response['Body']
         raw = body.read(bundle['size_bytes'] + 1)
         if len(raw) != bundle['size_bytes']:
             _fail()
@@ -578,12 +578,23 @@ class SessionSkills:
             'slug': slug, 'revision': page['revision'], 'bundle': copy.deepcopy(bundle),
             'path': str(destination), 'manifest': manifest}}
 
-    def start(self):
+    def start(self, *, loaded=(), authority_generation=None):
+        """Discover all skills; preload only the current applicable authority closure."""
         self.discover(refresh=True)
-        resources = [self.fetch(slug)['data'] for slug, page in self.catalog.items()
-                     if page.get('bundle', {}).get('load_policy') == 'always']
+        if loaded and self.generation != authority_generation:
+            _fail('context_stale')
+        resources = []
+        for page in loaded:
+            if page.get('bundle', {}).get('load_policy') != 'always':
+                continue
+            current = self.catalog.get(page['slug'])
+            if (current is None or current['revision'] != page['revision']
+                    or current.get('bundle') != page['bundle']):
+                _fail('context_stale')
+            resources.append(self.fetch(page['slug'])['data'])
         return {'status': 'ready', 'data': {'resources': resources,
-                'available_skills': self.summaries(self.discover()['data'])}}
+                'available_skills': self.summaries(
+                    self.discover()['data'], loaded, authority_generation)}}
 
 
 

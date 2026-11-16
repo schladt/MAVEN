@@ -97,10 +97,11 @@ def _source(value):
 
 
 def _ref(value):
-    # Keep provider validation shared with the catalog/API instead of interpreting refs.
-    from .validation import validate_secret_ref
+    from .secrets_contract import validate_consumer_ref
     try:
-        validate_secret_ref(value)
+        validate_consumer_ref(value)
+    except AdapterError:
+        raise
     except Exception:
         _fail()
 

@@ -84,9 +84,20 @@ class HomeSelectionTests(unittest.TestCase):
         self.assertEqual(load_home(self.home), {'invalid': 'Home folder belongs to a different MAVEN project'})
         self.rewrite(project_id=self.project, instance_id='instance-two')
         self.assertEqual(load_home(self.home), {'invalid': 'Home belongs to a different MAVEN instance'})
+        original = (self.home / 'home.json').read_bytes()
         with self.assertRaises(HomeError):
             self.save(project_id=str(uuid.uuid4()))
-        self.assertFalse((self.home / 'home.json').exists())
+        self.assertEqual((self.home / 'home.json').read_bytes(), original)
+
+    def test_invalid_replacement_preserves_previous_valid_selection(self):
+        previous = self.save()
+        before = (self.home / 'home.json').read_bytes()
+        for changes in ({'project_id': str(uuid.uuid4())}, {'instance_id': 'different-instance'},
+                        {'consent': {'origin': '', 'excerpt': 'invalid'}}):
+            with self.subTest(changes=changes), self.assertRaises(HomeError):
+                self.save(**changes)
+            self.assertEqual((self.home / 'home.json').read_bytes(), before)
+            self.assertEqual(load_home(self.home), previous)
 
     def test_root_must_be_outside_installation_and_checkout(self):
         inside = self.home / 'projects' / 'inner'
@@ -115,6 +126,20 @@ class StartChoiceTests(unittest.TestCase):
         self.folder = self.base / 'scratch'
         self.folder.mkdir()
         self.log = self.home / 'runtime' / 'start-choices.jsonl'
+
+    def test_native_status_namespaces_harness_and_marks_folder_hint(self):
+        first, second = maven_home.active('read_only'), maven_home.active('off')
+        maven_home.write_active(self.home, first, harness='omp', harness_session='same', folder=self.folder)
+        maven_home.write_active(self.home, second, harness='claude', harness_session='same', folder=self.folder)
+        exact = maven_home.read_active(self.home, harness='omp', harness_session='same', folder=self.folder)
+        self.assertEqual(exact['mode'], 'read_only')
+        self.assertFalse(exact['advisory'])
+        hint = maven_home.read_active(self.home, harness='omp', harness_session='another', folder=self.folder)
+        self.assertEqual(hint['mode'], 'off')
+        self.assertTrue(hint['advisory'])
+        self.assertEqual(hint['scope'], 'folder')
+        with self.assertRaises(HomeError):
+            maven_home.write_active(self.home, first, harness_session='same')
 
     def test_choices_append_privately_and_last_choice_is_per_folder(self):
         other = self.base / 'other'

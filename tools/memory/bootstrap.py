@@ -255,9 +255,11 @@ def apply(values, package, review_path, environment_path, *, confirm_review, bud
         if 'ROLLBACK' in status or status.endswith('_FAILED') or status.startswith('DELETE_'):
             raise MemoryClientError('stack_execution_failed')
         if current.get('ExecutionStatus') == 'EXECUTE_COMPLETE' and status in ('CREATE_COMPLETE', 'UPDATE_COMPLETE'):
-            if _outputs(stack)['recovery_epoch'] != review['recovery_epoch']:
+            reviewed_config = _outputs(stack)
+            if reviewed_config['recovery_epoch'] != review['recovery_epoch']:
                 raise MemoryClientError('stack_output_identity_mismatch')
-            return connect(values, environment_path, confirm_instance=review['instance_id'], cloud=cloud)
+            return connect(values, environment_path, confirm_instance=review['instance_id'], cloud=cloud,
+                           reviewed_config=reviewed_config)
         time.sleep(min(5, max(0, deadline - time.monotonic())))
     raise MemoryClientError('stack_execution_outcome_unknown')
 

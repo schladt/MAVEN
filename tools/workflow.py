@@ -47,6 +47,7 @@ def parser(action=None):
             command.add_argument('--query', default='')
             command.add_argument('--kind')
             command.add_argument('--after-id')
+            command.add_argument('--offset', type=int, default=0)
             command.add_argument('--limit', type=int, default=20)
         if name == 'read':
             command.add_argument('--record-id', required=True)
@@ -66,12 +67,15 @@ def parser(action=None):
             command.add_argument('--checkpoint-id', required=True)
         if name == 'pause':
             command.add_argument('--anchor')
+            command.add_argument('--drain', action='store_true')
         if name == 'resume':
             command.add_argument('--fresh', action='store_true')
             command.add_argument('--input', type=Path, help='Private JSON with available discussion, source and context_complete')
         if name == 'recover':
             command.add_argument('--checkpoint-id')
             command.add_argument('--worker-stopped', action='store_true')
+            command.add_argument('--writer-token', action='append', default=None)
+            command.add_argument('--observe-only', action='store_true', help='Inspect the original receipt without replay or writer recovery')
     return value
 
 
@@ -117,7 +121,8 @@ def _main(argv=None, *, action=None):
             result = dict(service.status(), maintenance=maintenance.status())
         elif args.action == 'search':
             result = service.search(query=args.query, kind=args.kind, scope=args.scope,
-                                    project_id=args.project_id, after_id=args.after_id, limit=args.limit)
+                                    project_id=args.project_id, after_id=args.after_id, limit=args.limit,
+                                    offset=args.offset)
         elif args.action == 'read':
             result = service.read_record(args.record_id, revision=args.revision, scope=args.scope, project_id=args.project_id)
         elif args.action == 'save':
@@ -130,7 +135,7 @@ def _main(argv=None, *, action=None):
         elif args.action == 'stop-work':
             result = maintenance.finish(args.checkpoint_id)
         elif args.action == 'pause':
-            result = maintenance.pause(anchor=args.anchor)
+            result = maintenance.pause(anchor=args.anchor, drain=args.drain)
         elif args.action == 'resume':
             options = _input(args.input) if args.input else {}
             if set(options) - {'discussion', 'source', 'context_complete'}:
@@ -140,11 +145,15 @@ def _main(argv=None, *, action=None):
             result = getattr(maintenance, args.operation)(**(_input(args.input) if args.input else {}))
         else:
             if args.checkpoint_id:
+                if args.observe_only:
+                    raise ArgumentError('use maintenance --operation status to inspect checkpoint receipts without mutation')
                 if not args.worker_stopped:
                     raise ArgumentError('checkpoint recovery requires --worker-stopped attestation')
-                result = maintenance.recover_checkpoint(args.checkpoint_id, worker_stopped=True)
+                result = maintenance.recover_checkpoint(args.checkpoint_id, worker_stopped=True,
+                                                        writer_tokens=args.writer_token)
             else:
-                result = service.recover()
+                result = service.recover(workers_stopped=args.worker_stopped, writer_tokens=args.writer_token,
+                                         observe_only=args.observe_only)
         report.update(status='ready', **result) if 'status' not in result else report.update(result)
     except (BoundaryError, MemoryClientError, MemoryError, ValueError, OSError, TypeError, KeyError) as error:
         report['status'] = 'blocked'
@@ -154,6 +163,18 @@ def _main(argv=None, *, action=None):
         request_key = getattr(error, 'request_key', None)
         if request_key:
             report['error']['request_key'] = request_key
+        if isinstance(error, MemoryClientError):
+            if error.detail is not None:
+                report['error']['detail'] = error.detail
+            from tools.memory.client import AUTHENTICATION_CODES
+            if error.code in AUTHENTICATION_CODES:
+                from tools.memory.environment import authentication_handoff, load_environment
+                try:
+                    handoff = authentication_handoff(error, load_environment(args.env))
+                    if handoff:
+                        report['authentication'] = handoff
+                except (MemoryClientError, OSError, ValueError):
+                    pass
         if service is not None:
             try:
                 local = service.status()

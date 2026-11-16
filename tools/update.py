@@ -16,6 +16,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tomllib
+from uuid import uuid4
 
 _PACKAGES = ('tools', 'maven_resources')
 _STATEFUL = frozenset(('AWS::RDS::DBCluster', 'AWS::RDS::DBInstance', 'AWS::SecretsManager::Secret',
@@ -47,12 +48,79 @@ def _installed_files(venv: Path) -> dict[str, str] | None:
         return None
     result = {}
     for row in csv.reader(io.StringIO(path.read_text(encoding='utf-8'))):
-        if len(row) < 2 or not row[1].startswith('sha256=') or row[0].split('/', 1)[0] not in _PACKAGES:
+        if len(row) < 2 or row[0].split('/', 1)[0] not in _PACKAGES or '__pycache__' in row[0].split('/'):
             continue
-        encoded = row[1][len('sha256='):]
-        result[row[0]] = base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)).hex()
+        target = path.parent.parent / row[0]
+        if ('..' in Path(row[0]).parts or target.is_symlink()
+                or not target.resolve().is_relative_to(path.parent.parent.resolve())):
+            result[row[0]] = 'unsafe'
+        else:
+            result[row[0]] = hashlib.sha256(target.read_bytes()).hexdigest() if target.is_file() else 'missing'
+    for package in _PACKAGES:
+        for target in (path.parent.parent / package).rglob('*'):
+            if target.is_file() and '__pycache__' not in target.parts and target.suffix != '.pyc':
+                name = target.relative_to(path.parent.parent).as_posix()
+                if name not in result:
+                    result[name] = 'unrecorded'
     return result
 
+
+def _packaging_inputs(checkout):
+    return {name: hashlib.sha256((Path(checkout) / name).read_bytes()).hexdigest()
+            if (Path(checkout) / name).is_file() else None
+            for name in ('pyproject.toml', 'README.md', 'LICENSE')}
+
+
+def record_package_inputs(home: Path, checkout: Path) -> None:
+    """Record installation inputs only after pip completed, alongside actual wheel metadata."""
+    from tools.uninstall.common import save_private
+    record = _record_path(Path(home) / 'venv')
+    if record is None:
+        raise ValueError('Installed package metadata is missing or ambiguous.')
+    metadata = {}
+    for name in ('METADATA', 'entry_points.txt'):
+        path = record.parent / name
+        if not path.is_file() or path.is_symlink():
+            raise ValueError('Installed package metadata is incomplete or unsafe: ' + name)
+        metadata[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    save_private(Path(home) / 'runtime/package-inputs.json', {
+        'schema': 1, 'source_inputs': _packaging_inputs(checkout),
+        'distribution': str(record.parent.relative_to(Path(home) / 'venv')), 'metadata': metadata})
+
+
+def _package_inputs_current(home: Path, checkout: Path) -> bool:
+    from tools.uninstall.common import read_private
+    record = _record_path(home / 'venv')
+    receipt_path = home / 'runtime/package-inputs.json'
+    if record is None or not receipt_path.is_file():
+        return False
+    receipt = read_private(receipt_path)
+    if (receipt.get('schema') != 1 or receipt.get('source_inputs') != _packaging_inputs(checkout)
+            or receipt.get('distribution') != str(record.parent.relative_to(home / 'venv'))):
+        return False
+    return all((record.parent / name).is_file() and not (record.parent / name).is_symlink()
+               and receipt.get('metadata', {}).get(name) ==
+               hashlib.sha256((record.parent / name).read_bytes()).hexdigest()
+               for name in ('METADATA', 'entry_points.txt'))
+
+
+
+def _installed_integrity(venv):
+    record = _record_path(venv)
+    if record is None:
+        return []
+    failed = []
+    for row in csv.reader(io.StringIO(record.read_text(encoding='utf-8'))):
+        if len(row) < 2 or not row[1].startswith('sha256='):
+            continue
+        target = record.parent.parent / row[0]
+        if not target.resolve().is_relative_to(venv.resolve()) or target.is_symlink() or not target.is_file():
+            failed.append(row[0])
+            continue
+        encoded = base64.urlsafe_b64encode(hashlib.sha256(target.read_bytes()).digest()).rstrip(b'=').decode()
+        if row[1] != 'sha256=' + encoded:
+            failed.append(row[0])
+    return failed
 
 def _checkout_files(checkout: Path) -> dict[str, str]:
     """Files the checkout's pyproject packages into the wheel: package modules plus package data."""
@@ -89,7 +157,7 @@ def _git(checkout: Path) -> dict:
 
 def local_report(home: Path, checkout: Path) -> dict:
     """Compare the installed software and installer-owned harness skills with the checkout."""
-    from tools.harness import HARNESS_PATHS
+    from tools.harness import installed_targets
     from tools.uninstall.common import read_private
     from tools.uninstall.local import MANIFEST
     home, checkout = Path(home), Path(checkout)
@@ -116,22 +184,100 @@ def local_report(home: Path, checkout: Path) -> dict:
                 missing.append(str(target))
             elif target.read_bytes() != (templates / name / 'SKILL.md').read_bytes():
                 stale.append(str(target))
-    configured = {str(Path.home() / paths[0]): name for name, paths in HARNESS_PATHS.items()}
-    harnesses = sorted({configured[item['path']] for item in manifest.get('integrations', [])
-                        if item.get('path') in configured})
-    current = not (software['changed'] or software['added'] or software['removed'] or stale or missing)
+    targets = installed_targets(home)
+    harnesses = sorted(targets['paths'])
+    metadata_current = _package_inputs_current(home, checkout)
+    integrity_failures = _installed_integrity(home / 'venv')
+    current = software['installed'] and metadata_current and not integrity_failures and not (
+        software['changed'] or software['added'] or software['removed'])
     return {'checkout': str(checkout), 'home': str(home), 'software': software,
+            'package_metadata_current': metadata_current,
+            'integrity_failures': integrity_failures,
             'skills': {'stale': stale, 'missing': missing}, 'harnesses': harnesses,
+            'skills_current': not (stale or missing),
+            'unresolved_integration_targets': targets['unresolved'],
             'git': _git(checkout), 'current': current,
-            'limitations': ['Dependency version changes in pyproject.toml are applied by the installer but not '
-                            'compared here.', 'Git ahead/behind uses the last fetch; nothing was fetched.']}
+            'limitations': ['Installed package bytes and recorded installation inputs are compared; '
+                            'dependency environment health is not verified.',
+                            'Git ahead/behind uses the last fetch; nothing was fetched.']}
 
 
-def install_command(home: Path, checkout: Path, harnesses: list[str]) -> list[str]:
+def install_command(home: Path, checkout: Path) -> list[str]:
+    from tools.harness import installed_targets
+    targets = installed_targets(home)
     command = [sys.executable, str(Path(checkout) / 'install.py'), '--home', str(home)]
-    for harness in harnesses:
-        command.extend(['--harness', harness])
+    # Recorded destinations, not today's ambient profile, determine update targets.
+    for harness, (config, context) in targets['paths'].items():
+        command.extend(['--harness', harness, '--harness-config', f'{harness}={config}',
+                        '--harness-context', f'{harness}={context}'])
+    for root in targets['skill_roots']:
+        command.extend(['--skill-dir', str(root)])
+    if not targets['lifecycle']:
+        command.append('--no-lifecycle-hooks')
+    if targets['statusline'] and 'claude' in targets['paths']:
+        command.append('--claude-statusline')
     return command
+
+
+def pending_owned_skills(home):
+    """Read exact unfinished file intents for local review without applying them."""
+    from tools.uninstall.common import read_private
+    result = []
+    for path in sorted((Path(home) / 'runtime/skill-installations').glob('*.json')):
+        intent = read_private(path)
+        if intent.get('completed'):
+            continue
+        if intent.get('schema') != 1 or intent.get('home') != str(home):
+            raise ValueError('Skill installation intent belongs to another home or schema.')
+        result.append({'path': str(path), 'intent': intent})
+    return result
+
+
+def apply_owned_skills(home, source, plan, references):
+    """Apply exact journaled skill writes under the caller's installation lock."""
+    from tools.harness import _read, write_skill
+    from tools.uninstall.common import save_private
+    from tools.uninstall.local import inventory, record_installation
+    home = Path(home)
+    references = {str(path) for path in references}
+    directory = home / 'runtime' / 'skill-installations'
+    pending = {}
+    for saved in pending_owned_skills(home):
+        path, intent = Path(saved['path']), saved['intent']
+        target = Path(intent['target'])
+        body = base64.b64decode(intent['body'], validate=True)
+        before = _read(target)
+        if before == body:
+            record_installation(home, intent['source'], [target],
+                                [target] if intent.get('skill_reference', str(target) in references) else [])
+            intent['completed'] = True
+            save_private(path, intent)
+        elif ((before is None and intent['expected'] is None) or
+              (before is not None and intent['expected'] is not None and inventory(target) == intent['expected'])):
+            pending[str(target)] = (path, intent)
+        else:
+            raise ValueError(f'Interrupted skill installation changed; original intent retained: {target}')
+    selected = {str(target): (target, body, expected) for target, body, expected in plan}
+    for target, (_, intent) in pending.items():
+        original = base64.b64decode(intent['body'], validate=True)
+        if target in selected and selected[target][1] != original:
+            raise ValueError('Interrupted skill candidate changed; finish the original installation first.')
+        selected[target] = (Path(target), original, intent['expected'])
+    for key, (target, body, expected) in selected.items():
+        if key in pending:
+            path, intent = pending[key]
+        else:
+            path = directory / (str(uuid4()) + '.json')
+            intent = {'schema': 1, 'home': str(home), 'source': str(source), 'target': key,
+                      'body': base64.b64encode(body).decode(), 'expected': expected,
+                      'skill_reference': key in references, 'completed': False}
+            save_private(path, intent)
+        write_skill(target, body, expected)
+        record_installation(home, intent['source'], [target],
+                            [target] if intent.get('skill_reference', str(target) in references) else [])
+        intent['completed'] = True
+        save_private(path, intent)
+    record_installation(home, source, [], references)
 
 
 def schema_status(values: dict) -> dict:

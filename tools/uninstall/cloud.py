@@ -10,13 +10,45 @@ import base64
 import hashlib
 import json
 import re
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from importlib.resources import files
 from pathlib import Path
 
-from .common import UninstallError, canonical, checked_path, digest, save_private
+from .common import PauseRequested, UninstallError, canonical, checked_path, digest, save_private
 
 _MAX_PAGES = 1000
-_POLL_ATTEMPTS = 6
+_WAIT = ContextVar('uninstall_provider_wait', default=(0.0, None))
+
+
+@contextmanager
+def provider_wait(seconds=0, cancelled=None):
+    if not 0 <= seconds <= 300:
+        raise UninstallError('provider wait must be between 0 and 300 seconds per cloud action')
+    token = _WAIT.set((time.monotonic() + seconds if seconds else 0.0, cancelled))
+    try:
+        yield
+    finally:
+        _WAIT.reset(token)
+
+
+def _poll():
+    """One immediate observation, then paced reads within one action's budget."""
+    deadline, cancelled = _WAIT.get()
+    while True:
+        if cancelled is not None and cancelled():
+            raise PauseRequested('Provider wait paused; submitted effects were not cancelled')
+        yield
+        if not deadline or time.monotonic() >= deadline:
+            return
+        until = min(deadline, time.monotonic() + 2)
+        while time.monotonic() < until:
+            if cancelled is not None and cancelled():
+                raise PauseRequested('Provider wait paused; submitted effects were not cancelled')
+            time.sleep(min(0.1, max(0, until - time.monotonic())))
+
+
 _RETAINED_TYPES = {
     'AWS::EC2::VPC', 'AWS::EC2::Subnet', 'AWS::EC2::RouteTable',
     'AWS::EC2::SubnetRouteTableAssociation', 'AWS::EC2::SecurityGroup',
@@ -481,7 +513,7 @@ def _plan(cloud, values, home, mode, abandon, optional, retained_resources):
             'retained': lifecycle_fragment.get('retained', []) + retained,
             'warnings': lifecycle_fragment.get('warnings', []) + warnings,
             'targets': lifecycle_fragment.get('targets', []) + [{'scope': 'cloud', 'home': home, 'instance_id': instance, 'stack_id': stack_id, 'mode': mode}],
-            'requires': list(dict.fromkeys(lifecycle_fragment.get('requires', []) + ['writers-quiescent', 'harnesses-stopped'] + (['purge'] if mode == 'purge' else [])))}
+            'requires': list(dict.fromkeys(lifecycle_fragment.get('requires', []) + ['writers-quiescent', 'harness-config-risk'] + (['purge'] if mode == 'purge' else [])))}
 
 
 def _automated(cloud, arn, *, resource_id=None):
@@ -602,7 +634,7 @@ def _plan_retained(cloud, values, home, mode, optional, retained_resources):
             'warnings': ['Only individually selected, exclusively owned retired resources are deleted. Unselected resources/keys remain.',
                          'Secrets have a 7-day recovery window; no immediate irreversible erasure is claimed.'],
             'targets': [{'scope': 'cloud', 'home': home, 'instance_id': instance, 'mode': mode, 'retained_only': True}],
-            'requires': ['writers-quiescent', 'harnesses-stopped', 'purge']}
+            'requires': ['writers-quiescent', 'harness-config-risk', 'purge']}
 
 
 def _step(progress, save, key, operation):
@@ -634,7 +666,7 @@ def _snapshot(cloud, details, entry, save):
             Tags=[{'Key': 'MavenInstanceId', 'Value': details['instance_id']}, {'Key': 'MavenExclusive', 'Value': 'true'}, {'Key': 'DataScope', 'Value': 'owner_memory'}, {'Key': 'MavenUninstall', 'Value': digest(details)}])
         entry['created'] = True
         save()
-    for _ in range(_POLL_ATTEMPTS):
+    for _ in _poll():
         response = rds.describe_db_cluster_snapshots(DBClusterSnapshotIdentifier=name)
         snapshot = response['DBClusterSnapshots'][0]
         tags = _tags(rds.list_tags_for_resource(ResourceName=snapshot['DBClusterSnapshotArn']).get('TagList', []))
@@ -781,7 +813,7 @@ def _delete_database(cloud, details, progress, save):
                 raise UninstallError('Database instance identity or cluster changed.')
             if instance['DBInstanceStatus'] != 'deleting':
                 rds.delete_db_instance(DBInstanceIdentifier=item['physical'], SkipFinalSnapshot=True, DeleteAutomatedBackups=False)
-            for _ in range(_POLL_ATTEMPTS):
+            for _ in _poll():
                 if not _call(rds, 'describe_db_instances', DBInstanceIdentifier=item['physical']):
                     return {'status': 'removed'}
             _pending(progress, save, 'Database instance deletion is pending.')
@@ -811,7 +843,7 @@ def _delete_database(cloud, details, progress, save):
                 _pending(progress, save, 'Database deletion-protection update is pending.')
         if cluster['Status'] != 'deleting':
             rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True, DeleteAutomatedBackups=False)
-        for _ in range(_POLL_ATTEMPTS):
+        for _ in _poll():
             if not _call(rds, 'describe_db_clusters', DBClusterIdentifier=cluster_id):
                 return {'status': 'removed'}
         _pending(progress, save, 'Database cluster deletion is pending.')
@@ -899,7 +931,7 @@ def _delete_stack(cloud, details, progress, save):
             entry['delete_requested'] = True
             save()
             cf.delete_stack(StackName=details['stack_id'], ClientRequestToken='maven-' + digest(details)[:48])
-        for _ in range(_POLL_ATTEMPTS):
+        for _ in _poll():
             response = _call(cf, 'describe_stacks', StackName=details['stack_id'])
             if not response or response['Stacks'][0]['StackStatus'] == 'DELETE_COMPLETE':
                 return {'status': 'removed'}
@@ -1004,10 +1036,22 @@ def execute(action, progress, save):
     if action.get('kind') != 'cloud-teardown':
         raise UninstallError('Unknown cloud uninstall action.')
     details = action['details']
-    values = _load(details['home'])
+    values = ({key: value for key, value in details['identity'].items() if value is not None}
+              if details.get('portable_recovery') else _load(details['home']))
     if _identity(values) != details['identity']:
         raise UninstallError('Cloud configuration changed since approval.')
-    cloud = _Cloud(values)
+    recovery_cache = details.get('recovery_login_cache')
+    if recovery_cache and not Path(values['MAVEN_DEPLOY_LOGIN_CACHE']).expanduser().exists():
+        values['MAVEN_DEPLOY_LOGIN_CACHE'] = recovery_cache
+    try:
+        cloud = _Cloud(values)
+    except Exception as error:
+        from tools.memory.environment import authentication_handoff, sign_in
+        if authentication_handoff(error, values, deploy=True):
+            raise UninstallError('Cloud recovery authentication required. Run ' +
+                                 sign_in(values, deploy=True)['command'] +
+                                 ' then resume this exact plan; no cloud completion is claimed.') from None
+        raise
     try:
         return _execute(cloud, details, progress, save, action.get('operation_dir'))
     except UninstallError:
@@ -1084,7 +1128,7 @@ def _execute(cloud, details, progress, save, operation_dir=None):
                     raise UninstallError('Snapshot identity changed.')
                 if response['DBClusterSnapshots'][0]['Status'] != 'deleting':
                     rds.delete_db_cluster_snapshot(DBClusterSnapshotIdentifier=arn)
-                for _ in range(_POLL_ATTEMPTS):
+                for _ in _poll():
                     if not _call(rds, 'describe_db_cluster_snapshots', DBClusterSnapshotIdentifier=arn):
                         return {'status': 'removed'}
                 _pending(progress, save, 'Selected snapshot deletion is pending.')
@@ -1111,7 +1155,7 @@ def _execute(cloud, details, progress, save, operation_dir=None):
                 if len(records) != 1 or records[0]['DBClusterAutomatedBackupsArn'] != backup['DBClusterAutomatedBackupsArn'] or _jsonable(records[0].get('ClusterCreateTime')) != backup.get('ClusterCreateTime'):
                     raise UninstallError('Automated backup identity changed.')
                 rds.delete_db_cluster_automated_backup(DbClusterResourceId=resource_id)
-                for _ in range(_POLL_ATTEMPTS):
+                for _ in _poll():
                     if not current():
                         return {'status': 'removed'}
                 _pending(progress, save, 'Selected automated backup deletion is pending.')
@@ -1123,6 +1167,14 @@ def _execute(cloud, details, progress, save, operation_dir=None):
                 pending.append(result)
     if pending:
         progress['pending_recovery_windows'] = pending
+        if details.get('portable_recovery'):
+            progress['pending'] = 'Secrets are scheduled for deletion, not verified absent.'
+            save()
+            return {'status': 'pending-provider', 'independent_local_safe': True,
+                    'instance_id': details['instance_id'], 'pending_recovery_windows': pending,
+                    'retained_notice': 'Secrets remain recoverable for seven days and until provider deletion; '
+                                       'unselected backups and encryption keys remain.',
+                    'live_restore_verified': False}
         _pending(progress, save, 'Secrets remain inside AWS recovery windows; deletion is scheduled, not complete.')
     progress.pop('pending', None)
     progress.pop('pending_recovery_windows', None)

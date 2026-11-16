@@ -68,9 +68,21 @@ _CODE_HELP = {
     'invalid_configuration': 'The saved connection settings are incomplete or do not belong together. '
                              'Check the instance, roles and endpoint in the saved settings.',
     'instance_confirmation_mismatch': 'The confirmed instance does not match the saved connection settings.',
+    'transport_unavailable': 'The selected service could not be reached. Check connectivity and the trusted CA '
+                             'configuration; this is not evidence that AWS sign-in expired.',
+    'selected_login_configuration_unavailable': 'The selected named AWS profile, region or cache configuration '
+                                                'is unavailable. Correct that selection; do not switch identities implicitly.',
+    'selected_profile_requires_login': 'The selected profile uses an unsupported credential method. Select a '
+                                      'named AWS login profile; static credentials are not accepted.',
+    'login_cache_must_be_owner_private': 'The selected login cache must be an owner-private directory. Correct '
+                                        'its permissions without changing the selected profile or identity.',
+    'login_cache_unavailable': 'The selected login cache cannot be read. Restore access to that exact cache.',
+    'invalid_login_cache': 'The selected login cache path is invalid. Choose an absolute private cache directory.',
+    'invalid_role_credentials': 'AWS returned invalid role credentials. No identity or readiness was verified; '
+                                'inspect the selected role configuration before resuming the same operation.',
 }
 _TRANSIENT_REASONS = {'warming', 'DatabaseResumingException', 'temporarily_unavailable'}
-_WAKE_INTERVAL, _WAKE_LIMIT, _WAKE_RETRIES = 5, 600, 3
+_WAKE_INTERVAL, _WAKE_LIMIT = 5, 600
 
 
 def _text(value):
@@ -82,29 +94,29 @@ def _clock(seconds):
 
 
 def _await_database(ui, controller, stage):
-    """Poll the auto-paused database with a visible timer; True once it accepts SQL."""
+    """Share bounded read-only warming progression; never retry an administration effect."""
+    from tools.memory.client import MemoryClientError, wait_for_read_only
     ui.message(f'{stage}: the Aurora database is resuming from auto-pause. Checking every '
                f'{_WAKE_INTERVAL}s for up to {_WAKE_LIMIT // 60} minutes; Ctrl+Q pauses safely.')
-    start, checks, status = time.monotonic(), 0, 'warming'
-    while True:
-        elapsed = int(time.monotonic() - start)
-        if elapsed >= checks * _WAKE_INTERVAL:
-            checks += 1
-            status = controller.database_status()
-            elapsed = int(time.monotonic() - start)
-            if status == 'awake':
-                ui.message(f'Database is awake after {_clock(elapsed)} ({checks} checks). Retrying {stage}.')
-                return True
-            if status not in ('warming', 'temporarily_unavailable'):
-                ui.message(f'Database check stopped after {_clock(elapsed)}: {status}.')
-                return False
-        if elapsed >= _WAKE_LIMIT:
-            ui.message(f'Database is still not awake after {_clock(elapsed)}.')
-            return False
-        ui.progress(f'Waiting for the database to wake — {_clock(elapsed)} elapsed, '
-                    f'check {checks}: {status}. Ctrl+Q pauses safely.')
-        ui.checkpoint()
-        time.sleep(1)
+    start = time.monotonic()
+
+    def probe():
+        status = controller.database_status()
+        if status == 'warming':
+            raise MemoryClientError('warming')
+        return status
+
+    def warming():
+        ui.progress(f'Waiting for the database to wake — {_clock(int(time.monotonic() - start))} '
+                    'elapsed. Ctrl+Q pauses safely.')
+
+    try:
+        status = wait_for_read_only(probe, budget=_WAKE_LIMIT, interval=_WAKE_INTERVAL,
+                                   checkpoint=ui.checkpoint, on_warming=warming)
+    except MemoryClientError as error:
+        status = error.code
+    ui.message('Database probe: ' + status + '. The retained operation has not been replayed.')
+    return status
 
 
 def _stage_name(step):
@@ -133,6 +145,12 @@ def _context(result, stage):
     lines.append('Saved: ' + stage + ' | Receipts: ' + str(len(result.get('receipts', []))) +
                  ' | Ctrl+Q pauses')
     return '\n'.join(lines)
+
+
+def _resume_command(result, home, identifier):
+    program = (['maven-setup'] if result.get('kind', 'setup') == 'setup'
+               else [sys.executable, '-m', 'tools.tui.administration'])
+    return shlex.join([*program, '--home', str(home), '--operation', identifier])
 
 
 def _instructions(result, home, identifier):
@@ -171,9 +189,18 @@ def _instructions(result, home, identifier):
                 and any(check.get('reason') not in _TRANSIENT_REASONS for check in failures)):
             instructions.append('Suggested fix: ' + checked['result']['remediation'])
     if handoff:
-        instructions.extend(['', handoff['reason'], '', 'External command:', shlex.join(handoff['command'])])
-        if handoff.get('environment'):
-            instructions.extend(['', 'Environment for that external command:', _text(handoff['environment'])])
+        command = ['env', *(key + '=' + value for key, value in handoff.get('environment', {}).items()),
+                   *handoff['command']]
+        instructions.extend(['', handoff['reason'], '', 'External command:', shlex.join(command)])
+    if result.get('probe_status') and result['probe_status'] != 'awake':
+        status = result['probe_status']
+        instructions.extend(['', 'Latest read-only database probe: ' + status,
+                             _CODE_HELP.get(status, 'The optional SQL probe is unavailable; the original operation is retained.')])
+        probe_handoff = result.get('probe_handoff')
+        if probe_handoff:
+            command = ['env', *(key + '=' + value for key, value in probe_handoff.get('environment', {}).items()),
+                       *probe_handoff['command']]
+            instructions.extend(['Probe authentication (selected everyday access):', shlex.join(command)])
     for key in ('notice', 'recovery'):
         if result.get(key):
             instructions.extend(['', result[key]])
@@ -181,7 +208,7 @@ def _instructions(result, home, identifier):
         instructions.extend(['', f'Resume operation retries "{stage}" for operation {identifier}.'])
     instructions.extend([
         '', 'Ctrl+Q pauses safely; the original operation and receipts are retained.',
-        '', 'Resume later: ' + shlex.join(['maven-setup', '--home', str(home), '--operation', identifier])])
+        '', 'Resume later: ' + _resume_command(result, home, identifier)])
     return '\n'.join(instructions)
 
 
@@ -231,10 +258,10 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
     result = controller.status(operation_id) if operation_id else controller.begin(kind, parameters)
     identifier = result['operation_id']
     ui.message('Resumable administration operation: ' + identifier)
-    resume = (['maven-setup', '--home', str(home), '--operation', identifier] if result.get('kind', kind) == 'setup' else
-              [sys.executable, '-m', 'tools.tui.administration', '--home', str(home), '--operation', identifier])
-    ui.message('Pause safely with Ctrl+Q. Resume the same operation: ' + shlex.join(resume))
-    wake_retries = 0
+    ui.message('Pause safely with Ctrl+Q. Resume the same operation: ' +
+               _resume_command({**result, 'kind': result.get('kind', kind)}, home, identifier))
+    warmed = set()
+    input_error = None
     while True:
         ui.checkpoint()
         from tools.environment_migrations import prerequisite
@@ -260,6 +287,9 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
             continue
         if question:
             description = question.get('description') or presentation.get('description') or 'Review this saved checkpoint before continuing. Choices are saved privately; never enter credentials.'
+            if input_error:
+                description = 'Not accepted: ' + input_error + '\n\n' + description
+                input_error = None
             details = _text(question.get('details') or presentation.get('details') or '')
             if question['kind'] == 'form':
                 fields = [Field(**{**field, 'choices': tuple(tuple(choice) for choice in field.get('choices', ()))})
@@ -308,6 +338,7 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
             except AdminInputError as error:
                 # The saved question is unchanged; show why and ask it again.
                 ui.message('Not accepted: ' + str(error))
+                input_error = str(error)
                 result = controller.status(identifier)
         elif result['state'] in ('completed', 'cancelled', 'abandoned'):
             outcome = result.get('outcome', result['state'])
@@ -320,13 +351,19 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
             if result.get('handoff', {}).get('type') == 'aws_login':
                 result = _aws_login(ui, controller, result, home, identifier)
                 continue
-            if result.get('error') == 'warming' and wake_retries < _WAKE_RETRIES:
-                # A paused database is expected after idle time: wait visibly, then retry the same step.
-                wake_retries += 1
-                if _await_database(ui, controller, stage):
+            if result.get('error') == 'warming' and result['step'] not in warmed:
+                warmed.add(result['step'])
+                status = _await_database(ui, controller, stage)
+                result = {**result, 'probe_status': status}
+                if status == 'awake' and result.get('read_only_retry') is True:
                     result = controller.advance(identifier)
                     continue
-            if not ui.review('Setup stopped — ' + stage, _instructions(result, home, identifier),
+                from tools.memory.client import AUTHENTICATION_CODES, MemoryClientError
+                if status in AUTHENTICATION_CODES:
+                    from tools.memory.environment import authentication_handoff, load_environment
+                    result['probe_handoff'] = authentication_handoff(
+                        MemoryClientError(status), load_environment(Path(home) / '.env'), deploy=False)
+            if not ui.review('Administration stopped — ' + stage, _instructions(result, home, identifier),
                              identity=identifier, accept='Resume operation'):
                 raise OperationPaused('Administration paused; evidence retained for ' + identifier)
             ui.checkpoint()

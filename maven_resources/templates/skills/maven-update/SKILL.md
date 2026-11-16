@@ -5,7 +5,7 @@ description: Update an installed MAVEN to its checkout's version, locally and in
 
 # Update MAVEN
 
-Use when the owner asks to update, upgrade or refresh MAVEN itself, or after the MAVEN checkout changed. This is not memory work: it changes the installation and the selected cloud instance, so every effect goes through `maven_admin` reviews with the owner's actual answers. Never invent approvals, run AWS sign-in yourself, or search the filesystem for MAVEN source.
+Use only when the owner asks to update, upgrade or refresh installed MAVEN itself. Editing a source checkout alone does not authorize installation or cloud changes. Every update effect goes through `maven_admin` reviews with the owner's actual answers. Never invent approvals, run AWS sign-in yourself, or search the filesystem for MAVEN source.
 
 ## 0. Choose the version
 
@@ -28,7 +28,7 @@ The first stage compares the installed software and installer-owned skills with 
 - `aws_login` handoffs: give the owner the command to run privately (everyday access first; maintenance access before the service stage), then advance. Identity confirmations are reviews like any other.
 - Reviews: show the owner the complete review (title, description and the decisive content: SQL file names for the schema, every changed resource and its replacement flag for the service, page titles and differences for instructions). Respond only with their real decision: `{approved, review_digest, source: {origin, excerpt}, confirmations}`. Declining pauses the operation; it never skips a stage silently.
 - Stages, in order: **schema** (pending ordered migrations, applied under maintenance mode), **service** (a CloudFormation change set built from the live stack's own deployment inputs; refused before review if it would remove or replace a database, secret, bucket or key), **instructions** (bundled pages that are new or differ from the active ones; the form shows exact differences and warns that an update replaces owner edits). Current stages pass without questions.
-- Error `warming`: the Aurora database is resuming from auto-pause. Wait about 30 seconds and advance again; repeat for up to 10 minutes before reporting it.
+- Error `warming`: the Aurora database is resuming from auto-pause. Use the returned bounded read-only retry path when available. It spaces probes but is not a hard transport deadline. Never retry an uncertain mutation as a readiness probe; reconcile its original receipt.
 - `uncertain` state: an effect may have reached AWS. Advance the same operation to reconcile it; never begin a replacement.
 
 ## 4. Finish

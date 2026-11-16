@@ -43,6 +43,18 @@ def validate_secret_ref(value):
     return value
 
 
+def validate_consumer_ref(value):
+    """The executable store's compatibility gate; ordinary memory keeps legacy locators."""
+    from .adapter_contracts import AdapterError
+    validate_secret_ref(value)
+    if value['provider'] not in ('ssm', 'encrypted-file'):
+        raise AdapterError('unsupported_secret_provider')
+    if value['provider'] == 'ssm' and not re.fullmatch(
+            r'/(?:[A-Za-z0-9_.-]+/)*[a-z0-9][a-z0-9_.-]{0,63}:[1-9][0-9]*', value['name']):
+        raise AdapterError('secret_reference_migration_required')
+    return value
+
+
 def validate_secret_request(route, value):
     from .validation import _memory
     if route == '/v1/memory/secret_lookup':

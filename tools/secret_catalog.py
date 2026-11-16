@@ -3,14 +3,12 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
-import os
 from pathlib import Path
-import stat
 import sys
 import uuid
 
 from tools.aws.secret_store import DEFAULT_STREAM_LIMIT, MAX_VALUE_BYTES, SecretStore, valid_name, _operation
-from tools.aws.secrets import StoreError
+from tools.aws.secrets import StorageRejected, StoreError, open_input
 from tools.coordination import private_lock
 from tools.home import load_home
 from tools.memory.boundary import private_path, read_private, save_private
@@ -87,10 +85,16 @@ class SecretCatalog:
             result['catalog_ref'] = state['catalog_ref']
         if state.get('error'):
             result['error'] = state['error']
+        if state.get('conflict'):
+            result['conflict'] = state['conflict']
         if state['state'] != 'completed':
-            result['next_action'] = ('Inspect the failed storage operation; no catalog was written.'
-                                     if state['state'] == 'storage_failed' else
-                                     'Retry catalog only with this operation_id; storage is never re-uploaded.')
+            result['next_action'] = (
+                'Inspect the failed storage operation; no catalog was written.'
+                if state['state'] == 'storage_failed' else
+                'Review conflict.current and storage_receipt. To deliberately repoint the catalog, use resolve_catalog '
+                'with this operation_id, the reviewed expected_revision, and the actual owner source; no secret is re-uploaded.'
+                if state['state'] == 'catalog_conflict' else
+                'Retry catalog only with this operation_id; storage is never re-uploaded.')
         return result
 
     @staticmethod
@@ -101,18 +105,19 @@ class SecretCatalog:
             return nullcontext(sys.stdin.buffer)
         if not source_path:
             raise StoreError('provide an explicit owner-private input file or CLI stdin')
-        path = Path(source_path).expanduser().absolute()
-        if path != path.resolve():
-            raise StoreError('secret input paths must not contain symlinks')
-        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-                raise StoreError('secret input must be an owner-private regular file')
-            return os.fdopen(fd, 'rb')
-        except BaseException:
-            os.close(fd)
-            raise
+        return open_input(source_path, private=True)
+
+    def _rotation_prior(self, prior, name, provider):
+        old_meta = prior['data']['value']
+        old_ref = prior['data'].get('secret_ref', {})
+        if old_ref.get('provider') != provider:
+            raise StoreError('rotation must preserve the catalog provider')
+        if isinstance(old_meta, dict) and old_meta.get('store_id', self.store.store_id) != self.store.store_id:
+            raise StoreError('catalog entry belongs to a different secret store')
+        if provider == 'ssm' and old_ref.get('name', '').split(':')[0] != self.store.parameter(name):
+            raise StoreError('catalog parameter does not match the selected store/name')
+        if provider == 'encrypted-file' and old_ref.get('store_id') != self.store.store_id:
+            raise StoreError('migrate the existing file catalog reference before rotation')
 
     def store_and_catalog(self, name, *, source_path=None, from_stdin=False, provider='ssm', replace=False,
                           operation_id=None, domain=None, service=None, source, max_bytes=DEFAULT_STREAM_LIMIT):
@@ -136,17 +141,7 @@ class SecretCatalog:
             if bool(prior) != replace:
                 raise StoreError('use replace only for an existing catalog entry; creation never overwrites one')
             if prior:
-                prior_data = prior['data']
-                old_meta = prior_data['value']
-                old_ref = prior_data.get('secret_ref', {})
-                if old_ref.get('provider') != provider:
-                    raise StoreError('rotation must preserve the catalog provider')
-                if isinstance(old_meta, dict) and old_meta.get('store_id', self.store.store_id) != self.store.store_id:
-                    raise StoreError('catalog entry belongs to a different secret store')
-                if provider == 'ssm' and old_ref.get('name', '').split(':')[0] != self.store.parameter(name):
-                    raise StoreError('catalog parameter does not match the selected store/name')
-                if provider == 'encrypted-file' and old_ref.get('store_id') != self.store.store_id:
-                    raise StoreError('migrate the existing file catalog reference before rotation')
+                self._rotation_prior(prior, name, provider)
             physical = (name[:30] + '.v' + uuid.UUID(operation_id).hex
                         if provider == 'encrypted-file' and replace else name)
             state = {'schema': 1, 'operation_id': operation_id, 'home_id': self.home_id,
@@ -166,8 +161,9 @@ class SecretCatalog:
                         receipt = self.store.put_file(physical, stream, max_bytes=max_bytes, operation_id=operation_id)
                 except Exception as error:
                     code = getattr(error, 'response', {}).get('Error', {}).get('Code')
-                    definitive = code in {'ParameterAlreadyExists', 'ParameterNotFound', 'AccessDenied',
-                                          'AccessDeniedException', 'ValidationException', 'PreconditionFailed'}
+                    definitive = isinstance(error, StorageRejected) or code in {
+                        'ParameterAlreadyExists', 'ParameterNotFound', 'AccessDenied',
+                        'AccessDeniedException', 'ValidationException', 'PreconditionFailed'}
                     state.update(state='storage_failed' if definitive else 'storage_uncertain',
                                  error='storage_rejected' if definitive else 'storage_outcome_unknown')
                     self._save(state)
@@ -201,8 +197,36 @@ class SecretCatalog:
                 self._save(state)
             return self._catalog(state)
 
+    def resolve_catalog(self, operation_id, *, expected_revision, source):
+        """Explicitly review a definitive CAS conflict; reuse storage, not rejected approval."""
+        validate_source(source)
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise StoreError('expected_revision must be the exact reviewed catalog revision')
+        operation_id = _operation(operation_id)
+        with private_lock(self.home, 'runtime/secrets/' + operation_id + '.lock'):
+            state = self._load(operation_id)
+            resolution = {'expected_revision': expected_revision, 'source': source}
+            if state.get('resolution') == resolution and state['state'] != 'catalog_conflict':
+                return self._status(state) if state['state'] == 'completed' else self._catalog(state)
+            if state['state'] != 'catalog_conflict' or not state.get('receipt') or not state.get('catalog_request'):
+                raise StoreError('retry the original catalog request to establish a definitive revision conflict first')
+            current = self.lookup(state['name'])
+            reviewed = state['conflict']['current']
+            if current != reviewed or expected_revision != (current['revision'] if current else 0):
+                raise StoreError('catalog changed since conflict review; retry_catalog and review the current record')
+            if current:
+                self._rotation_prior(current, state['name'], state['intent']['provider'])
+            state.setdefault('rejected_catalog_requests', []).append(state.pop('catalog_request'))
+            state.setdefault('catalog_resolutions', []).append(resolution)
+            state.update(resolution=resolution, catalog_prior=current, state='catalog_pending',
+                         catalog_attempt=state['catalog_attempt'] + 1)
+            state.pop('conflict', None)
+            state.pop('error', None)
+            self._save(state)
+            return self._catalog(state)
+
     def _request(self, state, generation):
-        receipt, prior = state['receipt'], state['prior']
+        receipt, prior = state['receipt'], state.get('catalog_prior', state['prior'])
         if receipt.get('store_id') != self.store.store_id or receipt.get('operation_id') != state['operation_id']:
             raise StoreError('storage receipt does not match the original operation')
         metadata = {'store_id': receipt['store_id'], 'provider': receipt['provider'],
@@ -239,7 +263,8 @@ class SecretCatalog:
                 'expected_revision': prior['revision'] if prior else 0, 'kind': 'setting',
                 'classification': 'Sensitive', 'data_scope': 'owner', 'project_id': self.home_id,
                 'data': {'key': 'secret:' + state['name'], 'scope': 'project', 'value': metadata,
-                         'secret_ref': receipt['secret_ref']}, 'tags': tags, 'source': state['intent']['source'],
+                         'secret_ref': receipt['secret_ref']}, 'tags': tags,
+                'source': state.get('resolution', {}).get('source', state['intent']['source']),
                 'change_reason': 'Explicit store-and-catalog: verified storage receipt', 'authority_generation': generation}
 
     def _catalog(self, state):
@@ -261,6 +286,15 @@ class SecretCatalog:
         except Exception as error:
             code = getattr(error, 'code', None) or getattr(error, 'status', None) or 'catalog_unavailable'
             state.update(state='catalog_pending', error=code)
+            if code == 'revision_conflict' and 'catalog_request' in state:
+                try:
+                    current = self.lookup(state['name'])
+                except Exception:
+                    pass  # Keep the exact rejected request; retry can retrieve the review later.
+                else:
+                    state.update(state='catalog_conflict', conflict={'current': current,
+                        'expected_revision': current['revision'] if current else 0,
+                        'rejected_request_key': state['catalog_request']['request_key']})
             if code == 'context_stale' and 'catalog_request' in state:
                 # Definitively rejected, not an uncertain write: refresh authority but
                 # retain the original pointer CAS and storage receipt. Never re-upload.
@@ -270,6 +304,7 @@ class SecretCatalog:
             return self._status(state)
         state.update(state='completed', catalog_ref={'record_id': result['record_id'], 'revision': result['revision']})
         state.pop('error', None)
+        state.pop('conflict', None)
         self._save(state)
         return self._status(state)
 
@@ -293,6 +328,11 @@ def main(argv=None):
     store.add_argument('--max-bytes', type=int, default=DEFAULT_STREAM_LIMIT)
     retry = commands.add_parser('retry-catalog')
     retry.add_argument('operation_id')
+    resolve = commands.add_parser('resolve-catalog')
+    resolve.add_argument('operation_id')
+    resolve.add_argument('--expected-revision', type=int, required=True)
+    resolve.add_argument('--source-origin', required=True)
+    resolve.add_argument('--source-excerpt', required=True)
     lookup = commands.add_parser('lookup')
     lookup.add_argument('name')
     args = parser.parse_args(argv)
@@ -303,6 +343,9 @@ def main(argv=None):
             result = {'record': controller.lookup(args.name), 'home_id': controller.home_id}
         elif args.action == 'retry-catalog':
             result = controller.retry_catalog(args.operation_id)
+        elif args.action == 'resolve-catalog':
+            result = controller.resolve_catalog(args.operation_id, expected_revision=args.expected_revision,
+                source={'origin': args.source_origin, 'excerpt': args.source_excerpt})
         else:
             options = vars(args).copy()
             options.pop('action')

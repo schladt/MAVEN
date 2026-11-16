@@ -523,6 +523,13 @@ class WorkflowApp(App):
                     message = "Paused; preserve the receipts and resume." if code in (3, 130) else "Not complete. Review the diagnostics and preserved recovery state."
             except OperationPaused as error:
                 code, message = 130, str(error)
+            except subprocess.CalledProcessError as error:
+                # Arguments/output may contain credentials; retain only the child exit status.
+                code, message = 2, (
+                    f"Child process exited with status {error.returncode}. "
+                    "Check the selected executable, network and trusted CA settings; "
+                    "preserve the operation receipts and resume the same operation. "
+                    "This is not proof of an authentication failure or rollback.")
             except Exception as error:
                 # Raw SDK/subprocess exceptions can contain private request material.
                 code, message = 2, f"Stopped ({type(error).__name__}). Preserve existing receipts; no success or rollback is implied."

@@ -168,7 +168,7 @@ def record_installation(home, source, owned_paths, skill_references, *, cache_ro
 
 def _fragment():
     return {'actions': [], 'retained': [], 'warnings': [], 'targets': [],
-            'requires': ['writers-quiescent', 'harnesses-stopped']}
+            'requires': ['writers-quiescent', 'harness-config-risk']}
 
 
 def _action(kind, target, stage, **details):
@@ -328,10 +328,30 @@ def _shared_skills(home, selected_homes):
     return protected, unknown
 
 
+def _installation_intents(home):
+    """Pending installation journals are evidence, never proof of owned runtime bytes."""
+    pending = {}
+    for kind in ('runtime-installations', 'skill-installations'):
+        for path in sorted((home / 'runtime' / kind).glob('*.json')):
+            value = read_private(path)
+            if (value.get('schema') != 1 or value.get('home') != str(home)
+                    or type(value.get('completed')) is not bool):
+                raise UninstallError('Malformed installation intent; preserve it before removal')
+            if not value['completed']:
+                pending[str(path)] = file_digest(path)
+    return pending
+
+
 def plan_machine(home, *, selected_homes=(), offline=False, export=None, adopt_legacy=False):
     home = checked_path(home)
     fragment = _fragment()
     _guard(fragment, home, offline=offline)
+    intents = _installation_intents(home)
+    fragment['actions'][0]['details']['installation_intents'] = intents
+    if intents:
+        fragment['warnings'].append('Unfinished installation intents are not completed ownership: '
+            + ', '.join(intents) + '. Their exact receipts will be retained externally; '
+            'removal does not finish or adopt their partially installed targets.')
     fragment['targets'].append({'scope': 'machine', 'home': str(home)})
     fragment['warnings'].append('Discovery covers only default, MAVEN_HOME, explicit and installer-registered homes; external shared caches are never removed.')
     if offline:
@@ -414,14 +434,15 @@ def plan_machine(home, *, selected_homes=(), offline=False, export=None, adopt_l
                   if _exists(home / name)]
     fragment['warnings'].append(
         f'The whole installation folder {home} is permanently deleted after removal, including private '
-        'settings (.env), saved AWS sign-in caches, unfinished setup state and detached session records'
+        'settings (.env), saved AWS sign-in caches and unfinished setup state'
         + (', the MAVEN Home selection and local start-choice records (' + ', '.join(home_files) + ')'
            if home_files else '')
         + (', and these files that did not match the installer receipt: ' + ', '.join(item['path'] for item in inside)
            if inside else '') + '. '
-        + ('Settings and runtime records are archived to the export directory first; sign-in caches, '
-           'locks and detached session records are not archived.' if export is not None else
-           'No export directory was given, so nothing is archived.'))
+        + ('Settings and runtime records are archived to the export directory first; sign-in caches '
+           'and locks are not archived.' if export is not None else
+           'No optional settings export was requested.')
+        + ' Exact detached registrations remain privately in the external operation directory; login caches are never copied there.')
     return fragment
 
 
@@ -676,6 +697,31 @@ def _purge_home(action, progress, save):
             'token_revocation_claimed': False}
 
 
+def _preserve_installation_intents(action, progress, save):
+    expected = action['details'].get('installation_intents')
+    if expected is None:
+        return
+    if _installation_intents(Path(action['details']['home'])) != expected:
+        raise UninstallError('Installation intents changed since review; preserve and replan')
+    if expected and not action.get('operation_dir'):
+        raise UninstallError('Unfinished installation intents require an external removal operation directory')
+    receipts = {}
+    for source, checksum in expected.items():
+        value = read_private(source)
+        if file_digest(source) != checksum:
+            raise UninstallError('Installation intent changed while preserving recovery evidence')
+        destination = Path(action['operation_dir']) / 'evidence' / ('installation-' + digest(source) + '.json')
+        evidence = {'source': source, 'source_sha256': checksum, 'receipt': value,
+                    'installation_completed_claimed': False}
+        if _exists(destination) and read_private(destination) != evidence:
+            raise UninstallError('External installation intent evidence changed')
+        save_private(destination, evidence)
+        receipts[source] = str(destination)
+    if receipts:
+        progress['installation_intent_evidence'] = receipts
+        save()
+
+
 def execute(action, progress, save):
     details = action['details']
     home = checked_path(details['home'], exists=False)
@@ -694,6 +740,7 @@ def execute(action, progress, save):
             raise UninstallError('Malformed removal marker; preserve it for recovery')
         kind = action['kind']
         if kind == 'local_barrier':
+            _preserve_installation_intents(action, progress, save)
             progress['intent'] = 'barrier'
             save()
             marker['whole_home'] = marker['whole_home'] or root is None
@@ -772,7 +819,9 @@ def _execution_locks(home, root):
         for checkout in sorted(roots):
             runtime = checked_path(checkout, exists=False) / '.maven/runtime'
             if _exists(runtime / 'cloud-workspace.lock'):
-                raise UninstallError('Workspace writer lock exists; resolve its owner before uninstall')
+                raise UninstallError('Legacy workspace writer evidence exists; use explicit workspace recovery '
+                                     'with actual writer quiescence before uninstall')
+            stack.enter_context(_lock(runtime / 'cloud-workspace-v2.lock'))
             if (runtime / 'project-setup').is_dir():
                 stack.enter_context(_lock(runtime / 'project-setup/lock'))
             sessions = runtime / 'sessions'
@@ -808,7 +857,9 @@ def _detach_registry(action, progress, save):
         item['access_revoked'] = True
     evidence = {'schema': 1, 'action': digest(action), 'cloud_closure_claimed': False,
                 'sessions': selected, 'reservations': reservations, 'original_registry': original}
-    destination = home / 'runtime' / ('uninstall-sessions-' + digest(action) + '.json')
+    operation = action.get('operation_dir')
+    destination = (Path(operation) / 'evidence' if operation else home / 'runtime') / (
+        'uninstall-sessions-' + digest(action) + '.json')
     updated = copy.deepcopy(state)
     for key in selected:
         del updated['sessions'][key]
@@ -829,7 +880,7 @@ def _detach_registry(action, progress, save):
 
 
 def _runtime_exclusions(runtime):
-    excluded = ['registry.lock', 'uninstall.json', 'sessions.json',
+    excluded = ['registry.lock', 'cloud-workspace-v2.lock', 'uninstall.json', 'sessions.json',
                 'aws-login-cache', 'aws-deploy-login-cache', 'setup/lock', 'project-setup/lock']
     sessions = runtime / 'sessions'
     if sessions.is_dir():
@@ -941,7 +992,9 @@ def _approved_registry_subset(action, state):
     home = Path(details['home'])
     marker = read_private(home / 'runtime/uninstall.json')
     for identifier in marker.get('actions', {}):
-        receipt = home / 'runtime' / ('uninstall-sessions-' + identifier + '.json')
+        operation = action.get('operation_dir')
+        receipt = (Path(operation) / 'evidence' if operation else home / 'runtime') / (
+            'uninstall-sessions-' + identifier + '.json')
         if not _exists(receipt):
             continue
         evidence = read_private(receipt)
@@ -1080,6 +1133,12 @@ def _finalize_machine(action, progress, save):
     if _exists(completed) and read_private(completed) != receipt:
         raise UninstallError('A different completion receipt exists; preserve it for recovery')
     save_private(completed, receipt)
+    if action.get('operation_dir'):
+        external = Path(action['operation_dir']) / 'evidence' / ('machine-' + digest(action) + '.json')
+        evidence = {'receipt': receipt, 'barrier': marker}
+        if _exists(external) and read_private(external) != evidence:
+            raise UninstallError('External machine completion evidence changed')
+        save_private(external, evidence)
     return {'status': 'detached', 'installation_active': False, 'home': str(home),
             'retained_artifacts_remain': True, 'token_revocation_claimed': False}
 

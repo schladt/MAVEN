@@ -18,7 +18,7 @@ import sys
 import time
 import uuid
 
-from .common import (UninstallError, canonical, checked_path, digest, file_digest,
+from .common import (PauseRequested, UninstallError, canonical, checked_path, digest, file_digest,
                      private_directory, read_private, save_private)
 
 HANDLERS = {'local', 'cloud', 'lifecycle'}
@@ -235,6 +235,44 @@ def build_plan(args):
             export_target = str(Path(args.export).expanduser().absolute() / ('machine-' + digest(home)[:16])) if args.export else None
             _merge(plan, local.plan_machine(home, selected_homes=tuple(homes), offline=args.offline,
                                            export=export_target, adopt_legacy=args.adopt_legacy))
+    if args.cloud:
+        external_dependencies = {'AWS_CONFIG_FILE': os.environ.get('AWS_CONFIG_FILE', str(Path.home() / '.aws/config'))}
+        external_dependencies.update({name: os.environ[name] for name in (
+            'AWS_SHARED_CREDENTIALS_FILE', 'AWS_CA_BUNDLE', 'REQUESTS_CA_BUNDLE', 'SSL_CERT_FILE')
+            if os.environ.get(name)})
+        for name, value in external_dependencies.items():
+            selected_path = Path(value).expanduser().absolute()
+            external_dependencies[name] = str(selected_path)
+            if any(_inside(location, Path(home)) for home in plan['machine_homes']
+                   for location in (selected_path, selected_path.resolve())):
+                raise UninstallError(name + ' is inside a removal target; configure its protected external '
+                                     'location before planning cloud recovery. No configuration or credentials were copied.')
+        from tools.tui.runtime import _copy_file, _matching_python, _stage_dependencies
+        plan['recovery_python'] = _matching_python(plan['machine_homes'], plan['recovery_python'])
+        _stage_dependencies(directory / 'cloud-runtime', plan_digest=identifier, ui=False)
+        plan['cloud_recovery'] = {
+            'manifest_sha256': file_digest(directory / 'cloud-runtime/manifest.json'),
+            'configuration': 'private lifecycle environments and reviewed deployment identity; no login caches copied',
+            'authentication': 'fresh deployment-profile login may be required after local cache deletion',
+            'external_environment': external_dependencies,
+        }
+        for action in plan['actions']:
+            if action['handler'] == 'cloud':
+                action['details']['portable_recovery'] = True
+                cache = action['details']['identity'].get('MAVEN_DEPLOY_LOGIN_CACHE')
+                if cache and any(_inside(Path(cache).expanduser().absolute(), Path(home))
+                                 for home in plan['machine_homes']):
+                    action['details']['recovery_login_cache'] = str(directory / 'authentication/deploy')
+            elif action['handler'] == 'lifecycle':
+                source = checked_path(Path(action['details']['home']) / '.env')
+                local._private_environment(source)
+                destination = directory / 'configuration' / (digest(str(source)) + '.env')
+                if _copy_file(source, destination) != action['details']['environment_sha256']:
+                    raise UninstallError('Lifecycle environment changed while staging recovery')
+                action['details']['recovery_environment'] = str(destination)
+        plan['warnings'].append('Cloud dependencies and private lifecycle settings are retained outside the installation. '
+                                'Login caches are never copied. If the original deployment cache is removed, '
+                                'fresh login uses the separately reviewed external recovery cache, never recreating the purged home.')
     plan['requires'] = sorted(set(plan['requires']))
     seen = set()
     actions = []
@@ -268,7 +306,12 @@ def build_plan(args):
                  'plan_digest': plan['plan_digest'], 'state': 'planned', 'actions': {}, 'created_at': _utc()})
     return {'status': 'planned', 'plan_path': str(directory / 'plan.json'), 'plan': plan,
             'recovery_command': [plan['recovery_python'], str(directory / 'runner' / 'run.py'),
-                                 'status', '--plan', str(directory / 'plan.json')]}
+                                 'status', '--plan', str(directory / 'plan.json')],
+            'resume_command': [plan['recovery_python'], '-B', str(directory / 'runner/run.py'),
+                               'resume', '--plan', str(directory / 'plan.json'),
+                               '--confirm', plan['plan_digest']],
+            'resume_approval_requirements': plan['requires'],
+            'resume_separate_confirmations': plan['confirmations']}
 
 
 def _load_plan(path):
@@ -340,16 +383,27 @@ def _status(plan, journal):
     for scope, states in by_scope.items():
         if 'unresolved' in states:
             scope_status[scope] = 'blocked'
+        elif 'pending-provider' in states:
+            scope_status[scope] = 'pending-provider'
         elif states and all(state == 'completed' for state in states):
             scope_status[scope] = 'completed'
         elif any(state != 'pending' for state in states):
             scope_status[scope] = 'in_progress'
         else:
             scope_status[scope] = 'pending'
+    homes = {}
+    for home in plan.get('machine_homes', []):
+        purge = next((item for item in plan['actions']
+                      if item['kind'] == 'local_home_purge' and item['target'] == home), None)
+        homes[home] = ('removed' if purge and journal['actions'].get(purge['id'], {}).get('state') == 'completed'
+                       else 'removal_pending' if purge else 'retained')
     return {'status': journal['state'], 'operation_id': plan['operation_id'],
             'plan_digest': plan['plan_digest'], 'scopes': plan['scopes'],
             'scope_status': scope_status, 'targets': plan['targets'], 'actions': actions,
-            'retained': plan['retained'], 'warnings': plan['warnings'],
+            'retained': plan['retained'], 'warnings': plan['warnings'], 'home_retention': homes,
+            'recovery_capability': 'cloud-dependencies-and-local-stdlib' if plan.get('cloud_recovery') else 'local-stdlib',
+            'recovery_directory': plan['operation_dir'],
+            'retention_basis': 'Recorded completed effects only; status does not re-inspect local or cloud state',
             'last_action': journal.get('last_action'),
             'pending': [identity for identity, entry in actions.items() if entry['state'] != 'completed'],
             'last_error': journal.get('last_error'), 'live_state_checked': False}
@@ -359,12 +413,14 @@ def _approve(plan, args):
     if args.confirm != plan['plan_digest']:
         raise UninstallError('--confirm must equal the complete reviewed plan digest')
     required = set(plan['requires'])
-    if required - {'writers-quiescent', 'harnesses-stopped', 'purge', 'abandon-sessions'}:
+    if required - {'writers-quiescent', 'harnesses-stopped', 'harness-config-risk', 'purge', 'abandon-sessions'}:
         raise UninstallError('unsupported approval requirement; preserve this plan')
     if 'writers-quiescent' in required and not args.writers_quiescent:
         raise UninstallError('stop affected writers and explicitly attest --writers-quiescent')
     if 'harnesses-stopped' in required and not args.harnesses_stopped:
         raise UninstallError('close affected assistant harnesses and attest --harnesses-stopped')
+    if 'harness-config-risk' in required and not getattr(args, 'harness_config_risk', False):
+        raise UninstallError('acknowledge running harness configuration rewrite/reload risk with --harness-config-risk')
     confirmations = plan['confirmations']
     if args.confirm_purge != confirmations.get('purge'):
         raise UninstallError('--confirm-purge must name the exact reviewed instance, only for purge')
@@ -374,17 +430,23 @@ def _approve(plan, args):
 
 def _resume_arguments(args):
     result = ['resume', '--plan', str(Path(args.plan).absolute()), '--confirm', args.confirm]
-    for flag in ('writers_quiescent', 'harnesses_stopped'):
-        if getattr(args, flag):
+    for flag in ('writers_quiescent', 'harnesses_stopped', 'harness_config_risk'):
+        if getattr(args, flag, False):
             result.append('--' + flag.replace('_', '-'))
     for flag in ('confirm_purge', 'confirm_abandon'):
         if getattr(args, flag):
             result.extend(['--' + flag.replace('_', '-'), getattr(args, flag)])
+    if getattr(args, 'wait_seconds', 0):
+        result.extend(['--wait-seconds', str(args.wait_seconds)])
     return result
 
 
 def _reexec_runner(path, plan, args, *, system=False):
     runner = path.parent / 'runner' / 'run.py'
+    if plan.get('cloud_recovery'):
+        from tools.tui.runtime import cloud_command
+        command, environment = cloud_command(plan, path.parent, _resume_arguments(args))
+        os.execve(command[0], command, environment)
     executable = sys.executable
     if system:
         executable = _external_python(plan['machine_homes'], plan['recovery_python'])
@@ -399,11 +461,15 @@ def apply(args, *, reexec=True, progress=None, should_pause=None):
     path, plan = _load_plan(args.plan)
     _approve(plan, args)
     _verify_runner(plan, path.parent)
+    if plan.get('cloud_recovery'):
+        from tools.tui.runtime import cloud_command
+        cloud_command(plan, path.parent, [])
     if getattr(args, 'tui_worker', False):
         _verify_worker(path, plan)
         reexec = False
     # Execute exactly the reviewed implementation even if the installation was updated.
-    if reexec and Path(__file__).resolve() != path.parent / 'runner/tools/uninstall/cli.py':
+    if reexec and (Path(__file__).resolve() != path.parent / 'runner/tools/uninstall/cli.py'
+                   or (plan.get('cloud_recovery') and str(path.parent / 'cloud-runtime/site') not in sys.path)):
         _reexec_runner(path, plan, args)
     journal_path = path.parent / 'journal.json'
     with _operation_lock(path.parent):
@@ -427,6 +493,7 @@ def apply(args, *, reexec=True, progress=None, should_pause=None):
         journal['state'] = 'applying'
         journal.pop('last_error', None)
         save()
+        provider_pending = False
         for action in plan['actions']:
             entry = journal['actions'].setdefault(action['id'], {'state': 'pending', 'progress': {}})
             if entry['state'] == 'completed':
@@ -448,8 +515,24 @@ def apply(args, *, reexec=True, progress=None, should_pause=None):
                                       'target': action['target']}
             save()
             try:
+                if provider_pending and action['handler'] != 'local':
+                    raise UninstallError('Pending provider work permits only independent local actions')
                 module = importlib.import_module('tools.uninstall.' + action['handler'])
-                result = module.execute(action, entry['progress'], save)
+                if action['handler'] == 'cloud':
+                    with module.provider_wait(getattr(args, 'wait_seconds', 0), should_pause):
+                        result = module.execute(action, entry['progress'], save)
+                else:
+                    result = module.execute(action, entry['progress'], save)
+                if (isinstance(result, dict) and result.get('status') == 'pending-provider'
+                        and action['handler'] == 'cloud' and plan.get('cloud_recovery')):
+                    # Only the secret-window boundary, after all other cloud effects,
+                    # grants local independence. Unknown failures still stop immediately.
+                    if result.get('independent_local_safe') is not True:
+                        raise UninstallError('Cloud recovery has not established local independence')
+                    entry['result'], entry['state'] = result, 'pending-provider'
+                    provider_pending = True
+                    save()
+                    continue
                 if not isinstance(result, dict) or result.get('status') not in SUCCESS:
                     if isinstance(result, dict):
                         entry['result'] = result
@@ -457,6 +540,10 @@ def apply(args, *, reexec=True, progress=None, should_pause=None):
                 entry['result'] = result
                 entry['state'] = 'completed'
                 save()
+            except PauseRequested:
+                entry['state'], journal['state'] = 'pending', 'paused'
+                save()
+                return status(path)
             except Exception as error:
                 entry['state'] = 'unresolved'
                 journal['state'] = 'blocked'
@@ -465,7 +552,7 @@ def apply(args, *, reexec=True, progress=None, should_pause=None):
                 journal['last_error'] = {'action_id': action['id'], 'kind': action['kind'], 'message': message}
                 save()
                 return status(path)
-        journal['state'] = 'completed'
+        journal['state'] = 'pending-provider' if provider_pending else 'completed'
         save()
     return status(path)
 
@@ -503,8 +590,12 @@ def parser():
         command.add_argument('--confirm', required=True, help='Full reviewed plan SHA-256')
         command.add_argument('--writers-quiescent', action='store_true')
         command.add_argument('--harnesses-stopped', action='store_true')
+        command.add_argument('--harness-config-risk', action='store_true',
+                             help='Acknowledge running harnesses may rewrite removed configuration and need restart')
         command.add_argument('--confirm-purge', metavar='INSTANCE_UUID')
         command.add_argument('--confirm-abandon', metavar='INSTANCE_UUID')
+        command.add_argument('--wait-seconds', type=int, choices=range(301), default=0,
+                             metavar='0..300', help='Bounded cancellable provider wait per cloud action')
         command.add_argument('--tui-worker', action='store_true', help=argparse.SUPPRESS)
     inspect = commands.add_parser('status', help='Read local receipts without cloud calls')
     inspect.add_argument('--plan', required=True, type=Path)
@@ -582,7 +673,7 @@ def _worker(args):
 
 
 def _exit_status(result):
-    return {'blocked': 2, 'paused': 3}.get(result['status'], 0)
+    return {'blocked': 2, 'paused': 3, 'pending-provider': 4}.get(result['status'], 0)
 
 
 def _interactive():

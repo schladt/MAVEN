@@ -147,9 +147,9 @@ class SessionRecoveryTests(unittest.TestCase):
         with self.assertRaises(BoundaryError):
             memory.project_context()
 
-    def test_identity_failure_revokes_shared_access_but_transient_failure_does_not(self):
+    def test_git_identity_failure_preserves_shared_memory_access(self):
         from tools.git_workflow import start_main
-        for failure, revoked in (('unexpected_login_identity', True), ('transport_unavailable', False)):
+        for failure in ('unexpected_login_identity', 'transport_unavailable'):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 home = Path(directory).resolve()
                 root = home / 'project'
@@ -172,11 +172,9 @@ class SessionRecoveryTests(unittest.TestCase):
                         contextlib.redirect_stdout(io.StringIO()) as output:
                     self.assertEqual(start_main(['--root', str(root), '--env', str(environment), '--json']), 2)
                 report = json.loads(output.getvalue())
-                self.assertEqual(logout.call_count, int(revoked))
-                self.assertEqual(registry.inspect(root, peer)['session']['state'],
-                                 'access_revoked' if revoked else 'active')
-                if revoked:
-                    self.assertIn(peer, report['local_access_cleanup']['affected_sessions'])
+                logout.assert_not_called()
+                self.assertEqual(registry.inspect(root, peer)['session']['state'], 'active')
+                self.assertNotIn('local_access_cleanup', report)
 
 class MemoryCloud:
     """Deterministic cloud fixture with versioned records and exact request receipts."""
@@ -466,11 +464,187 @@ class MemoryLifecycleTests(unittest.TestCase):
         with self.assertRaises(BoundaryError):
             self.service.save('note', self.note, source=self.source)
         restored = SessionService(self.root, self.identifier, env=self.env, client=self.cloud)
-        receipt = restored.recover()['recovery']
+        receipt = restored.recover(workers_stopped=True)['recovery']
         self.assertEqual(receipt['result']['request_key'], key)
         replay = restored.save('note', self.note, source=self.source, scope='universal', request_key=key)
         self.assertEqual(MemoryBoundary.ref(replay), receipt['record'])
         self.assertEqual(len([record for record in self.cloud.records.values() if record['kind'] == 'note']), 1)
+
+    def test_historical_claim_replay_never_reports_released_or_reassigned_lease(self):
+        self.service.initialize()
+        task = self.service.save('task', {'title': 'Check', 'description': '', 'state': 'open'}, source=self.source)
+        key = str(uuid.uuid4())
+        arguments = dict(action='claim', expected_revision=1, lease_seconds=60,
+                         source=self.source, request_key=key)
+        claimed = self.service.claim(task['record_id'], **arguments)
+        self.cloud.records[task['record_id']]['claim'] = None  # Lease expiry, unchanged revision.
+        replayed = self.service.claim(task['record_id'], **arguments)
+        self.assertIsNone(replayed['claim'])
+        self.assertEqual(replayed['claim_receipt']['fence'], claimed['claim_receipt']['fence'])
+        self.cloud.records[task['record_id']]['revision'] = 3
+        self.cloud.records[task['record_id']]['claim'] = {
+            'session_id': str(uuid.uuid4()), 'fence': 3, 'expires_at': '2099-01-01T00:00:00Z'}
+        replayed = self.service.claim(task['record_id'], **arguments)
+        self.assertIsNone(replayed['claim'])
+        self.assertEqual(replayed['revision'], 2)
+
+    def test_recovery_requires_exact_stopped_writers_and_preserves_unknown_request(self):
+        self.service.initialize()
+        self.cloud.lose_next = True
+        with self.assertRaises(MemoryClientError):
+            self.service.save('note', self.note, source=self.source)
+        pending = (self.root / self.service.pending_path).read_bytes()
+        token = str(uuid.uuid4())
+        with self.service.registry.transaction() as state:
+            state['sessions'][self.identifier]['writers'] = [token]
+        for arguments in ({}, {'workers_stopped': True},
+                          {'workers_stopped': True, 'writer_tokens': [str(uuid.uuid4())]}):
+            with self.subTest(arguments=arguments), self.assertRaises(BoundaryError):
+                self.service.recover(**arguments)
+            self.assertEqual((self.root / self.service.pending_path).read_bytes(), pending)
+        with patch.object(self.cloud, 'invoke', side_effect=MemoryClientError('transport_unavailable')):
+            with self.assertRaises(MemoryClientError):
+                self.service.recover(workers_stopped=True, writer_tokens=[token])
+        self.assertEqual(self.service.registry.inspect(self.root, self.identifier)['session']['writers'], [token])
+        result = self.service.recover(workers_stopped=True, writer_tokens=[token])
+        self.assertEqual(result['status'], 'recovered')
+        self.assertEqual(self.service.registry.inspect(self.root, self.identifier)['session']['writers'], [])
+        self.assertIsNone(self.service.status()['pending_request'])
+        self.git.assert_not_called()
+
+    def test_barrier_allows_status_and_receipt_observation_but_never_replay(self):
+        from tools.memory.maintenance import Maintenance
+        self.service.initialize()
+        controller = Maintenance(self.service)
+        controller.enqueue('Retain accepted work', source=self.source)
+        self.cloud.lose_next = True
+        with self.assertRaises(MemoryClientError):
+            self.service.save('note', self.note, source=self.source)
+        pending = (self.root / self.service.pending_path).read_bytes()
+        ledger = (self.root / controller.path).read_bytes()
+        registry = (self.env.parent / 'runtime/sessions.json').read_bytes()
+        save_private(self.env.parent, 'runtime/uninstall.json', {
+            'schema': 1, 'whole_home': False, 'project_roots': [str(self.root)], 'actions': {}})
+        self.assertEqual(controller.status()['pending_count'], 1)
+        self.assertEqual(len(controller.summary()['memory_summary']['pending']), 1)
+        self.assertIsNotNone(self.service.status()['pending_request'])
+        with patch.object(self.cloud, 'load_context', side_effect=AssertionError('observation loaded authority')):
+            result = self.service.recover(observe_only=True)
+        self.assertEqual(result['status'], 'observed')
+        self.assertEqual((self.root / self.service.pending_path).read_bytes(), pending)
+        self.assertEqual((self.root / controller.path).read_bytes(), ledger)
+        self.assertEqual((self.env.parent / 'runtime/sessions.json').read_bytes(), registry)
+        self.cloud.requests.clear()
+        self.assertEqual(self.service.recover(observe_only=True)['recovery']['status'], 'pending')
+        calls = len(self.cloud.calls)
+        with self.assertRaises(BoundaryError):
+            self.service.recover(workers_stopped=True)
+        self.assertFalse(any(route == '/v1/memory/write' for route, _ in self.cloud.calls[calls:]))
+        self.assertEqual((self.root / self.service.pending_path).read_bytes(), pending)
+
+    def test_crash_before_submission_replays_only_original_body_with_exact_tokens(self):
+        self.service.initialize()
+        invoke = self.cloud.invoke
+
+        def interrupted(route, body):
+            if route == '/v1/memory/write':
+                raise MemoryClientError('outcome_unknown', request_key=body['request_key'])
+            return invoke(route, body)
+
+        with patch.object(self.cloud, 'invoke', side_effect=interrupted), self.assertRaises(MemoryClientError):
+            self.service.save('note', self.note, source=self.source)
+        request = read_private(self.root, self.service.pending_path)
+        token = str(uuid.uuid4())
+        with self.service.registry.transaction() as state:
+            state['sessions'][self.identifier]['writers'] = [token]
+        calls = len(self.cloud.calls)
+        recovered = self.service.recover(workers_stopped=True, writer_tokens=[token])
+        writes = [body for route, body in self.cloud.calls[calls:] if route == '/v1/memory/write']
+        self.assertEqual(writes, [request['body']])
+        self.assertEqual(recovered['recovery']['result']['request_key'], request['body']['request_key'])
+        self.assertEqual(self.service.registry.inspect(self.root, self.identifier)['session']['writers'], [])
+
+    def test_process_crash_leaves_exact_writer_recoverable_without_git(self):
+        import subprocess
+        import sys
+        self.service.initialize()
+        script = (
+            'import os, sys\n'
+            'from tools.coordination import SessionRegistry\n'
+            'registry = SessionRegistry(sys.argv[1])\n'
+            'with registry.memory_writer(sys.argv[2], sys.argv[3]):\n'
+            '    os._exit(0)\n'
+        )
+        result = subprocess.run([sys.executable, '-c', script, str(self.env.parent),
+                                 str(self.root), self.identifier],
+                                cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tokens = self.service.registry.inspect(self.root, self.identifier)['session']['writers']
+        self.assertEqual(len(tokens), 1)
+        with self.assertRaises(BoundaryError):
+            self.service.save('note', self.note, source=self.source)
+        self.assertEqual(self.service.recover(workers_stopped=True, writer_tokens=tokens)['status'], 'recovered')
+        self.assertEqual(self.service.save('note', self.note, source=self.source)['revision'], 1)
+
+    def test_bare_git_candidate_cannot_veto_close_but_real_reservation_and_effects_do(self):
+        self.service.initialize()
+        checkpoint = self.service.checkpoint(summary='Memory handover', refs=[], cutoff=0,
+                                             checkpoint_id=str(uuid.uuid4()))['checkpoint']
+        path = self.service.runtime + '/approval.json'
+        for status in ('preparing', 'applying', 'unsynchronized', 'synchronized', 'memory_ready'):
+            with self.subTest(status=status):
+                save_private(self.root, path, {'status': status})
+                with self.assertRaises(BoundaryError):
+                    self.service.finish(summary='Memory handover', checkpoint_ref=checkpoint)
+                self.assertEqual(self.cloud.records[self.identifier]['data']['state'], 'active')
+        candidate = {'status': 'approval_required', 'proposed': {'candidate_digest': 'a' * 64}}
+        save_private(self.root, path, candidate)
+        self.service.registry.reserve(self.root, self.identifier)
+        with self.assertRaises(BoundaryError):
+            self.service.finish(summary='Memory handover', checkpoint_ref=checkpoint)
+        self.assertEqual(self.cloud.records[self.identifier]['data']['state'], 'active')
+        self.service.registry.release(self.root, self.identifier)
+        self.assertEqual(self.service.finish(summary='Memory handover', checkpoint_ref=checkpoint)['status'], 'closed')
+        self.assertEqual(read_private(self.root, path), candidate)
+
+    def test_reservation_racing_closure_intent_cannot_close_shared_git_session(self):
+        self.service.initialize()
+        checkpoint = self.service.checkpoint(summary='Memory handover', refs=[], cutoff=0,
+                                             checkpoint_id=str(uuid.uuid4()))['checkpoint']
+
+        def raced_save(root, path, value):
+            if path == self.service.runtime + '/finish.json' and value.get('status') == 'closing':
+                self.service.registry.reserve(self.root, self.identifier)
+            save_private(root, path, value)
+
+        with patch('tools.memory.lifecycle.save_private', side_effect=raced_save):
+            with self.assertRaises(BoundaryError):
+                self.service.finish(summary='Memory handover', checkpoint_ref=checkpoint)
+        self.assertEqual(self.cloud.records[self.identifier]['data']['state'], 'active')
+        self.service.registry.release(self.root, self.identifier)
+        with self.assertRaises(BoundaryError):
+            self.service.registry.reserve(self.root, self.identifier)
+        with self.assertRaises(BoundaryError):
+            self.service.registry.use_git(self.root, self.identifier)
+        self.assertEqual(self.service.finish(summary='Memory handover', checkpoint_ref=checkpoint)['status'], 'closed')
+
+    def test_memory_writer_allows_only_its_own_source_writer_context(self):
+        from contextvars import Context
+        self.service.initialize()
+        with self.service.registry.writer(self.root, self.identifier):
+            self.assertEqual(self.service.save('note', self.note, source=self.source)['revision'], 1)
+            with self.assertRaises(BoundaryError):
+                Context().run(self.service.save, 'note', self.note, source=self.source)
+
+    def test_instruction_listing_refuses_repeated_cursor(self):
+        self.service.initialize()
+        page = {'slug': 'core', 'revision': 1, 'page_kind': 'directive', 'data_scope': 'owner'}
+        response = {'status': 'ready', 'data': {
+            'pages': [page], 'authority_generation': 1, 'next_after_slug': 'core'}}
+        with patch.object(self.cloud, 'invoke', return_value=response) as invoke:
+            with self.assertRaisesRegex(BoundaryError, 'progressing'):
+                self.service.instructions()
+        self.assertEqual(invoke.call_count, 2)
 
     def test_claim_fences_and_definitive_revision_conflict_leave_no_uncertain_write(self):
         self.service.initialize()
@@ -525,11 +699,11 @@ class MemoryLifecycleTests(unittest.TestCase):
                             self.service.save('note', self.note, source=self.source, request_key=key)
                         self.assertEqual(self.service.status()['pending_request']['request_key'], key)
                         with patch.object(self.cloud, 'invoke', side_effect=unknown), self.assertRaises(MemoryClientError):
-                            self.service.recover()
+                            self.service.recover(workers_stopped=True)
                         self.assertEqual(self.service.status()['pending_request']['request_key'], key)
                     with patch.object(self.cloud, 'invoke', side_effect=reject), self.assertRaises(MemoryClientError) as error:
                         if recovery:
-                            self.service.recover()
+                            self.service.recover(workers_stopped=True)
                         else:
                             self.service.save('note', self.note, source=self.source, request_key=key)
                     self.assertEqual(error.exception.code, code)
@@ -555,9 +729,9 @@ class MemoryLifecycleTests(unittest.TestCase):
                     return invoke(route, body)
 
                 with patch.object(self.cloud, 'invoke', side_effect=reject), self.assertRaises(MemoryClientError):
-                    self.service.recover()
+                    self.service.recover(workers_stopped=True)
                 self.assertEqual(self.service.status()['pending_request']['request_key'], key)
-        self.assertEqual(self.service.recover()['recovery']['result']['request_key'], key)
+        self.assertEqual(self.service.recover(workers_stopped=True)['recovery']['result']['request_key'], key)
         self.assertIsNone(self.service.status()['pending_request'])
 
     def test_owner_context_skips_synthetic_pages_without_reading_them(self):
@@ -599,8 +773,8 @@ class MemoryLifecycleTests(unittest.TestCase):
         self.service.initialize()
         maintenance = Maintenance(self.service)
         checkpoint_id = str(uuid.uuid4())
-        original = maintenance.checkpoint(summary='Original exact handover', checkpoint_id=checkpoint_id)
         other = maintenance.checkpoint(summary='Different handover', checkpoint_id=str(uuid.uuid4()))
+        original = maintenance.checkpoint(summary='Original exact handover', checkpoint_id=checkpoint_id)
         with patch.object(self.service.registry, 'finish_memory', side_effect=OSError('interrupted local release')):
             with self.assertRaises(OSError):
                 maintenance.finish(checkpoint_id)
@@ -637,7 +811,7 @@ class MemoryLifecycleTests(unittest.TestCase):
         restored = SessionService(self.root, self.identifier, env=self.env, client=self.cloud)
         with self.assertRaises(BoundaryError):
             restored.finish(summary='Preserved handover', checkpoint_ref=checkpoint)
-        recovered = restored.recover()['recovery']
+        recovered = restored.recover(workers_stopped=True)['recovery']
         self.assertEqual(recovered['result']['request_key'], key)
         calls = len(self.cloud.calls)
         self.assertEqual(restored.finish(summary='Preserved handover', checkpoint_ref=checkpoint)['status'], 'closed')
@@ -663,8 +837,8 @@ class MemoryLifecycleTests(unittest.TestCase):
             with self.subTest(status=status):
                 pending = dict(receipt, status=status)
                 save_private(self.root, path, pending)
-                with self.assertRaises(BoundaryError):
-                    self.service.save('note', self.note, source=self.source)
+                self.assertEqual(self.service.save('note', self.note, source=self.source)['revision'], 1)
+                self.assertEqual(self.service.initialize(resume=True)['status'], 'ready')
                 with self.assertRaises(ProjectError):
                     configure_git(self.root, remote='origin', accepted_url='git@example.org:owner/other.git',
                                   branch='main', env=self.env)
@@ -697,15 +871,18 @@ class MemoryLifecycleTests(unittest.TestCase):
         self.assertEqual(self.cloud.records[pending['record_id']]['revision'], 1)
         self.assertIsNone(self.service.status()['pending_request'])
 
-    def test_pending_publication_blocks_cutover_without_overwriting_receipt(self):
+    def test_pending_publication_preserves_receipt_and_blocks_only_shared_closure(self):
+        from tools.memory.maintenance import Maintenance
+        from tools.memory.boundary import read_private
         path = f'.maven/runtime/sessions/{self.identifier}/approval.json'
         receipt = {'status': 'unsynchronized', 'checkpoint_sha': 'a' * 40}
         save_private(self.root, path, receipt)
+        self.assertEqual(self.service.initialize()['status'], 'ready')
+        checkpoint = Maintenance(self.service).checkpoint(summary='Memory remains usable')
         with self.assertRaises(BoundaryError):
-            self.service.initialize()
-        from tools.memory.boundary import read_private
+            Maintenance(self.service).finish(checkpoint['checkpoint']['checkpoint_id'])
         self.assertEqual(read_private(self.root, path), receipt)
-        self.assertFalse(self.cloud.calls)
+        self.assertEqual(self.cloud.records[self.identifier]['data']['state'], 'active')
 
     def test_cli_reports_real_argument_errors_and_status_never_connects(self):
         from tools.workflow import main, start_main
@@ -778,12 +955,20 @@ class MemoryLifecycleTests(unittest.TestCase):
         from tools.workspace import Workspace, WorkspaceMemory
         self.service.initialize()
         workspace = Workspace(WorkspaceMemory(self.service))
+        incoming = self.root / '.maven/incoming'
+        incoming.mkdir(mode=0o700)
+        source = incoming / 'fixture.txt'
+        source.write_text('Synthetic private source')
+        source.chmod(0o600)
         with self.service.registry.writer(self.root, self.identifier):
-            setting = workspace.store('fixture', {'truthful': True})
-            operation = workspace.operation('fixture', 'completed', {'setting': MemoryBoundary.ref(setting)})
+            acquired = workspace.intake(path='.maven/incoming/fixture.txt', kind='reference',
+                origin='Synthetic fixture', sensitivity='Sensitive',
+                authorization='Fixture owner authorized preservation', disposition='retain')
         result = Maintenance(self.service).checkpoint(summary='Include workspace receipts')
         refs = self.cloud.records[result['checkpoint']['receipt']['record_id']]['data']['memory_refs']
-        self.assertIn(MemoryBoundary.ref(setting), refs)
+        self.assertIn(acquired['receipt'], refs)
+        operation = self.cloud.records[acquired['operation_id']]
+        self.assertEqual(operation['data']['state'], 'completed')
         self.assertIn(MemoryBoundary.ref(operation), refs)
 
     def peer_session(self, *, project=None, state='active', revision=3):
@@ -843,7 +1028,7 @@ class MemoryLifecycleTests(unittest.TestCase):
         with self.assertRaises(MemoryClientError):
             self.service.close_peer(peer, expected_revision=3, source=self.source, reason='Owner confirmed it stopped')
         self.assertEqual(self.service.status()['pending_request']['record_id'], peer)
-        recovered = self.service.recover()['recovery']
+        recovered = self.service.recover(workers_stopped=True)['recovery']
         self.assertEqual(recovered['record'], {'record_id': peer, 'revision': 4})
         self.assertEqual(self.cloud.records[peer]['data']['state'], 'abandoned')
         self.assertEqual(self.cloud.records[self.identifier]['data']['state'], 'active')

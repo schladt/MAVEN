@@ -80,7 +80,9 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual(names[first_new:], ['012_agentic_memory.sql', '013_performance.sql', '014_authority_guard.sql',
                                              '015_home_context.sql', '016_cleanup.sql', '017_project_archive_visibility.sql',
                                              '018_skill_discovery.sql', '019_secret_catalog.sql',
-                                             '020_secret_adapter_grants.sql', '021_secret_adapter_scope_guard.sql'])
+                                             '020_secret_adapter_grants.sql', '021_secret_adapter_scope_guard.sql',
+                                             '022_reviewed_cleanup.sql', '023_retired_work_visibility.sql',
+                                             '024_immutable_secret_consumption.sql'])
         installed = {name: digest for name, digest, _ in bundle[:first_new]}
         old = {**store.control_document(CONFIG, 'ready'), 'schema_version': 1,
                'app_secret_arn': CONFIG['app_secret_arn'], 'app_secret_version': 'fixture-version'}
@@ -187,14 +189,16 @@ class CloudContractTests(unittest.TestCase):
 class CleanupAdminTests(unittest.TestCase):
     DIGEST = 'a' * 64
     RECORD = '20000000-0000-4000-8000-000000000001'
+    OPERATION = '20000000-0000-4000-8000-000000000002'
 
-    def run_cleanup(self, call, result, error=None):
+    def run_cleanup(self, call, result, error=None, *, capability=True):
         session = Mock()
         session.client.return_value.get_caller_identity.return_value = {
             'Arn': 'arn:aws:sts::123456789012:assumed-role/memory-admin/owner'}
         database = Mock()
         database.transaction.return_value.__enter__ = Mock(return_value='tx')
         database.transaction.return_value.__exit__ = Mock(return_value=False)
+        database.scalar.return_value = capability
         database.json_scalar.side_effect = error if error else [json.dumps(result)]
         state = {**store.control_document(CONFIG, 'ready'), 'app_secret_arn': CONFIG['app_secret_arn'],
                  'app_secret_version': 'fixture-version'}
@@ -219,13 +223,16 @@ class CleanupAdminTests(unittest.TestCase):
         self.assertEqual(value, [{'record_id': self.RECORD, 'found': False}])
         self.assertEqual(call.args[1], {'ids': json.dumps([self.RECORD])})
         _, call = self.run_cleanup(lambda session: admin.forget_records(
-            CONFIG, session, [self.RECORD], restore=True, actor='owner', reason='Restore', approval_digest=self.DIGEST),
+            CONFIG, session, [self.RECORD], operation_id=self.OPERATION, expected_revisions={self.RECORD: 1},
+            restore=True, actor='owner', reason='Restore', approval_digest=self.DIGEST),
             {'receipt_id': self.RECORD, 'changed': [self.RECORD], 'unchanged': []})
         self.assertTrue(call.args[0].startswith('maven.forget_records('))
         self.assertEqual(call.args[1], {'ids': json.dumps([self.RECORD]), 'restore': True, 'actor': 'owner',
-                                        'reason': 'Restore', 'digest': self.DIGEST})
+                                        'reason': 'Restore', 'digest': self.DIGEST, 'operation_id': self.OPERATION,
+                                        'expected_revisions': validation.canonical({self.RECORD: 1})})
         _, call = self.run_cleanup(lambda session: admin.erase_records(
-            CONFIG, session, [self.RECORD], actor='owner', reason='Erase', approval_digest=self.DIGEST),
+            CONFIG, session, [self.RECORD], operation_id=self.OPERATION, expected_revisions={self.RECORD: 1},
+            actor='owner', reason='Erase', approval_digest=self.DIGEST),
             {'receipt_id': self.RECORD, 'records': []})
         self.assertTrue(call.args[0].startswith('maven.erase_records('))
         self.assertEqual(call.args[2], 'tx')
@@ -233,17 +240,52 @@ class CleanupAdminTests(unittest.TestCase):
     def test_refusals_fail_before_or_from_sql_without_values(self):
         for record_ids, digest in (([], self.DIGEST), ([self.RECORD] * 201, self.DIGEST), ([self.RECORD], 'A' * 64)):
             with self.assertRaises(validation.MemoryError) as error:
-                admin.erase_records(CONFIG, Mock(), record_ids, actor='owner', reason='Erase', approval_digest=digest)
+                admin.erase_records(CONFIG, Mock(), record_ids, operation_id=self.OPERATION,
+                                    expected_revisions={self.RECORD: 1}, actor='owner', reason='Erase', approval_digest=digest)
             self.assertEqual(error.exception.status, 'cleanup_refused')
         refusal = Exception()
         refusal.response = {'Error': {'Code': 'DatabaseErrorException',
                                       'Message': 'ERROR: cleanup_refused:lifecycle_kind'}}
         with self.assertRaises(validation.MemoryError) as error:
             self.run_cleanup(lambda session: admin.forget_records(
-                CONFIG, session, [self.RECORD], actor='owner', reason='Forget', approval_digest=self.DIGEST),
+                CONFIG, session, [self.RECORD], operation_id=self.OPERATION, expected_revisions={self.RECORD: 1},
+                actor='owner', reason='Forget', approval_digest=self.DIGEST),
                 None, refusal)
         self.assertEqual((error.exception.status, error.exception.http_status, error.exception.metadata),
                          ('cleanup_refused', 409, {'detail': 'lifecycle_kind'}))
+
+    def test_old_schema_refuses_only_cleanup_mutation(self):
+        with self.assertRaises(validation.MemoryError) as error:
+            self.run_cleanup(lambda session: admin.erase_records(
+                CONFIG, session, [self.RECORD], operation_id=self.OPERATION, expected_revisions={self.RECORD: 1},
+                actor='owner', reason='Erase', approval_digest=self.DIGEST), None, capability=False)
+        self.assertEqual(error.exception.status, 'cleanup_upgrade_required')
+        self.assertIn('ordinary memory remains available', error.exception.metadata['detail'])
+        result, _ = self.run_cleanup(lambda session: admin.cleanup_describe(CONFIG, session, [self.RECORD]),
+                                     [], capability=False)
+        self.assertEqual(result, [])
+
+    def test_exact_review_is_required_before_transport(self):
+        for revisions in ({}, {self.RECORD: True}, {self.RECORD: 0}, {self.RECORD: 2147483648},
+                          {self.RECORD: 1, self.OPERATION: 1}, None):
+            with self.subTest(revisions=revisions), patch.object(admin, '_cleanup') as transport:
+                with self.assertRaises(validation.MemoryError) as error:
+                    admin.erase_records(CONFIG, Mock(), [self.RECORD], operation_id=self.OPERATION,
+                                        expected_revisions=revisions, actor='owner', reason='Erase',
+                                        approval_digest=self.DIGEST)
+                self.assertEqual(error.exception.metadata, {'detail': 'expected_revisions'})
+                transport.assert_not_called()
+
+    def test_lost_response_retry_preserves_exact_operation_and_review(self):
+        args = dict(operation_id=self.OPERATION, expected_revisions={self.RECORD: 7},
+                    actor='owner', reason='Erase', approval_digest=self.DIGEST)
+        original = {'receipt_id': self.OPERATION, 'operation_id': self.OPERATION, 'records': []}
+        with patch.object(admin, '_cleanup', side_effect=[validation.MemoryError('outcome_unknown'), original]) as transport:
+            with self.assertRaises(validation.MemoryError):
+                admin.erase_records(CONFIG, Mock(), [self.RECORD], **args)
+            result = admin.erase_records(CONFIG, Mock(), [self.RECORD], **args)
+        self.assertEqual(result, original)
+        self.assertEqual(transport.call_args_list[0].args[2:], transport.call_args_list[1].args[2:])
 
 
 if __name__ == '__main__':

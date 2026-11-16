@@ -71,7 +71,7 @@ class LocalUninstallTests(unittest.TestCase):
         environment.chmod(0o600)
         self.assertIn(str(self.home), local.discover_homes())
         fragment = local.plan_machine(self.home, offline=True)
-        self.assertTrue(any('No export directory' in warning for warning in fragment['warnings']))
+        self.assertTrue(any('No optional settings export' in warning for warning in fragment['warnings']))
         self.assertFalse(any(item['path'] == str(environment) for item in fragment['retained']))
         self.apply(fragment)
         self.assertFalse(self.home.exists())

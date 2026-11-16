@@ -31,14 +31,14 @@ Python 3.11+ with `venv` is required. If UI dependencies are missing, a brief in
 prompt requests consent to download them into a temporary private runtime; system
 Python is never modified.
 
-**Required secrets-store selection**
+**Optional secrets-store selection**
 
-Core setup includes a secrets-store stage before reporting ready. Import integration
-locators from an explicit private `.env` or approved record, enter the exact existing
-settings manually, or approve creation of the exact private S3 bucket and generated
-SSM wrapping key. Prefixes are namespaces, not resources to discover or adopt by name.
-The review pins account, region, daily/maintenance identities, resources and effects.
-Secret values and generated key plaintext never belong in reviews, journals or chat.
+Core memory readiness requires the selected identity, instance and current applicable
+authority, not a secrets store or Git configuration. When secrets are wanted, import
+locators from an explicit private `.env` or approved record, enter existing settings,
+or approve the exact private S3 bucket and generated SSM wrapping key.
+Prefixes are namespaces, not resources to discover or adopt by name. The review pins
+identity, resources and effects; plaintext never belongs in reviews, journals or chat.
 
 Read-only verification checks the selected resources/access; it does **not** prove
 write permissions. Resume retains the original create operation and verifies its
@@ -131,9 +131,9 @@ billable execution to the exact generated package and change-set digest. Databas
 initialization remains a separate consequential approval.
 
 Starter instructions are prepared locally without an extra confirmation. **One
-collection approval replaces the eighteen per-page submission/activation approvals**:
-it authorizes uploading and activating all nine exact instruction pages, in dependency
-order. The review explains what “authority” means, lists page titles, and provides
+collection approval replaces separate per-page submission/activation approvals**:
+it authorizes uploading and activating the exact reviewed instruction collection,
+in dependency order. The review explains what “authority” means, lists page titles, and provides
 complete contents under **Technical details**. Progress reports the current page
 and completed count. This is not an all-or-nothing cloud transaction: completed
 pages remain active after a pause or failure. Resume preserves the approval and
@@ -169,12 +169,15 @@ without that choice. A failed login offers manual recovery, not a readiness clai
 MAVEN keeps its own private AWS sign-in caches inside the installation home
 (`runtime/aws-login-cache` for daily use, `runtime/aws-deploy-login-cache` for
 maintenance). A plain `aws login --profile …` writes the AWS default cache, which MAVEN
-does not read. When a sign-in expires, use the exact command MAVEN shows (in the
-installer's **Sign in** screen, a blocked tool result, or `maven_status`), for example:
+does not read. When sign-in expires, the **current stopping screen** repeats the
+exact cache, profile and region command, also available in `maven_status`, for example:
 
 ```sh
 AWS_LOGIN_CACHE_DIRECTORY=~/.maven/runtime/aws-login-cache aws login --profile maven-interactive --region us-east-1
 ```
+
+Permission failures, network failures and an unfinished local-software handoff are
+not sign-in requests. Their screens retain the original operation's resume command.
 
 Read-only access preflights distinguish **Passed**, **Missing access**, and
 **Could not verify**. Missing access blocks the affected phase with remediation and
@@ -194,12 +197,12 @@ The actual returned principal is verified before any subsequent cloud action.
 
 ### Optional harness connection and project enablement
 
-After verified cloud access and complete approved authority, optionally configure
-OMP, Claude Code, Codex, Copilot or Gemini. Select harnesses directly, then approve
-one exact local file-change review that also confirms affected harnesses are stopped.
-Identical already-configured integrations require no repeat approval or rewrite.
-Skip leaves their files unchanged. Conflicting or modified files are preserved;
-partial completed writes remain recorded in selective-uninstall ownership receipts.
+After verified cloud access and complete applicable authority, optionally configure
+OMP, Claude Code, Codex, Copilot or Gemini. Approve the exact local file changes and
+acknowledge the risk of changing running harness configuration; this is not a claim
+that writers stopped. Actual writer quiescence is checked separately where required.
+Identical integrations need no rewrite. Conflicting targets are preserved without
+blocking independent safe targets; receipts retain each completed write.
 If an older install left `venv/bin/maven-mcp` group-writable (`0775`), this same
 review can repair that exact installer-owned executable to `0755` and update only
 its ownership entry. Already manually-corrected launchers can have their stale
@@ -216,6 +219,27 @@ The installer never chooses a project folder or binds its source checkout.
 Project enablement can select an existing cloud project or create a named one with
 genuine source evidence. Memory needs no Git configuration; optional Git assistance
 is separate. Project selection does not commit, push, pull or switch branches.
+
+To change only a cloud project's name, ask **“Rename this project to NAME.”**
+Use the existing project administration form's **rename** mode with the enabled
+folder's absolute `root`, exact `project_id`, and new `name`. Approve the full review:
+old/new names, project and instance UUIDs, account/region, and the naming impact on
+all machines. The revisioned entity update preserves the UUID, history, aliases,
+tags, folder, local binding, Home selection, Git and infrastructure. A missing or
+unavailable project is refused, never recreated. A changed project or authority
+requires a fresh exact review. If a response is lost, advance that same operation:
+MAVEN reconciles its original request and verifies the updated cloud record before
+reporting completion; do not replace an uncertain request with a new operation.
+
+To create a cloud project without changing an already-enabled folder, select
+**create_cloud** in the project administration form, supply its absolute existing
+`root` and new `name`, and leave `project_id` empty. Review the exact generated UUID,
+request key, account, region, instance and current root. Approval creates only the
+cloud entity: project config, Home selection and runtime evidence stay untouched.
+Connecting the folder requires a separately reviewed **switch** operation.
+An unavailable old project does not prevent this universal creation. Resume the
+same administration operation after an uncertain response; its original request
+and receipt are reconciled and exact cloud content is read back before completion.
 
 ### Resume instance setup
 
@@ -268,15 +292,14 @@ displayed confirmation prefix. Declining leaves it unchanged. Approved abandonme
   `runtime/administration/restart-<original-operation-UUID>.json`.
 - Leaves original request artifacts, approvals, receipts, installed software, AWS
   login caches and cloud resources intact. The old operation becomes read-only.
-- Clears active connection settings and starts a distinct setup with fresh choices,
-  approvals and an isolated artifact directory. Projects using this home need a new
-  completed connection before memory works again.
+- Retains the exact `.env` bytes and selectors as **unverified**, starting a distinct
+  setup with fresh approvals and an isolated artifact directory. It does not silently
+  switch identity, delete the connection or require AWS access just to restart locally.
 
-Stop/recover registered MAVEN sessions and release reservations first. Setup locks
-prevent abandoning a currently running local setup. If local tools were removed,
-the installer offers its normal reviewed software-only restoration before restart.
-An interrupted restart resumes its journaled replacement operation; it never resets
-new settings again after a completed restart.
+Setup locks prevent abandoning an actively running setup. Relevant sessions and
+reservations must be resolved before effects that change their binding. If local
+tools were removed, use the reviewed software-only restoration. An interrupted
+restart resumes its journaled replacement operation without repeating completed work.
 
 **Abandonment is not cloud rollback:** submitted AWS work may continue and resources
 may still incur charges. Unknown effects remain unresolved. Reconnect to existing
@@ -655,11 +678,11 @@ themselves. The guided update applies them as one resumable setup operation in m
 For the secrets/Google cutover, use the installer update with affected harness
 sessions stopped. It installs local software/harness files first, then presents any
 required legacy environment migration before strict settings loading. The update
-operation applies additive **SQL018 → SQL019 → SQL020 → SQL021**, then the matching
-service/IAM change set, optional owner-reviewed instruction changes, and required
-secrets-store/readiness checks. Installing files is not enabling a new MCP session:
-start a fresh harness only after the entire update completes and load current authority.
-The installer does not restart existing MCP connections or refresh their contexts.
+operation applies the bundled additive migrations through **SQL024**, then the
+matching service/IAM change set and optional owner-reviewed instruction changes.
+Secrets remain optional. Installing files does not enable a new MCP session:
+restart the harness after the update and load current authority. Existing MCP
+connections are not restarted or refreshed automatically.
 
 Before any host receives the removed Google runtime, inspect live instruction
 dependencies and obtain separate owner approval to revoke its cloud skill.
@@ -685,7 +708,7 @@ operation UUID. Nothing here activates/revokes authority or touches stored crede
 
 | Stage | What it compares | What it does when different |
 | --- | --- | --- |
-| Local | Installed package files (`RECORD`) and installer-owned harness skills vs the checkout | Hands off the installer command; restart harnesses, then resume. Edited or shared skills are preserved |
+| Local | Actual installed bytes, launchers and package metadata against recorded package inputs; harness skills checked separately | Reviewed reinstall when proof is absent or differs; preserves edited/shared skills and recorded custom targets |
 | Schema | `maven.schema_migrations` vs the bundled ordered migrations (admin role, read-only) | Separately reviewed forward migration; a non-prefix history is reported, not bypassed |
 | Service | Deployed template vs the current template built from the live stack's parameters (maintenance access) | Reviewed `UPDATE` change set; removal/replacement of RDS, Secrets Manager, S3 or KMS resources is refused before review; reconnects from the updated outputs |
 | Instructions | Active page content hashes vs the bundled catalog | Optional; one collection approval proposes and activates new and changed pages at their current revisions |
@@ -702,6 +725,13 @@ metadata. Existing checkout `build/` and `*.egg-info` directories are left untou
 and cannot reintroduce files removed from the source. If setup is waiting at
 **Update local software**, complete the local installer handoff and restart setup
 with the same operation ID; that prerequisite is not an AWS sign-in request.
+
+Normal handoff uses the installed interpreter with `-I`, a neutral working directory
+and verified distribution/module origins, not checkout imports or `PYTHONPATH`.
+Interrupted runtime, skill and activation changes retain their original intent and
+phase inventory; unknown changes require exact-tree review, not silent adoption.
+Emergency checkout recovery is a separate explicit choice. Currency evidence does
+not certify dependency health or that a remote release is newest.
 
 Each stage that is already current passes without a question. A change set is created
 only to review it; execution needs approval. First inspect pending publication, setup
@@ -724,7 +754,7 @@ remain preserved. Already-applied migration hashes must still match the bundle's
 ordered prefix—resuming does not overwrite or reinterpret migration history.
 
 The current contract is schema 2 / client protocol 4; `012_agentic_memory.sql`
-established the memory-native foundation, with additive migrations through 021.
+established the memory-native foundation, with additive migrations through 024.
 Ordinary schema-1 use is rejected. Both `maven-memory migrate --confirm-instance
 "$INSTANCE_ID"` and `maven-memory install migrate --confirm-instance "$INSTANCE_ID"`
 accept a schema-1 binding solely for the separately approved administrator migration.
@@ -763,12 +793,10 @@ their exact inventories. Dashboard discovery and inspection read local receipts,
 not live AWS state.
 
 The protected uninstaller stages existing dependencies offline; it does not download
-packages. The unified installer's initial UI bootstrap may separately request consent
-to download missing UI dependencies before task selection. When available, the selected
-installation's Python supplies its existing dependencies for the protected dashboard.
-Otherwise the current UI interpreter is used. Cloud operations still require AWS
-packages and explicitly selected logins. Noninteractive `plan`, `apply`, `resume`,
-and `status` remain dependency-free for local removal with Python 3.11+.
+packages. CLI cloud recovery retains the existing cloud dependencies without requiring
+Textual; local `plan`, `apply`, `resume` and `status` need only Python 3.11+.
+The unified installer's UI bootstrap separately asks before downloading missing UI
+dependencies. Cloud operations still require the explicitly selected login.
 
 ### Select independent scopes
 
@@ -803,6 +831,9 @@ export destinations. The default is `~/.maven-uninstall/<UUID>`. It contains
 Keep the whole directory private and intact; it is needed after installed tools
 have been removed. Review the entire plan, its targets, inventories, warnings,
 retained artifacts, and `plan_digest`.
+Before registry detachment or home purge, recovery evidence is saved outside the
+selected roots, even without an optional export. Configuration and unfinished
+installation intents remain private; AWS login caches are never copied.
 
 The interactive launcher stages a disposable private UI outside installation homes,
 so the screen survives removal of its original environment. Worker execution uses
@@ -817,9 +848,9 @@ In the TUI, review the complete plan, then confirm each selected destructive tar
 using only its first six characters (the full identity if shorter). The full target
 is shown, and the prefix never selects a target or substitutes for backend identity
 checks. Purge and administrative abandonment retain separate confirmations.
-Changed plans invalidate all collected approvals. The TUI still asks whether affected
-writers stopped; running assistant harnesses only produce a warning, because a harness
-that saves its own configuration can write a removed MAVEN entry back.
+Changed plans invalidate approvals. Writer quiescence and running-harness configuration
+risk are separate acknowledgements: a harness may later write removed entries back,
+but accepting that risk is not an assertion that its writers stopped.
 
 Registered local sessions with no in-flight writers do not block planning: the plan
 warns, and the barrier detaches their registrations and retains the exact entries as
@@ -835,17 +866,17 @@ Existing recovery snapshots created before the TUI worker protocol remain immuta
 the dashboard can inspect them and shows their original CLI recovery command rather
 than replacing the approved implementation.
 
-For the CLI, stop affected local writers and close affected assistant harnesses before
-applying. These flags are truthful attestations, not commands that stop processes:
+For new plans, stop affected writers and acknowledge running-harness configuration
+risk. Frozen older plans retain their original truthful `--harnesses-stopped` contract:
 
 ```sh
 maven-uninstall apply --plan "$PRIVATE_OPERATION_DIRECTORY/plan.json" \
-  --confirm "$PLAN_DIGEST" --writers-quiescent --harnesses-stopped
+  --confirm "$PLAN_DIGEST" --writers-quiescent --harness-config-risk
 
 maven-uninstall status --plan "$PRIVATE_OPERATION_DIRECTORY/plan.json"
 
 maven-uninstall resume --plan "$PRIVATE_OPERATION_DIRECTORY/plan.json" \
-  --confirm "$PLAN_DIGEST" --writers-quiescent --harnesses-stopped
+  --confirm "$PLAN_DIGEST" --writers-quiescent --harness-config-risk
 ```
 
 Use the exact digest from the reviewed plan. Purge additionally requires
@@ -853,19 +884,16 @@ Use the exact digest from the reviewed plan. Purge additionally requires
 `--confirm-abandon "$INSTANCE_ID"`. Repeat those confirmations on resume.
 Changed identities/content require review, not an edited plan or deleted journal.
 
-`status` reads local receipts without contacting AWS and reports each selected
-scope separately. A completed scope is not a claim that retained artifacts are
-gone. Exit 2/`blocked` may mean an external effect occurred or deletion is pending;
-inspect the recorded action before resuming. Exit 3 indicates a saved worker pause;
-exit 130 indicates an interactive pause/interruption. There is no automatic rollback.
+`status` reads local receipts without contacting AWS and reports each scope separately.
+Exit 2 means blocked; exit 3 means a saved worker pause; exit 4/`pending-provider`
+means submitted provider work has not reached verified absence. Exit 130 means an
+interactive pause. Local completion never implies cloud completion or rollback.
 
-The returned `recovery_command` uses a verified Python interpreter outside selected
-installation homes. Use that command after self-removal; to resume, replace its
-`status` arguments with the approved `resume` arguments above. The recovery runner
-itself remains dependency-free for local cleanup. CLI-only cloud recovery needs the
-cloud-capable interpreter, configuration and selected login until cloud actions
-finish; the TUI also retains its verified dependency snapshot. Combined plans perform
-cloud work before removing installed tools.
+The `recovery_command` uses a verified Python outside selected homes. Preserve its
+runner, dependency snapshot and selected configuration. A fresh selected login may
+be needed after home removal; caches are not exported. Combined plans may finish
+independent local actions while cloud deletion remains pending, but only after
+external recovery prerequisites are preserved. Resume the original operation.
 
 ### Project memory and local originals
 
@@ -901,7 +929,7 @@ only when no installer ownership receipt proves it is MAVEN's, it is your home
 directory, it contains the source checkout or a registered project, another
 installation may use a sign-in cache inside it, or it holds a `.git`, mounted or
 foreign-owned entry. Anything added or changed after review stops the deletion.
-Without `--export`, nothing is archived; the TUI asks before continuing.
+Without `--export`, no optional originals archive is made; required recovery evidence is still preserved.
 `--export "$PRIVATE_EXPORT_DIRECTORY"` produces verified private ZIP archives first,
 moving resolved originals/settings only after verification. Archives contain
 `inventory.json` and `data/` entries; sign-in caches, locks and detached session
@@ -956,6 +984,8 @@ protection, object versions, and delete markers rather than assuming stack delet
 is sufficient. Unselected backups and encryption keys remain. Secrets Manager
 deletion uses a seven-day recovery window and remains pending until absence is
 confirmed; it is not reported as immediate erasure.
+`--wait-seconds` is bounded from 0 to 300; a seven-day provider window remains
+`pending-provider`, not a failed deletion or a reason to start another operation.
 
 Clean session closure is the default. `--abandon-sessions` is a separate reviewed
 choice for unreachable clients. It preserves unfinished session/request evidence,
@@ -986,7 +1016,7 @@ permission to start a replacement operation.
 
 ### Verification limits
 
-Verification stays local: focused temporary-file checks, simulated provider/package
-boundaries, headless Textual interactions and real-terminal smoke checks. No cloud
-resources or separate testing environment are required. Local removal/recovery checks
-are not proof of live IAM permissions, PostgreSQL concurrency, AWS teardown or restoration.
+Local tests cover temporary-file recovery, simulated provider/package boundaries,
+Textual interactions and terminal smoke checks. Optional isolated PostgreSQL tests
+exercise migrations and competing transactions. None of these certifies live IAM,
+AWS teardown/restoration, or every harness host's lifecycle behavior.

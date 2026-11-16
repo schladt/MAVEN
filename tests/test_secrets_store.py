@@ -3,6 +3,7 @@ import base64
 from copy import deepcopy
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -247,6 +248,182 @@ class SecretStoreTests(unittest.TestCase):
                 validate_secret_ref(dict(reference, **change))
 
 
+    def test_upload_uses_bucket_default_including_kms_instead_of_forcing_aes256(self):
+        original = self.session.files.create_multipart_upload
+        key = 'arn:aws:kms:us-east-1:123456789012:key/synthetic-key'
+        applied = []
+        def enforcing_bucket(**request):
+            algorithm = request.get('ServerSideEncryption', 'aws:kms')
+            selected = request.get('SSEKMSKeyId', key)
+            if algorithm != 'aws:kms' or selected != key:
+                raise provider_error('AccessDenied')
+            applied.append((algorithm, selected))
+            self.assertEqual(request['ExpectedBucketOwner'], VALUES['MAVEN_ACCOUNT_ID'])
+            return original(**request)
+        with patch.object(self.session.files, 'create_multipart_upload', side_effect=enforcing_bucket) as create:
+            receipt = self.store.put_file('owner.kms', io.BytesIO(b'synthetic KMS payload'), max_bytes=100)
+        self.assertEqual(applied, [('aws:kms', key)])
+        self.assertNotIn('ServerSideEncryption', create.call_args.kwargs)
+        self.assertEqual(self.store.read_secret(receipt['secret_ref']), b'synthetic KMS payload')
+
+    def test_store_snapshot_and_cli_restore_do_not_mix_changed_settings(self):
+        from contextlib import redirect_stdout
+        from tools.aws import secrets as cli
+        values = dict(VALUES)
+        selected = SecretStore(values, self.session)
+        values['MAVEN_SECRETS_BUCKET'] = 'different-bucket'
+        self.assertEqual(selected.binding['bucket'], VALUES['MAVEN_SECRETS_BUCKET'])
+        for mapping in (selected.values, selected.binding):
+            with self.assertRaises(TypeError):
+                mapping['bucket'] = 'different'
+        payload = b'synthetic streaming restore' * 100
+        receipt = selected.put_file('owner.restore', io.BytesIO(payload), max_bytes=len(payload))
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'output'
+            with patch.object(cli, 'load_settings', side_effect=[dict(VALUES), values]) as settings, \
+                    patch.object(cli, 'aws_session', return_value=self.session), \
+                    patch('tools.aws.secret_store.MAX_CONSUMER_BYTES', 1), \
+                    patch.object(self.session.files, 'get_object', wraps=self.session.files.get_object) as get, \
+                    redirect_stdout(io.StringIO()):
+                self.assertEqual(cli.main(['file', 'get', 'owner.restore', str(destination)]), 0)
+            settings.assert_called_once()
+            self.assertEqual(get.call_args.kwargs, {
+                'Bucket': VALUES['MAVEN_SECRETS_BUCKET'], 'Key': receipt['object_key'],
+                'ExpectedBucketOwner': VALUES['MAVEN_ACCOUNT_ID']})
+            self.assertEqual(destination.read_bytes(), payload)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o600)
+            self.assertFalse(list(Path(directory).glob('.maven-restore-*')))
+
+    def test_restore_never_overwrites_a_destination_created_at_publication(self):
+        self.store.put_file('owner.restore', io.BytesIO(b'plaintext'), max_bytes=100)
+        link = os.link
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'output'
+            def race(source, target):
+                destination.write_bytes(b'existing owner file')
+                link(source, target)
+            with patch('tools.aws.secret_store.os.link', side_effect=race), \
+                    self.assertRaisesRegex(StoreError, 'destination exists'):
+                self.store.restore_file('owner.restore', destination)
+            self.assertEqual(destination.read_bytes(), b'existing owner file')
+            self.assertFalse(list(Path(directory).glob('.maven-restore-*')))
+            with patch.object(self.session.files, 'get_object') as get, self.assertRaises(StoreError):
+                self.store.restore_file('owner.restore', destination)
+            get.assert_not_called()
+
+    def test_unauthenticated_restore_closes_body_and_removes_plaintext_temporary(self):
+        from aws_encryption_sdk.exceptions import AWSEncryptionSDKClientError
+        from cryptography.exceptions import InvalidSignature
+        receipt = self.store.put_file('owner.restore', io.BytesIO(b'plaintext'), max_bytes=100)
+        ciphertext = bytearray(self.session.files.objects[receipt['object_key']]['value'])
+        ciphertext[-1] ^= 1
+        response = self.session.files.get_object(Key=receipt['object_key'])
+        response['Body'] = io.BytesIO(ciphertext)
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'output'
+            with patch.object(self.session.files, 'get_object', return_value=response), \
+                    self.assertRaises((AWSEncryptionSDKClientError, InvalidSignature)):
+                self.store.restore_file('owner.restore', destination)
+            self.assertTrue(response['Body'].closed)
+            self.assertFalse(destination.exists())
+            self.assertFalse(list(Path(directory).glob('.maven-restore-*')))
+            from contextlib import redirect_stderr
+            from tools.aws import secrets as cli
+            response['Body'] = io.BytesIO(ciphertext)
+            diagnostic = io.StringIO()
+            with patch.object(cli, 'load_settings', return_value=VALUES), \
+                    patch.object(cli, 'aws_session', return_value=self.session), \
+                    patch.object(self.session.files, 'get_object', return_value=response), \
+                    redirect_stderr(diagnostic):
+                self.assertEqual(cli.main(['file', 'get', 'owner.restore', str(destination)]), 2)
+            self.assertEqual(diagnostic.getvalue().strip(), 'file encryption or authentication failed')
+            self.assertTrue(response['Body'].closed)
+            self.assertFalse(destination.exists())
+            self.assertFalse(list(Path(directory).glob('.maven-restore-*')))
+
+    def test_operation_reconciliation_scans_all_pages_and_refuses_ambiguity_or_cycles(self):
+        operation = str(uuid.uuid4())
+        entry = {'Type': 'SecureString', 'Description': 'MAVEN storage operation ' + operation, 'Version': 1}
+        for pages, error in (
+                ([{'Parameters': [entry], 'NextToken': 'second'}, {'Parameters': []}], None),
+                ([{'Parameters': [entry], 'NextToken': 'second'},
+                  {'Parameters': [{**entry, 'Version': 2}]}], 'ambiguous'),
+                ([{'Parameters': [entry], 'NextToken': 'same'},
+                  {'Parameters': [], 'NextToken': 'same'}], 'pagination'),
+                ([{'Parameters': [], 'NextToken': 'one'}, {'Parameters': [], 'NextToken': 'two'},
+                  {'Parameters': [], 'NextToken': 'one'}], 'pagination')):
+            with self.subTest(error=error), patch.object(self.session.parameters, 'get_parameter_history', side_effect=pages) as history:
+                if error:
+                    with self.assertRaisesRegex(StoreError, error):
+                        self.store.reconcile('owner.api', 'ssm', operation)
+                else:
+                    self.assertEqual(self.store.reconcile('owner.api', 'ssm', operation)['version'], 1)
+                self.assertEqual(history.call_count, len(pages))
+                self.assertTrue(all(call.kwargs['WithDecryption'] is False for call in history.call_args_list))
+
+    def test_consumers_reject_unsupported_or_mutable_selectors_without_provider_reads(self):
+        for reference in (
+                {'provider': 'secretsmanager', 'name': 'legacy-secret'},
+                {'provider': 'ssm', 'name': '/synthetic/secrets/owner.api'},
+                {'provider': 'ssm', 'name': '/synthetic/secrets/owner.api:latest'},
+                {'provider': 'ssm', 'name': '/synthetic/secrets/owner.api:0'},
+                {'provider': 'ssm', 'name': '/synthetic/secrets/owner.api:01'}):
+            with self.subTest(reference=reference), patch.object(self.session, 'client') as client, self.assertRaises(StoreError):
+                self.store.read_secret(reference)
+            client.assert_not_called()
+
+    def test_retained_file_key_remains_readable_after_current_key_rotation(self):
+        receipt = self.store.put_file('owner.old', io.BytesIO(b'old encrypted file'), max_bytes=100)
+        rotated = SecretStore(dict(VALUES, MAVEN_SECRETS_KEY_ID='fedcba9876543210'), self.session)
+        self.assertEqual(rotated.store_id, self.store.store_id)
+        self.assertEqual(rotated.read_secret(receipt['secret_ref']), b'old encrypted file')
+
+    def test_special_input_is_rejected_before_opening_and_regular_descriptor_is_nonblocking(self):
+        from tools.aws.secrets import open_input
+        with tempfile.TemporaryDirectory() as directory:
+            fifo = Path(directory).resolve() / 'fifo'
+            os.mkfifo(fifo, 0o600)
+            for path in (fifo, fifo.parent):
+                with self.subTest(path=path), patch('tools.aws.secrets.os.open') as opened, self.assertRaises(StoreError):
+                    open_input(path, private=True)
+                opened.assert_not_called()
+            regular = fifo.parent / 'file'
+            regular.write_bytes(b'synthetic')
+            regular.chmod(0o600)
+            with patch('tools.aws.secrets.os.open', wraps=os.open) as opened:
+                with open_input(regular, private=True) as stream:
+                    self.assertEqual(stream.read(), b'synthetic')
+            self.assertTrue(opened.call_args.args[1] & os.O_NONBLOCK)
+
+    def test_input_replaced_by_fifo_after_precheck_cannot_block_on_open(self):
+        from tools.aws.secrets import open_input
+        opened = os.open
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory).resolve() / 'input'
+            path.write_bytes(b'synthetic')
+            path.chmod(0o600)
+            def replace_with_fifo(selected, flags):
+                path.unlink()
+                os.mkfifo(path, 0o600)
+                self.assertTrue(flags & os.O_NONBLOCK)
+                return opened(selected, flags)
+            with patch('tools.aws.secrets.os.open', side_effect=replace_with_fifo), self.assertRaises(StoreError):
+                open_input(path, private=True)
+
+    def test_restore_publishes_only_after_decryptor_finalization(self):
+        from contextlib import contextmanager
+        @contextmanager
+        def incomplete_authentication(name):
+            yield io.BytesIO(b'unauthenticated plaintext')
+            raise StoreError('authentication did not finish')
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / 'output'
+            with patch.object(self.store, '_decrypt_file', incomplete_authentication), \
+                    self.assertRaisesRegex(StoreError, 'authentication did not finish'):
+                self.store.restore_file('owner.restore', destination)
+            self.assertFalse(destination.exists())
+            self.assertFalse(list(Path(directory).glob('.maven-restore-*')))
+
 class SecretCatalogTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -354,6 +531,88 @@ class SecretCatalogTests(unittest.TestCase):
         universal['data']['scope'] = 'global'
         with self.assertRaises(MemoryError):
             validate('/v1/memory/secret_catalog', universal)
+
+    def test_invalid_local_ssm_input_is_definitive_and_never_reconciled_or_uploaded(self):
+        for value in (b'', b'x' * 4097, b'\xff'):
+            self.input.write_bytes(value)
+            with self.subTest(length=len(value)), patch.object(self.store.session, 'client') as provider:
+                result = self.create()
+            self.assertEqual((result['state'], result['storage'], result['error']),
+                             ('storage_failed', 'failed', 'storage_rejected'))
+            provider.assert_not_called()
+            with patch.object(self.store, 'reconcile') as reconcile:
+                self.assertEqual(self.catalog.retry_catalog(result['operation_id']), result)
+            reconcile.assert_not_called()
+        self.assertFalse(self.cloud.records)
+
+    def test_missing_storage_receipt_is_still_uncertain_after_possible_submission(self):
+        original = self.session.parameters.put_parameter
+        def missing_receipt(**request):
+            original(**request)
+            return {}
+        with patch.object(self.session.parameters, 'put_parameter', side_effect=missing_receipt):
+            result = self.create()
+        self.assertEqual(result['storage'], 'outcome_unknown')
+        self.assertEqual(self.catalog.retry_catalog(result['operation_id'])['state'], 'completed')
+        self.assertEqual(len(self.session.parameters.versions['/synthetic/secrets/owner.api']), 1)
+
+    def test_conflict_resolution_requires_exact_review_and_reuses_original_storage_receipt(self):
+        self.create()
+        self.cloud.fail_before = 'temporarily_unavailable'
+        pending = self.create(replace=True)
+        original = deepcopy(self.catalog._load(pending['operation_id'])['catalog_request'])
+        concurrent = deepcopy(self.cloud.records['owner.api'])
+        concurrent['revision'] = 2
+        concurrent['data']['value']['previous_metadata'] = 'owner concurrent metadata'
+        self.cloud.records['owner.api'] = concurrent
+        conflict = self.catalog.retry_catalog(pending['operation_id'])
+        self.assertEqual(conflict['state'], 'catalog_conflict')
+        self.assertEqual(conflict['conflict']['current'], concurrent)
+        with self.assertRaises(StoreError):
+            self.catalog.resolve_catalog(pending['operation_id'], expected_revision=1, source=SOURCE)
+        approval = {'origin': 'offline-owner-resolution', 'excerpt': 'Use the original stored version at reviewed revision 2.'}
+        self.cloud.fail_after = 'outcome_unknown'
+        with patch.object(self.store, 'put') as put:
+            uncertain = self.catalog.resolve_catalog(pending['operation_id'], expected_revision=2, source=approval)
+            self.assertEqual(uncertain['catalog'], 'pending')
+            saved = self.catalog.resolve_catalog(pending['operation_id'], expected_revision=2, source=approval)
+        put.assert_not_called()
+        self.assertEqual(saved['state'], 'completed')
+        self.assertEqual(saved['storage_receipt'], pending['storage_receipt'])
+        journal = self.catalog._load(pending['operation_id'])
+        self.assertEqual(journal['rejected_catalog_requests'], [original])
+        self.assertEqual(journal['catalog_request']['source'], approval)
+        self.assertEqual(journal['catalog_request']['expected_revision'], 2)
+        self.assertNotEqual(journal['catalog_request']['request_key'], original['request_key'])
+        record = self.cloud.records['owner.api']
+        self.assertEqual(record['revision'], 3)
+        self.assertEqual(record['data']['secret_ref'], pending['storage_receipt']['secret_ref'])
+        self.assertEqual(record['data']['value']['previous_metadata'], 'owner concurrent metadata')
+        self.assertEqual(len(self.session.parameters.versions['/synthetic/secrets/owner.api']), 2)
+
+    def test_conflict_resolution_cannot_retarget_a_changed_record_without_new_review(self):
+        self.create()
+        self.cloud.fail_before = 'revision_conflict'
+        pending = self.create(replace=True)
+        self.cloud.records['owner.api']['revision'] += 1
+        with patch.object(self.store, 'put') as put, self.assertRaisesRegex(StoreError, 'changed since conflict review'):
+            self.catalog.resolve_catalog(pending['operation_id'], expected_revision=1, source=SOURCE)
+        put.assert_not_called()
+        self.assertEqual(self.catalog._load(pending['operation_id'])['receipt'], pending['storage_receipt'])
+
+    def test_explicit_legacy_catalog_replacement_publishes_a_new_pinned_revision(self):
+        self.create()
+        record = self.cloud.records['owner.api']
+        record['data']['secret_ref']['name'] = '/synthetic/secrets/owner.api'
+        record['data']['value'] = 'legacy owner metadata'
+        with self.assertRaises(StoreError):
+            self.store.read_secret(record['data']['secret_ref'])
+        migrated = self.create(replace=True)
+        self.assertEqual(migrated['state'], 'completed')
+        new = self.cloud.records['owner.api']
+        self.assertEqual(new['revision'], 2)
+        self.assertEqual(new['data']['secret_ref']['name'], '/synthetic/secrets/owner.api:2')
+        self.assertEqual(new['data']['value']['previous_metadata'], 'legacy owner metadata')
 
 
 if __name__ == '__main__':

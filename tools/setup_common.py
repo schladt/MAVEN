@@ -125,12 +125,10 @@ def setup_lock(directory):
 
 def verify_authority(env, project_id=None, *, values=None):
     from tools.memory.environment import configured_client
+    from tools.memory.client import authority_scope
     client = configured_client(env, values=values)
     try:
-        scope = {'workflow': 'start-work', 'operation': 'start-work'}
-        if project_id:
-            scope['project_id'] = project_id
-        context = client.load_context(scope)
+        context = client.load_context(authority_scope(project_id))
         if not any(page.get('page_kind') == 'directive' for page in context['data']['instructions']):
             raise SetupPending('Routine cloud access succeeded, but applicable approved MAVEN authority is missing. Ask the instance owner to approve complete authority, then resume.')
         if project_id:
@@ -193,9 +191,31 @@ def database_status(values):
             client.close()
         return 'awake'
     except Exception as error:
-        code = (getattr(error, 'response', {}).get('Error', {}).get('Code', '')
-                or getattr(error, 'code', '') or type(error).__name__)
-        return 'warming' if code == 'DatabaseResumingException' else code
+        from tools.memory.client import aws_error
+        return aws_error(error).code
+
+
+def wait_for_database(values, *, budget=60.0, interval=2.0, checkpoint=None, on_warming=None):
+    """Bounded read-only SELECT progression, never an administration-step retry.
+
+    SQL administration credentials are needed only for this optional diagnostic,
+    not ordinary memory readiness. The budget is checked between requests.
+    """
+    from tools.memory.client import MemoryClientError, wait_for_read_only
+
+    def probe():
+        status = database_status(values)
+        if status == 'warming':
+            raise MemoryClientError('warming')
+        return status
+
+    try:
+        return wait_for_read_only(probe, budget=budget, interval=interval,
+                                  checkpoint=checkpoint, on_warming=on_warming)
+    except MemoryClientError as error:
+        if error.code != 'warming':
+            raise
+        return 'warming'
 
 
 def permission_preflight(values, task):
@@ -212,11 +232,11 @@ def permission_preflight(values, task):
             action()
             checks.append({'check': label, 'status': 'Passed'})
         except Exception as error:
-            code = getattr(error, 'response', {}).get('Error', {}).get('Code', '')
-            denied = code in ('AccessDenied', 'AccessDeniedException', 'UnauthorizedOperation',
-                              'ForbiddenException')
+            from tools.memory.client import aws_error
+            code = aws_error(error).code
+            denied = code == 'not_authorized'
             checks.append({'check': label, 'status': 'Missing access' if denied and required else 'Could not verify',
-                           'reason': code or getattr(error, 'code', type(error).__name__)})
+                           'reason': code})
 
     def call(session, service, method, **kwargs):
         client = session.client(service, **options)
@@ -302,22 +322,13 @@ def permission_preflight(values, task):
 
 
 def inspect_login_identity(values, *, deploy=False):
-    """Inspect only the explicitly selected login profile; never initiate login."""
-    import boto3
+    """Inspect the session-owned login cache, permitting initial unbound setup."""
     from botocore.config import Config
-    from tools.memory.environment import transport_ca_bundle
-    prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
-    previous = os.environ.get('AWS_LOGIN_CACHE_DIRECTORY')
-    os.environ['AWS_LOGIN_CACHE_DIRECTORY'] = values[prefix + 'LOGIN_CACHE']
+    from botocore.exceptions import BotoCoreError, ClientError
+    from tools.memory.client import aws_error
+    from tools.memory.environment import login_session, transport_ca_bundle
+    session = login_session(values, deploy=deploy, region=values.get('MAVEN_AWS_REGION', 'us-east-1'))
     try:
-        session = boto3.Session(profile_name=values[prefix + 'PROFILE'],
-                                region_name=values['MAVEN_AWS_REGION'])
-        credentials = session.get_credentials()
-        if credentials is None:
-            from botocore.exceptions import NoCredentialsError
-            raise NoCredentialsError()
-        if credentials.method != 'login':
-            raise SetupPending('Use the explicitly selected AWS login-only profile, not static credentials.')
         client = session.client('sts', verify=transport_ca_bundle(), config=Config(
             connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
         try:
@@ -327,8 +338,5 @@ def inspect_login_identity(values, *, deploy=False):
         identity = {key: result[key] for key in ('Arn', 'Account', 'UserId') if key in result}
         check_login_identity(values, identity, deploy=deploy)
         return identity
-    finally:
-        if previous is None:
-            os.environ.pop('AWS_LOGIN_CACHE_DIRECTORY', None)
-        else:
-            os.environ['AWS_LOGIN_CACHE_DIRECTORY'] = previous
+    except (BotoCoreError, ClientError) as error:
+        raise aws_error(error) from None

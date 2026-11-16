@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from tools.administration import AdminInputError
 from tools.coordination import SessionBusy, session_uuid
 from tools.memory.boundary import BoundaryError, digest, private_path, read_private, save_private
-from tools.memory.client import MemoryClientError
+from tools.memory.client import AUTHENTICATION_CODES, MemoryClientError
 from tools.memory.maintenance import Maintenance, MaintenanceError
 from tools.memory.validation import MEMORY_DATA_FIELDS, MemoryError
 from tools.project import ProjectError, instance_home
@@ -183,20 +183,31 @@ class MavenApplication:
         self._lock = threading.RLock()
         self._unbound_client = None
         self._unbound_authority = None
+        self._project_identity = None
         self._warm_stop = threading.Event()
         self._warm_thread = None
 
     def initialize(self, root=None, *, harness='mcp', harness_session=None, session_id=None,
-                   resume=False, assignment_id=None, home=False, cwd=None):
+                   resume=False, assignment_id=None, home=False, cwd=None, restore_only=False):
         from tools.memory.lifecycle import SessionService
         from tools.coordination import SessionRegistry, private_lock, project_binding_lock
         from tools.startup import bind_conversation
         root = self._selected_root(root, home)
         session_id = session_uuid(session_id) if session_id else None
         assignment_id = session_uuid(assignment_id) if assignment_id else None
+        if restore_only and (not resume or not session_id):
+            raise MaintenanceError('read-only restore requires resume=true and the exact original session identity')
         with project_binding_lock(self.home, root), self._lock:
-            with private_lock(self.home, 'runtime/registry.lock'):
-                SessionRegistry(self.home)._allow_work(root)
+            if not restore_only:
+                with private_lock(self.home, 'runtime/registry.lock'):
+                    SessionRegistry(self.home)._allow_work(root)
+            existing_id = self.binding['session_id'] if self.binding else session_id
+            if existing_id:
+                existing_path = f'.maven/runtime/sessions/{existing_id}/mcp-binding.json'
+                if (private_path(root, existing_path).exists()
+                        and read_private(root, existing_path).get('superseded_by')):
+                    raise MaintenanceError('failed initialization was superseded; use its replacement binding or '
+                                           'maven_startup action=new with failed_start_session_id=' + existing_id)
             if self.assignment_id is not None and assignment_id != self.assignment_id:
                 raise MaintenanceError('a delegated connection cannot change its originating assignment')
             if assignment_id is not None and self.binding is None:
@@ -216,6 +227,8 @@ class MavenApplication:
                 identifier = session_id or str(uuid.uuid4())
                 path = f'.maven/runtime/sessions/{identifier}/mcp-binding.json'
                 stored = read_private(root, path) if private_path(root, path).exists() else None
+                if restore_only and stored is None:
+                    raise MaintenanceError('read-only restore requires the original persisted MCP binding')
                 if stored is not None and not resume:
                     raise MaintenanceError('restoring this binding requires explicit resume')
                 if assignment_id and (stored is None or not stored.get('initialized')):
@@ -235,11 +248,10 @@ class MavenApplication:
                     if assignment_id:
                         maintenance.status(assignment_id)
                     candidate = {**selection, 'project_id': service.project_id}
-                    if not assignment_id:
-                        if stored is None:
-                            save_private(root, path, {**candidate, 'initialized': False,
-                                                     'resume_required': resume})
-                        bind_conversation(self.home, candidate)
+                    if not assignment_id and not restore_only:
+                        bind_conversation(self.home, candidate, persisted=(
+                            {**candidate, 'initialized': False, 'resume_required': resume}
+                            if stored is None else None))
                 except Exception:
                     service.close()
                     raise
@@ -249,6 +261,10 @@ class MavenApplication:
                 self._resume_initialization = (resume if stored is None else
                                                stored.get('initialized', False) or stored.get('resume_required', False))
             self.initialized = False
+            if restore_only:
+                return {'status': 'restored', 'binding': dict(self.binding), 'initialized': False,
+                        'session': self.service.status(), 'maintenance': self.maintenance.status(),
+                        'message': 'Exact binding restored for observation only; no readiness, replay or capture.'}
             if self.assignment_id:
                 result = self.service.context()
             else:
@@ -287,14 +303,18 @@ class MavenApplication:
         selected = load_home(self.home)
         if selected and 'invalid' not in selected and selected['project_id'] == self.binding['project_id']:
             return active('home', label=selected['label'], project_id=self.binding['project_id'])
-        return active('project', label=Path(self.binding['root']).name, project_id=self.binding['project_id'])
+        identity = self._project_identity
+        verified = bool(identity and identity['project_id'] == self.binding['project_id'])
+        label = identity['name'] if verified else Path(self.binding['root']).name + ' (folder; cloud name unverified)'
+        return {**active('project', label=label, project_id=self.binding['project_id']),
+                'label_source': 'cloud_project' if verified else 'folder', 'cloud_project_verified': verified}
 
     def _record_start(self, current, cwd, *, harness, harness_session, folder):
         # The session is already ready; an unwritable private log must not hide that.
         from tools.home import HomeError, record_choice, write_active
         try:
             record_choice(self.home, cwd, current['mode'], harness=harness, harness_session=harness_session)
-            write_active(self.home, current, harness_session=harness_session, folder=folder)
+            write_active(self.home, current, harness=harness, harness_session=harness_session, folder=folder)
         except (OSError, HomeError):
             return False
         return True
@@ -308,7 +328,7 @@ class MavenApplication:
             record_choice(self.home, cwd, choice, harness=harness, harness_session=harness_session)
             self.choice = active(choice)
             self._unbound_authority = None
-            write_active(self.home, self.choice, harness_session=harness_session, folder=cwd)
+            write_active(self.home, self.choice, harness=harness, harness_session=harness_session, folder=cwd)
             return dict(self.choice)
 
     def _ready(self, result):
@@ -348,7 +368,8 @@ class MavenApplication:
             raise MaintenanceError('this worker connection is limited to its delegated assignment')
 
     def consultation(self, scope, project_id):
-        if self.assignment_id and (scope == 'all' or project_id not in (None, self.service.project_id)):
+        if self.assignment_id and (scope == 'all' or project_id not in (
+                None, self.binding['project_id'] if self.binding else None)):
             raise MaintenanceError('delegated consultation is limited to universal and originating-project memory')
 
     def admin(self):
@@ -417,7 +438,8 @@ class MavenApplication:
             return {'status': 'unavailable', 'pages': [],
                     'error': error.code if isinstance(error, MemoryClientError) else 'discovery_unavailable',
                     'message': 'Skill discovery unavailable; no cached authority was substituted.',
-                    'sign_in': self.sign_in()}
+                    **({'sign_in': self.sign_in()} if isinstance(error, MemoryClientError)
+                       and error.code in AUTHENTICATION_CODES else {})}
 
     def context(self, skill_slug=None):
         if skill_slug is None:
@@ -450,6 +472,7 @@ class MavenApplication:
         except (OSError, ValueError, KeyError, MemoryClientError):
             return None
         return {'profile': exact['profile'], 'command': exact['command'],
+                'argv': exact['argv'], 'environment': exact['environment'],
                 'note': 'Run in a terminal; a plain `aws login` is not read by MAVEN. Never enter credentials in chat.'}
 
     def rebind_hint(self, start=None, *, harness=None, harness_session=None):
@@ -464,21 +487,189 @@ class MavenApplication:
             if binding else 'This is a new conversation, not an existing peer. Use maven_startup to inspect '
             'project sessions and initialize a separate session; never select the newest peer.')}
 
-    def startup(self, cwd, *, harness='mcp', harness_session=None, home=False, action='inspect'):
+    def _failed_start_selection(self, cwd, *, harness, harness_session, home):
+        from tools.startup import conversation_binding, inspect_startup
+        binding = self.binding
+        folder = self._selected_root(None, True) if home else Path(cwd)
+        selected = inspect_startup(self.home, folder)
+        if (selected.get('root') != binding['root'] or selected.get('project_id') != binding['project_id']
+                or binding['home'] != str(self.home) or binding['env'] != str(self.env)
+                or harness != binding['harness']):
+            raise MaintenanceError('failed-start recovery must keep the exact project, root, instance and harness')
+        native = conversation_binding(self.home, harness=harness, harness_session=harness_session)
+        if native is not None and native != binding:
+            raise MaintenanceError('the requested native conversation already belongs to another session')
+
+    def _startup_project(self, client, project_id):
+        self._project_identity = None
+        try:
+            response = client.invoke('/v1/memory/read', {'record_id': project_id})
+        except MemoryClientError as error:
+            if error.code != 'record_unavailable':
+                raise
+            return {'project_id': project_id, 'local_association': True, 'cloud_verified': False,
+                    'error': error.code,
+                    'message': 'The folder retains this project ID, but its cloud project record is unavailable. '
+                               'This does not establish deletion or archival. No project is created or rebound.'}
+        record = response.get('data', {})
+        if (response.get('status') != 'ready' or record.get('record_id') != project_id
+                or record.get('kind') != 'entity' or record.get('data_scope') != 'owner'
+                or record.get('project_id') is not None
+                or record.get('data', {}).get('entity_type') != 'project'
+                or not isinstance(record.get('data', {}).get('name'), str) or not record['data']['name'].strip()
+                or 'archived' in record.get('tags', []) or record.get('data', {}).get('state') == 'archived'):
+            raise BoundaryError('the exact enabled cloud project could not be verified')
+        self._project_identity = {'project_id': project_id, 'name': record['data']['name']}
+        return {**self._project_identity, 'local_association': True, 'cloud_verified': True}
+
+    def _inspect_failed_start(self, cwd, *, harness, harness_session, home):
+        from tools.startup import failed_start_evidence
+        self._failed_start_selection(cwd, harness=harness, harness_session=harness_session, home=home)
+        report = self.diagnose(cwd, harness=self.binding['harness'],
+                               harness_session=self.binding['harness_session'], home=home)
+        try:
+            failed_start_evidence(self.home, self.binding)
+            eligible, reason = True, None
+        except BoundaryError as error:
+            eligible, reason = False, str(error)
+        project = self._startup_project(self.unbound_client(), self.binding['project_id'])
+        report['active'] = self.active()
+        report['message'] = project.get('message', 'MAVEN: initialization is not ready; the original binding is preserved.')
+        return {**report, 'status': 'recovery' if project['cloud_verified'] else 'blocked',
+                'live_state_checked': True, 'project_check': project,
+                'requested_identity': {'harness': harness, 'harness_session': harness_session},
+                'failed_initialization': {'local_replacement_allowed': eligible,
+                                          'cloud_absence_verified': False, 'blocker': reason},
+                'next_action': 'Retry only the exact original binding, or explicitly request startup action=new. '
+                               'New requires a verified cloud project, fresh proof of no cloud session and no '
+                               'retained work. Inspection does not detach the failed binding.'}
+
+    def _resume_failed_start(self, root, identifier, *, cwd, harness, harness_session):
+        from tools.coordination import SessionRegistry, private_lock, project_binding_lock
+        from tools.memory.environment import load_environment
+        from tools.memory.lifecycle import SessionService
+        from tools.startup import resume_failed_start
+        root = Path(root).resolve(strict=True)
+        prefix = f'.maven/runtime/sessions/{session_uuid(identifier)}'
+        with project_binding_lock(self.home, root, shared=False), self._lock:
+            with private_lock(self.home, 'runtime/registry.lock'):
+                SessionRegistry(self.home)._allow_work(root)
+                receipt = read_private(root, prefix + '/failed-start-recovery.json')
+                original, replacement = receipt['binding'], receipt['replacement_binding']
+                if (original.get('root') != str(root) or original.get('home') != str(self.home)
+                        or original.get('env') != str(self.env)
+                        or original.get('session_id') != identifier
+                        or replacement.get('harness') != harness
+                        or replacement.get('harness_session') != harness_session
+                        or self.binding is not None and self.binding not in (original, replacement)):
+                    raise MaintenanceError('resume only the exact failed-start root, instance and replacement harness identity')
+                lifecycle_path = prefix + '/lifecycle.json'
+                if private_path(root, lifecycle_path).exists():
+                    lifecycle = read_private(root, lifecycle_path)
+                    values = {} if self.service_factory and not self.env.exists() else load_environment(self.env)
+                    if lifecycle.get('identity') != SessionService._identity(values):
+                        raise MaintenanceError('failed-start memory instance or credential selection changed')
+                client = self.unbound_client()
+                project = self._startup_project(client, original['project_id'])
+                if not project['cloud_verified']:
+                    return {'status': 'blocked', 'binding': original, 'project_check': project,
+                            'message': project['message']}
+                try:
+                    client.invoke('/v1/memory/read', {'record_id': identifier, 'include_archived': True})
+                except MemoryClientError as error:
+                    if error.code != 'record_unavailable':
+                        raise
+                else:
+                    raise BoundaryError('the original cloud session exists or its absence is unverified')
+                replacement = resume_failed_start(self.home, original)
+                if self.service is not None:
+                    self.service.close()
+                self.service, self.maintenance, self.binding = None, None, None
+                self.initialized = self._resume_initialization = False
+        result = self.initialize(root, harness=harness, harness_session=harness_session,
+                                 session_id=replacement['session_id'], resume=True, cwd=cwd)
+        return {**result, 'replaced_failed_binding': original, 'replacement_resumed': True}
+
+    def _new_after_failed_start(self, cwd, *, harness, harness_session, home):
+        from tools.coordination import SessionRegistry, private_lock, project_binding_lock
+        from tools.startup import failed_start_evidence, project_sessions, replace_failed_start
+        root = self.binding['root']
+        receipt_path = f'.maven/runtime/sessions/{self.binding["session_id"]}/failed-start-recovery.json'
+        if private_path(root, receipt_path).exists():
+            return self._resume_failed_start(root, self.binding['session_id'], cwd=cwd,
+                                             harness=harness, harness_session=harness_session)
+        with project_binding_lock(self.home, root, shared=False), self._lock:
+            if self.initialized or self._resume_initialization:
+                raise MaintenanceError('a previously initialized session cannot be replaced by startup')
+            self._failed_start_selection(cwd, harness=harness, harness_session=harness_session, home=home)
+            with private_lock(self.home, 'runtime/registry.lock'):
+                SessionRegistry(self.home)._allow_work(root)
+                original = dict(self.binding)
+                evidence = failed_start_evidence(self.home, original)
+                if harness_session and evidence['registry'] and any(
+                        identifier != original['session_id'] and item.get('root') == root
+                        and item.get('harness') == harness and item.get('harness_session') == harness_session
+                        for identifier, item in evidence['registry']['sessions'].items()):
+                    raise MaintenanceError('the requested native conversation has another registered session')
+                # Confirm the configured instance has not changed since the failed attempt.
+                self.service._values()
+                client = self.unbound_client()
+                project = self._startup_project(client, original['project_id'])
+                if not project['cloud_verified']:
+                    return {'status': 'blocked', 'binding': original, 'active': self.active(),
+                            'live_state_checked': True, 'project_check': project,
+                            'message': project['message']}
+                # Search is bounded and excludes archived records. Only the exact read can
+                # prove this identity unavailable; login/outage errors must propagate.
+                try:
+                    client.invoke('/v1/memory/read', {'record_id': original['session_id'], 'include_archived': True})
+                except MemoryClientError as error:
+                    if error.code != 'record_unavailable':
+                        raise
+                else:
+                    raise BoundaryError('the original cloud session exists or its absence is unverified')
+                cloud = project_sessions(client, original['project_id'])
+                if any(item['session_id'] == original['session_id'] for item in cloud['sessions']):
+                    raise BoundaryError('cloud inspection contradicts the original session absence')
+                replacement = {**original, 'session_id': str(uuid.uuid4()), 'harness_session': harness_session}
+                replace_failed_start(self.home, original, replacement, evidence)
+                self.service.close()
+                self.service, self.maintenance, self.binding = None, None, None
+                self.initialized = False
+                self._resume_initialization = False
+        result = self.initialize(root, harness=harness, harness_session=harness_session,
+                                 session_id=replacement['session_id'], resume=True, cwd=cwd)
+        return {**result, 'replaced_failed_binding': original,
+                'startup_review': {'cloud_sessions': cloud, 'project_check': project, 'live_state_checked': True,
+                                   'cloud_session_absence_verified': original['session_id']}}
+
+    def startup(self, cwd, *, harness='mcp', harness_session=None, home=False, action='inspect',
+                failed_start_session_id=None):
         """Inspect first, then begin only an authorized unambiguous conversation."""
         from tools.startup import inspect_startup, project_sessions
         self.primary()
         if action not in ('inspect', 'continue', 'new'):
             raise MaintenanceError('startup action must be inspect, continue or new')
+        if failed_start_session_id is not None:
+            if action != 'new':
+                raise MaintenanceError('failed_start_session_id requires explicit startup action=new')
+            folder = self._selected_root(None, True) if home else Path(cwd)
+            selected = inspect_startup(self.home, folder)
+            if not selected.get('root'):
+                raise MaintenanceError('failed-start recovery requires its exact enabled project root')
+            return self._resume_failed_start(selected['root'], failed_start_session_id, cwd=cwd,
+                                             harness=harness, harness_session=harness_session)
         if self.binding is None and self.choice and self.choice['mode'] in ('read_only', 'off') and not home:
             return {'status': self.choice['mode'], 'active': self.active(), 'live_state_checked': False,
                     **({'available_skills': self.available_skills()} if self.choice['mode'] == 'read_only' else {}),
                     'message': 'This conversation chose no capture. Select Home or a project explicitly before initializing.'}
         if self.binding:
-            if (harness != self.binding['harness'] or harness_session != self.binding['harness_session']):
-                raise MaintenanceError('startup cannot replace this process or conversation binding')
             if action == 'new':
-                raise MaintenanceError('this process is already bound; start a new harness conversation')
+                return self._new_after_failed_start(cwd, harness=harness, harness_session=harness_session, home=home)
+            if action == 'inspect' and not self.initialized:
+                return self._inspect_failed_start(cwd, harness=harness, harness_session=harness_session, home=home)
+            if harness != self.binding['harness'] or harness_session != self.binding['harness_session']:
+                raise MaintenanceError('startup cannot replace this process or conversation binding')
             if action == 'continue':
                 return self.initialize(self.binding['root'], harness=harness, harness_session=harness_session,
                                        session_id=self.binding['session_id'], resume=True, cwd=cwd)
@@ -492,6 +683,13 @@ class MavenApplication:
             return report
         if home and report['root'] != str(folder):
             raise MaintenanceError('this conversation selected another project; use a new conversation to switch Home')
+        if action == 'new' and report.get('replacement_binding') and report.get('binding'):
+            return self._resume_failed_start(report['root'], report['binding']['session_id'], cwd=cwd,
+                                             harness=harness, harness_session=harness_session)
+        project = self._startup_project(self.unbound_client(), report['project_id'])
+        report.update(project_check=project, live_state_checked=True)
+        if not project['cloud_verified']:
+            return {**report, 'status': 'blocked', 'message': project['message']}
         cloud = project_sessions(self.unbound_client(), report['project_id'])
         report.update(cloud_sessions=cloud, live_state_checked=True)
         binding = report.get('binding')
@@ -604,7 +802,7 @@ def create_server(application=None):
             try:
                 return function(*args, **kwargs)
             except MemoryClientError as error:
-                if error.code == 'selected_login_unavailable_or_expired':
+                if error.code in AUTHENTICATION_CODES:
                     exact = app.sign_in()
                     return {'status': 'blocked', 'error': error.code, 'request_key': error.request_key,
                             'binding': app.binding, 'cloud_saved': False, 'sign_in': exact,
@@ -667,6 +865,8 @@ def create_server(application=None):
         if scope not in ('universal', 'context'):
             raise MaintenanceError('unbound consultation is limited to universal memory')
         home_id = app.home_selection()['project_id'] if include_home else None
+        app.consultation(scope, project_id)
+        app.consultation('context', home_id)
         if project_id is not None and project_id != home_id:
             raise MaintenanceError('unbound consultation is limited to universal memory'
                                    + (' and the Home project' if include_home else ''))
@@ -728,9 +928,14 @@ def create_server(application=None):
                                       and generation == app._unbound_authority['authority_generation']
                                       and any((loaded['slug'], loaded['revision']) == (page.get('slug'), page.get('revision'))
                                               for loaded in app._unbound_authority['instructions']))})
-            after = data.get('next_after_slug')
-            if after is None or not data['pages']:
+            following = data.get('next_after_slug')
+            if following is None:
                 break
+            if (not isinstance(following, str) or not data['pages']
+                    or following != data['pages'][-1].get('slug')
+                    or after is not None and following <= after):
+                raise BoundaryError('instruction listing cursor did not advance')
+            after = following
         return {'authority_generation': generation, 'pages': pages, 'unbound': True}
 
     @server.tool()
@@ -738,13 +943,13 @@ def create_server(application=None):
     def maven_initialize(root: str | None = None, harness: str = 'mcp', harness_session: str | None = None,
                          session_id: str | None = None, resume: bool = False,
                          assignment_id: str | None = None, home: bool = False,
-                         cwd: str | None = None) -> dict[str, Any]:
+                         cwd: str | None = None, restore_only: bool = False) -> dict[str, Any]:
         """Initialize an explicitly enabled project and load complete current authority. Announce initialization before calling, then readiness or a blocker. Restore an exact binding, never the newest session.
 
-        home=true (root omitted) starts MAVEN Home from the configured ~/.maven/home.json and is refused when it is missing or invalid. cwd is the agent's workspace folder; the start choice is recorded locally for it. The result carries active {mode, label, project_id, line}; print its line."""
+        home=true (root omitted) starts the configured MAVEN Home. cwd records the actual workspace. restore_only=true requires resume and the exact persisted session: attach for status/diagnosis/original receipt observation during mutation barriers, without initialization, capture or readiness. Print the returned active.line only when present."""
         return app.initialize(root, harness=harness, harness_session=harness_session,
                               session_id=session_id, resume=resume, assignment_id=assignment_id,
-                              home=home, cwd=cwd)
+                              home=home, cwd=cwd, restore_only=restore_only)
 
     @server.tool()
     @guarded
@@ -764,11 +969,13 @@ def create_server(application=None):
     @server.tool()
     @guarded
     def maven_startup(cwd: str, harness: str = 'mcp', harness_session: str | None = None,
-                      home: bool = False, action: Literal['inspect', 'continue', 'new'] = 'inspect') -> dict[str, Any]:
+                      home: bool = False, action: Literal['inspect', 'continue', 'new'] = 'inspect',
+                      failed_start_session_id: str | None = None) -> dict[str, Any]:
         """Visible startup and recovery workflow. Say MAVEN is checking, then inspect. No enabled project: ask start_hint, no automatic capture. home=true is only for the owner's Start Home choice.
 
-        Pass the real native harness conversation identity supplied by its hook; never PID/cwd/newest session. continue resumes only that exact conversation or starts a separate session in an enabled project. Stale/unfinished peers require a choice; new explicitly leaves them untouched. Closed sessions are never reopened. Read complete returned authority before declaring ready. Workers use their originating binding, never this tool."""
-        return app.startup(cwd, harness=harness, harness_session=harness_session, home=home, action=action)
+        Pass the real native harness identity; never PID/cwd/newest session. continue resumes that exact conversation or starts separately. new leaves peers untouched. For this process's never-successful initialization only, new may replace its failed binding after exact cloud absence and local quiescence checks in the same project/instance. To resume an interrupted replacement, use action=new with failed_start_session_id naming the exact original attempt and the originally selected replacement harness identity; no new ID is generated. Its exact native pointer may also select that journal. Closed sessions are never reopened. Read returned authority before declaring ready. Workers use their originating binding."""
+        return app.startup(cwd, harness=harness, harness_session=harness_session, home=home, action=action,
+                           failed_start_session_id=failed_start_session_id)
 
     @server.tool(annotations=read_hint)
     @guarded
@@ -838,6 +1045,7 @@ def create_server(application=None):
         With query: whitespace terms (at most 8) must all match at word boundaries in title/name, tags or body; results are ranked (title 3, tag 2, body 1 per term, then most recent) and carry a rank and a snippet around the first body match. Answer from snippets when they suffice; read full records only when needed. Page with offset/next_offset (query) or after_id/next_after_id (listing). limit is at most 20. Archived projects and their contents, records tagged 'archived' and data.state 'archived' are excluded by default. Set include_archived=true only for an explicit archived-history request; it never reactivates a project. Parallel searches/reads are fine.
 
         unbound=true is a read-only universal consultation without any project session (no binding, no capture); use it only when the owner explicitly asks to use what MAVEN knows in a folder that is not enabled. Before initialization, scope 'universal' is unbound automatically. Results are labelled unbound. include_home=true (unbound only) also covers the configured Home project; no other project_id is accepted."""
+        app.consultation(scope, project_id)
         if unbound_requested(unbound, scope):
             home_id = unbound_projects(scope, project_id, include_home)
             return unbound_search(query=query, kind=kind, after_id=after_id, limit=limit,
@@ -845,7 +1053,6 @@ def create_server(application=None):
         if include_home:
             raise MaintenanceError('include_home belongs only to unbound consultation')
         app.bound()
-        app.consultation(scope, project_id)
         return app.service.search(query=query, kind=kind, scope=scope, project_id=project_id,
                                   after_id=after_id, limit=limit, include_archived=include_archived,
                                   offset=offset)
@@ -857,13 +1064,13 @@ def create_server(application=None):
                    project_id: str | None = None, unbound: bool = False,
                    include_home: bool = False, include_archived: bool = False) -> dict[str, Any]:
         """Read a real memory record, optionally at its exact revision. Archived projects and their contents require include_archived=true and an explicit owner request, even with a known record ID. This is historical consultation, never reactivation. Reference data does not activate instructions. Preserve project attribution when explicitly consulting other projects. Prefer search snippets; read full records when the snippet is insufficient. unbound=true (or scope 'universal' before initialization) reads a universal record without any session, only on explicit owner intent; include_home=true also accepts a record of the configured Home project."""
+        app.consultation(scope, project_id)
         if unbound_requested(unbound, scope):
             return unbound_read(record_id, revision, unbound_projects(scope, project_id, include_home),
                                 include_archived=include_archived)
         if include_home:
             raise MaintenanceError('include_home belongs only to unbound consultation')
         app.bound()
-        app.consultation(scope, project_id)
         return app.service.read_record(record_id, revision=revision, scope=scope, project_id=project_id,
                                        include_archived=include_archived)
 
@@ -913,7 +1120,7 @@ def create_server(application=None):
                           worker_token: str | None = None, changes: list[Change | TaskChange] | None = None,
                           summary: str | None = None, no_changes: bool = False,
                           worker_stopped: bool = False, detail: bool = False) -> dict[str, Any]:
-        app.bound()
+        app.bound(require_ready=action != 'status')
         if action == 'enqueue':
             app.primary()
             if intent is None or source is None:
@@ -979,11 +1186,11 @@ def create_server(application=None):
 
     @server.tool()
     @guarded
-    def maven_pause(anchor: str | None = None) -> dict[str, Any]:
-        """Pause new automatic maintenance in this session. Keep explicit operations and required instruction checks. Anchor references available harness history, not a copied transcript; submitted writes may finish."""
+    def maven_pause(anchor: str | None = None, drain: bool = False) -> dict[str, Any]:
+        """Pause automatic maintenance. drain=true closes admission and lets already accepted work finish through its persisted cutoff for wrap-up; ordinary pause keeps accepted automatic work paused. Anchor references real harness history."""
         app.primary()
         app.bound()
-        return app.maintenance.pause(anchor=anchor)
+        return app.maintenance.pause(anchor=anchor, drain=drain)
 
     @server.tool()
     @guarded
@@ -1017,19 +1224,24 @@ def create_server(application=None):
     @server.tool()
     @guarded
     def maven_recover(operation_id: str | None = None, checkpoint_id: str | None = None,
-                      workers_stopped: bool = False) -> dict[str, Any]:
-        """Explicitly reconcile original receipts after establishing actual writer quiescence. This can replay an original cloud mutation; use status for read-only diagnosis. Never infer worker death from age."""
+                      workers_stopped: bool = False, writer_tokens: list[str] | None = None,
+                      observe_only: bool = False) -> dict[str, Any]:
+        """Reconcile original receipts, never infer writer death from age. observe_only=true reads the original pending receipt without replay, authority refresh or quiescence. Otherwise workers_stopped=true attests actual quiescence; writer_tokens must exactly name all retained writers. No replacement request IDs."""
         app.primary()
         app.bound(require_ready=False)
-        if workers_stopped is not True:
+        if not observe_only and workers_stopped is not True:
             raise MaintenanceError('recovery requires actual relevant-writer quiescence')
         if operation_id and checkpoint_id:
             raise MaintenanceError('select one exact recovery target')
+        if observe_only:
+            if operation_id or checkpoint_id or writer_tokens:
+                raise MaintenanceError('receipt observation selects only this session original pending request')
+            return app.service.recover(observe_only=True)
         if operation_id:
-            return app.maintenance.recover(operation_id, worker_stopped=True)
+            return app.maintenance.recover(operation_id, worker_stopped=True, writer_tokens=writer_tokens)
         if checkpoint_id:
-            return app.maintenance.recover_checkpoint(checkpoint_id, worker_stopped=True)
-        return app.service.recover()
+            return app.maintenance.recover_checkpoint(checkpoint_id, worker_stopped=True, writer_tokens=writer_tokens)
+        return app.service.recover(workers_stopped=True, writer_tokens=writer_tokens)
 
     @server.tool()
     @guarded
@@ -1056,12 +1268,33 @@ def create_server(application=None):
 
         MAVEN Home: begin kind "home" with parameters {action, root, project_id, label} to enable, change or disable the owner-selected Home after a full review. For an already-bound folder, select mode "switch" in the Home or project form to attach an existing cloud project; existing sessions must be cleanly stopped and original evidence is preserved. No cloud project is merged or deleted.
 
+        Project rename: begin kind "project" with {root}, then choose mode "rename",
+        the existing project_id and new name. Review the exact cloud instance/project
+        revision and all-machines name change. The UUID, folder, Home selection and
+        infrastructure remain unchanged; an unavailable project is never recreated.
+
+        Cloud-only creation: choose mode "create_cloud" with name and empty project_id.
+        This creates a reviewed new cloud entity without changing the root's current
+        association; connecting the folder is a separately reviewed switch.
+
+        A switch may preserve proven never-initialized local attempts without closing
+        a cloud session. Only when the owner confirms exact historical sessions and
+        workers stopped, begin with stopped_session_ids: [UUIDs]. The full switch
+        review requires its exact confirmations and preserves their evidence without
+        asserting cloud closure. Registered or uncertain historical work is refused.
+
         Cloud project archival: begin kind "project_lifecycle" with parameters {action: "archive"|"reactivate", project_id: <exact cloud project UUID>}. No local folder, temporary binding or uninstall is needed. Present the exact cloud identity/state and all-machines effect review, obtain actual owner approval, then advance the same operation. Archive preserves history but blocks work and hides the project and its contents by default; explicit include_archived search/read is historical consultation only. Active sessions and unresolved work block archival; never close them automatically. Reactivation is a separate explicit review.
 
         Memory clean-up (on the owner's request only): begin kind "cleanup" with parameters {action: "review"} for a read-only candidate list grouped by suggestion (forget, erase, archive); propose a choice per item and wait for the owner. Ordinary record archival is a normal maven_save revision adding the "archived" tag; cloud projects instead use project_lifecycle as above. Forget, Restore and Erase run only here: begin kind "cleanup" with {action: "forget"|"restore"|"erase", record_ids: [<=200 UUIDs], reason}, present the exact review (records, versions, and for Erase its caveats: irreversible; Aurora backups keep old content up to 30 days; other machines keep cached copies until they next run a MAVEN clean-up) and apply only after the owner's approval. Every clean-up first sweeps this machine's local caches for erased records and reports the files changed.
 
         Responses omit choice_checkpoints, responses, navigation and retired_interactions unless detail=true."""
         result = administer(action, kind, parameters, operation_id, interaction_id, revision, response)
+        outcome = result.get('outcome', {})
+        if (action == 'advance' and result.get('state') == 'completed'
+                and outcome.get('status') == 'renamed' and app.binding
+                and outcome['project_id'] == app.binding['project_id']):
+            app._project_identity = {'project_id': outcome['project_id'], 'name': outcome['name']}
+            result = {**result, 'active': app.active()}
         return result if detail else _without_admin_detail(result)
 
     def administer(action, kind, parameters, operation_id, interaction_id, revision, response):

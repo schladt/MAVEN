@@ -329,8 +329,8 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 identifier = str(uuid4())
                 controller = Mock(home=Path(directory))
                 controller.status.return_value = {
-                    'operation_id': identifier, 'state': 'blocked', 'step': 'migrate', 'error': 'warming',
-                    'pending_interaction': None, 'next_actions': ['advance'], 'receipts': []}
+                    'operation_id': identifier, 'state': 'blocked', 'step': 'verify', 'error': 'warming',
+                    'read_only_retry': True, 'pending_interaction': None, 'next_actions': ['advance'], 'receipts': []}
                 controller.database_status.side_effect = statuses
                 controller.advance.return_value = {
                     'operation_id': identifier, 'state': 'cancelled', 'step': 'done', 'pending_interaction': None}
@@ -338,7 +338,8 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                 fake_time = Mock(monotonic=lambda: clock.now)
                 fake_time.sleep.side_effect = lambda seconds: setattr(clock, 'now', clock.now + seconds)
                 with patch('tools.tui.administration.AdminOperations', return_value=controller), \
-                        patch('tools.tui.administration.time', fake_time):
+                        patch('tools.tui.administration.time', fake_time), \
+                        patch('tools.memory.client.time', fake_time):
                     app = WorkflowApp('Setup', ['Setup'], lambda ui: present(ui, Path(directory), operation_id=identifier))
                     async with app.run_test(size=(80, 24)) as pilot:
                         await pilot.pause(0.5)
@@ -350,7 +351,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                         else:
                             controller.advance.assert_not_called()
                             self.assertIsInstance(app.screen, ReviewScreen)
-                            self.assertIn('Setup stopped', app.screen.heading)
+                            self.assertIn('Administration stopped', app.screen.heading)
                         await pilot.press('ctrl+q')
 
     async def test_aws_login_manual_back_and_pause_never_launch_a_command(self):
@@ -765,6 +766,94 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(app.activity_text.startswith('Paused'))
             finally:
                 release.set()
+
+    async def test_awake_probe_never_automatically_replays_a_mutation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            identifier = str(uuid4())
+            controller = Mock(home=Path(directory))
+            controller.status.return_value = {
+                'operation_id': identifier, 'kind': 'update', 'state': 'uncertain',
+                'step': 'migrate', 'error': 'warming', 'pending_interaction': None,
+                'next_actions': ['advance'], 'receipts': []}
+            controller.database_status.return_value = 'awake'
+            with patch('tools.tui.administration.AdminOperations', return_value=controller):
+                app = WorkflowApp('Update', [], lambda ui: present(ui, Path(directory), operation_id=identifier))
+                async with app.run_test(size=(100, 34)) as pilot:
+                    await pilot.pause()
+                    controller.database_status.assert_called_once()
+                    controller.advance.assert_not_called()
+                    self.assertIsInstance(app.screen, ReviewScreen)
+                    displayed = '\n'.join(widget.text for widget in app.screen.query(TextArea))
+                    self.assertIn('tools.tui.administration', displayed)
+                    self.assertNotIn('maven-setup', displayed)
+                    self.assertNotIn('aws login', displayed)
+                    await pilot.press('ctrl+q')
+
+    async def test_child_failure_keeps_exit_status_but_not_arguments_or_output(self):
+        import subprocess
+        def operation(ui):
+            raise subprocess.CalledProcessError(17, ['child', 'private-argument'],
+                                                output='private-output', stderr='private-error')
+        app = WorkflowApp('Child failure', [], operation)
+        async with app.run_test(size=(100, 34)) as pilot:
+            await pilot.pause()
+            self.assertEqual(app.exit_code, 2)
+            self.assertIn('status 17', app.activity_text)
+            self.assertNotIn('private-', app.activity_text)
+            self.assertIn('not proof of an authentication failure', app.activity_text)
+            await pilot.press('ctrl+q')
+
+    async def test_rejected_form_reason_is_visible_on_the_current_form(self):
+        from tools.administration import AdminInputError
+        with tempfile.TemporaryDirectory() as directory:
+            identifier = str(uuid4())
+            question = {'kind': 'form', 'title': 'Select access', 'interaction_id': 'selection',
+                        'revision': 1, 'fields': [{'name': 'profile', 'label': 'Named profile', 'default': 'owner'}]}
+            result = {'kind': 'home', 'operation_id': identifier, 'state': 'waiting',
+                      'step': 'identity', 'pending_interaction': question,
+                      'next_actions': ['respond'], 'receipts': []}
+            controller = Mock(home=Path(directory))
+            controller.status.return_value = result
+            controller.respond.side_effect = AdminInputError('Invalid answer for profile: select a named login profile.')
+            with patch('tools.tui.administration.AdminOperations', return_value=controller):
+                app = WorkflowApp('Selected access', [], lambda ui: present(ui, Path(directory), operation_id=identifier))
+                async with app.run_test(size=(100, 34)) as pilot:
+                    await pilot.pause()
+                    await pilot.click('#submit')
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, FormScreen)
+                    self.assertIn('Invalid answer for profile', app.screen.description)
+                    controller.advance.assert_not_called()
+                    await pilot.press('ctrl+q')
+
+
+
+class UiAvailabilityTests(unittest.TestCase):
+    def test_textual_supported_lower_bound_and_prereleases(self):
+        from tools.tui.bootstrap import ui_available
+        for version, supported in (('2.0.0', False), ('2.1.0', True), ('2.9.0', True),
+                                   ('3.0.0', False), ('2.1.0rc1', False)):
+            with self.subTest(version=version), \
+                    patch('tools.tui.bootstrap.util.find_spec', return_value=object()), \
+                    patch('tools.tui.bootstrap.metadata.version',
+                          side_effect=lambda name: version if name == 'textual' else '25.0'):
+                self.assertEqual(ui_available(), supported)
+
+    def test_auth_command_is_executable_with_exact_cache_profile_and_region(self):
+        import shlex
+        from tools.tui.administration import _instructions
+        result = {'kind': 'home', 'step': 'identity_inspect', 'state': 'blocked',
+                  'error': 'selected_login_unavailable_or_expired',
+                  'handoff': {'type': 'aws_login', 'reason': 'Selected login expired.',
+                              'command': ['aws', 'login', '--profile', 'owner profile', '--region', 'us-east-1'],
+                              'environment': {'AWS_LOGIN_CACHE_DIRECTORY': '/private/selected cache'}}}
+        rendered = _instructions(result, Path('/private/home space'), 'retained-operation')
+        command = rendered.split('External command:\n', 1)[1].split('\n', 1)[0]
+        self.assertEqual(shlex.split(command), ['env', 'AWS_LOGIN_CACHE_DIRECTORY=/private/selected cache',
+                         'aws', 'login', '--profile', 'owner profile', '--region', 'us-east-1'])
+        self.assertIn('tools.tui.administration', rendered)
+        self.assertNotIn('maven-setup', rendered)
+
 
 
 if __name__ == '__main__':

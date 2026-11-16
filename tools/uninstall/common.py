@@ -13,6 +13,10 @@ class UninstallError(ValueError):
     """An uninstall action cannot safely proceed; preserve its receipt."""
 
 
+class PauseRequested(UninstallError):
+    """A bounded provider wait stopped; original submitted work remains resumable."""
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False,
                       allow_nan=False).encode('utf-8')

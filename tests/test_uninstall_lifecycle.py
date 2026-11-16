@@ -191,6 +191,7 @@ class ProjectTransitionTests(unittest.TestCase):
                     ({**selected, 'lifecycle': {**applied, 'generation': 4}}, False),
                     ({**selected, 'lifecycle': {**applied, 'archived': not archived}}, False),
                     ({**selected, 'content_hash': 'f' * 64}, False),
+                    ({**selected, 'content_hash': 'f' * 64, 'lifecycle': applied}, False),
                     ({**selected, 'lifecycle': {**applied, 'action_key': '0' * 64}}, False),
                 ]
                 for observed, accepted in cases:

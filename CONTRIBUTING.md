@@ -24,8 +24,6 @@ Use the existing Python 3.11+ environment with the required optional extras. Ins
 behavior. Do not create a separate test environment or deploy cloud resources merely
 to verify changes. Core recovery must not import MCP, UI or model dependencies.
 
-Include the `google` extra only to exercise optional Google behavior. Those tests
-use synthetic accounts and mocked services; no live Google access is required.
 Keep a separate private `MAVEN_HOME` for any explicitly authorized manual work.
 The repository must not contain your environment file, credentials, runtime state,
 project receipts or downloaded originals.
@@ -85,8 +83,8 @@ work using system Python without importing Textual or AWS packages.
   together. Prefer a small boundary test over a new test framework.
 - Never make tests deploy, send mail, share files, log in, publish or access an owner's
   live cloud. Live exercises require separate owner approval and exact targets.
-- Check installed resource access as well as source-checkout behavior. Core must
-  remain usable without optional Google packages.
+- Check installed resource access as well as source-checkout behavior. Core recovery
+  must remain usable without optional MCP or UI packages.
 - Preserve revision guards, request keys and unknown-outcome receipts. Do not solve
   races by ignoring errors, deleting evidence or resetting unrelated Git state.
 - Use only invented fixtures and reserved example domains. Do not paste private

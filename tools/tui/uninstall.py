@@ -17,16 +17,16 @@ from tools.uninstall.common import UninstallError
 STEPS = ['Dashboard', 'Scopes', 'Projects', 'Machine', 'Cloud', 'Recovery',
          'Inventory', 'Review', 'Approvals', 'Execution', 'Result']
 HARNESS_WARNING = (
-    'Removal does not require closing assistant harnesses. Running sessions keep their loaded '
+    'New removal plans permit idle assistant harnesses to remain open. Running sessions keep their loaded '
     'configuration until restarted and lose MAVEN tools once its runtime is removed.\n\n'
     'A harness that saves its own configuration file while running can write the removed MAVEN '
     'entry back. After closing each harness, reopen it and confirm MAVEN is no longer listed.')
 NO_ARCHIVE_WARNING = (
     'No archive directory was given. Machine removal permanently deletes each selected installation '
     'folder, including its private settings (.env), saved AWS sign-in caches, unfinished setup state '
-    'and session records. A folder is kept only when it cannot be proven safe to delete; the review '
-    'lists any exceptions.\n\n'
-    'Go Back to enter an archive directory and keep a copy of the settings and records.')
+    'and session records. Exact detached registrations remain in the private external recovery directory; '
+    'login caches are never archived. A folder is kept only when it cannot be proven safe to delete.\n\n'
+    'Go Back to enter an archive directory and keep an optional copy of settings and runtime records.')
 
 
 def _json(value):
@@ -217,10 +217,15 @@ def _approve(ui, path, plan):
             return None
         arguments.append('--writers-quiescent')
     if 'harnesses-stopped' in plan['requires']:
-        if not ui.review('Assistant harnesses may still be running', HARNESS_WARNING,
-                         accept='Continue with removal', back=True):
+        if not ui.confirm('Have you actually closed all affected assistant harnesses? '
+                          'This frozen plan requires them stopped, not merely a risk acknowledgement.'):
             return None
         arguments.append('--harnesses-stopped')
+    if 'harness-config-risk' in plan['requires']:
+        if not ui.review('Running harness configuration risk', HARNESS_WARNING,
+                         accept='Acknowledge configuration rewrite risk', back=True):
+            return None
+        arguments.append('--harness-config-risk')
     _unchanged(path, plan)
     return arguments
 
@@ -243,7 +248,7 @@ def _execute(ui, path, plan, arguments):
     ui.stage('Execution')
     ui.message('Recovery directory: ' + str(Path(path).parent) +
                '\nStaged worker dependencies, when needed, are retained at ' +
-               str(Path(path).parent / 'ui-runtime') + '. '
+               str(Path(path).parent / ('cloud-runtime' if plan.get('cloud_recovery') else 'ui-runtime')) + '. '
                'Pause waits for the current action; remote work may continue. No rollback is implied.')
     ui.checkpoint()
     child = subprocess.Popen(command, env=environment, stdin=subprocess.PIPE,
@@ -404,6 +409,10 @@ def _dashboard(ui):
             if result['status'] == 'paused':
                 ui.message('Paused at a saved action boundary. Preserve the recovery directory and '
                            'resume the exact plan later. Remote work may continue; no rollback is implied.')
+            if result['status'] == 'pending-provider':
+                ui.message('Independent local work finished where safe. Cloud secrets are scheduled, '
+                           'not verified absent. Preserve this recovery directory and resume the same '
+                           'plan after the provider recovery window; a fresh deployment login may be required.')
             if ui.pause_requested.is_set() or result['status'] == 'paused':
                 return cli._exit_status(result)
             ui.stage('Result')

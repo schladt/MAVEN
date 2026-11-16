@@ -40,8 +40,8 @@ def _checkout(home: Path) -> Path | None:
         return None
     try:
         source = read_private(manifest).get('source')
-    except Exception:
-        return None
+    except (SetupPending, OSError, ValueError) as error:
+        raise HomeError('Installation ownership metadata is unreadable; inspect it before choosing a Home folder') from error
     return Path(source).resolve() if source else None
 
 
@@ -68,8 +68,7 @@ def validate_root(home: Path, root: Path) -> Path:
 def load_home(home: Path) -> dict | None:
     """The validated Home selection, None when not configured, or {'invalid': reason}."""
     from tools.memory.client import MemoryClientError
-    from tools.memory.environment import load_environment
-    from tools.project import ProjectError, load_project
+    from tools.project import ProjectError
     home = Path(home).absolute()
     path = home / HOME_FILE
     if not path.exists() and not path.is_symlink():
@@ -78,21 +77,7 @@ def load_home(home: Path) -> dict | None:
         if path.is_symlink():
             raise HomeError('home.json must not be a symlink')
         value = read_private(path)
-        if value.get('schema') != 1 or not isinstance(value.get('label'), str) or not value['label'].strip():
-            raise HomeError('home.json has an unsupported schema')
-        root = validate_root(home, Path(value['root']))
-        if str(root) != value['root']:
-            raise HomeError('home.json root must be its resolved absolute path')
-        project = load_project(root)
-        if project['project_id'] != value.get('project_id'):
-            raise HomeError('Home folder belongs to a different MAVEN project')
-        values = load_environment(home / '.env') if (home / '.env').exists() else {}
-        if values.get('MAVEN_MEMORY_INSTANCE_ID') != value.get('instance_id'):
-            raise HomeError('Home belongs to a different MAVEN instance')
-        consent = value.get('consent')
-        if (not isinstance(consent, dict) or not str(consent.get('origin', '')).strip()
-                or not isinstance(consent.get('excerpt'), str)):
-            raise HomeError('home.json lacks the recorded owner consent')
+        _validate_selection(home, value)
     except (HomeError, ProjectError, SetupPending) as error:
         return {'invalid': str(error)}
     except (OSError, ValueError, KeyError, TypeError, MemoryClientError):
@@ -100,22 +85,38 @@ def load_home(home: Path) -> dict | None:
     return value
 
 
+def _validate_selection(home: Path, value: dict) -> None:
+    from tools.memory.environment import load_environment
+    from tools.project import load_project
+    if value.get('schema') != 1 or not isinstance(value.get('label'), str) or not value['label'].strip():
+        raise HomeError('home.json has an unsupported schema')
+    root = validate_root(home, Path(value['root']))
+    if str(root) != value['root']:
+        raise HomeError('home.json root must be its resolved absolute path')
+    if load_project(root)['project_id'] != value.get('project_id'):
+        raise HomeError('Home folder belongs to a different MAVEN project')
+    values = load_environment(home / '.env') if (home / '.env').exists() else {}
+    if values.get('MAVEN_MEMORY_INSTANCE_ID') != value.get('instance_id'):
+        raise HomeError('Home belongs to a different MAVEN instance')
+    consent = value.get('consent')
+    if (not isinstance(consent, dict) or not str(consent.get('origin', '')).strip()
+            or not isinstance(consent.get('excerpt'), str)):
+        raise HomeError('home.json lacks the recorded owner consent')
+
+
 def save_home(home: Path, *, root: Path, project_id: str, instance_id: str, label: str,
-              consent: dict) -> dict:
+              consent: dict, enabled_at: str | None = None) -> dict:
     home = Path(home).absolute()
     root = validate_root(home, root)
     record = {'schema': 1, 'root': str(root), 'project_id': str(uuid.UUID(project_id)),
-              'instance_id': instance_id, 'label': label.strip(), 'enabled_at': _now(),
+              'instance_id': instance_id, 'label': label.strip(), 'enabled_at': enabled_at or _now(),
               'consent': {'origin': consent['origin'], 'excerpt': consent['excerpt']}}
     if not record['label']:
         raise HomeError('Home label is required')
+    _validate_selection(home, record)
     private_directory(home)
     save_json(home / HOME_FILE, record)
-    loaded = load_home(home)
-    if not loaded or 'invalid' in loaded:
-        (home / HOME_FILE).unlink(missing_ok=True)
-        raise HomeError((loaded or {}).get('invalid', 'Home selection could not be verified'))
-    return loaded
+    return record
 
 
 def remove_home(home: Path) -> bool:
@@ -220,39 +221,49 @@ def active(mode: str, *, label: str | None = None, project_id: str | None = None
     return value
 
 
-def _active_name(harness_session: str | None, folder: str | Path | None) -> str | None:
-    if harness_session:
-        return 'session-' + uuid.uuid5(uuid.NAMESPACE_URL, 'maven-harness-session:' + harness_session).hex + '.json'
+def active_name(*, harness: str | None = None, harness_session: str | None = None,
+                folder: str | Path | None = None) -> str | None:
+    if harness and harness_session:
+        identity = json.dumps([harness, harness_session], separators=(',', ':'))
+        return 'session-' + uuid.uuid5(uuid.NAMESPACE_URL, 'maven-harness-session:' + identity).hex + '.json'
     if folder:
         resolved = str(Path(folder).expanduser().resolve())
         return 'folder-' + uuid.uuid5(uuid.NAMESPACE_URL, 'maven-folder:' + resolved).hex + '.json'
     return None
 
 
-def write_active(home: Path, value: dict, *, harness_session: str | None = None,
-                 folder: str | Path | None = None) -> None:
-    """Private state for status lines, keyed by harness session and by workspace folder."""
-    names = {name for name in (_active_name(harness_session, None), _active_name(None, folder)) if name}
+def write_active(home: Path, value: dict, *, harness: str | None = None,
+                 harness_session: str | None = None, folder: str | Path | None = None) -> None:
+    """Private native-conversation state and a separate last-known folder hint."""
+    if harness_session and not harness:
+        raise HomeError('A native status requires its actual harness namespace')
+    names = {name for name in (active_name(harness=harness, harness_session=harness_session),
+                               active_name(folder=folder)) if name}
     if not names:
         return
     directory = Path(home).absolute() / ACTIVE_DIRECTORY
     private_directory(directory)
-    payload = json.dumps({**value, 'harness_session': harness_session,
+    payload = json.dumps({**value, 'harness': harness, 'harness_session': harness_session,
                           'folder': str(Path(folder).expanduser().resolve()) if folder else None,
                           'at': _now()}, sort_keys=True) + '\n'
     for name in names:
         atomic_private(directory / name, payload)
 
 
-def read_active(home: Path, *, harness_session: str | None = None,
+def read_active(home: Path, *, harness: str | None = None, harness_session: str | None = None,
                 folder: str | Path | None = None) -> dict | None:
-    """Session state first, then the latest state recorded for the folder."""
-    for name in (_active_name(harness_session, None), _active_name(None, folder)):
+    """Exact native state first; folder fallback is explicitly advisory."""
+    from tools.memory.client import MemoryClientError
+    for advisory, name in ((False, active_name(harness=harness, harness_session=harness_session)),
+                            (True, active_name(folder=folder))):
         path = Path(home).absolute() / ACTIVE_DIRECTORY / name if name else None
         if path is None or not path.is_file() or path.is_symlink():
             continue
         try:
-            return read_private(path)
-        except Exception:
+            value = read_private(path)
+            if not advisory and (value.get('harness'), value.get('harness_session')) != (harness, harness_session):
+                continue
+            return {**value, 'advisory': advisory, 'scope': 'folder' if advisory else 'conversation'}
+        except (SetupPending, OSError, ValueError, MemoryClientError):
             continue
     return None

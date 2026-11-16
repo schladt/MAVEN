@@ -7,8 +7,8 @@ from pathlib import Path
 
 from maven_resources import resource_path
 from tools.harness import (
-    HARNESS_PATHS, SKILLS, _read, apply_integration, integration_plan,
-    retired_skill_plan, retire_skills, skill_plan, validate_default_profiles, write_skill,
+    HARNESS_PATHS, SKILLS, _read, apply_integration, integration_plan, installed_targets,
+    retired_skill_plan, retire_skills, skill_plan, validate_default_profiles,
     launcher_permission_plan, repair_launcher_permissions,
 )
 from tools.interaction import Field, OperationPaused
@@ -16,6 +16,7 @@ from tools.uninstall.common import UninstallError, read_private, save_private
 from tools.uninstall.local import (
     MANIFEST, _lock, record_installation, reinstall_marker,
 )
+from tools.update import apply_owned_skills, pending_owned_skills
 
 
 NAMES = {'omp': 'OMP', 'claude': 'Claude Code', 'codex': 'Codex',
@@ -41,17 +42,15 @@ def _cloud_context(home, outcome):
 
 def _verified(home, outcome):
     if not (isinstance(outcome, dict) and outcome.get('instance_ready') is True
-            and outcome.get('secrets_ready') is True
             and outcome.get('home') == str(home) and isinstance(outcome.get('binding'), dict)
             and all(outcome.get(key) for key in ('instance_id', 'account', 'region', 'profile'))):
         return False
     from tools.memory.environment import load_environment
     from tools.memory.client import MemoryClientError
     from tools.setup_common import expected_account, SetupPending
-    from tools.secret_setup import configured as secrets_configured
     try:
         values = load_environment(home / '.env')
-        return (secrets_configured(values) and values == outcome['binding']
+        return (values == outcome['binding']
                 and outcome['account'] == expected_account(values)
                 and outcome['instance_id'] == values.get('MAVEN_MEMORY_INSTANCE_ID')
                 and outcome['region'] == values.get('MAVEN_AWS_REGION', 'us-east-1')
@@ -84,7 +83,7 @@ def _launcher_owned(home, prior, repair):
 
 
 def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
-    """Review and apply optional default-profile files without reinstalling MAVEN.
+    """Review and apply optional recorded or explicitly selected local profile files.
 
     Returns status, selected, written and reason. A conflict after mutation retains
     the list of completed writes; existing ownership receipts remain authoritative.
@@ -96,13 +95,15 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
     ui.stage('Connect your coding harness')
     user_home = Path.home()
     # The selection form already supports skip; avoid a redundant configure gate.
+    recorded = installed_targets(home)
+    destinations = recorded['paths']
     statusline = False
     lifecycle = True
     while True:
         fields = [Field(name, label, name in result['selected'], kind='bool', help=(
-            f'MCP: {user_home / HARNESS_PATHS[name][0]}\n'
-            f'Startup guidance: {user_home / HARNESS_PATHS[name][1]}\n'
-            f'Skills: {user_home / HARNESS_PATHS[name][2]}')) for name, label in NAMES.items()]
+            f'MCP: {destinations.get(name, (user_home / HARNESS_PATHS[name][0],))[0]}\n'
+            f'Startup guidance: {destinations.get(name, (None, user_home / HARNESS_PATHS[name][1]))[1]}\n'
+            f'Skills: {", ".join(map(str, recorded["skill_roots"])) if name in destinations else user_home / HARNESS_PATHS[name][2]}')) for name, label in NAMES.items()]
         fields.append(Field('statusline', STATUSLINE_LABEL, statusline, kind='bool', required=False, help=(
             'Applies only when Claude Code is selected. Adds an owned statusLine command to '
             f'{user_home / ".claude/settings.json"}; an existing different status line is preserved.')))
@@ -113,7 +114,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
             'Other harness end hooks are best effort and cannot prevent exit.')))
         values = ui.form('Choose the harnesses you use', fields,
                          description=('Select any installed harnesses, or leave all unchecked to skip. '
-                                      'These are your default user-profile locations. Differing MAVEN '
+                                      'Recorded destinations are retained; new selections use default profiles. Differing MAVEN '
                                       'entries and unrelated files will be preserved. No credentials are copied.'),
                          submit='Review selected / Skip', back=True)
         if values is None:
@@ -124,25 +125,57 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
         lifecycle = bool(values.get('lifecycle', False))
         if not selected:
             return result
-        roots = [user_home / HARNESS_PATHS[name][2] for name in selected]
+        conflicts = [{'target': path, 'status': 'conflict',
+                      'reason': 'Legacy custom destination is ambiguous; select explicit paths in the installer.'}
+                     for path in recorded['unresolved']]
         try:
-            validate_default_profiles(selected)
+            available = []
+            for name in selected:
+                try:
+                    if name not in destinations:
+                        if recorded['unresolved']:
+                            raise ValueError('An existing custom destination is ambiguous; use explicit installer paths '
+                                             'instead of adding guessed defaults.')
+                        validate_default_profiles([name])
+                    available.append(name)
+                except ValueError as exc:
+                    conflicts.append({'target': name, 'status': 'conflict', 'reason': str(exc)})
+            roots = list(dict.fromkeys([*recorded['skill_roots'], *[
+                user_home / HARNESS_PATHS[name][2] for name in available if name not in destinations]]))
             prior = _ownership(home)
             recorded_launcher = prior.get('owned', {}).get(str(home / 'venv'), {}).get('bin/maven-mcp')
             launcher_repair = launcher_permission_plan(home, recorded=recorded_launcher)
+            pending_skills = pending_owned_skills(home)
             if launcher_repair is not None:
                 _launcher_owned(home, prior, launcher_repair)
             if lifecycle:
                 hook = home / 'venv/bin/maven-session-hook'
                 if _read(hook) is None or not hook.stat().st_mode & 0o100:
-                    raise ValueError('Native lifecycle integration requires the installed maven-session-hook '
-                                     'launcher. Complete the reviewed local software update first.')
+                    conflicts.append({'target': str(hook), 'status': 'conflict',
+                                      'reason': 'Native lifecycle requires the maven-session-hook launcher; update local software.'})
+                    lifecycle = False
             if ca_bundle is None and os.environ.get('AWS_CA_BUNDLE'):
                 ca_bundle = Path(os.environ['AWS_CA_BUNDLE']).expanduser().absolute()
-            changes = integration_plan(home, selected, ca_bundle=ca_bundle, statusline=statusline,
-                                       lifecycle=lifecycle)
-            skills = skill_plan(roots, home)
-            retired = retired_skill_plan(home, roots)
+            changes = integration_plan(home, available, ca_bundle=ca_bundle,
+                                       statusline=statusline and 'claude' in available,
+                                       lifecycle=lifecycle, paths={name: destinations[name] for name in available
+                                                                   if name in destinations})
+            skills, retired, safe_roots = [], [], []
+            for root in roots:
+                try:
+                    planned = skill_plan([root], home, conflicts=conflicts)
+                    retiring = retired_skill_plan(home, [root], conflicts=conflicts)
+                except (OSError, ValueError, UninstallError) as exc:
+                    conflicts.append({'target': str(root), 'status': 'conflict', 'reason': str(exc)})
+                    continue
+                skills.extend(planned)
+                retired.extend(retiring)
+                safe_roots.append(root)
+            roots = safe_roots
+            conflicts.extend({'target': str(change.path), 'status': 'conflict',
+                              'reason': change.receipt['conflict']} for change in changes
+                             if change.receipt.get('conflict'))
+            result['targets'] = list(conflicts)
         except (OSError, ValueError, UninstallError) as exc:
             result.update(status='conflict', reason=str(exc))
             action = ui.choose('Harness files preserved', [
@@ -155,11 +188,15 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
 
         visible = [f'MAVEN home: {home}', 'Harnesses: ' + ', '.join(NAMES[name] for name in selected),
                    'Only these local changes are proposed:']
-        if launcher_repair is None and not skills and not retired and all(
-                change.before == change.after and not change.receipt.get('conflict') for change in changes):
+        if not conflicts and not pending_skills and launcher_repair is None and not skills and not retired and all(
+                change.before == change.after for change in changes):
             result.update(status='unchanged', reason='Identical local harness files preserved; no writes were needed.')
             return result
         details = []
+        visible.extend('Conflict, preserved: ' + item['target'] + ' — ' + item['reason'] for item in conflicts)
+        for pending in pending_skills:
+            visible.append('Resume exact journaled local file installation: ' + pending['intent']['target'])
+            details.append('Original local installation intent:\n' + json.dumps(pending, indent=2))
         if launcher_repair is not None:
             if launcher_repair['mode'] == 0o775:
                 visible.append(f'Repair only {home / "venv/bin/maven-mcp"}: mode 0775 → 0755; bytes unchanged.')
@@ -213,10 +250,15 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                 raise ValueError('This home requires explicit local reinstallation after uninstall; no harness files changed.')
             prior = _ownership(home)
             source = Path(prior['source']) if prior.get('source') else resource_path('templates').parent
-            if skill_plan(roots, home) != skills or retired_skill_plan(home, roots) != retired:
+            if pending_owned_skills(home) != pending_skills:
+                raise ValueError('Pending local installation intents changed since review; review the original evidence again.')
+            if (skill_plan(roots, home, conflicts=[]) != skills
+                    or retired_skill_plan(home, roots, conflicts=[]) != retired):
                 raise ValueError('Skill files changed since review; preserved. Review again before writing.')
             checked = set()
             for change in changes:
+                if change.receipt.get('conflict'):
+                    continue
                 # Native hooks can follow MCP/statusLine changes to the same JSON file.
                 if change.path not in checked and _read(change.path) != change.before:
                     raise ValueError(f'Integration changed since review; preserved: {change.path}')
@@ -240,21 +282,28 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                     result['written'].append(str(home / MANIFEST))
             references = [root / name / 'SKILL.md' for root in roots for name in SKILLS]
             record_installation(home, source, [], references)
-            for target, body, expected in skills:
-                write_skill(target, body, expected)
-                result['written'].append(str(target))
-                record_installation(home, source, [target], references)
+            apply_owned_skills(home, source, skills, references)
+            result['written'].extend(str(target) for target, _, _ in skills)
+            result['targets'].extend({'target': pending['intent']['target'], 'status': 'reconciled'}
+                                     for pending in pending_skills)
+            result['written'].extend(pending['path'] for pending in pending_skills)
             for change in changes:
+                if change.receipt.get('conflict'):
+                    continue
                 # Journal before mutation and preserve the original pinned receipt
                 # when a subsequent run sees identical, already-owned content.
                 record_installation(home, source, [], [], integrations=[change.receipt])
                 apply_integration(change)
                 if change.before != change.after:
                     result['written'].append(str(change.path))
+                result['targets'].append({'target': str(change.path),
+                                          'status': 'written' if change.before != change.after else 'unchanged'})
             for target, expected in retired:
                 retire_skills([(target, expected)])
                 result['written'].append(str(target))
-        result.update(status='written' if result['written'] else 'unchanged', reason='Reviewed local integration is configured.')
+        result.update(status='conflict' if conflicts else ('written' if result['written'] else 'unchanged'),
+                      reason='Safe reviewed targets configured; conflicting targets preserved.' if conflicts
+                      else 'Reviewed local integration is configured.')
     except (OSError, ValueError, UninstallError) as exc:
         result.update(status='conflict', reason=str(exc))
     return result
@@ -277,6 +326,10 @@ def show_completion(ui, home, result, *, outcome=None):
              'skipped': 'Harness configuration: skipped.',
              'conflict': 'Harness configuration: conflict; differing/unrelated files preserved.'}[status]
     lines = [cloud, local, result.get('reason', '')]
+    if result.get('targets'):
+        lines.append('Per-target outcomes:\n' + '\n'.join(
+            item['status'] + ': ' + item['target'] +
+            (' — ' + item['reason'] if item.get('reason') else '') for item in result['targets']))
     if result.get('written'):
         lines.append('Completed local changes:\n' + '\n'.join(result['written']))
     if status in ('written', 'unchanged') or result.get('written'):

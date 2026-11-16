@@ -109,7 +109,7 @@ The wizard offers two paths:
   Select maintenance access separately. **Prepare deployment review** requests a
   change-set preview without deploying resources. Review costs and approve exact
   billable execution, database initialization, then **one approval to upload and
-  activate all nine starter instruction pages**. Complete artifacts remain available
+  activate the complete starter instruction collection**. Complete artifacts remain available
   in expandable technical details. The current deployment template is restricted
   to `us-east-1` and a same-account human IAM user; see
   [deployment limitations](docs/getting-started.md#deployment-limitations-and-costs).

@@ -662,6 +662,9 @@ def inspect_checkpoint(root, policy, memory, registry, *, action, message=None):
     before = candidate_digest(root, paths)
     checks = run_project_checks(root, policy)
     report['checks'] = checks
+    report['check_policy'] = ('Exact owner approval may publish failing checks; rerun results must '
+                              'equal these reviewed results. Approval is not integration readiness.')
+    report['failed_checks'] = [check for check in checks if not check['passed']]
     if (candidate_paths(root) != paths or candidate_digest(root, paths) != before
             or head(root, policy) != report['head'] or index_paths(root)):
         raise WorkflowFailure('repository changed during inspection; no approval was created')
@@ -684,7 +687,7 @@ def inspect_checkpoint(root, policy, memory, registry, *, action, message=None):
     proposal['memory'] = memory.prepare_checkpoint(root, paths, report['head'], reservation['reservation_id'])
     proposal['approval_code'] = approval_code(proposal)
     report.update(status='approval_required', proposed=proposal)
-    report['next_action'] = f"Review exact proposal, then maven-{action} --root ROOT --session {memory.session_id} --writers-quiescent --apply {proposal['approval_code']}"
+    report['next_action'] = f"Review exact proposal{' INCLUDING FAILED CHECKS' if report['failed_checks'] else ''}, then maven-git {action} --root ROOT --session {memory.session_id} --writers-quiescent --apply {proposal['approval_code']}"
     receipt(root, report)
     return report
 
@@ -928,9 +931,9 @@ def cancel_work(root, policy, memory, registry, *, approval_only=False):
 
 def recover_work(root, policy, memory, registry, *, code=None, writer_tokens=None):
     report = base_report('recover', root, memory.session_id)
-    if writer_tokens is not None:
-        registry.recover_writers(root, memory.session_id, writer_tokens)
     report['reconciled_request'] = memory.recover()
+    if writer_tokens is not None:
+        registry.recover_writers(root, memory.session_id, writer_tokens, workers_stopped=True)
     stored = maybe_receipt(root, memory.session_id)
     if stored and stored['status'] == 'memory_ready':
         return complete_boundary(root, policy, memory, registry, stored)
@@ -1076,7 +1079,7 @@ def _main(argv=None, *, action=None):
             raise WorkflowFailure('exact-request recovery requires explicit relevant-writer quiescence attestation')
         if args.action in ('checkpoint', 'stop-work') and args.apply and (args.summary or args.memory_ref):
             raise WorkflowFailure('apply cannot rewrite the approved session summary or memory references')
-        with session_lock(root, identifier):
+        with session_lock(root, identifier, shared=args.action == 'status'):
             if args.action == 'start' and not args.resume:
                 if args.harness_session and not args.harness:
                     raise WorkflowFailure('--harness-session requires explicit --harness')
@@ -1156,25 +1159,20 @@ def _main(argv=None, *, action=None):
         report['status'] = 'blocked'
         report.setdefault('issues', []).append(str(error))
         report['next_action'] = 'Inspect this session status; preserve receipts and use explicit cancel or recover.'
+        from tools.memory.client import AUTHENTICATION_CODES
+        if isinstance(error, MemoryClientError) and error.code in AUTHENTICATION_CODES:
+            from tools.memory.environment import authentication_handoff
+            with contextlib.suppress(MemoryClientError, OSError, ValueError):
+                handoff = authentication_handoff(error, load_environment(args.env))
+                if handoff:
+                    report['authentication'] = handoff
+                    report['next_action'] = handoff['reconnect']
         with contextlib.suppress(Exception):
             report['coordination'] = registry.inspect(root, identifier)
             stored = maybe_receipt(root, identifier)
             if stored and stored['status'] in ('applying', 'unsynchronized', 'synchronized'):
                 report['status'] = 'unsynchronized'
                 report['retained_approval'] = stored
-        if isinstance(error, MemoryClientError) and error.code in {
-                'unexpected_login_identity', 'authentication_required', 'not_authorized',
-                'selected_login_unavailable_or_expired', 'selected_login_or_role_unavailable',
-                'invalid_service_response', 'invalid_transport_ca_bundle',
-                'login_cache_must_be_owner_private'}:
-            try:
-                report['local_access_cleanup'] = registry.revoke(root, identifier, logout_cache)
-                report['coordination'] = registry.inspect(root, identifier)
-                report['next_action'] = (
-                    'Shared local access cleanup was requested after a security failure; inspect its verified result. '
-                    'Preserve receipts; resolve the failure and explicitly log in before resuming affected sessions.')
-            except (BoundaryError, OSError) as cleanup_error:
-                report['issues'].append('security cleanup could not be verified: ' + str(cleanup_error))
     finally:
         if client is not None:
             try:

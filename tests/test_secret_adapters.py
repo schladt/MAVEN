@@ -132,6 +132,35 @@ class AdapterContractTests(unittest.TestCase):
         with self.assertRaises(contracts.AdapterError):
             contracts.validate_grant({**grant, 'expires_at': '2030-01-01T00:00:00'})
 
+    def test_legacy_memory_references_are_not_usable_invocations_or_grants(self):
+        from tools.memory.secrets_contract import validate_secret_ref
+        for reference, code in (
+                ({'provider': 'ssm', 'name': '/fixture/test'}, 'secret_reference_migration_required'),
+                ({'provider': 'ssm', 'name': '/fixture/test:latest'}, 'secret_reference_migration_required'),
+                ({'provider': 'ssm', 'name': '/fixture/test:0'}, 'secret_reference_migration_required'),
+                ({'provider': 'ssm', 'name': '/fixture/test:01'}, 'secret_reference_migration_required'),
+                ({'provider': 'secretsmanager', 'name': 'fixture/test'}, 'unsupported_secret_provider')):
+            with self.subTest(reference=reference):
+                self.assertEqual(validate_secret_ref(reference), reference)
+                request = invocation(secret_ref=reference)
+                with self.assertRaisesRegex(contracts.AdapterError, '^' + code + '$'):
+                    contracts.validate_invocation(request)
+                grant = adapters.SecretAdapters(HOME, client=Mock()).grant_document(
+                    invocation(), mode='standing', expires_at='2030-01-01T00:00:00Z')
+                grant['secret_ref'] = reference
+                with self.assertRaisesRegex(contracts.AdapterError, '^' + code + '$'):
+                    contracts.validate_grant(grant)
+
+    def test_encrypted_file_reference_keeps_its_exact_binding(self):
+        reference = {'provider': 'encrypted-file', 'name': 'fixture/files/owner.key',
+                     'bucket': 'synthetic-files', 'store_id': 'a' * 64, 'key_id': '0123456789abcdef',
+                     'version_id': 'exact-version'}
+        request = invocation(secret_ref=reference)
+        self.assertIs(contracts.validate_invocation(request), request)
+        grant = adapters.SecretAdapters(HOME, client=Mock()).grant_document(
+            request, mode='single-use', expires_at='2030-01-01T00:00:00Z')
+        self.assertEqual(grant['secret_ref'], reference)
+
 
 @unittest.skipUnless(os.name == 'posix', 'private FD and process-group runner is POSIX')
 class AdapterRunnerTests(unittest.TestCase):
@@ -196,6 +225,18 @@ class AdapterRunnerTests(unittest.TestCase):
             adapters.run_adapter(data, invocation(), SECRET)
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_large_input_and_child_stderr_are_drained_without_deadlock(self):
+        code = ('import sys,json; sys.stderr.write("x"*8192); sys.stderr.flush(); '
+                'data=sys.stdin.buffer.read(); print(json.dumps({"ok":len(data)>65536}))')
+        data = definition(code)
+        data['max_output_bytes'] = 16384
+        self.assertTrue(adapters.run_adapter(data, invocation(), SECRET * 4096)['results']['ok'])
+
+    def test_closed_secret_fd_is_not_retried_and_only_typed_result_survives(self):
+        code = 'import os,sys,json; os.close(int(sys.argv[1])); print(json.dumps({"ok":True}))'
+        self.assertEqual(adapters.run_adapter(definition(code, mode='fd'), invocation(), SECRET * 4096),
+                         {'status': 'completed', 'results': {'ok': True}})
+
     @unittest.skipUnless(Path('/proc').exists(), 'Linux process state check')
     def test_timeout_kills_descendant_process_group(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -246,6 +287,42 @@ class AdapterControllerTests(unittest.TestCase):
         controller.store.read_secret.assert_not_called()
         self.assertEqual(result['invocation']['catalog_record_id'], CATALOG_ID)
         self.assertNotIn(SECRET.decode(), json.dumps(result))
+
+    def test_unsupported_or_mutable_reference_never_prepares_or_consumes_permission(self):
+        for reference, code in (
+                ({'provider': 'ssm', 'name': '/fixture/test'}, 'secret_reference_migration_required'),
+                ({'provider': 'ssm', 'name': '/fixture/test:latest'}, 'secret_reference_migration_required'),
+                ({'provider': 'secretsmanager', 'name': 'fixture/test'}, 'unsupported_secret_provider')):
+            with self.subTest(reference=reference):
+                client = Mock()
+                client.invoke.return_value = ready(policy())
+                controller = self.controller(client)
+                controller.catalog.lookup.return_value['data']['secret_ref'] = reference
+                with self.assertRaisesRegex(contracts.AdapterError, '^' + code + '$'):
+                    controller.prepare(adapter='secret-adapter-fixture', secret_name='fixture.test',
+                        purpose='offline regression', operation='check', destination='fixture.invalid', parameters={})
+                self.assertEqual(client.invoke.call_count, 1)
+                self.assertEqual(client.invoke.call_args.args[0], contracts.POLICY_ROUTE)
+                client.reset_mock()
+                with patch.object(adapters, 'run_adapter') as run, self.assertRaisesRegex(contracts.AdapterError, '^' + code + '$'):
+                    controller.execute(invocation=invocation(secret_ref=reference), grant='secret-grant-fixture', grant_revision=1)
+                client.invoke.assert_not_called()
+                controller.store.read_secret.assert_not_called()
+                run.assert_not_called()
+
+    def test_store_binding_mismatch_is_rejected_before_grant_consumption(self):
+        from tools.aws.secrets import StoreError
+        for wrong_identity in (True, False):
+            client = Mock()
+            controller = self.controller(client)
+            if wrong_identity:
+                controller.store.store_id = 'b' * 64
+            else:
+                controller.store.validate_reference.side_effect = StoreError('another namespace')
+            with self.subTest(wrong_identity=wrong_identity), self.assertRaisesRegex(contracts.AdapterError, '^adapter_store_mismatch$'):
+                controller.execute(invocation=invocation(), grant='secret-grant-fixture', grant_revision=1)
+            client.invoke.assert_not_called()
+            controller.store.read_secret.assert_not_called()
 
     def test_cloud_unavailable_or_reconciled_consumption_never_reads_secret(self):
         for second in (RuntimeError('sensitive provider detail'), ready({'consumed': True}, reconciled=True)):
@@ -592,9 +669,9 @@ class AdapterPostgreSQLTests(unittest.TestCase):
         statements.append(write_record('setting', rotated, CATALOG_ID, project=HOME, revision=1))
         statements.append(f"SELECT pg_temp.adapter_assert({consume(attempt)}->'status','\"reference_unavailable\"');")
         statements.append('SET CONSTRAINTS ALL IMMEDIATE; ROLLBACK;')
-        completed = subprocess.run([shutil.which('psql'), '-X', '-q', '-v', 'ON_ERROR_STOP=1'],
+        completed = subprocess.run([shutil.which('psql'), '-d', os.environ['MAVEN_MEMORY_TEST_DSN'],
+                                    '-X', '-q', '-v', 'ON_ERROR_STOP=1'],
                                    input='\n'.join(statements), text=True, capture_output=True,
-                                   env={**os.environ, 'PGDATABASE': os.environ['MAVEN_MEMORY_TEST_DSN']},
                                    timeout=90, check=False)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 

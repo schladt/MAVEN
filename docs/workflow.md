@@ -43,6 +43,11 @@ not establish readiness. Where automatic startup is unavailable, ask **initializ
 MAVEN**; the [capability matrix](integrations.md#harness-capability-matrix) discloses
 this foreground fallback.
 
+Startup eagerly retrieves `always` skill resources only when they belong to the
+current applicable instruction/dependency closure. An unrelated catalog skill's
+unavailable resources do not block that closure; discovering a skill still does not
+load or authorize it.
+
 Each new/forked work session has a distinct MAVEN identity. The assistant retains
 its explicit root/project/session binding across cwd changes and compaction, then
 reloads current authority. Resume selects the original session explicitly, never the
@@ -170,11 +175,11 @@ Each tool wait is bounded (20 seconds by default, at most 120); if included work
 unfinished it returns pending, not saved. The assistant retains the checkpoint identity,
 finishes included semantic work through a native worker or foreground fallback, then
 advances that same checkpoint. Waiting alone does not launch a reasoning worker.
-**“Wrap up this session”** reconciles required work, saves the handover/checkpoint and
-closes only this session once cloud persistence is verified and no closure-blocking
-memory operations remain. Unpublished code can be reported as unfinished work without
-blocking memory closure. Neither operation backs up source files, commits, pushes,
-activates instructions, closes a peer session or revokes shared credentials.
+**“Wrap up this session”** first calls `maven_pause(drain=true)`: freeze all new
+assignment admission while accepted workers finish. Save the handover/checkpoint
+and close only this session after verified persistence and no closure-blocking
+operations. Unpublished code does not block closure. Neither operation backs up
+source, commits, pushes, activates instructions, closes peers or revokes credentials.
 
 At checkpoint completion, explicit wrap-up or a requested summary, show **universal
 updates/promotions**, **project updates**, and **pending work**. Do not interrupt after
@@ -185,7 +190,7 @@ mode changes, conflicts, failures and requests for owner decisions remain visibl
 
 The optional OMP adapter offers **Wrap up and exit**, **Exit without wrapping up**,
 or **Stay** for an open exact-conversation binding. It cancels the immediate exit
-before asking the agent to pause new automatic maintenance, finish accepted work,
+before asking the agent to call `maven_pause(drain=true)`, finish accepted work,
 checkpoint and close. It checks the exact closure receipt, not the assistant's text,
 before exiting. Failure leaves the harness open; report pending work and paused mode.
 
@@ -210,6 +215,10 @@ discussion and creates bounded catch-up work. Report missing context honestly; d
 claim complete reconstruction. **“Resume fresh”** resumes without looking back.
 Both mode changes are visible and survive normal session restoration.
 
+Drain is distinct from ordinary pause: accepted workers may continue, but neither
+automatic nor explicit new assignments are admitted. Explicit resume cancels drain;
+another ordinary pause does not silently reopen admission.
+
 ## Outages and recovery
 
 Report degraded state and distinguish **pending locally**, **cloud-saved**, **blocked**
@@ -230,8 +239,11 @@ boundaries and cannot roll back completed external effects.
 Repair is specific: renew the selected login, reconcile an original request/checkpoint,
 finish its original closure, close an owner-confirmed stopped peer, or review a folder
 switch/local integration change. Read-only diagnosis never changes cloud records.
-Unknown writes require real relevant-worker quiescence before `maven_recover`.
-Neither a timestamp nor an end-hook event is that attestation.
+Unknown writes require real relevant-worker quiescence and the exact retained
+`writer_tokens` before `maven_recover(workers_stopped=true, …)`. Age and end hooks are
+not proof. `maven_initialize(resume=true, session_id=…, restore_only=true)` restores
+an exact binding for observation, not readiness or capture;
+`maven_recover(observe_only=true)` inspects original receipts without replay.
 
 
 ## Optional Git publication
@@ -252,6 +264,11 @@ other hosts. Unknown commit/push outcomes retain their original candidate and re
 reconcile explicitly rather than retry blindly or repair Git destructively. A previous
 publication receipt must be recovered with its original supported path before unsafe
 cutover; it cannot be relabeled as a memory-native checkpoint.
+
+A pending Git review does not block ordinary memory. An owned publication reservation
+or submitted uncertain effect still blocks closure. Explicit approval may accept
+failed configured checks; the review retains those failures and never labels that
+candidate integration-ready. Memory completion does not log out shared credentials.
 
 ## Recovery interfaces and removal
 
@@ -310,12 +327,15 @@ startup and every read; reversible with `restore`) and **Erase** (every revision
 current content, owned source excerpts, fact values and receipt results rewritten to a
 content-free tombstone; irreversible) run only through an owner-approved `maven_admin`
 kind `cleanup` operation with at most 200 record ids and a reason. Its exact review
-lists every record and version count; approval writes an immutable receipt with the
-review digest and no content. Erase caveats: Aurora automated backups keep old content
-up to 30 days; other machines keep any locally cached copy until they next run a MAVEN
-clean-up. Every clean-up first sweeps this machine's local runtime (every registered
-project and the Home folder) for erased records and reports each file changed; an
-unresolved request for an erased record blocks the sweep until it is recovered.
+pins every current revision. The original operation ID and revision map fence the
+transaction; replay returns its original receipt, not a new description of current
+records. Older servers without this capability refuse the effect.
+Receipts retain IDs and review digests, with hashed actor identity and fixed action
+reasons rather than free-text content. Erase includes legacy fact predicates and
+local administration copies; unresolved local requests must be recovered before
+redaction. Shared sources and backups have separate retention: Aurora automated
+backups keep old content up to 30 days, and other machines retain cached copies until
+their next clean-up sweep. Every sweep reports changed local files.
 
 An interrupted closure retains its original checkpoint and finish intent. Restore
 the exact binding even if initialization reports that the session is closing or

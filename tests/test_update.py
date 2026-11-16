@@ -42,9 +42,21 @@ class LocalUpdateTests(unittest.TestCase):
                      'maven_resources/templates/skills/maven/SKILL.md': b'skill v2\n'}
         dist = self.home / 'venv/lib/python3.14/site-packages/maven_cloud_memory-0.1.0.dist-info'
         dist.mkdir(parents=True)
+        self.dist = dist
+        for name, data in installed.items():
+            target = dist.parent / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        launcher = self.home / 'venv/bin/maven-mcp'
+        launcher.parent.mkdir(parents=True)
+        launcher.write_bytes(b'entrypoint\n')
+        (dist / 'METADATA').write_text('Name: maven-cloud-memory\nVersion: 0.1.0\n')
+        (dist / 'entry_points.txt').write_text('[console_scripts]\nmaven-mcp = tools.mcp.server:main\n')
         (dist / 'RECORD').write_text(''.join(f'{name},{_record_hash(data)},{len(data)}\n'
                                              for name, data in installed.items()) +
-                                     '../../../bin/maven-mcp,sha256=x,1\ntools/__pycache__/x.pyc,,\n')
+                                     f'../../../bin/maven-mcp,{_record_hash(launcher.read_bytes())},11\n'
+                                     'tools/__pycache__/x.pyc,,\n')
+        update.record_package_inputs(self.home, self.checkout)
 
     def test_report_lists_changed_added_and_removed_software(self):
         report = update.local_report(self.home, self.checkout)
@@ -57,6 +69,108 @@ class LocalUpdateTests(unittest.TestCase):
         (self.checkout / 'tools/added.py').unlink()
         (self.checkout / 'tools/removed.py').write_text('gone\n')
         self.assertTrue(update.local_report(self.home, self.checkout)['current'])
+
+    def test_unchanged_record_does_not_hide_deleted_or_changed_installed_bytes(self):
+        original_record = (self.dist / 'RECORD').read_bytes()
+        target = self.dist.parent / 'tools/kept.py'
+        for body in (b'corrupt\n', None):
+            with self.subTest(body=body):
+                if body is None:
+                    target.unlink()
+                else:
+                    target.write_bytes(body)
+                report = update.local_report(self.home, self.checkout)
+                self.assertIn('tools/kept.py', report['software']['changed'])
+                self.assertIn('tools/kept.py', report['integrity_failures'])
+                self.assertFalse(report['current'])
+                self.assertEqual((self.dist / 'RECORD').read_bytes(), original_record)
+
+    def test_entrypoint_only_input_or_installed_metadata_change_is_not_current(self):
+        pyproject = self.checkout / 'pyproject.toml'
+        original = pyproject.read_text()
+        pyproject.write_text(original + '\n[project.scripts]\nmaven-new = "tools.new:main"\n')
+        self.assertFalse(update.local_report(self.home, self.checkout)['package_metadata_current'])
+        pyproject.write_text(original)
+        (self.dist / 'entry_points.txt').write_text('[console_scripts]\n')
+        self.assertFalse(update.local_report(self.home, self.checkout)['package_metadata_current'])
+
+    def test_missing_entrypoint_and_unrecorded_module_are_reported(self):
+        (self.home / 'venv/bin/maven-mcp').unlink()
+        (self.dist.parent / 'tools/extra.py').write_text('unexpected\n')
+        report = update.local_report(self.home, self.checkout)
+        self.assertIn('../../../bin/maven-mcp', report['integrity_failures'])
+        self.assertIn('tools/extra.py', report['software']['removed'])
+
+    def test_skill_write_interruption_recovers_original_ownership_before_next_upgrade(self):
+        from tools.uninstall.common import read_private
+        root = self.base / 'custom-skills'
+        plan = skill_plan([root], self.home)
+        target, body, _ = plan[0]
+        with patch.object(local, 'record_installation', side_effect=OSError('interrupted')):
+            with self.assertRaises(OSError):
+                update.apply_owned_skills(self.home, self.checkout, [plan[0]], [target])
+        receipts = list((self.home / 'runtime/skill-installations').glob('*.json'))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(target.read_bytes(), body)
+        update.apply_owned_skills(self.home, self.checkout, [], [target])
+        self.assertTrue(read_private(receipts[0])['completed'])
+        self.assertIn(str(target), read_private(self.home / local.MANIFEST)['owned'])
+        # A subsequent exact owned replacement remains possible.
+        expected = local.inventory(target)
+        update.apply_owned_skills(self.home, self.checkout, [(target, body + b'\n', expected)], [target])
+        self.assertEqual(target.read_bytes(), body + b'\n')
+
+    def test_interrupted_skill_refuses_changed_bytes_without_adoption(self):
+        root = self.base / 'custom-skills'
+        entry = skill_plan([root], self.home)[0]
+        with patch.object(local, 'record_installation', side_effect=OSError('interrupted')):
+            with self.assertRaises(OSError):
+                update.apply_owned_skills(self.home, self.checkout, [entry], [entry[0]])
+        entry[0].write_bytes(b'owner edit')
+        with self.assertRaisesRegex(ValueError, 'changed'):
+            update.apply_owned_skills(self.home, self.checkout, [], [entry[0]])
+        self.assertEqual(entry[0].read_bytes(), b'owner edit')
+
+    def test_update_command_preserves_recorded_custom_destinations_and_private_settings(self):
+        from tools.harness import apply_integration, integration_plan
+        custom = self.base / 'custom-profile'
+        custom.mkdir()
+        config, context, skills = custom / 'mcp.json', custom / 'CONTEXT.md', custom / 'skills'
+        config.write_text('{"owner":{"keep":true}}\n')
+        context.write_text('Owner context\n')
+        config.chmod(0o600)
+        context.chmod(0o600)
+        environment = self.home / '.env'
+        environment.write_text('MAVEN_AWS_PROFILE=original\nMAVEN_AWS_LOGIN_CACHE=/original/cache\n')
+        environment.chmod(0o600)
+        before = environment.read_bytes()
+        changes = integration_plan(self.home, ['omp'], user_home=self.base,
+                                   paths={'omp': (config, context)}, lifecycle=False)
+        references = [skills / 'maven/SKILL.md']
+        for change in changes:
+            local.record_installation(self.home, self.checkout, [], references, integrations=[change.receipt])
+            apply_integration(change)
+        command = update.install_command(self.home, self.checkout)
+        self.assertIn('omp=' + str(config), command)
+        self.assertIn('omp=' + str(context), command)
+        self.assertIn(str(skills), command)
+        self.assertNotIn(str(self.base / '.omp/agent/mcp.json'), command)
+        self.assertEqual(json.loads(config.read_text())['owner'], {'keep': True})
+        self.assertTrue(context.read_text().startswith('Owner context\n'))
+        self.assertEqual(environment.read_bytes(), before)
+
+    def test_preserved_skill_difference_does_not_make_installed_software_noncurrent(self):
+        (self.checkout / 'tools/changed.py').write_text('old\n')
+        (self.checkout / 'tools/added.py').unlink()
+        (self.checkout / 'tools/removed.py').write_text('gone\n')
+        target = self.base / 'custom-skills/maven/SKILL.md'
+        target.parent.mkdir(parents=True)
+        target.write_text('Owner-customized skill\n')
+        local.record_installation(self.home, self.checkout, [], [target])
+        report = update.local_report(self.home, self.checkout)
+        self.assertTrue(report['current'])
+        self.assertFalse(report['skills_current'])
+        self.assertEqual(report['skills']['stale'], [str(target)])
 
     def test_owned_unmodified_skill_is_upgraded_and_modified_skill_is_preserved(self):
         roots = [self.base / '.omp/agent/skills']

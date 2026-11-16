@@ -2,19 +2,24 @@
 from __future__ import annotations
 
 import base64
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime
 import hashlib
 import io
 import json
 import math
+import os
+from pathlib import Path
 import re
 import uuid
+import tempfile
+from types import MappingProxyType
 
 from botocore.exceptions import ClientError
 
 from tools.aws.settings import prefix, required
-from tools.aws.secrets import KEY_ID, NAME, StoreError, file_keyring
+from tools.aws.secrets import KEY_ID, NAME, StorageRejected, StoreError, file_keyring
+from tools.memory.secrets_contract import validate_consumer_ref
 from tools.memory.environment import selected_aws_session
 
 MAX_VALUE_BYTES = 4096
@@ -76,7 +81,7 @@ class BoundedReader(io.RawIOBase):
     """Limit unknown-length plaintext without spooling it to disk or reading it all."""
     def __init__(self, source, maximum):
         if type(maximum) is not int or not 0 < maximum <= MAX_FILE_BYTES:
-            raise StoreError('file byte limit must be positive and at most 5 TiB')
+            raise StorageRejected('file byte limit must be positive and at most 5 TiB')
         self.source, self.maximum, self.count = source, maximum, 0
 
     def readable(self):
@@ -109,9 +114,10 @@ def _date(value):
 
 class SecretStore:
     def __init__(self, values, session=None):
-        self.values = dict(values)
-        self.binding = store_binding(self.values)
-        self.store_id = hashlib.sha256(json.dumps(self.binding, sort_keys=True,
+        self.values = MappingProxyType(dict(values))
+        binding = store_binding(self.values)
+        self.binding = MappingProxyType(binding)
+        self.store_id = hashlib.sha256(json.dumps(binding, sort_keys=True,
                                                  separators=(',', ':')).encode()).hexdigest()
         self.session = session or selected_aws_session(self.values, region=self.binding['region'])
 
@@ -127,16 +133,16 @@ class SecretStore:
     def put(self, name, value, *, replace=False, operation_id=None):
         parameter, operation_id = self.parameter(name), _operation(operation_id)
         if not isinstance(value, bytes) or not 0 < len(value) <= MAX_VALUE_BYTES:
-            raise StoreError('SSM input must contain 1 to 4096 UTF-8 bytes')
+            raise StorageRejected('SSM input must contain 1 to 4096 UTF-8 bytes')
         try:
             text = value.decode('utf-8')
         except UnicodeDecodeError:
-            raise StoreError('SSM input must be UTF-8') from None
+            raise StorageRejected('SSM input must be UTF-8') from None
         ssm = self.session.client('ssm')
         if replace:
             existing = ssm.get_parameter(Name=parameter, WithDecryption=False)['Parameter']
             if existing.get('Type') != 'SecureString':
-                raise StoreError('refusing to replace a parameter that is not SecureString')
+                raise StorageRejected('refusing to replace a parameter that is not SecureString')
         # SSM has no compare-and-swap. Catalog references pin the returned version;
         # concurrent catalog pointer changes are rejected separately, never overwritten.
         response = ssm.put_parameter(Name=parameter, Value=text, Type='SecureString',
@@ -152,7 +158,7 @@ class SecretStore:
         valid_name(name)
         _operation(operation_id)
         if provider == 'ssm':
-            ssm, token = self.session.client('ssm'), None
+            ssm, token, match, seen = self.session.client('ssm'), None, None, set()
             while True:
                 request = {'Name': self.parameter(name), 'WithDecryption': False, 'MaxResults': 50}
                 if token:
@@ -160,19 +166,25 @@ class SecretStore:
                 try:
                     response = ssm.get_parameter_history(**request)
                 except ClientError as error:
-                    if error.response.get('Error', {}).get('Code') == 'ParameterNotFound':
+                    if error.response.get('Error', {}).get('Code') == 'ParameterNotFound' and token is None:
                         return None
                     raise
-                matches = [entry for entry in response.get('Parameters', [])
-                           if entry.get('Description') == 'MAVEN storage operation ' + operation_id
-                           and entry.get('Type') == 'SecureString']
-                if matches:
-                    if len(matches) != 1:
+                for entry in response.get('Parameters', []):
+                    if (entry.get('Description') != 'MAVEN storage operation ' + operation_id
+                            or entry.get('Type') != 'SecureString'):
+                        continue
+                    if match is not None:
                         raise StoreError('storage operation has ambiguous versions')
-                    return self._receipt(name, operation_id, matches[0]['Version'])
+                    version = entry.get('Version')
+                    if type(version) is not int or version < 1:
+                        raise StoreError('storage operation has invalid version metadata')
+                    match = self._receipt(name, operation_id, version)
                 token = response.get('NextToken')
                 if not token:
-                    return None
+                    return match
+                if not isinstance(token, str) or token in seen:
+                    raise StoreError('storage history pagination did not advance')
+                seen.add(token)
         if provider != 'encrypted-file':
             raise StoreError('unsupported secret store provider')
         try:
@@ -208,7 +220,7 @@ class SecretStore:
         operation_id = _operation(operation_id)
         if source_size is not None:
             if type(source_size) is not int or not 0 <= source_size <= max_bytes:
-                raise StoreError('file input exceeds its reviewed byte limit')
+                raise StorageRejected('file input exceeds its reviewed byte limit')
         bounded = BoundedReader(stream, max_bytes)
         key_id = self.values['MAVEN_SECRETS_KEY_ID']
         keyring = file_keyring(self.session.client('ssm'), key_id, values=self.values)
@@ -223,10 +235,10 @@ class SecretStore:
         if source_size is not None:
             options['source_length'] = source_size
         with client.stream(**options) as encryptor:
+            # Rely on the bucket default inspected during setup, including its exact KMS key.
             upload = s3.create_multipart_upload(
                 Bucket=bucket, Key=object_key, ExpectedBucketOwner=self.binding['account'],
-                Metadata={'maven-key-id': key_id, 'maven-operation': operation_id},
-                ServerSideEncryption='AES256')
+                Metadata={'maven-key-id': key_id, 'maven-operation': operation_id})
             upload_id, parts = upload['UploadId'], []
             try:
                 while True:
@@ -317,50 +329,96 @@ class SecretStore:
         next_cursor = base64.urlsafe_b64encode(json.dumps(next_tokens).encode()).decode() if more else None
         return {'store_id': self.store_id, 'items': result, 'next_cursor': next_cursor}
 
-    def read_secret(self, reference):
-        """Private runner input only. Never return this method's result through MCP."""
-        if not isinstance(reference, dict):
-            raise StoreError('secret reference is invalid')
-        if reference.get('provider') == 'ssm':
-            name = reference.get('name', '')
-            if not name.startswith(self.binding['parameter_prefix']):
+    def validate_reference(self, reference):
+        """Preflight supported immutable references without reading bytes or spending grants."""
+        from tools.memory.adapter_contracts import AdapterError
+        from tools.memory.validation import MemoryError
+        try:
+            validate_consumer_ref(reference)
+        except AdapterError as error:
+            raise StoreError('unsupported provider; migrate the catalog to this store before approval'
+                             if error.code == 'unsupported_secret_provider' else
+                             'SSM reference must pin an exact version; explicitly replace the legacy catalog entry before approval') from None
+        except MemoryError:
+            raise StoreError('secret reference is invalid') from None
+        if reference['provider'] == 'ssm':
+            if not reference['name'].startswith(self.binding['parameter_prefix']):
                 raise StoreError('secret reference belongs to another store')
-            selector = name[len(self.binding['parameter_prefix']):].split(':')
-            valid_name(selector[0])
-            if len(selector) > 2 or len(selector) == 2 and not re.fullmatch(r'[1-9][0-9]*', selector[1]):
-                raise StoreError('secret version must be an exact positive integer')
-            item = self.session.client('ssm').get_parameter(Name=name, WithDecryption=True)['Parameter']
-            if item.get('Type') != 'SecureString' or (len(selector) == 2 and item.get('Version') != int(selector[1])):
-                raise StoreError('secret reference version or type changed')
-            result = item['Value'].encode('utf-8')
-            if len(result) > MAX_VALUE_BYTES:
-                raise StoreError('secret exceeds the consumer byte limit')
-            return result
-        if (reference.get('provider') != 'encrypted-file' or reference.get('store_id') != self.store_id
-                or reference.get('bucket') != self.binding['bucket']
-                or not reference.get('name', '').startswith(self.binding['object_prefix'])):
+            name, version = reference['name'][len(self.binding['parameter_prefix']):].split(':')
+            valid_name(name)
+            return
+        if (reference['store_id'] != self.store_id or reference['bucket'] != self.binding['bucket']
+                or not reference['name'].startswith(self.binding['object_prefix'])):
             raise StoreError('encrypted file reference belongs to another store')
-        name = reference['name'][len(self.binding['object_prefix']):]
+        valid_name(reference['name'][len(self.binding['object_prefix']):])
+
+    @contextmanager
+    def _decrypt_file(self, name, *, reference=None):
+        """One authenticated streaming path for both bounded consumers and explicit restore."""
+        import aws_encryption_sdk
+        from aws_encryption_sdk import CommitmentPolicy
         valid_name(name)
-        key_id = reference.get('key_id', '')
-        if not KEY_ID.fullmatch(key_id):
-            raise StoreError('encrypted file key identifier is invalid')
-        query = {'Bucket': reference['bucket'], 'Key': reference['name'],
+        query = {'Bucket': self.binding['bucket'], 'Key': self.binding['object_prefix'] + name,
                  'ExpectedBucketOwner': self.binding['account']}
-        if reference.get('version_id'):
+        if reference is not None and reference.get('version_id'):
             query['VersionId'] = reference['version_id']
         response = self.session.client('s3').get_object(**query)
         with closing(response['Body']) as body:
-            if response.get('Metadata', {}).get('maven-key-id') != key_id:
+            key_id = response.get('Metadata', {}).get('maven-key-id', '')
+            if not isinstance(key_id, str) or not KEY_ID.fullmatch(key_id):
+                raise StoreError('encrypted file key identifier is invalid')
+            if reference is not None and key_id != reference['key_id']:
                 raise StoreError('encrypted file key metadata changed')
-            import aws_encryption_sdk
-            from aws_encryption_sdk import CommitmentPolicy
             keyring = file_keyring(self.session.client('ssm'), key_id, values=self.values)
             client = aws_encryption_sdk.EncryptionSDKClient(
                 commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT)
-            with client.stream(mode='d', source=body, source_length=response['ContentLength'],
-                               keyring=keyring, encryption_context={'maven-object': name, 'maven-key-id': key_id}) as decrypted:
-                value = decrypted.read(MAX_CONSUMER_BYTES + 1)
-                if len(value) > MAX_CONSUMER_BYTES or decrypted.read(1):
-                    raise StoreError('encrypted file exceeds the consumer byte limit')
-                return value
+            decrypted = client.stream(mode='d', source=body, source_length=response['ContentLength'],
+                                      keyring=keyring,
+                                      encryption_context={'maven-object': name, 'maven-key-id': key_id})
+            try:
+                yield decrypted
+                decrypted.close()  # Authentication/finalization must succeed before publication.
+            finally:
+                # On failed authentication, abort the IO stream without the SDK context
+                # manager logging a second footer error or retrying it at finalization.
+                io.IOBase.close(decrypted)
+
+    def restore_file(self, name, destination):
+        """Stream to a private temporary file; publish only authenticated plaintext, never overwrite."""
+        destination = Path(destination)
+        if destination.exists() or destination.is_symlink():
+            raise StoreError('destination exists; choose a new path')
+        temp_path = None
+        try:
+            with self._decrypt_file(name) as decrypted:
+                descriptor, temp_path = tempfile.mkstemp(prefix='.maven-restore-', dir=destination.parent)
+                with os.fdopen(descriptor, 'wb') as output:
+                    while chunk := decrypted.read(1024 ** 2):
+                        output.write(chunk)
+                    output.flush()
+                    os.fsync(output.fileno())
+            try:
+                os.link(temp_path, destination)
+            except FileExistsError:
+                raise StoreError('destination exists; choose a new path') from None
+        finally:
+            if temp_path is not None:
+                os.unlink(temp_path)
+
+    def read_secret(self, reference):
+        """Private runner input only. Never return this method's result through MCP."""
+        self.validate_reference(reference)
+        if reference['provider'] == 'ssm':
+            item = self.session.client('ssm').get_parameter(Name=reference['name'], WithDecryption=True)['Parameter']
+            if item.get('Type') != 'SecureString' or item.get('Version') != int(reference['name'].rsplit(':', 1)[1]):
+                raise StoreError('secret reference version or type changed')
+            result = item['Value'].encode('utf-8')
+            if not 0 < len(result) <= MAX_VALUE_BYTES:
+                raise StoreError('secret exceeds the consumer byte limit')
+            return result
+        name = reference['name'][len(self.binding['object_prefix']):]
+        with self._decrypt_file(name, reference=reference) as decrypted:
+            value = decrypted.read(MAX_CONSUMER_BYTES + 1)
+            if len(value) > MAX_CONSUMER_BYTES or decrypted.read(1):
+                raise StoreError('encrypted file exceeds the consumer byte limit')
+            return value

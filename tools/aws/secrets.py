@@ -16,7 +16,7 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
+from types import MappingProxyType
 import warnings
 
 from botocore.exceptions import BotoCoreError, ClientError, ProfileNotFound
@@ -33,17 +33,17 @@ class StoreError(Exception):
     """A safe error that contains no secret value or AWS response body."""
 
 
-def _prefix(key: str, *, parameter: bool = True) -> str:
-    try:
-        return prefix(load_settings(), key, parameter=parameter)
-    except MemoryClientError:
-        raise StoreError("secret store namespace is not configured in private settings") from None
+class StorageRejected(StoreError):
+    """Known rejection before publication; never an uncertain provider outcome."""
 
 
-def parameter_name(name: str) -> str:
+def parameter_name(name: str, *, values=None) -> str:
     if not NAME.fullmatch(name):
         raise StoreError("name must be one short lowercase segment (letters, digits, _, ., -)")
-    return _prefix("MAVEN_SECRETS_PARAMETER_PREFIX") + name
+    try:
+        return prefix(load_settings() if values is None else values, "MAVEN_SECRETS_PARAMETER_PREFIX") + name
+    except MemoryClientError:
+        raise StoreError("secret store namespace is not configured in private settings") from None
 
 
 def secret_input(from_stdin: bool) -> str:
@@ -73,16 +73,12 @@ def secret_input(from_stdin: bool) -> str:
     return value
 
 
-def aws_session():
+def aws_session(values=None):
     try:
-        values = load_settings()
+        values = load_settings() if values is None else values
         return selected_aws_session(values, region=required(values, "MAVEN_AWS_REGION"))
     except MemoryClientError:
         raise StoreError("AWS identity is unavailable; configure and log in to the explicitly selected profile") from None
-
-
-def ssm_client():
-    return aws_session().client("ssm")
 
 
 def stored_value(client, name: str) -> str:
@@ -92,9 +88,9 @@ def stored_value(client, name: str) -> str:
     return parameter["Value"]
 
 
-def file_config() -> tuple[str, str]:
+def file_config(values=None) -> tuple[str, str]:
     try:
-        values = load_settings()
+        values = load_settings() if values is None else values
         bucket = required(values, "MAVEN_SECRETS_BUCKET")
         key_id = required(values, "MAVEN_SECRETS_KEY_ID")
     except MemoryClientError:
@@ -106,15 +102,14 @@ def file_config() -> tuple[str, str]:
     return bucket, key_id
 
 
-def file_keyring(ssm, key_id: str, *, values=None):
+def file_keyring(ssm, key_id: str, *, values):
     from aws_cryptographic_material_providers.mpl import AwsCryptographicMaterialProviders
     from aws_cryptographic_material_providers.mpl.config import MaterialProvidersConfig
     from aws_cryptographic_material_providers.mpl.models import AesWrappingAlg, CreateRawAesKeyringInput
 
     try:
         wrapping_key = base64.b64decode(
-            stored_value(ssm, (prefix(values, "MAVEN_SECRETS_FILE_KEY_PREFIX") if values is not None
-                               else _prefix("MAVEN_SECRETS_FILE_KEY_PREFIX")) + key_id), validate=True,
+            stored_value(ssm, prefix(values, "MAVEN_SECRETS_FILE_KEY_PREFIX") + key_id), validate=True,
         )
     except (ValueError, binascii.Error):
         raise StoreError("file wrapping key is invalid") from None
@@ -130,79 +125,63 @@ def file_keyring(ssm, key_id: str, *, values=None):
     ))
 
 
-def upload_file(args, session, bucket: str, key_id: str) -> None:
-    from tools.aws.secret_store import DEFAULT_STREAM_LIMIT, MAX_FILE_BYTES, SecretStore
+def open_input(path, *, private=False):
+    """Reject special files before opening; recheck the nonblocking descriptor for races."""
+    path = Path(path).expanduser().absolute()
+    if path != path.resolve():
+        raise StorageRejected("input paths must not contain symlinks")
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise StorageRejected("input must be a regular file")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if (not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
+                or private and (opened.st_uid != os.getuid() or opened.st_mode & 0o077)):
+            raise StorageRejected("input must be an unchanged owner-private regular file" if private
+                                  else "input must be an unchanged regular file")
+        return os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def upload_file(args, selected) -> None:
+    from tools.aws.secret_store import DEFAULT_STREAM_LIMIT, MAX_FILE_BYTES
     from_stdin = getattr(args, "stdin", False)
     if from_stdin and (args.source is not None or sys.stdin.isatty()):
         raise StoreError("--stdin requires a binary pipe and no source path")
     if not from_stdin and args.source is None:
         raise StoreError("provide an existing source file or --stdin")
-    selected = SecretStore(load_settings(), session=session)
-    if selected.binding["bucket"] != bucket or selected.values["MAVEN_SECRETS_KEY_ID"] != key_id:
-        raise StoreError("file store configuration changed")
     maximum = args.max_bytes if args.max_bytes is not None else (
         DEFAULT_STREAM_LIMIT if from_stdin else MAX_FILE_BYTES)
-    context = nullcontext(sys.stdin.buffer) if from_stdin else open(args.source, "rb")
+    context = nullcontext(sys.stdin.buffer) if from_stdin else open_input(args.source)
     with context as stream:
         size = None if from_stdin else os.fstat(stream.fileno()).st_size
         receipt = selected.put_file(args.name, stream, source_size=size, max_bytes=maximum)
     print(json.dumps(receipt) if args.json else "Encrypted file stored.")
 
 
-def restore_file(args, session, bucket: str) -> None:
-    import aws_encryption_sdk
-    from aws_encryption_sdk import CommitmentPolicy
-
-    destination = Path(args.destination)
-    if destination.exists() or destination.is_symlink():
-        raise StoreError("destination exists; choose a new path")
-    s3 = session.client("s3")
-    response = s3.get_object(Bucket=bucket, Key=_prefix("MAVEN_SECRETS_OBJECT_PREFIX", parameter=False) + args.name)
-    body = response["Body"]
-    temp_path = None
-    try:
-        key_id = response.get("Metadata", {}).get("maven-key-id", "")
-        if not KEY_ID.fullmatch(key_id):
-            raise StoreError("file has no valid wrapping key identifier")
-        keyring = file_keyring(session.client("ssm"), key_id)
-        client = aws_encryption_sdk.EncryptionSDKClient(
-            commitment_policy=CommitmentPolicy.REQUIRE_ENCRYPT_REQUIRE_DECRYPT,
-        )
-        context = {"maven-object": args.name, "maven-key-id": key_id}
-        descriptor, temp_path = tempfile.mkstemp(prefix=".maven-restore-", dir=destination.parent)
-        with os.fdopen(descriptor, "wb") as output:
-            with client.stream(
-                mode="d", source=body, source_length=response["ContentLength"],
-                keyring=keyring, encryption_context=context,
-            ) as decryptor:
-                while chunk := decryptor.read(1024 ** 2):
-                    output.write(chunk)
-            output.flush()
-            os.fsync(output.fileno())
-        try:
-            os.link(temp_path, destination)
-        except FileExistsError:
-            raise StoreError("destination exists; choose a new path") from None
-        print("File restored.")
-    finally:
-        body.close()
-        if temp_path is not None:
-            os.unlink(temp_path)
+def restore_file(args, selected) -> None:
+    selected.restore_file(args.name, args.destination)
+    print("File restored.")
 
 
 def file_action(args) -> None:
     from aws_encryption_sdk.exceptions import AWSEncryptionSDKClientError
+    from cryptography.exceptions import InvalidSignature
 
     if not NAME.fullmatch(args.name):
         raise StoreError("name must be one short lowercase segment (letters, digits, _, ., -)")
-    bucket, key_id = file_config()
-    session = aws_session()
+    from tools.aws.secret_store import SecretStore
+    values = MappingProxyType(dict(load_settings()))
+    selected = SecretStore(values, session=aws_session(values))
     try:
         if args.file_action == "put":
-            upload_file(args, session, bucket, key_id)
+            upload_file(args, selected)
         else:
-            restore_file(args, session, bucket)
-    except AWSEncryptionSDKClientError:
+            restore_file(args, selected)
+    except (AWSEncryptionSDKClientError, InvalidSignature):
         raise StoreError("file encryption or authentication failed") from None
 
 
@@ -242,7 +221,8 @@ def main(argv=None) -> int:
         if args.action == "file":
             file_action(args)
             return 0
-        name = parameter_name(args.name)
+        values = MappingProxyType(dict(load_settings()))
+        name = parameter_name(args.name, values=values)
         if args.action == "use-stdin":
             argv = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not argv:
@@ -255,7 +235,7 @@ def main(argv=None) -> int:
 
         # Read a new value before making any AWS request; never put it in argv or the environment.
         value = secret_input(args.stdin) if args.action in ("put", "replace", "check") else None
-        client = ssm_client()
+        client = aws_session(values).client("ssm")
         if args.action in ("put", "replace"):
             if args.action == "replace":
                 stored_value(client, name)  # Refuse to turn a missing name into a new parameter.

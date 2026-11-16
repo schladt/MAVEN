@@ -158,8 +158,10 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 value['hooks']['SessionStart'][0]['hooks'][0]['timeout'] = 99
                 target.write_text(json.dumps(value))
             before = target.read_bytes()
-            with self.assertRaises(ValueError):
-                integration_plan(self.home, [harness], user_home=self.user, lifecycle=True)
+            planned = integration_plan(self.home, [harness], user_home=self.user, lifecycle=True)
+            self.assertTrue(any(change.path == target and change.receipt.get('conflict') for change in planned))
+            for change in planned:
+                apply_integration(change)
             receipt = next(item for item in read_private(self.home / MANIFEST)['integrations'] if item['path'] == str(target))
             with self.assertRaises(ValueError):
                 removal_content(receipt)
@@ -167,9 +169,14 @@ class LifecycleIntegrationTests(unittest.TestCase):
 
     def test_custom_profile_refusal_does_not_touch_defaults(self):
         for harness in HARNESS_PATHS:
-            with self.subTest(harness=harness), self.assertRaisesRegex(ValueError, 'default or staged'):
-                integration_plan(self.home, [harness], user_home=self.user, lifecycle=True,
+            with self.subTest(harness=harness):
+                planned = integration_plan(self.home, [harness], user_home=self.user, lifecycle=True,
                     paths={harness: (self.user / 'custom/config', self.user / 'custom/context')})
+                blocked = [change for change in planned if change.receipt.get('conflict')]
+                self.assertEqual(len(blocked), 1)
+                self.assertIn('default or staged', blocked[0].receipt['conflict'])
+                self.assertEqual({change.path for change in planned if not change.receipt.get('conflict')},
+                                 {self.user / 'custom/config', self.user / 'custom/context'})
         self.assertFalse((self.user / '.claude').exists())
         for harness, variable in (('omp', 'OMP_PROFILE'), ('claude', 'CLAUDE_CONFIG_DIR'),
                                   ('codex', 'CODEX_HOME'), ('copilot', 'COPILOT_HOME'), ('gemini', 'GEMINI_CLI_HOME')):
@@ -194,6 +201,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
                 patch('venv.EnvBuilder.create', side_effect=create_runtime), \
                 patch.object(install.subprocess, 'run', return_value=Mock(returncode=0)), \
                 patch.object(install, '_install_command', side_effect=install_package), \
+                patch('tools.update.record_package_inputs'), \
                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(install.main(arguments), 0)
         for relative in LIFECYCLE_PATHS.values():
@@ -242,17 +250,17 @@ class LifecycleIntegrationTests(unittest.TestCase):
         entries['SessionStart'][0]['hooks'][0]['timeout'] = 99
         target.write_text(json.dumps({'hooks': entries}))
         target.chmod(0o600)
-        with self.assertRaises(ValueError):
-            integration_plan(self.home, ['codex'], user_home=self.user, lifecycle=True)
+        planned = integration_plan(self.home, ['codex'], user_home=self.user, lifecycle=True)
+        self.assertTrue(any(change.path == target and change.receipt.get('conflict') for change in planned))
         self.apply(['omp'])
         resource = resource_path
         replacement = Mock()
         replacement.read_text.return_value = resource('templates/harness/maven-lifecycle.js').read_text() + '\n// update\n'
         with patch('tools.harness.resource_path', side_effect=lambda name: replacement if name.endswith('.js') else resource(name)), \
                 patch('tools.uninstall.local._integration_references', return_value=(
-                    {str(self.user / LIFECYCLE_PATHS['omp'])}, False)), \
-                self.assertRaisesRegex(ValueError, 'Shared lifecycle'):
-            integration_plan(self.home, ['omp'], user_home=self.user, lifecycle=True)
+                    {str(self.user / LIFECYCLE_PATHS['omp'])}, False)):
+            planned = integration_plan(self.home, ['omp'], user_home=self.user, lifecycle=True)
+        self.assertTrue(any('Shared lifecycle' in change.receipt.get('conflict', '') for change in planned))
 
     def test_grouped_uninstall_refuses_post_review_owner_edits(self):
         from tools.uninstall.local import _fragment, _plan_integrations, _remove_integration
@@ -284,7 +292,7 @@ class LifecycleIntegrationTests(unittest.TestCase):
         self.assertEqual(json.loads(removal_content(receipt)), {
             'version': 1, 'hooks': {'sessionStart': [owner]}})
 
-    def test_tui_refuses_lifecycle_without_installed_launcher_before_review(self):
+    def test_missing_optional_hook_launcher_preserves_hooks_but_applies_safe_targets(self):
         from tools.tui.harness import configure_harnesses
         launcher = self.home / 'venv/bin/maven-mcp'
         launcher.parent.mkdir(parents=True)
@@ -292,13 +300,140 @@ class LifecycleIntegrationTests(unittest.TestCase):
         launcher.chmod(0o755)
         ui = Mock()
         ui.form.return_value = {**{name: name == 'omp' for name in HARNESS_PATHS}, 'lifecycle': True}
-        ui.choose.return_value = 'skip'
+        ui.review.return_value = True
         with patch.dict(os.environ, {}, clear=True):
             result = configure_harnesses(ui, self.home)
         self.assertEqual(result['status'], 'conflict')
-        self.assertIn('maven-session-hook', result['reason'])
-        ui.review.assert_not_called()
+        self.assertTrue(any('maven-session-hook' in item['reason'] for item in result['targets']
+                            if item['status'] == 'conflict'))
+        ui.review.assert_called_once()
+        self.assertTrue((self.user / HARNESS_PATHS['omp'][0]).exists())
         self.assertFalse((self.user / LIFECYCLE_PATHS['omp']).exists())
+
+    def test_conflicting_harness_does_not_suppress_other_selected_harness(self):
+        path = self.user / HARNESS_PATHS['claude'][0]
+        original = json.dumps({'mcpServers': {'maven': {'command': 'owner-command'}}})
+        path.write_text(original)
+        path.chmod(0o600)
+        changes = integration_plan(self.home, ['claude', 'omp'], user_home=self.user)
+        self.assertTrue(any(change.receipt.get('conflict') for change in changes))
+        for change in changes:
+            apply_integration(change)
+        self.assertEqual(path.read_text(), original)
+        self.assertTrue((self.user / HARNESS_PATHS['omp'][0]).exists())
+
+    def test_recorded_custom_destinations_are_exact_and_legacy_unknowns_never_default(self):
+        from tools.harness import installed_targets
+        from tools.uninstall.common import save_private
+        config, context = self.user / 'custom/mcp.json', self.user / 'custom/policy.txt'
+        changes = integration_plan(self.home, ['claude'], paths={'claude': (config, context)})
+        for change in changes:
+            record_installation(self.home, self.source, [], [], integrations=[change.receipt])
+            apply_integration(change)
+        recorded = installed_targets(self.home)
+        self.assertEqual(recorded['paths'], {'claude': (config, context)})
+        self.assertEqual(recorded['unresolved'], [])
+        manifest = read_private(self.home / MANIFEST)
+        for item in manifest['integrations']:
+            item.pop('harness', None)
+            item.pop('target', None)
+        save_private(self.home / MANIFEST, manifest)
+        recorded = installed_targets(self.home)
+        self.assertEqual(recorded['paths'], {})
+        self.assertEqual(set(recorded['unresolved']), {str(config), str(context)})
+        self.assertFalse((self.user / '.claude.json').exists())
+
+    def test_owned_legacy_status_command_migrates_without_adopting_owner_changes(self):
+        from tools.harness import _statusline_change
+        target = self.user / '.claude/settings.json'
+        target.parent.mkdir()
+        old = {'type': 'command', 'command': str(self.home / 'venv/bin/maven-statusline')}
+        target.write_text(json.dumps({'statusLine': old, 'theme': 'owner'}))
+        target.chmod(0o600)
+        record_installation(self.home, self.source, [], [], integrations=[{
+            'path': str(target), 'format': 'json-setting', 'key': 'statusLine',
+            'value': old, 'created': False}])
+        with patch('tools.uninstall.local._integration_references', return_value=(set(), False)):
+            change = _statusline_change(self.home, target)
+        self.assertIn('MAVEN_HOME=', change.receipt['value']['command'])
+        apply_integration(change)
+        self.assertEqual(json.loads(target.read_text())['theme'], 'owner')
+        target.write_text(json.dumps({'statusLine': {'command': 'owner-command'}}))
+        self.assertTrue(_statusline_change(self.home, target).receipt.get('conflict'))
+
+
+    def test_skill_conflict_is_per_file_and_safe_siblings_remain_planned(self):
+        from tools.harness import skill_plan, SKILLS
+        root = self.user / 'custom skills'
+        target = root / SKILLS[0] / 'SKILL.md'
+        target.parent.mkdir(parents=True)
+        target.write_text('owner skill')
+        target.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, 'Existing skill differs'):
+            skill_plan([root], self.home)
+        conflicts = []
+        plan = skill_plan([root], self.home, conflicts=conflicts)
+        self.assertEqual([item['target'] for item in conflicts], [str(target)])
+        self.assertEqual({path.parent.name for path, _, _ in plan}, set(SKILLS[1:]))
+        self.assertEqual(target.read_text(), 'owner skill')
+
+    def test_staged_recorded_lifecycle_refresh_never_writes_default_profile(self):
+        from tools.harness import installed_targets
+        staged = self.user / 'staged'
+        changes = integration_plan(self.home, ['omp'], user_home=staged, lifecycle=True)
+        for change in changes:
+            record_installation(self.home, self.source, [], [], integrations=[change.receipt])
+            apply_integration(change)
+        targets = installed_targets(self.home)
+        self.assertEqual(targets['lifecycle_paths']['omp'], staged / LIFECYCLE_PATHS['omp'])
+        replacement = Mock()
+        actual = resource_path
+        replacement.read_text.return_value = actual('templates/harness/maven-lifecycle.js').read_text() + '\n// revised\n'
+        with patch('tools.harness.resource_path', side_effect=lambda name: replacement if name.endswith('.js') else actual(name)):
+            updated = integration_plan(self.home, ['omp'], paths=targets['paths'], lifecycle=True)
+        self.assertFalse(any(change.receipt.get('conflict') for change in updated))
+        for change in updated:
+            apply_integration(change)
+        self.assertTrue((staged / LIFECYCLE_PATHS['omp']).read_text().endswith('// revised\n'))
+        self.assertFalse((self.user / '.omp').exists())
+
+    def test_existing_statusline_remains_consistent_with_new_hooks_in_shared_file(self):
+        for change in integration_plan(self.home, ['claude'], statusline=True):
+            record_installation(self.home, self.source, [], [], integrations=[change.receipt])
+            apply_integration(change)
+        changes = integration_plan(self.home, ['claude'], lifecycle=True, statusline=True)
+        for change in changes:
+            apply_integration(change)
+        document = json.loads((self.user / LIFECYCLE_PATHS['claude']).read_text())
+        self.assertIn('MAVEN_HOME=', document['statusLine']['command'])
+        self.assertIn('SessionStart', document['hooks'])
+
+
+    def test_tui_reviews_and_reconciles_pending_skill_receipt_even_when_bytes_match(self):
+        import base64
+        from tools.tui.harness import configure_harnesses
+        from tools.uninstall.common import save_private
+        launcher = self.home / 'venv/bin/maven-mcp'
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text('#!/fixture/python\n')
+        launcher.chmod(0o755)
+        ui = Mock()
+        ui.form.return_value = {**{name: name == 'omp' for name in HARNESS_PATHS}, 'lifecycle': False}
+        ui.review.return_value = True
+        with patch.dict(os.environ, {}, clear=True):
+            configure_harnesses(ui, self.home)
+        target = self.user / HARNESS_PATHS['omp'][2] / 'maven/SKILL.md'
+        pending = self.home / 'runtime/skill-installations/original.json'
+        save_private(pending, {'schema': 1, 'home': str(self.home), 'source': str(self.source),
+                              'target': str(target), 'body': base64.b64encode(target.read_bytes()).decode(),
+                              'expected': None, 'completed': False, 'skill_reference': True})
+        with patch.dict(os.environ, {}, clear=True):
+            result = configure_harnesses(ui, self.home)
+        self.assertEqual(ui.review.call_count, 2)
+        self.assertIn('Resume exact journaled local file installation', ui.review.call_args.args[1])
+        self.assertTrue(read_private(pending)['completed'])
+        self.assertIn({'target': str(target), 'status': 'reconciled'}, result['targets'])
+
 
 
 if __name__ == '__main__':

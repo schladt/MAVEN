@@ -17,11 +17,11 @@ import subprocess
 import sys
 import tempfile
 
-from uuid import UUID
+from uuid import UUID, uuid4
 from tools.interaction import Field, OperationPaused, checkpoint, current, message, require, stage
 from tools.harness import (
     HARNESS_PATHS as INTEGRATIONS, SKILLS, apply_integration, integration_plan,
-    skill_plan, retired_skill_plan, retire_skills, validate_default_profiles, write_skill,
+    skill_plan, retired_skill_plan, retire_skills, validate_default_profiles,
     launcher_permission_plan, repair_launcher_permissions,
 )
 
@@ -121,16 +121,75 @@ def _activation(home: Path, ca_bundle: Path | None) -> list[str]:
         ))
     body = '# MAVEN shell environment. Never source the separate .env file.\n' + '\n'.join(commands) + '\n'
     target = home / 'activate'
+    from tools.update import apply_owned_skills
+    apply_owned_skills(home, Path(__file__).resolve().parent,
+                       [] if target.exists() or target.is_symlink() else [(target, body.encode(), None)], [])
     if target.exists() or target.is_symlink():
         _private_file(target)
         if ca_bundle and target.read_text() != body:
             _notify('Existing activation snippet preserved; use the explicit exports below for the selected CA.')
             return commands
-    else:
-        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
-        with os.fdopen(fd, 'w') as stream:
-            stream.write(body)
     return [f'source {shlex.quote(str(target))}']
+
+
+def _runtime_intent(home, source, owned):
+    """Keep one original installation identity across uncertain local subprocess effects."""
+    from tools.uninstall.common import read_private, save_private
+    from tools.uninstall.local import inventory
+    from tools.update import _checkout_files, _packaging_inputs
+    directory = home / 'runtime' / 'runtime-installations'
+    inputs = _checkout_files(source)
+    inputs.update(_packaging_inputs(source))
+    pending = [(path, read_private(path)) for path in directory.glob('*.json')]
+    pending = [(path, value) for path, value in pending if not value.get('completed')]
+    if len(pending) > 1:
+        raise ValueError('Multiple unfinished runtime intents; preserve and select the original installation.')
+    target = home / 'venv'
+    actual = inventory(target) if target.exists() else None
+    if pending:
+        path, value = pending[0]
+        if value.get('schema') != 1 or value.get('home') != str(home) or value.get('inputs') != inputs:
+            raise ValueError('Interrupted runtime installation inputs changed; restore the original checkout inputs.')
+        if actual != value['inventory']:
+            previous_root = (value['inventory'] or {}).get('')
+            current_root = (actual or {}).get('')
+            if previous_root and (not current_root or any(
+                    previous_root[key] != current_root[key] for key in ('dev', 'ino', 'uid', 'type'))):
+                raise ValueError('Interrupted runtime directory identity changed; preserve the original installation intent.')
+            # No subprocess receipt can prove which unknown bytes were produced before a kill.
+            # A fresh exact local review may reconcile only this original installation intent.
+            if current() is None or not value.get('applying') or not require().review(
+                    'Reconcile interrupted runtime installation',
+                    'The original local installation was interrupted during ' + value['applying'] +
+                    '. Review the exact changed runtime inventory before continuing its original intent. '
+                    'Private settings and unrelated files outside this runtime remain untouched.',
+                    details=json.dumps({'intent': str(path), 'before': value['inventory'], 'current': actual},
+                                       indent=2)):
+                raise ValueError('Interrupted runtime bytes require exact guided reconciliation; original intent retained.')
+            value['reconciliations'].append({'phase': value['applying'], 'before': value['inventory'], 'current': actual})
+            value['inventory'] = actual
+            save_private(path, value)
+        return path, value
+    if target.exists() and not (target / 'pyvenv.cfg').is_file():
+        raise ValueError(f'Existing non-venv target preserved: {target}')
+    path = directory / (str(uuid4()) + '.json')
+    value = {'schema': 1, 'home': str(home), 'inputs': inputs, 'owned': owned,
+             'inventory': actual, 'applying': None, 'reconciliations': [], 'completed': False}
+    save_private(path, value)
+    return path, value
+
+
+@contextlib.contextmanager
+def _runtime_effect(intent, home, phase):
+    from tools.uninstall.common import save_private
+    from tools.uninstall.local import inventory
+    path, value = intent
+    value['applying'] = phase
+    save_private(path, value)
+    yield
+    value['inventory'] = inventory(home / 'venv')
+    value['applying'] = None
+    save_private(path, value)
 
 
 def main(argv=None) -> int:
@@ -143,11 +202,11 @@ def main(argv=None) -> int:
     parser.add_argument('--stage-harnesses', type=Path,
                         help='Write integrations under an inactive staging home instead of user configuration')
     parser.add_argument('--harness-config', action='append', default=[], metavar='NAME=PATH',
-                        help='Explicit custom-profile MCP config file; pair with --harness-context and --skill-dir')
+                        help='Explicit custom-profile MCP config file; pair with --harness-context; --skill-dir selects skills')
     parser.add_argument('--harness-context', action='append', default=[], metavar='NAME=PATH',
                         help='Explicit custom-profile startup context file')
     parser.add_argument('--harness-stopped', action='store_true',
-                        help='Confirm affected harnesses are closed before changing live integration files')
+                        help='Record that affected harnesses are closed (optional); restart them after integration updates')
     parser.add_argument('--ca-bundle', type=Path, help='Explicit trusted PEM CA bundle, e.g. supplied by corporate IT')
     parser.add_argument('--claude-statusline', action='store_true',
                         help="With --harness claude: show the active MAVEN project in Claude Code's status line "
@@ -155,7 +214,7 @@ def main(argv=None) -> int:
     parser.add_argument('--lifecycle-hooks', action=argparse.BooleanOptionalAction, default=True,
                         help='Install native startup/end adapters with selected default/staged harnesses '
                              '(default enabled; OMP 18.20+ also offers cancellable wrap-up then exit). '
-                             'Custom profile paths require --no-lifecycle-hooks.')
+                             'Custom profiles refresh only previously recorded lifecycle destinations.')
     parser.add_argument('--local-only', action='store_true',
                         help='Install local tools only; no prompts, login, cloud setup, or project initialization')
     args = parser.parse_args(argv)
@@ -180,6 +239,14 @@ def main(argv=None) -> int:
                 _options(args)
                 home = args.home.expanduser().absolute()
                 if args.uninstall:
+                    if not (home / 'venv/bin/python').is_file():
+                        source = Path(__file__).resolve().parent
+                        if not ui.review('Emergency checkout recovery',
+                                         'The installed runtime is missing. Run removal from this checkout, '
+                                         'not installed software. Existing removal approvals remain required.',
+                                         details=f'Python: {sys.executable}\nCheckout: {source}'):
+                            raise OperationPaused('Emergency checkout recovery declined.')
+                        handoff['emergency_source'] = str(source)
                     handoff.update(home=home, uninstall=True)
                     ui.close_when_finished()
                     return 0
@@ -228,10 +295,15 @@ def main(argv=None) -> int:
             return result
         # The first app is closed before the installed setup app owns the terminal.
         from tools.tui.bootstrap import run_terminal
-        return run_terminal(
-            _handoff_command(handoff), cwd=Path(__file__).resolve().parent,
-            env=dict(os.environ, MAVEN_HOME=str(handoff['home']), PYTHONPATH=str(Path(__file__).resolve().parent)),
-        )
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ('PYTHONPATH', 'PYTHONHOME', 'PYTHONUSERBASE')}
+        environment['MAVEN_HOME'] = str(handoff['home'])
+        with tempfile.TemporaryDirectory(prefix='maven-handoff-') as neutral:
+            result = run_terminal(_handoff_command(handoff), cwd=neutral, env=environment)
+        if result:
+            _notify(f'Selected task exited {result}; its original private operation is retained. '
+                    'Resume that exact operation in this home after addressing the child diagnostic.', file=sys.stderr)
+        return result
     except (EOFError, KeyboardInterrupt, OperationPaused):
         _notify('Installation paused; existing private configuration is preserved.', file=sys.stderr)
         return 130
@@ -240,23 +312,63 @@ def main(argv=None) -> int:
         return 1
 
 
+_INSTALLED_HANDOFF = """
+import importlib.metadata
+import importlib.util
+from pathlib import Path
+import runpy
+import sys
+home = Path(sys.argv.pop(1))
+module = sys.argv.pop(1)
+expected = (home / 'venv').resolve()
+try:
+    distribution = importlib.metadata.distribution('maven-cloud-memory')
+    package = importlib.util.find_spec('tools')
+    valid = (Path(sys.prefix).resolve() == expected and package is not None and package.origin
+             and Path(package.origin).resolve().is_relative_to(expected)
+             and Path(distribution.locate_file('')).resolve().is_relative_to(expected)
+             and Path(package.origin).resolve() == Path(distribution.locate_file('tools/__init__.py')).resolve())
+except importlib.metadata.PackageNotFoundError:
+    valid = False
+if not valid:
+    raise SystemExit('Installed MAVEN package origin is unavailable or mismatched; repair this exact runtime.')
+selected = importlib.util.find_spec(module)
+if selected is None or not selected.origin or not Path(selected.origin).resolve().is_relative_to(expected):
+    raise SystemExit('Installed task module origin is unavailable or mismatched; no checkout fallback was used.')
+sys.argv[0] = module
+runpy.run_module(module, run_name='__main__', alter_sys=True)
+"""
+
+
 def _handoff_command(handoff):
     """The installed program that continues the task chosen in the installer menu."""
     home = handoff['home']
     python = home / 'venv/bin/python'
+    prefix = [str(python), '-I', '-c', _INSTALLED_HANDOFF, str(home)]
+    if not python.is_file():
+        source = handoff.get('emergency_source')
+        if not source or not (handoff.get('uninstall') or handoff.get('restart_operation')):
+            raise ValueError('Installed runtime is missing; explicitly review emergency checkout recovery.')
+        source = Path(source).resolve()
+        if source != Path(__file__).resolve().parent or not (source / 'pyproject.toml').is_file():
+            raise ValueError('Emergency recovery checkout does not match the reviewed installer.')
+        prefix = [sys.executable, '-I', '-c',
+                  'import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); '
+                  'module=sys.argv.pop(1); runpy.run_module(module,run_name="__main__",alter_sys=True)',
+                  str(source)]
     if handoff.get('uninstall'):
-        return [str(python) if python.is_file() else sys.executable, '-m', 'tools.uninstall']
+        return [*prefix, 'tools.uninstall']
     if handoff.get('home_action'):
-        return [str(python), '-m', 'tools.tui.administration', '--home', str(home),
+        return [*prefix, 'tools.tui.administration', '--home', str(home),
                 '--action', handoff['home_action']]
     if handoff.get('restart_operation'):
-        return [str(python) if python.is_file() else sys.executable, '-m', 'tools.setup',
+        return [*prefix, 'tools.setup',
                 '--home', str(home), '--restart-operation', handoff['restart_operation']]
     if handoff.get('repair_secrets'):
-        return [str(python), '-m', 'tools.setup', '--home', str(home), '--repair-secrets']
+        return [*prefix, 'tools.setup', '--home', str(home), '--repair-secrets']
     if handoff.get('migrate_environment'):
-        return [str(python), '-m', 'tools.setup', '--home', str(home), '--migrate-environment']
-    command = [str(python), '-m', 'tools.setup', '--home', str(home), '--mode', handoff['mode']]
+        return [*prefix, 'tools.setup', '--home', str(home), '--migrate-environment']
+    command = [*prefix, 'tools.setup', '--home', str(home), '--mode', handoff['mode']]
     if handoff.get('operation'):
         command.extend(['--operation', handoff['operation']])
     if handoff.get('fresh_operation'):
@@ -507,10 +619,19 @@ def _install_command(command):
         return subprocess.run(command, check=True, umask=0o022)
     # Local installation is one coherent unit through its ownership receipt. Do
     # not honor a pause between pip's mutation and recording that ownership.
-    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                             umask=0o022)
     if result.returncode:
-        raise ValueError('Local dependency installation failed. Check network access and the trusted CA bundle; existing private settings and skills are preserved.')
+        diagnostic = (result.stderr or b'').decode('utf-8', errors='replace').lower()
+        reason = ('TLS trust verification failed; select the approved CA bundle' if
+                  'certificate_verify_failed' in diagnostic or 'sslcertverificationerror' in diagnostic else
+                  'dependency requirements could not be resolved; review the selected Python/package requirements' if
+                  'no matching distribution' in diagnostic or 'resolutionimpossible' in diagnostic else
+                  'the installation filesystem denied a write; check its ownership and available space' if
+                  'permission denied' in diagnostic or 'no space left' in diagnostic else
+                  'package installation failed; check network access and package-index availability')
+        raise ValueError(f'Local installation exited {result.returncode}: {reason}. '
+                         'Original local intent and private settings are preserved; resume this same home.')
     return result
 
 
@@ -558,10 +679,10 @@ def _install(args, handoff=None):
             return result
         configs = custom_paths(getattr(args, 'harness_config', []))
         contexts = custom_paths(getattr(args, 'harness_context', []))
-        if configs.keys() != contexts.keys() or (configs and not args.skill_dir):
-            raise ValueError('Custom profiles require paired --harness-config/--harness-context and explicit --skill-dir.')
+        if configs.keys() != contexts.keys():
+            raise ValueError('Custom profiles require paired --harness-config/--harness-context.')
         if staging and configs:
-            raise ValueError('Stage under the inactive home first; custom live paths require --harness-stopped.')
+            raise ValueError('Choose either an inactive staging home or explicit custom destination paths, not both.')
         custom = {name: (path, contexts[name]) for name, path in configs.items()}
         if not staging:
             validate_default_profiles(name for name in args.harness if name not in custom)
@@ -571,15 +692,18 @@ def _install(args, handoff=None):
         deferred = False
         require_stopped = bool(roots and not args.harness_stopped and not (staging and not args.skill_dir))
         if require_stopped and current() is None:
-            raise ValueError('Close affected harnesses and add --harness-stopped, or use '
-                             '--stage-harnesses with an inactive directory. No integration changed.')
+            _notify('Restart affected harnesses to load updated tools. Concurrent harness configuration writes '
+                    'can overwrite the reviewed integration; unrelated configuration is preserved.')
+        skill_conflicts = []
+        from tools.update import pending_owned_skills
+        pending_skills = pending_owned_skills(home)
         try:
-            plan = skill_plan(roots, home)
+            plan = skill_plan(roots, home, conflicts=skill_conflicts)
             integrations = integration_plan(home, selected_harnesses,
                                             user_home=integration_home, ca_bundle=ca_bundle, paths=custom,
                                             statusline=getattr(args, 'claude_statusline', False),
                                             lifecycle=getattr(args, 'lifecycle_hooks', True))
-            retired_skills = retired_skill_plan(home, roots)
+            retired_skills = retired_skill_plan(home, roots, conflicts=skill_conflicts)
         except ValueError as exc:
             if current() is None:
                 raise
@@ -596,6 +720,9 @@ def _install(args, handoff=None):
                 f'Next: {"local tools only; no AWS/project setup" if args.local_only else "installed maven-setup for explicit cloud selection"}',
                 'Shell profiles: unchanged',
                 'Skill roots:\n' + ('\n'.join(map(str, roots)) or '(none)'),
+                'Original unfinished file intents to reconcile:\n' + json.dumps(pending_skills, indent=2),
+                'Preserved skill conflicts:\n' + ('\n'.join(
+                    str(item['target']) + ': ' + item['reason'] for item in skill_conflicts) or '(none)'),
                 'Skill files to create or update:\n' + ('\n'.join(
                     str(target) + (' (update installer-owned copy)' if expected else '')
                     for target, _, expected in plan) or '(none; existing identical skills preserved)'),
@@ -632,6 +759,8 @@ def _install(args, handoff=None):
         _private_directory(home)
         from tools.uninstall.local import _lock, reinstall_marker, finish_reinstallation
         installation_locks.enter_context(_lock(home / 'runtime/registry.lock'))
+        if pending_owned_skills(home) != pending_skills:
+            raise ValueError('Pending file installation intents changed after review; review the original intents again.')
         completed_marker = reinstall_marker(home)
         new_caches = [home / 'runtime' / name for name in ('aws-login-cache', 'aws-deploy-login-cache')
                       if not (home / 'runtime' / name).exists()]
@@ -652,39 +781,45 @@ def _install(args, handoff=None):
             raise ValueError('Installer ownership receipt does not match this home; preserved for review.')
         own_runtime = not installation.exists() or str(installation) in ownership.get('owned', {})
         own_activation = not (home / 'activate').exists()
-        if installation.exists() and not (installation / 'pyvenv.cfg').is_file():
-            raise ValueError(f'Existing non-venv target preserved: {installation}')
         if current() is None:
             _notify('\nStep 3/4 — Create/reuse the virtual environment and install MAVEN')
         else:
             stage('Install tools')
         import venv
-        if not installation.exists():
-            venv.EnvBuilder(with_pip=True).create(installation)
+        runtime_intent = _runtime_intent(home, source, own_runtime)
+        own_runtime = runtime_intent[1]['owned']
+        if not installation.exists() or (own_runtime and (
+                not (installation / 'bin/python').is_file() or not (installation / 'pyvenv.cfg').is_file())):
+            with _runtime_effect(runtime_intent, home, 'venv creation'):
+                venv.EnvBuilder(with_pip=True).create(installation)
         python = installation / 'bin' / 'python'
         if not python.is_file():
             raise ValueError(f'Existing virtual environment is incomplete: {installation}. '
                              'Preserve it for review and choose another --home, or repair that environment.')
-        pip_ready = subprocess.run([str(python), '-m', 'pip', '--version'], capture_output=True, text=True)
-        if pip_ready.returncode:
-            _install_command([str(python), '-m', 'ensurepip', '--upgrade'])
-        with _package_source(source) as package_source:
-            package = str(package_source) + '[ui,mcp]'
-            _install_command([str(python), '-m', 'pip', 'install', '--upgrade', package])
-        # pip derives entry-point mode from its umask. Never leave 0775 launchers
-        # for the harness reader, which correctly rejects group-writable files.
-        for name in ('maven-mcp', 'maven-session-hook'):
-            launcher_repair = launcher_permission_plan(home, name=name)
-            if launcher_repair is not None:
-                repair_launcher_permissions(home, launcher_repair, name=name)
+        from tools.update import apply_owned_skills, record_package_inputs, _checkout_files, _packaging_inputs
+        with _runtime_effect(runtime_intent, home, 'package installation'):
+            pip_ready = subprocess.run([str(python), '-I', '-m', 'pip', '--version'], capture_output=True, text=True)
+            if pip_ready.returncode:
+                _install_command([str(python), '-I', '-m', 'ensurepip', '--upgrade'])
+            with _package_source(source) as package_source:
+                packaged_inputs = {**_checkout_files(package_source), **_packaging_inputs(package_source)}
+                if packaged_inputs != runtime_intent[1]['inputs']:
+                    raise ValueError('Package inputs changed after the original installation intent; restore them before retrying.')
+                package = str(package_source) + '[ui,mcp]'
+                _install_command([str(python), '-I', '-m', 'pip', 'install', '--upgrade', package])
+                record_package_inputs(home, package_source)
+            # pip derives entry-point mode from its umask; repair only reviewed owned launchers.
+            for name in ('maven-mcp', 'maven-session-hook'):
+                launcher_repair = launcher_permission_plan(home, name=name)
+                if launcher_repair is not None:
+                    repair_launcher_permissions(home, launcher_repair, name=name)
         if not environment.exists():
             body = (source / 'maven_resources' / 'templates' / 'environment.example').read_bytes()
             fd = os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
             with os.fdopen(fd, 'wb') as stream:
                 stream.write(body)
-        for target, body, expected in plan:
-            _no_symlink_parents(target)
-            write_skill(target, body, expected)
+        apply_owned_skills(home, source, plan,
+                           [root / name / 'SKILL.md' for root in roots for name in SKILLS])
         activation = _activation(home, ca_bundle)
         owned_paths = [target for target, _, _ in plan]
         if own_runtime:
@@ -694,10 +829,13 @@ def _install(args, handoff=None):
         record_installation(home, source, owned_paths,
                             [root / name / 'SKILL.md' for root in roots for name in SKILLS],
                             cache_roots=new_caches)
+        from tools.uninstall.common import save_private
+        runtime_intent[1]['completed'] = True
+        save_private(runtime_intent[0], runtime_intent[1])
         # Journal exact ownership before mutation: interruption leaves either an
         # absent entry or a safely removable exact entry, never an orphan.
         for change in integrations:
-            if change.receipt is not None:
+            if change.receipt is not None and not change.receipt.get('conflict'):
                 record_installation(home, source, [], [], integrations=[change.receipt])
             apply_integration(change)
         retire_skills(retired_skills)
@@ -709,8 +847,13 @@ def _install(args, handoff=None):
         _notify('In each new terminal, activate this installation (no shell profiles were modified):')
         for command in activation:
             _notify(f'  {command}')
-        if roots:
-            _notify('MAVEN front-door and maintenance skills installed/preserved.')
+        if roots or integrations:
+            _notify('Selected harness targets processed; conflicting owner files are preserved.')
+            for conflict in skill_conflicts:
+                _notify(f'Preserved skill conflict: {conflict["target"]}: {conflict["reason"]}')
+            for change in integrations:
+                if change.receipt and change.receipt.get('conflict'):
+                    _notify(f'Preserved integration conflict: {change.path}: {change.receipt["conflict"]}')
             if staging:
                 _notify(f'Inactive integration staged under {integration_home}; live harness configuration unchanged. '
                         'Review and install against the selected profile after affected harnesses stop.')
@@ -728,11 +871,15 @@ def _install(args, handoff=None):
             handoff['home'] = home
             handoff['activation'] = activation
             changed = ([str(target) for target, _, _ in plan] +
-                       [str(change.path) for change in integrations if change.before != change.after] +
+                       [str(change.path) for change in integrations if change.before != change.after
+                        and not (change.receipt and change.receipt.get('conflict'))] +
                        [str(target) for target, _ in retired_skills])
             handoff['integration'] = {
-                'status': 'written' if changed else 'unchanged' if selected_harnesses else 'skipped',
-                'selected': selected_harnesses, 'written': changed,
+                'status': ('partial' if changed else 'conflict') if skill_conflicts or any(
+                    change.receipt and change.receipt.get('conflict') for change in integrations) else
+                    'written' if changed else 'unchanged' if selected_harnesses else 'skipped',
+                'selected': selected_harnesses, 'written': changed, 'conflicts': skill_conflicts,
+                'reconciled': [saved['intent']['target'] for saved in pending_skills],
                 'reason': ('Harness integration deferred; live files were not changed.' if deferred else
                            'Cloud access was not checked during this software installation.'),
             }

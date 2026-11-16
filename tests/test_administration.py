@@ -246,8 +246,8 @@ class AdministrationTests(unittest.TestCase):
             self.assertEqual(result['outcome']['home'], str(self.home))
             self.assertEqual(result['outcome']['account'], identity['Account'])
             self.assertTrue(result['outcome']['instance_ready'])
-            self.assertTrue(result['outcome']['secrets_ready'])
-            self.assertTrue(any(receipt['step'] == 'secrets_verify' for receipt in result['receipts']))
+            self.assertFalse(result['outcome']['secrets_ready'])
+            self.assertFalse(any(receipt['step'] == 'secrets_verify' for receipt in result['receipts']))
             self.assertFalse(result['outcome']['project_configured'])
             self.assertNotIn('optional_project', result['answers'])
             self.assertNotIn('deploy_identity', result['answers'])
@@ -293,8 +293,11 @@ class AdministrationTests(unittest.TestCase):
             'StackId': 'arn:aws:cloudformation:us-east-1:123456789012:stack/maven-stack-01/1',
             'StackStatus': 'UPDATE_COMPLETE', 'Parameters': [{'ParameterKey': 'InstanceId', 'ParameterValue': instance}]}]}
         cloud.get_template.return_value = {'TemplateBody': {'deployed': 'old'}}
-        document = {'review': {'change_set': {'Changes': [{'ResourceChange': change} for change in stack_changes]}},
-                    'review_sha256': 'f' * 64}
+        change_set = {'ChangeSetId': 'reviewed-change', 'StackId': cloud.describe_stacks.return_value['Stacks'][0]['StackId'],
+                      'ChangeSetName': 'reviewed-change', 'StackName': 'maven-stack-01',
+                      'Parameters': [], 'Capabilities': [], 'RoleARN': None, 'IncludeNestedStacks': None,
+                      'OnStackFailure': None, 'Changes': [{'ResourceChange': change} for change in stack_changes]}
+        document = {'review': {'change_set': change_set}, 'review_sha256': 'f' * 64}
         patches = [
             patch('tools.administration._connection_config', return_value={'instance_id': instance, 'schema_version': 2}),
             patch('tools.setup_common.inspect_login_identity', return_value=identity),
@@ -305,6 +308,7 @@ class AdministrationTests(unittest.TestCase):
                                                               'pending': ['012_agentic_memory.sql']}),
             patch('tools.update.build_service_package', side_effect=lambda stack, path, instance: path.mkdir()),
             patch('tools.memory.bootstrap._cloud', return_value=cloud),
+            patch('tools.memory.bootstrap._describe_changes', return_value={**change_set, 'ExecutionStatus': 'AVAILABLE'}),
             patch('tools.memory.bootstrap._package', return_value=(
                 {'deployment_inputs': {'InstanceId': instance}}, json.dumps({'deployed': 'new'}), [])),
             patch('tools.memory.bootstrap.plan', side_effect=lambda values, package, path, change_type: save_json(path, document)),
@@ -349,7 +353,17 @@ class AdministrationTests(unittest.TestCase):
         mocks['plan'].assert_called_once()
         self.assertEqual(mocks['plan'].call_args.kwargs['change_type'], 'UPDATE')
         self.assertTrue(result['outcome']['instance_ready'])
-        self.assertTrue(result['outcome']['secrets_ready'])
+        self.assertFalse(result['outcome']['secrets_ready'])
+
+    def test_safe_field_diagnostic_does_not_require_environment_or_hide_original_error(self):
+        detail = 'Unknown field: extra'
+        with patch.object(AdminOperations, '_project', side_effect=MemoryClientError('invalid_request', detail=detail)):
+            result = self.controller.begin('project', {'root': str(self.base)})
+        self.assertEqual(result['state'], 'blocked')
+        self.assertEqual(result['error'], 'invalid_request')
+        self.assertEqual(result['error_detail'], detail)
+        self.assertNotIn('handoff', result)
+        self.assertFalse((self.home / '.env').exists())
 
     def test_migration_failure_keeps_diagnostics_and_clears_them_on_retry(self):
         self.update_fixture([])
@@ -408,6 +422,70 @@ class AdministrationTests(unittest.TestCase):
         apply.assert_not_called()
         self.assertFalse(any('changes' in approval['review'] for approval in result['approvals']))
 
+    def test_unsubmitted_service_drift_refreshes_same_operation_and_preserves_artifacts(self):
+        mocks = self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'MemoryFunction',
+                                      'ResourceType': 'AWS::Lambda::Function', 'Replacement': 'False'}])
+        answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')}}
+        with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}):
+            result = self.run_update(answers, stop_at='service_update')
+        result = self.respond(result)
+        original = self.controller._wizard(result).directory / 'service-change-set.json'
+        before = original.read_bytes()
+        manifest, template, parameters = mocks['_package'].return_value
+        mocks['_package'].return_value = ({'deployment_inputs': {
+            **manifest['deployment_inputs'], 'OwnerEmail': 'old@example.invalid'}}, template, parameters)
+        stack = mocks['_cloud'].return_value.describe_stacks.return_value['Stacks'][0]
+        stack['Parameters'].append({'ParameterKey': 'OwnerEmail', 'ParameterValue': 'new@example.invalid'})
+        with patch('tools.memory.bootstrap.apply') as apply:
+            refreshed = self.controller.advance(result['operation_id'])
+        self.assertEqual(refreshed['operation_id'], result['operation_id'])
+        self.assertEqual(refreshed['step'], 'update_service')
+        self.assertEqual(refreshed['service_candidate_revision'], 1)
+        self.assertEqual(original.read_bytes(), before)
+        self.assertEqual(refreshed['approvals'], result['approvals'])
+        apply.assert_not_called()
+        mocks['_package'].return_value = ({'deployment_inputs': {
+            **manifest['deployment_inputs'], 'OwnerEmail': 'new@example.invalid'}}, template, parameters)
+        refreshed = self.controller.advance(result['operation_id'])
+        self.assertEqual(refreshed['pending_interaction']['key'], 'service_update')
+        self.assertEqual(original.read_bytes(), before)
+        self.assertNotEqual(mocks['plan'].call_args.args[2], original)
+
+    def test_service_refresh_refuses_unknown_preview_or_execution(self):
+        result = self.controller.begin('setup', {'mode': 'new'})
+        state = self.controller._load(result['operation_id'])
+        wizard = self.controller._wizard(state)
+        save_json(wizard.directory / 'service-change-set.json.pending', {'request_token': str(uuid4())})
+        before = self.controller._path(result['operation_id']).read_bytes()
+        with self.assertRaisesRegex(SetupPending, 'submitted or unresolved'):
+            self.controller._refresh_service_candidate(state, wizard, wizard.directory)
+        self.assertEqual(self.controller._path(result['operation_id']).read_bytes(), before)
+
+    def test_changed_authority_selection_refreshes_review_in_same_operation(self):
+        from tools.memory.onboarding import catalog
+        candidates = catalog()[0][:2]
+        mocks = self.update_fixture([])
+        changes = [{'slug': item['slug'], 'title': item['title'], 'action': 'update',
+                    'page_id': str(uuid4()), 'revision': 3, 'candidate': item, 'diff': '-old\n+new'}
+                   for item in candidates]
+        mocks['authority_changes'].return_value = changes[:1]
+        answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')}}
+        with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}), \
+                patch('tools.memory.bootstrap.apply', return_value={'status': 'connected'}):
+            offered = self.run_update(answers, stop_at='authority_update')
+            result = self.respond(offered, {'update': True})
+            mocks['authority_changes'].return_value = changes
+            result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['operation_id'], offered['operation_id'])
+        self.assertEqual(result['pending_interaction']['key'], 'authority_update')
+        self.assertNotEqual(result['pending_interaction']['interaction_id'],
+                            offered['pending_interaction']['interaction_id'])
+        self.assertEqual([row['slug'] for row in result['authority_changes']],
+                         [row['slug'] for row in changes])
+        self.assertFalse((self.controller._wizard(result).directory / 'authority-update').exists())
+
     def test_update_offers_instruction_changes_as_one_collection_review(self):
         from tools.memory.onboarding import catalog
         candidate = catalog()[0][0]
@@ -431,6 +509,15 @@ class AdministrationTests(unittest.TestCase):
         page = review['review']['pages'][0]
         self.assertEqual((page['page_id'], page['expected_revision']),
                          (mocks['authority_changes'].return_value[0]['page_id'], 3))
+
+    def test_optional_secrets_operation_does_not_veto_memory_setup_choices(self):
+        wizard = Wizard(self.home)
+        secret_owner = str(uuid4())
+        wizard.state['secrets_operation'] = secret_owner
+        wizard.save()
+        result = self.controller.begin('setup', {'mode': 'existing'})
+        self.assertEqual(result['pending_interaction']['key'], 'selection')
+        self.assertEqual(Wizard(self.home).state['secrets_operation'], secret_owner)
 
     def test_setup_never_steals_unresolved_or_unverified_ownership(self):
         for phase in ('awaiting_decision', 'working', 'blocked', 'uncertain', 'cancelled', 'completed'):
@@ -507,12 +594,13 @@ class AdministrationTests(unittest.TestCase):
         state = self.controller._load(identifier)
         state.update(state='uncertain', step='apply', pending_interaction=None)
         self.controller._save(state)
-        with patch('tools.memory.bootstrap.apply') as cloud:
+        with patch('tools.memory.bootstrap.apply') as cloud, \
+                patch('tools.secret_setup.identities', side_effect=AssertionError('local archive must not log in')):
             review = review_restart(self.home, identifier)
             result = restart(self.home, identifier, confirm_review=_digest(review), source=self.source)
             successor = result['operation_id']
             self.assertNotEqual(successor, identifier)
-            self.assertEqual(Wizard(self.home).values, {})
+            self.assertEqual(Wizard(self.home).env.read_text(), original_environment)
             old = self.controller.status(identifier)
             self.assertEqual(old['state'], 'abandoned')
             self.assertEqual(old['next_actions'], [])
@@ -532,6 +620,25 @@ class AdministrationTests(unittest.TestCase):
             self.assertEqual(repeated['operation_id'], successor)
             self.assertEqual(Wizard(self.home).values['MAVEN_AWS_PROFILE'], 'new-owner')
             cloud.assert_not_called()
+
+    def test_local_restart_preserves_legacy_and_conflicting_aws_selectors_offline(self):
+        from tools.setup_restart import review_restart, restart
+        from tools.administration import _digest
+        original = self.controller.begin('setup', {'mode': 'existing'})
+        path = self.home / '.env'
+        raw = ('MAVEN_AWS_PROFILE="daily"\nMAVEN_ACCOUNT_ID="123456789012"\n'
+               'MAVEN_DEPLOY_EXPECTED_PRINCIPAL="arn:aws:iam::210987654321:user/maintenance"\n'
+               'MAVEN_GOOGLE_PARAMETER_PREFIX="/legacy/workspace/"\n')
+        path.write_text(raw)
+        path.chmod(0o600)
+        with patch('tools.memory.environment.selected_aws_session', side_effect=AssertionError('offline archive')), \
+                patch('tools.secret_setup.identities', side_effect=AssertionError('offline archive')):
+            review = review_restart(self.home, original['operation_id'])
+            result = restart(self.home, original['operation_id'], confirm_review=_digest(review), source=self.source)
+        self.assertEqual(path.read_text(), raw)
+        self.assertEqual(result['state'], 'pending')
+        self.assertFalse(result['live_state_checked'])
+        self.assertEqual(result['restarted_from'], original['operation_id'])
 
     def test_restart_rejects_stale_review_and_preserves_active_sessions(self):
         from tools.setup_restart import review_restart, restart
@@ -686,7 +793,8 @@ class AdministrationTests(unittest.TestCase):
         with patch('tools.administration.subprocess.run') as worker:
             result = self.controller.advance(result['operation_id'])
             self.assertEqual(result['state'], 'blocked')
-            self.assertIn('harnesses-stopped', result['handoff']['required_external_attestations'])
+            self.assertEqual(set(result['handoff']['required_external_attestations']),
+                             {'harness-config-risk', 'writers-quiescent'})
             self.assertNotIn('--harnesses-stopped', result['handoff']['command'])
             self.controller.status(result['operation_id'])
             worker.assert_not_called()
@@ -898,7 +1006,7 @@ class AdministrationTests(unittest.TestCase):
         self.assertIn('Unknown', question['description'])
         self.assertTrue(all(field['help'] for field in question['fields']))
         result = self.respond(result, {'profile': 'daily-owner', 'cache': str(self.home / 'runtime/daily-login')})
-        with patch('tools.setup_common.inspect_login_identity', side_effect=RuntimeError('expired')), \
+        with patch('tools.setup_common.inspect_login_identity', side_effect=MemoryClientError('authentication_required')), \
                 patch('subprocess.run') as launch:
             result = self.controller.advance(result['operation_id'])
         launch.assert_not_called()
@@ -960,7 +1068,43 @@ class AdministrationTests(unittest.TestCase):
             self.controller.back(result['operation_id'])
         self.assertEqual(self.controller._path(result['operation_id']).read_bytes(), before)
 
-    def test_old_optional_project_checkpoint_requires_store_without_project_mutation(self):
+    def test_recovery_uses_original_effect_fence_and_propagates_uncertainty(self):
+        target = self.controller.begin('project', {'root': str(self.base)})
+        target = self.respond(target, {'root': str(self.base), 'mode': 'create', 'name': 'First', 'project_id': ''})
+        target = self.respond(self.advance_to_question(target))
+        approvals = target['approvals']
+        recovery = self.respond(self.controller.begin('recovery', {
+            'operation_id': target['operation_id'], 'action': 'recover'}))
+        with patch('tools.project_setup.setup_project', side_effect=MemoryClientError('operation_outcome_unknown')):
+            recovery = self.controller.advance(recovery['operation_id'])
+        original = self.controller.status(target['operation_id'])
+        self.assertEqual((recovery['state'], original['state']), ('uncertain', 'uncertain'))
+        self.assertTrue(original['effect_started'])
+        self.assertEqual(original['approvals'], approvals)
+        self.assertNotIn('back', original['next_actions'])
+        with self.assertRaises(SetupPending):
+            self.controller.back(target['operation_id'])
+        with patch('tools.project_setup.setup_project', return_value={'status': 'ready', 'project': {}}):
+            recovery = self.controller.advance(recovery['operation_id'])
+        self.assertEqual(recovery['state'], 'completed')
+        self.assertEqual(recovery['outcome']['state'], 'completed')
+
+    def test_recovery_never_executes_abandoned_or_failed_operations(self):
+        for terminal in ('abandoned', 'failed'):
+            target = self.controller.begin('project', {'root': str(self.base)})
+            state = self.controller._load(target['operation_id'])
+            state.update(state=terminal, step='project_apply', pending_interaction=None)
+            self.controller._save(state)
+            recovery = self.respond(self.controller.begin('recovery', {
+                'operation_id': target['operation_id'], 'action': 'recover'}))
+            before = self.controller._path(target['operation_id']).read_bytes()
+            with patch.object(AdminOperations, '_project') as execute:
+                result = self.controller.advance(recovery['operation_id'])
+            execute.assert_not_called()
+            self.assertEqual(result['state'], 'blocked')
+            self.assertEqual(self.controller._path(target['operation_id']).read_bytes(), before)
+
+    def test_old_optional_project_checkpoint_finishes_without_optional_store(self):
         result = self.controller.begin('setup', {})
         state = self.controller._load(result['operation_id'])
         old = {'interaction_id': str(uuid4()), 'revision': state['revision'] + 1,
@@ -975,8 +1119,8 @@ class AdministrationTests(unittest.TestCase):
                 patch('tools.project_setup.setup_project') as project:
             result = self.controller.advance(result['operation_id'])
         project.assert_not_called()
-        self.assertEqual((result['state'], result['step']), ('pending', 'secrets_start'))
-        self.assertFalse(result.get('outcome', {}).get('instance_ready'))
+        self.assertEqual((result['state'], result['step']), ('completed', 'verify'))
+        self.assertTrue(result['outcome']['instance_ready'])
         self.assertEqual(result['retired_interactions'], [old])
 
     def test_new_reviewed_operation_never_discards_unfinished_setup(self):
@@ -1059,7 +1203,7 @@ class AdministrationTests(unittest.TestCase):
         wizard.settings({'MAVEN_AWS_REGION': 'us-east-1', 'MAVEN_STACK_NAME': 'memory',
             'MAVEN_DEPLOY_PROFILE': 'maintainer', 'MAVEN_DEPLOY_LOGIN_CACHE': str(self.home / 'runtime/maintenance'),
             'MAVEN_DEPLOY_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/maintainer'})
-        with patch('tools.setup_common.inspect_login_identity', side_effect=RuntimeError('expired')), \
+        with patch('tools.setup_common.inspect_login_identity', side_effect=MemoryClientError('authentication_required')), \
                 patch('tools.uninstall.cli.build_plan') as plan, \
                 patch('subprocess.run') as launch:
             result = self.controller.begin('uninstall', {'cloud': True})
@@ -1068,6 +1212,18 @@ class AdministrationTests(unittest.TestCase):
         self.assertEqual(result['handoff']['type'], 'aws_login')
         self.assertIn('Maintenance', result['handoff']['purpose'])
         self.assertEqual(result['handoff']['account'], '123456789012')
+
+    def test_non_authentication_failure_never_offers_login(self):
+        wizard = Wizard(self.home)
+        wizard.settings({'MAVEN_AWS_REGION': 'us-east-1', 'MAVEN_STACK_NAME': 'memory',
+                         'MAVEN_DEPLOY_PROFILE': 'maintainer',
+                         'MAVEN_DEPLOY_LOGIN_CACHE': str(self.home / 'runtime/maintenance')})
+        with patch('tools.setup_common.inspect_login_identity', side_effect=MemoryClientError('network_unavailable')), \
+                patch('tools.uninstall.cli.build_plan') as plan:
+            result = self.controller.begin('uninstall', {'cloud': True})
+        self.assertEqual(result['error'], 'network_unavailable')
+        self.assertNotIn('handoff', result)
+        plan.assert_not_called()
 
     def test_effect_stopped_by_expired_sign_in_offers_that_profiles_exact_sign_in(self):
         from tools.memory.client import MemoryClientError
@@ -1082,12 +1238,12 @@ class AdministrationTests(unittest.TestCase):
 
         def identity(values, *, deploy=False):
             if deploy:
-                raise RuntimeError('expired')
+                raise MemoryClientError('authentication_required')
             return {'Account': '123456789012', 'Arn': 'arn:aws:iam::123456789012:user/daily'}
         with patch.object(AdminOperations, '_setup', side_effect=MemoryClientError('selected_login_unavailable_or_expired')), \
                 patch('tools.setup_common.inspect_login_identity', side_effect=identity):
             result = self.controller.advance(result['operation_id'])
-        self.assertEqual((result['state'], result['step']), ('uncertain', 'update_service_apply'))
+        self.assertEqual((result['state'], result['step']), ('blocked', 'update_service_apply'))
         self.assertEqual(result['handoff']['type'], 'aws_login')
         self.assertEqual(result['handoff']['command'][:4], ['aws', 'login', '--profile', 'maintainer'])
         self.assertEqual(result['handoff']['environment'],
@@ -1098,10 +1254,7 @@ class AdministrationTests(unittest.TestCase):
         result = self.controller.begin('setup', {'mode': 'existing'})
         wizard = Wizard(self.home)
         wizard.settings({'MAVEN_AWS_REGION': 'us-east-1', 'MAVEN_MEMORY_INSTANCE_ID': str(uuid4()),
-                         'MAVEN_AWS_PROFILE': 'owner', 'MAVEN_ACCOUNT_ID': '123456789012',
-                         'MAVEN_SECRETS_BUCKET': 'fixture-secrets', 'MAVEN_SECRETS_KEY_ID': '0123456789abcdef',
-                         'MAVEN_SECRETS_PARAMETER_PREFIX': '/fixture/values/',
-                         'MAVEN_SECRETS_FILE_KEY_PREFIX': '/fixture/keys/', 'MAVEN_SECRETS_OBJECT_PREFIX': 'files/'})
+                         'MAVEN_AWS_PROFILE': 'owner', 'MAVEN_ACCOUNT_ID': '123456789012'})
         state = self.controller._load(result['operation_id'])
         self.controller._complete_setup(state, wizard, 9)
         state['receipts'].append({'step': 'verify', 'result': {'instance_ready': True}})
@@ -1205,16 +1358,17 @@ class PermissionPreflightTests(unittest.TestCase):
         self.assertIn('Unknown', expected_account({}))
         check_login_identity({}, {'Account': '123456789012', 'Arn': 'arn:aws:iam::123456789012:user/owner'})
 
-    def test_missing_credentials_require_signin_without_treating_them_as_static_keys(self):
-        from botocore.exceptions import NoCredentialsError
+    def test_missing_login_credentials_never_fall_back_or_contact_sts(self):
+        from tools.memory.client import MemoryClientError
         session = Mock()
         session.get_credentials.return_value = None
-        values = {'MAVEN_AWS_PROFILE': 'daily', 'MAVEN_AWS_LOGIN_CACHE': '/private/cache',
-                  'MAVEN_AWS_REGION': 'us-east-1'}
-        with patch('boto3.Session', return_value=session):
-            with self.assertRaises(NoCredentialsError):
-                inspect_login_identity(values)
-        session.client.assert_not_called()
+        with tempfile.TemporaryDirectory() as cache:
+            values = {'MAVEN_AWS_PROFILE': 'daily', 'MAVEN_AWS_LOGIN_CACHE': str(Path(cache).resolve()),
+                      'MAVEN_AWS_REGION': 'us-east-1'}
+            with patch('boto3.Session', return_value=session):
+                with self.assertRaisesRegex(MemoryClientError, 'selected_profile_requires_login'):
+                    inspect_login_identity(values)
+            session.client.assert_not_called()
 
 
 class HomeAdministrationTests(unittest.TestCase):
@@ -1268,9 +1422,10 @@ class HomeAdministrationTests(unittest.TestCase):
 
     def invoke(self, route, body):
         if route == '/v1/memory/search':
-            self.assertEqual(body, {'kind': 'entity', 'tag': 'maven-home', 'scope': 'universal'})
-            return {'status': 'ready', 'data': {'records': [
-                record for record in self.entities.values() if 'maven-home' in record['tags']]}}
+            self.assertEqual({key: body[key] for key in ('kind', 'tag', 'scope')},
+                             {'kind': 'entity', 'tag': 'maven-home', 'scope': 'universal'})
+            records = [record for record in self.entities.values() if 'maven-home' in record['tags']]
+            return {'status': 'ready', 'data': {'records': records[body['offset']:body['offset'] + body['limit']]}}
         if route == '/v1/memory/read':
             return {'status': 'ready', 'data': json.loads(json.dumps(self.entities[body['record_id']]))}
         if route == '/v1/memory/write':
@@ -1451,6 +1606,69 @@ class HomeAdministrationTests(unittest.TestCase):
         again = self.controller.begin('home', {'action': 'disable'})
         self.assertEqual((again['state'], again['outcome']['status']), ('completed', 'unchanged'))
 
+    def test_home_review_refuses_intervening_local_selection(self):
+        from tools.home import save_home, load_home
+        projects = [self.entity(name) for name in ('Old', 'Intervening', 'Replacement')]
+        roots = [self.base / name for name in ('old', 'intervening', 'replacement')]
+        for root, project in zip(roots, projects):
+            self.enable_folder(root, project)
+        save_home(self.home, root=roots[0], project_id=projects[0], instance_id=self.instance,
+                  label='Old', consent=self.source)
+        result = self.controller.begin('home', {})
+        result = self.controller.advance(self.answer(result, mode='enabled', root=str(roots[2]), replace=True)['operation_id'])
+        result = self.approve(result)
+        intervening = save_home(self.home, root=roots[1], project_id=projects[1], instance_id=self.instance,
+                                label='Intervening', consent=self.source)
+        result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['state'], 'blocked')
+        self.assertEqual(load_home(self.home), intervening)
+        self.assertEqual(self.writes, [])
+
+    def test_interrupted_disable_reconciles_original_removal_without_cloud(self):
+        from tools.home import save_home, remove_home
+        project = self.entity('Personal')
+        root = self.base / 'personal'
+        self.enable_folder(root, project)
+        save_home(self.home, root=root, project_id=project, instance_id=self.instance,
+                  label='Personal', consent=self.source)
+        result = self.approve(self.controller.begin('home', {'action': 'disable'}))
+
+        def interrupted(home):
+            remove_home(home)
+            raise KeyboardInterrupt()
+
+        with patch('tools.home.remove_home', side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.controller.advance(result['operation_id'])
+        with patch('tools.environment_migrations.prerequisite', side_effect=AssertionError('local-only')):
+            result = AdminOperations(self.home).advance(result['operation_id'])
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['outcome']['status'], 'removed')
+        self.assertFalse((self.home / 'home.json').exists())
+        self.assertEqual(self.writes, [])
+
+    def test_interrupted_home_write_reuses_exact_selection(self):
+        from tools.home import save_home, load_home
+        project = self.entity('Personal')
+        root = self.base / 'personal'
+        self.enable_folder(root, project)
+        result = self.controller.begin('home', {})
+        result = self.controller.advance(self.answer(result, mode='enabled', root=str(root))['operation_id'])
+        result = self.approve(result)
+
+        def interrupted(*args, **kwargs):
+            save_home(*args, **kwargs)
+            raise KeyboardInterrupt()
+
+        with patch('tools.home.save_home', side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.controller.advance(result['operation_id'])
+        original = load_home(self.home)
+        result = AdminOperations(self.home).advance(result['operation_id'])
+        self.assertEqual(result['state'], 'completed', result.get('error'))
+        self.assertEqual(load_home(self.home), original)
+        self.assertEqual(len(self.writes), 1)
+
     def test_home_parameters_are_validated(self):
         for parameters in ({'action': 'remove'}, {'mode': 'create'}, {'root': 7}):
             with self.subTest(parameters=parameters), self.assertRaises(ValueError):
@@ -1543,7 +1761,8 @@ class CleanupAdministrationTests(unittest.TestCase):
         result = self.controller.begin('cleanup', {'action': 'review'})
         self.assertEqual(result['state'], 'completed', result.get('error'))
         outcome = result['outcome']
-        self.assertTrue(outcome['read_only'])
+        self.assertFalse(outcome['read_only'])
+        self.assertFalse(outcome['cloud_changed'])
         self.assertEqual(outcome['total'], 4)
         self.assertEqual({key: [item['reasons'][0] for item in value] for key, value in outcome['groups'].items()},
                          {'erase': ['superseded'], 'forget': ['duplicate', 'archived'], 'archive': ['stale_task']})
@@ -1623,6 +1842,63 @@ class CleanupAdministrationTests(unittest.TestCase):
             self.assertIn(message, result['error'])
         self.sql['forget_records'].assert_not_called()
 
+    def test_lost_cleanup_response_replays_exact_original_request_without_redescribe(self):
+        target = self.record()
+        result = self.controller.begin('cleanup', {
+            'action': 'erase', 'record_ids': [target], 'reason': 'Obsolete record'})
+        original_digest = result['pending_interaction']['review_digest']
+        result = self.approve(result)
+        receipt = {'receipt_id': str(uuid4()), 'records': [{'record_id': target, 'versions': 2}]}
+
+        def lost(*args, **kwargs):
+            self.records[target].update(erased=True, revision=3)
+            raise MemoryClientError('operation_outcome_unknown')
+
+        self.sql['erase_records'].side_effect = lost
+        result = self.controller.advance(result['operation_id'])
+        self.assertEqual(result['state'], 'uncertain')
+        original_call = self.sql['erase_records'].call_args
+        self.assertEqual(original_call.kwargs['operation_id'], result['operation_id'])
+        self.assertEqual(original_call.kwargs['expected_revisions'], {target: 2})
+        self.assertEqual(original_call.kwargs['approval_digest'], original_digest)
+        self.sql['cleanup_describe'].side_effect = AssertionError('Replay must not re-describe erased data')
+        self.sql['erase_records'].side_effect = None
+        self.sql['erase_records'].return_value = receipt
+        result = AdminOperations(self.home).advance(result['operation_id'])
+        self.assertEqual(result['state'], 'completed', result.get('error'))
+        self.assertEqual(self.sql['erase_records'].call_args, original_call)
+        self.assertEqual(result['outcome']['receipt_id'], receipt['receipt_id'])
+
+    def test_erase_scrubs_resolved_administration_titles_and_keeps_approval_digest(self):
+        target = self.record()
+        title = self.records[target]['title']
+        self.source = {**self.source, 'excerpt': title}
+        self.sql['cleanup_candidates'].return_value = {'candidates': [
+            {**self.records[target], 'suggested': 'erase'}], 'truncated': False}
+        prior = self.controller.begin('cleanup', {'action': 'review'})
+        result = self.controller.begin('cleanup', {
+            'action': 'erase', 'record_ids': [target], 'reason': 'Obsolete record'})
+        digest = result['pending_interaction']['review_digest']
+        self.sql['erase_records'].return_value = {'receipt_id': str(uuid4()), 'records': []}
+        result = self.controller.advance(self.approve(result)['operation_id'])
+        self.assertEqual(result['state'], 'completed', result.get('error'))
+        self.assertEqual(result['approvals'][-1]['review_digest'], digest)
+        for identifier in (prior['operation_id'], result['operation_id']):
+            self.assertNotIn(title, self.controller._path(identifier).read_text())
+        self.assertIn(target, self.controller._path(result['operation_id']).read_text())
+
+    def test_unresolved_administration_request_blocks_erasure_without_redaction(self):
+        target = self.record()
+        pending = self.controller.begin('cleanup', {
+            'action': 'forget', 'record_ids': [target], 'reason': 'Duplicate'})
+        before = self.controller._path(pending['operation_id']).read_bytes()
+        result = self.controller.begin('cleanup', {
+            'action': 'erase', 'record_ids': [target], 'reason': 'Obsolete record'})
+        self.assertEqual(result['state'], 'blocked')
+        self.assertIn('unresolved selected work', result['error'])
+        self.assertEqual(self.controller._path(pending['operation_id']).read_bytes(), before)
+        self.sql['erase_records'].assert_not_called()
+
     def test_erase_lists_caveats_and_sweeps_only_erased_records_content(self):
         from tools.administration import ERASE_CAVEATS
         target, other = self.record(), self.record()
@@ -1636,7 +1912,9 @@ class CleanupAdministrationTests(unittest.TestCase):
             'route': 'write', 'request_key': swept['request_key'], 'record': {'record_id': target, 'revision': 2},
             'result': {'record_id': target, 'revision': 2, 'request_key': swept['request_key'],
                        'replayed': False, 'data': {'title': 'Acme Corp private'}}})
-        failed = {'route': 'write', 'body': self.write_request(target), 'session_id': self.session_id, 'digest': 'x'}
+        from tools.memory.boundary import digest
+        failed = {'route': 'write', 'body': self.write_request(target), 'session_id': self.session_id}
+        failed['digest'] = digest(failed)
         self.write_runtime('failed-memory-write.json', {'request': failed, 'status': 'revision_conflict'})
         manifest = {'manifest': {'session_id': self.session_id, 'memory_refs': [{'record_id': target, 'revision': 2}],
                                  'summary': 'Checkpoint'}, 'status': 'checkpointed'}
@@ -1676,6 +1954,20 @@ class CleanupAdministrationTests(unittest.TestCase):
         self.assertEqual(everything.count('Acme Corp private'), 0)
         self.assertIn('Keep me', everything)
         self.assertEqual(json.loads(next((self.root / self.runtime / 'checkpoints').iterdir()).read_text()), manifest)
+
+    def test_legacy_failed_request_keeps_outer_digest_format_when_scrubbed(self):
+        from tools.administration import sweep_erased, ERASED_LOCAL
+        from tools.memory.boundary import digest
+        target = self.record()
+        request = {'route': 'write', 'body': self.write_request(target), 'session_id': self.session_id}
+        self.write_runtime('failed-memory-write.json', {
+            'request': request, 'status': 'revision_conflict', 'pending_digest': digest(request)})
+        sweep_erased([self.root], [target], ERASED_LOCAL)
+        saved = self.read_runtime('failed-memory-write.json')
+        self.assertNotIn('digest', saved['request'])
+        self.assertEqual(saved['pending_digest'], digest(saved['request']))
+        self.assertEqual(saved['request']['body']['request_key'], request['body']['request_key'])
+        self.assertEqual(saved['request']['body']['data'], ERASED_LOCAL)
 
     def test_pending_journal_for_erased_record_refuses_erase_and_sweep(self):
         from tools.administration import sweep_erased

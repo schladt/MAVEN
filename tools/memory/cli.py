@@ -110,6 +110,7 @@ def parser() -> argparse.ArgumentParser:
     for key in ('kind', 'project-id', 'query', 'tag', 'subject-id', 'state', 'after-id'):
         listing.add_argument('--' + key)
     listing.add_argument('--limit', type=int)
+    listing.add_argument('--offset', type=int)
     listing.add_argument('--scope', choices=('context', 'project', 'universal', 'all'), default='context')
     claim = actions.add_parser('claim', help='Claim/release/complete a task using an explicit fenced request')
     claim.add_argument('input', type=Path)
@@ -163,7 +164,7 @@ def _memory_action(args):
                 route = '/v1/memory/read'
             else:
                 body = {key: getattr(args, key) for key in
-                        ('kind', 'project_id', 'scope', 'query', 'tag', 'subject_id', 'state', 'after_id', 'limit')
+                        ('kind', 'project_id', 'scope', 'query', 'tag', 'subject_id', 'state', 'after_id', 'limit', 'offset')
                         if getattr(args, key) is not None}
                 route = '/v1/memory/search'
         elif args.action == 'claim':
@@ -407,6 +408,17 @@ def main(argv: list[str] | None = None) -> int:
         result = {'status': exc.code}
         if exc.request_key:
             result['request_key'] = exc.request_key
+        if exc.detail is not None:
+            result['detail'] = exc.detail
+        from .client import AUTHENTICATION_CODES
+        if exc.code in AUTHENTICATION_CODES:
+            from .environment import authentication_handoff
+            try:
+                handoff = authentication_handoff(exc, load_environment(args.env))
+                if handoff:
+                    result['authentication'] = handoff
+            except (MemoryClientError, OSError, ValueError):
+                pass
         print(json.dumps(result))
         return 2
     except KeyboardInterrupt:

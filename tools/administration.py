@@ -38,6 +38,8 @@ ERASE_CAVEATS = (
     'erase; every file changed is reported. Checkpoint manifests hold only record references and are kept.',
     'Other machines keep any locally cached copy until they next run a MAVEN clean-up (any clean-up action '
     'sweeps them).',
+    'Resolved administration review copies are also scrubbed: record identity, revision and original approval '
+    'digest remain as content-free evidence. Unresolved requests must be reconciled before erasure.',
 )
 # Local replacement for content of records erased earlier, when that erase's tombstone is not at hand.
 ERASED_LOCAL = {'erased': True}
@@ -212,12 +214,26 @@ def _sweep_session(root, session, ids, tombstone):
     failed = load('failed-memory-write.json')
     request = (failed or {}).get('request')
     if isinstance(request, dict) and isinstance(request.get('body'), dict) and request['body'].get('record_id') in ids:
+        from tools.memory.client import DEFINITIVE_MUTATION_ERRORS
+        if failed.get('status') not in DEFINITIVE_MUTATION_ERRORS:
+            blockers.append(f'{Path(root) / runtime / "failed-memory-write.json"}: unresolved original write; recover it before erasure.')
+            request = None
+        elif ('digest' in request and ('pending_digest' in failed or request['digest'] != digest(
+                {key: value for key, value in request.items() if key != 'digest'}))) or (
+                'digest' not in request and failed.get('pending_digest') != digest(request)):
+            blockers.append(f'{Path(root) / runtime / "failed-memory-write.json"}: original request digest is invalid; preserve it for recovery.')
+            request = None
+    if isinstance(request, dict) and isinstance(request.get('body'), dict) and request['body'].get('record_id') in ids:
         body = _erased_request(request['body'], tombstone)
         if body != request['body']:
             rewritten = {key: value for key, value in request.items() if key != 'digest'}
             rewritten['body'] = body
-            rewritten['digest'] = digest(rewritten)
-            updates['failed-memory-write.json'] = {**failed, 'request': rewritten}
+            if 'digest' in request:
+                rewritten['digest'] = digest(rewritten)
+                updates['failed-memory-write.json'] = {**failed, 'request': rewritten}
+            else:
+                updates['failed-memory-write.json'] = {**failed, 'request': rewritten,
+                                                       'pending_digest': digest(rewritten)}
     maintenance = load('maintenance.json')
     if maintenance is not None:
         changed, dirty = deepcopy(maintenance), False
@@ -243,8 +259,8 @@ def _session_directories(root):
     from tools.memory.boundary import BoundaryError, private_path
     try:
         base = private_path(root, '.maven/runtime/sessions')
-    except BoundaryError:
-        return []
+    except BoundaryError as error:
+        raise SetupPending('A registered project session directory is unsafe or unreadable; inspect it before cleanup.') from error
     if not base.is_dir():
         return []
     found = []
@@ -326,19 +342,27 @@ class AdminOperations:
             'secrets_setup': set(),
             'environment_migration': {'path'},
             'repair': set(),
-            'project': {'root'},
+            'project': {'root', 'stopped_session_ids'},
             'install': {'source', 'harness', 'profile'},
             'uninstall': {'project', 'reactivate_project', 'project_home', 'home', 'machine',
                           'all_homes', 'cloud', 'cloud_home', 'cloud_mode', 'archive_project',
                           'offline', 'export', 'optional_resource', 'retained_resource',
                           'abandon_sessions', 'output', 'adopt_legacy', 'plan_path'},
-            'recovery': {'operation_id', 'root', 'session_id', 'action'},
-            'home': {'action', 'root', 'project_id', 'label'},
+            'recovery': {'operation_id', 'root', 'session_id', 'action', 'writer_tokens'},
+            'home': {'action', 'root', 'project_id', 'label', 'stopped_session_ids'},
             'cleanup': {'action', 'record_ids', 'reason'},
             'project_lifecycle': {'action', 'project_id'},
         }
         if kind not in allowed or not isinstance(parameters, dict) or set(parameters) - allowed[kind]:
             raise AdminInputError('Unsupported administration kind or parameters.')
+        if 'stopped_session_ids' in parameters:
+            from tools.project_switch import validate_stopped_session_ids
+            try:
+                validate_stopped_session_ids(parameters['stopped_session_ids'])
+            except SetupPending as error:
+                raise AdminInputError(str(error)) from error
+            if kind == 'home' and parameters.get('action', 'enable') != 'enable':
+                raise AdminInputError('stopped_session_ids applies only to an explicitly reviewed folder switch.')
         if kind == 'setup' and parameters.get('mode') not in (None, 'existing', 'new', 'update'):
             raise AdminInputError('Setup mode must be existing, new or update.')
         if kind == 'setup' and 'checkout' in parameters and (
@@ -404,7 +428,7 @@ class AdminOperations:
             if result['removal']['status'] == 'completed':
                 result['state'] = 'completed'
         result['next_actions'] = (['respond'] if result['pending_interaction'] else
-                                  [] if result['state'] in ('completed', 'cancelled', 'abandoned') else ['advance'])
+                                  [] if result['state'] in ('completed', 'cancelled', 'abandoned', 'failed') else ['advance'])
         if self._back_checkpoint(state) is not None:
             result['next_actions'].append('back')
         return result
@@ -439,7 +463,7 @@ class AdminOperations:
                     return self.status(operation_id)
                 _source(response.get('source'))
                 if response.get('confirmations', {}) != question.get('confirmations', {}):
-                    raise AdminInputError('Separate purge/abandon confirmations must match the exact reviewed instances.')
+                    raise AdminInputError('Separate confirmations must match the exact reviewed targets and stopped-session attestations.')
                 state['approvals'].append({'interaction_id': interaction_id, 'revision': revision,
                                            'review_digest': question['review_digest'], 'source': response['source'],
                                            'review': question['review'],
@@ -484,6 +508,8 @@ class AdminOperations:
                 if key == 'cleanup_selection':
                     _cleanup_ids(re.split(r'[\s,]+', response['record_ids'].strip()))
                     _cleanup_reason(response['reason'])
+                if key in ('home', 'project') and state['parameters'].get('stopped_session_ids') and response.get('mode') != 'switch':
+                    raise AdminInputError('stopped_session_ids applies only to an explicitly reviewed folder switch.')
                 if key == 'home':
                     try:
                         self._home_selection(response)
@@ -494,11 +520,23 @@ class AdminOperations:
                 if key == 'project':
                     if not Path(response['root']).is_absolute() or not Path(response['root']).is_dir():
                         raise AdminInputError('Select an absolute existing project directory.')
-                    if response['mode'] == 'create':
+                    if response['mode'] in ('create', 'create_cloud'):
                         if not response['name'].strip() or response['project_id']:
                             raise AdminInputError('Creation requires a name and no existing project UUID.')
-                    elif str(UUID(response['project_id'])) != response['project_id'] or response['name']:
-                        raise AdminInputError('Select an exact existing project UUID without a new name.')
+                        if response['mode'] == 'create_cloud' and len(response['name']) > 240:
+                            raise AdminInputError('Cloud creation requires a project name of at most 240 characters.')
+                    else:
+                        try:
+                            valid_id = str(UUID(response['project_id'])) == response['project_id']
+                        except ValueError:
+                            valid_id = False
+                        if not valid_id:
+                            raise AdminInputError('Select an exact existing project UUID.')
+                        if response['mode'] == 'rename':
+                            if not response['name'].strip() or len(response['name']) > 240:
+                                raise AdminInputError('Rename requires a nonblank project name of at most 240 characters.')
+                        elif response['name']:
+                            raise AdminInputError('Select an existing project without a new name, or choose rename.')
                 if key == 'optional_project':
                     raise SetupPending('Installer project enablement has been removed. Advance this operation to finish instance readiness without changing a project.')
                 if key == 'install' and (not Path(response['source']).is_absolute()
@@ -513,7 +551,7 @@ class AdminOperations:
         return self.status(operation_id)
 
     def _back_checkpoint(self, state):
-        if state['state'] in ('working', 'uncertain', 'completed', 'cancelled', 'abandoned'):
+        if state.get('effect_started') or state['state'] in ('working', 'uncertain', 'failed', 'completed', 'cancelled', 'abandoned'):
             return None
         current = (state.get('pending_interaction') or {}).get('interaction_id')
         for checkpoint in reversed(state.get('choice_checkpoints', [])):
@@ -600,7 +638,7 @@ class AdminOperations:
             targets = {name: review[name] for name in
                        ('instance_id', 'identity', 'selection', 'instance', 'targets',
                         'machine_homes', 'scopes', 'region', 'mode', 'connection',
-                        'home_file', 'remove', 'consent', 'replaces', 'switch')
+                        'home_file', 'remove', 'consent', 'replaces', 'switch', 'rename', 'create_cloud')
                        if name in review}
             if key == 'starter_collection':
                 targets = {}
@@ -634,89 +672,126 @@ class AdminOperations:
         state.update(state='blocked', handoff={'reason': reason, 'command': command,
                      'environment': environment or {}, 'completion_claimed': False})
 
-    def _expired_login_handoff(self, state):
-        """A step stopped on an expired sign-in: offer the exact sign-in, with MAVEN's private
-        login cache, for whichever selected profile has expired. The step's state is kept."""
-        from tools.memory.environment import load_environment, sign_in
-        from tools.setup_common import expected_account, inspect_login_identity
-        values = load_environment(self.home / '.env')
-        for deploy, prefix in ((False, 'MAVEN_AWS_'), (True, 'MAVEN_DEPLOY_')):
-            if not values.get(prefix + 'PROFILE') or not values.get(prefix + 'LOGIN_CACHE'):
-                continue
+    def _expired_login_handoff(self, state, error, *, values=None, deploy=None):
+        from tools.memory.environment import authentication_handoff, load_environment
+        from tools.memory.client import AUTHENTICATION_CODES, MemoryClientError, aws_error
+        if aws_error(error).code not in AUTHENTICATION_CODES:
+            return False
+        from tools.setup_common import expected_account
+        if values is None:
             try:
-                inspect_login_identity(values, deploy=deploy)
-                continue
-            except Exception:
-                pass
-            exact = sign_in(values, deploy=deploy)
-            outcome = state['state']
-            self._handoff(state, exact['purpose'] + ' sign-in is missing or expired. Choose Sign in in the terminal, '
-                          'or run this exact command externally (a plain aws login is not read by MAVEN), '
-                          'then resume this same operation.', exact['argv'], environment=exact['environment'])
-            state['handoff'].update(type='aws_login', purpose=exact['purpose'], account=expected_account(values),
-                                    profile=exact['profile'],
-                                    expected_principal=values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown'))
-            state['state'] = outcome
-            return
+                values = load_environment(self.home / '.env')
+            except MemoryClientError:
+                return False
+        if deploy is None:
+            deploy = (state.get('presentation', {}).get('purpose', '').startswith('Maintenance')
+                      or state['step'] in ('plan', 'apply', 'update_service_apply', 'update_service',
+                                            'migration_stack', 'discover', 'deploy_identity'))
+        handoff = authentication_handoff(error, values, deploy=deploy)
+        if handoff:
+            prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
+            state['handoff'] = {**handoff, 'completion_claimed': False, 'account': expected_account(values),
+                                'expected_principal': values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown')}
+        return handoff is not None
 
     def advance(self, operation_id):
         self._prepare()
         from tools.environment_migrations import prerequisite
         original = self._load(operation_id)
-        pending = prerequisite(self, original)
+        if original['state'] in ('completed', 'cancelled', 'abandoned', 'failed'):
+            return self.status(operation_id)
+        prerequisite_target = original
+        if original['kind'] == 'recovery' and original['parameters'].get('operation_id'):
+            prerequisite_target = self._load(original['parameters']['operation_id'])
+        local_only = (prerequisite_target['kind'] in ('install', 'environment_migration')
+                      or prerequisite_target['kind'] == 'recovery'
+                      or (prerequisite_target['kind'] == 'home'
+                          and prerequisite_target['parameters'].get('action') == 'disable')
+                      or (prerequisite_target['kind'] == 'uninstall'
+                          and prerequisite_target['parameters'].get('offline')))
+        if original['kind'] == 'recovery' and original['parameters'].get('action', 'diagnose') == 'diagnose':
+            local_only = True
+        pending = None if local_only else prerequisite(self, prerequisite_target)
         if pending:
             return {**self.status(operation_id), 'prerequisite_operation': pending['operation_id'],
                     'prerequisite': pending, 'next_actions': ['advance_prerequisite'],
                     'notice': 'Complete the separate persisted migration review, then advance this original operation. Its interactions and approvals are unchanged.'}
         with setup_lock(self.directory):
-            state = self._load(operation_id)
-            if (state['kind'] == 'setup' and
-                    (state.get('pending_interaction') or {}).get('key') in _LEGACY_STARTER_REVIEWS):
-                question = state['pending_interaction']
-                state.setdefault('retired_interactions', []).append(question)
-                state.update(pending_interaction=None, step=question['next_step'], state='pending')
-            if (state['kind'] == 'setup' and
-                    (state.get('pending_interaction') or {}).get('key') in ('optional_project', 'project')):
-                if state['step'] == 'project_apply' or any(
-                        receipt['step'].startswith('project_') for receipt in state['receipts']):
-                    raise SetupPending('Legacy project effects may be submitted or unresolved. Reconcile their original receipts separately; installer setup cannot rewind or retry them.')
-                state.setdefault('retired_interactions', []).append(state['pending_interaction'])
-                state.update(pending_interaction=None, step='verify', state='pending')
-            if state['pending_interaction'] or state['state'] in ('completed', 'cancelled', 'abandoned'):
-                return self.status(operation_id)
-            state.update(state='working', live_state_checked=False)
-            state.pop('error', None)
-            state.pop('error_detail', None)
-            state.pop('handoff', None)
-            if state['step'] in ('connection', 'plan', 'apply', 'initialize', 'migrate',
-                                  'migration_bind', 'starter_submit', 'starter_activate',
-                                  'update_service_apply', 'project_apply', 'removal_apply', 'recover',
-                                  'home_apply', 'home_disable', 'cleanup_apply', 'cleanup_sweep',
-                                  'project_lifecycle_apply'):
-                state['effect_sequence'] = state.get('effect_sequence', 0) + 1
-            self._save(state)  # Persist the phase before any potentially uncertain effect.
-            try:
-                with redirect_stdout(sys.stderr):
-                    getattr(self, '_' + state['kind'])(state)
-            except Exception as error:
-                # SDK and subprocess messages can contain credentials. Preserve safe codes only.
-                code = _error_code(error)
-                state['state'] = 'uncertain' if any(word in code for word in ('unknown', 'uncertain', 'unavailable', 'timeout')) else 'blocked'
-                state['error'] = str(error) if isinstance(error, SetupPending) else code
-                from tools.memory.validation import MemoryError
-                if isinstance(error, MemoryError) and code in (
-                        'migration_rejected', 'migration_failed', 'migration_outcome_unknown'):
-                    state['error_detail'] = error.metadata.get('detail', '')
-                state['recovery'] = 'Inspect status, correct the prerequisite, then advance this same operation. Original request artifacts are retained.'
-                if state['error'] == 'selected_login_unavailable_or_expired':
-                    try:
-                        self._expired_login_handoff(state)
-                    except (OSError, ValueError, KeyError):
-                        pass  # Settings unreadable: the stopped screen still names the error.
-            if state['state'] == 'working':
-                state['state'] = 'pending'
-            self._save(state)
+            self._advance_locked(self._load(operation_id))
         return self.status(operation_id)
+
+    def _advance_locked(self, state):
+        """Execute one phase while the caller holds the administration lock."""
+        if (state['kind'] == 'setup' and
+                (state.get('pending_interaction') or {}).get('key') in _LEGACY_STARTER_REVIEWS):
+            question = state['pending_interaction']
+            state.setdefault('retired_interactions', []).append(question)
+            state.update(pending_interaction=None, step=question['next_step'], state='pending')
+        if (state['kind'] == 'setup' and
+                (state.get('pending_interaction') or {}).get('key') in ('optional_project', 'project')):
+            if state['step'] == 'project_apply' or any(
+                    receipt['step'].startswith('project_') for receipt in state['receipts']):
+                raise SetupPending('Legacy project effects may be submitted or unresolved. Reconcile their original receipts separately; installer setup cannot rewind or retry them.')
+            state.setdefault('retired_interactions', []).append(state['pending_interaction'])
+            state.update(pending_interaction=None, step='verify', state='pending')
+        if state['pending_interaction'] or state['state'] in ('completed', 'cancelled', 'abandoned', 'failed'):
+            return
+        if (state['kind'] == 'cleanup' and state['step'] == 'cleanup_apply'
+                and state['state'] in ('working', 'uncertain') and not state.get('effect_started')
+                and not state.get('cleanup_request')):
+            state['legacy_cleanup_uncertain'] = True
+        if (state['kind'] == 'setup' and state['step'] == 'update_service_apply'
+                and state['state'] in ('working', 'uncertain', 'blocked') and not state.get('effect_started')
+                and not state.get('service_apply_started')):
+            # Legacy interrupted executions have no new intent field; preserve their original request.
+            state['service_apply_started'] = True
+        state.update(state='working', live_state_checked=False)
+        for key in ('error', 'error_detail', 'handoff', 'read_only_retry'):
+            state.pop(key, None)
+        if state['step'] in ('connection', 'plan', 'apply', 'initialize', 'migrate',
+                              'migration_bind', 'starter_submit', 'starter_activate',
+                              'update_service_apply', 'project_apply', 'removal_apply', 'recover',
+                              'home_apply', 'home_disable', 'cleanup_apply', 'cleanup_sweep',
+                              'project_lifecycle_apply'):
+            state['effect_sequence'] = state.get('effect_sequence', 0) + 1
+            state['effect_started'] = True
+        self._save(state)
+        try:
+            with redirect_stdout(sys.stderr):
+                getattr(self, '_' + state['kind'])(state)
+        except Exception as error:
+            code = _error_code(error)
+            uncertain = any(word in code.lower() for word in ('unknown', 'uncertain', 'timeout'))
+            if state.get('effect_started') and not isinstance(error, (SetupPending, ValueError)):
+                from tools.memory.client import MemoryClientError
+                from tools.memory.validation import MemoryError
+                uncertain = uncertain or not isinstance(error, (MemoryClientError, MemoryError))
+            state['state'] = 'uncertain' if uncertain else 'blocked'
+            state['error'] = str(error) if isinstance(error, SetupPending) else code
+            from tools.memory.client import MemoryClientError
+            if isinstance(error, MemoryClientError) and error.detail:
+                state['error_detail'] = error.detail
+            elif isinstance(error, subprocess.CalledProcessError):
+                state['error_detail'] = 'Child process exited with status ' + str(error.returncode) + '; command output was not retained.'
+            state['read_only_retry'] = code == 'warming' and state['step'] in (
+                'verify', 'update_schema', 'home_review', 'project_review', 'cleanup_review')
+            from tools.memory.validation import MemoryError
+            if isinstance(error, MemoryError) and code in (
+                    'migration_rejected', 'migration_failed', 'migration_outcome_unknown',
+                    'cleanup_upgrade_required', 'cleanup_refused'):
+                state['error_detail'] = error.metadata.get('detail', '')
+            state['recovery'] = 'Inspect status, correct the prerequisite, then advance this same operation. Original request artifacts are retained.'
+            try:
+                self._expired_login_handoff(state, error)
+                if state.get('handoff', {}).get('type') == 'aws_login':
+                    state['state'] = 'blocked'
+            except (OSError, ValueError, KeyError):
+                pass
+        if state['state'] not in ('blocked', 'uncertain', 'failed'):
+            state.pop('effect_started', None)
+        if state['state'] == 'working':
+            state['state'] = 'pending'
+        self._save(state)
 
     def _wizard(self, state):
         from tools.setup import Wizard
@@ -746,9 +821,6 @@ class AdminOperations:
                 wizard.state = {'schema': 1, 'administration_operation': state['operation_id'],
                                 'administration_artifacts': state['operation_id']}
             else:
-                secret_owner = wizard.state.get('secrets_operation')
-                if secret_owner and self._load(secret_owner)['state'] != 'completed':
-                    raise SetupPending('Resume original secrets operation ' + secret_owner + ' before starting memory setup.')
                 if (set(wizard.state) - {'schema', 'secrets_operation'}
                         or any(path.name not in ('state.json', 'lock') for path in wizard.directory.iterdir())):
                     raise SetupPending('Existing legacy setup evidence has no verified terminal operation. Resume the original maven-setup terminal flow; do not replace its receipts.')
@@ -795,7 +867,8 @@ class AdminOperations:
             'region': wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'),
             'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
             'profile': wizard.values.get('MAVEN_AWS_PROFILE'),
-            'instance_ready': True, 'secrets_ready': True, 'authority_generation': generation, 'project_configured': False,
+            'instance_ready': True, 'secrets_ready': bool(state.get('secrets_ready')),
+            'authority_generation': generation, 'project_configured': False,
             'binding': dict(wizard.values)})
 
 
@@ -815,7 +888,7 @@ class AdminOperations:
             from tools.setup_common import expected_account
             deploy = (step.startswith('deploy_identity') or
                       step in ('discover', 'discovery_select', 'provision', 'prepare', 'plan', 'apply_review', 'apply',
-                               'migration_stack', 'update_service') or
+                               'migration_stack', 'update_service', 'update_service_apply') or
                       (step == 'connect_review' and not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID')))
             prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
             actual = state.get(('deploy_identity' if deploy else 'identity') + '_actual', {})
@@ -885,6 +958,7 @@ class AdminOperations:
                     imported.pop('MAVEN_DEPLOY_LOGIN_CACHE', None)
                     _connection_config(imported)
                     review['imported_settings'] = imported
+                    review['target_settings'] = dict(wizard.values)
                     state['presentation'].update(account=expected_account(imported),
                         target=imported.get('MAVEN_MEMORY_INSTANCE_ID', connection))
                 self._review(state, 'connection', 'Review exact connection selection; existing mode never deploys or initializes', review, 'connection')
@@ -905,6 +979,9 @@ class AdminOperations:
                     updates.update(imported)
                 elif review['connection']:
                     updates['MAVEN_STACK_NAME'] = review['connection']
+                target = review.get('target_settings')
+                if target is not None and wizard.values not in (target, {**target, **updates}):
+                    raise SetupPending('Local settings changed after import review; preserve this operation and review the new exact target.')
                 wizard.settings(updates)
                 if answers['selection']['mode'] == 'existing' and not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'):
                     state.update(step='deploy_identity', identity_return_step=(
@@ -956,13 +1033,10 @@ class AdminOperations:
                               help='Private local token folder; daily-use and maintenance folders must remain separate.')], step,
                         description=str(error) + '\nExpected account: ' + expected_account(wizard.values))
                     return
-                except Exception:
-                    self._handoff(state, 'Sign in only after choosing Sign in in the terminal. In chat, run this command privately in an external terminal, then advance this exact operation. AWS optional agent skills/MCP integrations are not required.',
-                                  ['aws', 'login', '--profile', selected['profile'], '--region', wizard.values['MAVEN_AWS_REGION']],
-                                  environment={'AWS_LOGIN_CACHE_DIRECTORY': str(cache)})
-                    state['handoff'].update(type='aws_login', purpose=state['presentation']['purpose'],
-                        account=expected_account(wizard.values), profile=selected['profile'],
-                        expected_principal=wizard.values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown'))
+                except Exception as error:
+                    if not self._expired_login_handoff(state, error, values=wizard.values, deploy=deploy):
+                        raise
+                    state['state'] = 'blocked'
                     return
                 state[key + '_actual'] = identity
                 state['presentation'].update(account=identity['Account'], principal=identity['Arn'],
@@ -1163,14 +1237,10 @@ class AdminOperations:
             elif step.startswith('starter'):
                 self._starter(state, wizard)
             elif step == 'verify':
-                from tools.secret_setup import integration_settings
-                verified = state.get('secrets_ready')
-                if not verified or verified['settings'] != integration_settings(wizard.values):
-                    state['step'] = 'secrets_start'
-                    return
+                # Optional secret-store access is verified only when that capability is selected.
                 generation = wizard.verify_authority()
                 self._receipt(state, step, {'authority_generation': generation, 'instance_ready': True,
-                                            'secrets_ready': True})
+                                            'secrets_ready': bool(state.get('secrets_ready'))})
                 self._complete_setup(state, wizard, generation)
             elif step == 'optional_project' or step.startswith('project_'):
                 if step == 'project_apply' or any(receipt['step'].startswith('project_') for receipt in state['receipts']):
@@ -1179,11 +1249,33 @@ class AdminOperations:
             else:
                 raise SetupPending('Unknown setup phase; retain evidence and use the matching implementation.')
 
+    def _refresh_service_candidate(self, state, wizard, directory):
+        pending = directory / 'service-change-set.json.pending'
+        if state.get('service_apply_started') or (pending.exists() and not (directory / 'service-change-set.json').exists()):
+            raise SetupPending('The original service request is submitted or unresolved. Reconcile its exact change set before refreshing.')
+        review_path = directory / 'service-change-set.json'
+        if review_path.exists():
+            from tools.memory import bootstrap
+            expected = read_private(review_path)['review']['change_set']
+            cloud = bootstrap._cloud(wizard.values)
+            try:
+                change = bootstrap._describe_changes(cloud, expected['ChangeSetId'], expected['StackId'])
+            finally:
+                cloud.close()
+            if change.get('ExecutionStatus') != 'AVAILABLE' or bootstrap._review_fields(change) != expected:
+                raise SetupPending('The original change set is not verified unexecuted and unchanged. Reconcile it before refreshing.')
+        number = state.get('service_candidate_revision', 0) + 1
+        state.setdefault('service_candidates', []).append(str(directory))
+        state.update(service_candidate_revision=number, service_candidate_directory=f'service-candidate-{number}',
+                     step='update_service', pending_interaction=None)
+        self._save(state)
+
     def _update(self, state, wizard, step, answers):
         """Bring an existing installation to its checkout: local software, schema, service, instructions."""
         from tools import update
         from tools.memory import bootstrap
         from tools.memory.environment import configured_client, load_environment
+        service_directory = wizard.directory / state.get('service_candidate_directory', '')
         if step in ('update_local', 'update_local_wait'):
             checkout = state['parameters'].get('checkout') or _installation_source(self.home)
             report = update.local_report(self.home, Path(checkout).expanduser())
@@ -1207,7 +1299,7 @@ class AdminOperations:
                     details=json.dumps(report, indent=2))
                 return
             if not report['current']:
-                command = update.install_command(self.home, Path(report['checkout']), report['harnesses'])
+                command = update.install_command(self.home, Path(report['checkout']))
                 self._handoff(state, 'Run this installer in a separate terminal and choose "Update local MAVEN '
                               'software". Then restart this harness (or rerun maven-setup) so it loads the new '
                               'software, and advance this same operation. Its Review screen lists every change.',
@@ -1256,7 +1348,8 @@ class AdminOperations:
             finally:
                 cloud.close()
             deployed = json.loads(deployed) if isinstance(deployed, str) else deployed
-            package = wizard.directory / 'service-package'
+            private_directory(service_directory)
+            package = service_directory / 'service-package'
             if not package.exists():
                 try:
                     update.build_service_package(stack, package, wizard.values['MAVEN_MEMORY_INSTANCE_ID'])
@@ -1265,8 +1358,8 @@ class AdminOperations:
             manifest, template, _ = bootstrap._package(package)
             if any(update.stack_parameters(stack).get(key) != value
                    for key, value in manifest['deployment_inputs'].items()):
-                raise SetupPending('The stack\'s deployment inputs changed after this update prepared its package. '
-                                   'Start a new update operation.')
+                self._refresh_service_candidate(state, wizard, service_directory)
+                return
             if json.loads(template) == deployed:
                 live = bootstrap._outputs(stack)
                 self._receipt(state, step, {'service': 'current', 'stack': stack['StackId']})
@@ -1277,7 +1370,7 @@ class AdminOperations:
                 else:
                     state['step'] = 'update_authority'
                 return
-            review_path = wizard.directory / 'service-change-set.json'
+            review_path = service_directory / 'service-change-set.json'
             bootstrap.plan(wizard.values, package, review_path, change_type='UPDATE')
             document = read_private(review_path)
             risks = update.stateful_risks(document)
@@ -1294,8 +1387,23 @@ class AdminOperations:
         elif step == 'update_service_apply':
             review = state['approvals'][-1]['review']
             self._approved(state, 'service_update', review)
-            result = bootstrap.apply(wizard.values, wizard.directory / 'service-package',
-                                     wizard.directory / 'service-change-set.json', wizard.env,
+            if not state.get('service_apply_started'):
+                manifest, _, _ = bootstrap._package(service_directory / 'service-package')
+                cloud = bootstrap._cloud(wizard.values)
+                try:
+                    stacks = cloud.describe_stacks(StackName=wizard.values['MAVEN_STACK_NAME'])['Stacks']
+                finally:
+                    cloud.close()
+                if len(stacks) != 1:
+                    raise SetupPending('Select exactly one reviewed service stack.')
+                if any(update.stack_parameters(stacks[0]).get(key) != value
+                       for key, value in manifest['deployment_inputs'].items()):
+                    self._refresh_service_candidate(state, wizard, service_directory)
+                    return
+                state['service_apply_started'] = True
+                self._save(state)
+            result = bootstrap.apply(wizard.values, service_directory / 'service-package',
+                                     service_directory / 'service-change-set.json', wizard.env,
                                      confirm_review=review['review_sha256'])
             wizard.values = load_environment(wizard.env)
             self._receipt(state, step, result)
@@ -1336,7 +1444,9 @@ class AdminOperations:
                 finally:
                     client.close()
                 if [change['slug'] for change in changes] != [change['slug'] for change in state['authority_changes']]:
-                    raise SetupPending('The active instructions changed after they were shown. Start a new update operation.')
+                    state['step'] = 'update_authority'
+                    self._update(state, wizard, 'update_authority', answers)
+                    return
                 update.prepare_authority_update(directory, changes, {
                     'origin': 'MAVEN update preparation',
                     'excerpt': 'Bundled instruction updates prepared locally for owner review; '
@@ -1464,20 +1574,34 @@ class AdminOperations:
     def _project(self, state):
         step = state['step']
         if step in ('start', 'project_selection'):
-            self._question(state, 'project', 'Enable memory in an explicit project; Git is not required', [
+            self._question(state, 'project', 'Select, switch or rename an explicit project; Git is not required', [
                 Field('root', 'Absolute existing project directory', state['parameters'].get('root', '')),
                 Field('mode', 'Project selection', 'existing', kind='select', choices=(
                     ('Existing project', 'existing'), ('Create project', 'create'),
-                    ('Switch this enabled folder to a different existing cloud project', 'switch'))),
+                    ('Create cloud project only; leave this folder association unchanged', 'create_cloud'),
+                    ('Switch this enabled folder to a different existing cloud project', 'switch'),
+                    ('Rename this folder’s existing cloud project across all machines', 'rename'))),
                 Field('project_id', 'Existing project UUID (blank when creating)', required=False),
-                Field('name', 'New project name (blank when selecting)', required=False)], 'project_review')
+                Field('name', 'New project name (create, create_cloud or rename only)', required=False)], 'project_review')
         elif step == 'project_review':
             review = {'selection': state['answers']['project'], 'binding': self._project_binding()}
             if review['selection']['mode'] == 'switch':
                 from tools.project_switch import prepare_switch
                 review['switch'] = prepare_switch(
                     self.home, review['selection']['root'], review['selection']['project_id'],
+                    state['operation_id'], review['binding'],
+                    stopped_session_ids=state['parameters'].get('stopped_session_ids'))
+            elif review['selection']['mode'] == 'rename':
+                from tools.project_rename import prepare_rename
+                selected = review['selection']
+                review['rename'] = prepare_rename(
+                    self.home, selected['root'], selected['project_id'], selected['name'],
                     state['operation_id'], review['binding'])
+            elif review['selection']['mode'] == 'create_cloud':
+                from tools.project_create import prepare_create
+                selected = review['selection']
+                review['create_cloud'] = prepare_create(
+                    self.home, selected['root'], selected['name'], state['operation_id'], review['binding'])
             values = review['binding']['environment']
             from tools.setup_common import expected_account
             state['presentation'] = {'title': 'Standalone project enablement', 'purpose': 'Daily-use memory access',
@@ -1486,16 +1610,37 @@ class AdminOperations:
                 'region': values.get('MAVEN_AWS_REGION', 'us-east-1'),
                 'target': review['binding']['connection']['instance_id'], 'description': '', 'details': ''}
             self._preflight(state, values, 'routine')
-            self._review(state, 'project', 'Approve exact project, instance and selected AWS identity; no Git mutation', review, 'project_apply')
+            title = ('Approve exact cloud project rename across all machines; UUID, folder, memory and Home selection unchanged'
+                     if review['selection']['mode'] == 'rename' else
+                     'Approve exact cloud-only project creation; local association unchanged until a separately reviewed switch'
+                     if review['selection']['mode'] == 'create_cloud' else
+                     'Approve exact project, instance and selected AWS identity; no Git mutation')
+            self._review(state, 'project', title, review, 'project_apply',
+                         confirmations=review.get('switch', {}).get('stopped_confirmation'))
         elif step == 'project_apply':
             from tools.project_setup import setup_project
             review = state['approvals'][-1]['review']
             selected = review['selection']
             binding = self._project_binding()
             source = self._approved(state, 'project', {**review, 'binding': binding})
+            if selected['mode'] == 'create_cloud':
+                from tools.project_create import apply_create
+                result = apply_create(self.home, review['create_cloud'], binding, source,
+                                      state.setdefault('create_cloud_progress', {}), lambda: self._save(state))
+                self._receipt(state, step, result)
+                state.update(state='completed', outcome=result, live_state_checked=True)
+                return
+            if selected['mode'] == 'rename':
+                from tools.project_rename import apply_rename
+                result = apply_rename(self.home, review['rename'], binding, source,
+                                      state.setdefault('rename_progress', {}), lambda: self._save(state))
+                self._receipt(state, step, result)
+                state.update(state='completed', outcome=result, live_state_checked=True)
+                return
             if selected['mode'] == 'switch':
                 from tools.project_switch import apply_switch
-                result = apply_switch(self.home, review['switch'], binding, source)
+                result = apply_switch(self.home, review['switch'], binding, source,
+                                      stopped_confirmation=state['answers']['project'].get('confirmations'))
                 self._receipt(state, step, result)
                 state.update(state='completed', outcome=result)
                 return
@@ -1572,11 +1717,26 @@ class AdminOperations:
         """Universal project entities on this instance that carry the maven-home tag."""
         client = self._home_client()
         try:
-            page = client.invoke('/v1/memory/search', {'kind': 'entity', 'tag': HOME_TAG, 'scope': 'universal'})['data']
+            records = []
+            seen = set()
+            for offset in range(0, 2000, 20):
+                page = client.invoke('/v1/memory/search', {
+                    'kind': 'entity', 'tag': HOME_TAG, 'scope': 'universal',
+                    'limit': 20, 'offset': offset})['data']
+                rows = page.get('records', [])
+                identifiers = {row['record_id'] for row in rows}
+                if seen & identifiers:
+                    raise SetupPending('Home discovery did not advance; no complete replacement review is available.')
+                records.extend(rows)
+                seen.update(identifiers)
+                if len(rows) < 20:
+                    break
+            else:
+                raise SetupPending('Home discovery exceeds the bounded review; narrow the tagged project inventory before replacement.')
         finally:
             client.close()
         return sorted(({'project_id': record['record_id'], 'name': record.get('data', {}).get('name')}
-                       for record in page.get('records', [])
+                       for record in records
                        if record.get('data', {}).get('entity_type') == 'project'
                        and HOME_TAG in (record.get('tags') or [])), key=lambda item: item['project_id'])
 
@@ -1630,18 +1790,24 @@ class AdminOperations:
                 self._review(state, 'home_disable', 'Turn off MAVEN Home on this machine: remove only ' + path,
                              review, 'home_disable')
             elif step == 'home_disable':
-                self._approved(state, 'home_disable', review)
-                removed = remove_home(self.home)
-                result = {'status': 'removed' if removed else 'unchanged', 'removed': [path] if removed else [],
-                          'cloud_changed': False}
+                approved = state['approvals'][-1]['review']
+                self._approved(state, 'home_disable', approved)
+                if current != approved['current_home'] and not (current is None and state.get('home_remove_intent')):
+                    raise SetupPending('The local Home selection changed after review; nothing was removed.')
+                if not state.get('home_remove_intent'):
+                    state['home_remove_intent'] = {'current_home': current, 'path': path}
+                    self._save(state)
+                remove_home(self.home)
+                result = {'status': 'removed', 'removed': [path], 'cloud_changed': False}
                 self._receipt(state, step, result)
                 state.update(state='completed', outcome=result)
             return
         if step in ('start', 'home_selection'):
+            from tools.memory.client import MemoryClientError
             try:
                 homes, lookup = self._home_projects(), ''
-            except Exception:  # Discovery is optional; the owner can still enter the UUID.
-                homes, lookup = [], ' The lookup for an existing Home on this instance was unavailable.'
+            except (MemoryClientError, SetupPending, OSError) as error:
+                homes, lookup = [], ' The optional Home lookup was unavailable (' + _error_code(error) + ').'
             root = parameters.get('root', '')
             enabled = bool(root) and Path(root).is_absolute() and (Path(root) / '.maven/project.json').is_file()
             mode = 'enabled' if enabled else 'existing' if homes else 'create'
@@ -1685,7 +1851,8 @@ class AdminOperations:
                 from tools.project_switch import prepare_switch
                 review['switch'] = prepare_switch(
                     self.home, selection['root'], selection['project_id'], state['operation_id'],
-                    binding, home_selection=selection)
+                    binding, home_selection=selection,
+                    stopped_session_ids=state['parameters'].get('stopped_session_ids'))
             values = binding['environment']
             from tools.setup_common import expected_account
             state['presentation'] = {'title': 'MAVEN Home', 'purpose': 'Daily-use memory access',
@@ -1695,7 +1862,7 @@ class AdminOperations:
                 'description': '', 'details': ''}
             self._preflight(state, values, 'routine')
             self._review(state, 'home_review', 'Approve MAVEN Home: exact folder, project, instance and consent',
-                         review, 'home_apply')
+                         review, 'home_apply', confirmations=review.get('switch', {}).get('stopped_confirmation'))
         elif step == 'home_apply':
             from tools.project_setup import setup_project
             reviewed = state['approvals'][-1]['review']
@@ -1704,11 +1871,19 @@ class AdminOperations:
             root = Path(selection['root'])
             prior = next((receipt['result'] for receipt in state['receipts'] if receipt['step'] == 'home_project'), None)
             project_id = selection['project_id'] or (prior or {}).get('project_id')
-            if not selection['replace']:
-                others = self._home_conflicts(project_id, self._home_projects(), load_home(self.home))
-                if others:
-                    raise SetupPending('A different project became MAVEN Home after review (' + ', '.join(others)
-                                       + '); nothing was changed. Review a new Home selection.')
+            current = load_home(self.home)
+            intent = state.get('home_write_intent')
+            own_selection = intent is not None and current == intent
+            switching = selection['mode'] == 'switch' and state.get('home_transition_started')
+            if not own_selection and not switching:
+                if current != reviewed['current_home']:
+                    raise SetupPending('The local Home selection changed after review; preserve it and review the new exact target.')
+                others = self._home_conflicts(selection['project_id'], self._home_projects(), current)
+                if others != reviewed['replaces']:
+                    raise SetupPending('The Home replacement conflicts changed after review; review the new exact targets.')
+            if not state.get('home_transition_started'):
+                state['home_transition_started'] = True
+                self._save(state)
             try:
                 if prior is None:
                     if selection['mode'] == 'enabled':
@@ -1717,7 +1892,9 @@ class AdminOperations:
                         result = {'status': 'unchanged', 'root': str(root)}
                     elif selection['mode'] == 'switch':
                         from tools.project_switch import apply_switch
-                        result = apply_switch(self.home, reviewed['switch'], reviewed['binding'], source)
+                        result = apply_switch(
+                            self.home, reviewed['switch'], reviewed['binding'], source,
+                            stopped_confirmation=state['answers']['home_review'].get('confirmations'))
                     else:
                         create = selection['mode'] == 'create'
                         if create and not root.exists():
@@ -1733,6 +1910,7 @@ class AdminOperations:
                         project_id = result['project']['project_id']
                     prior = {'project_id': project_id, 'setup': result}
                     self._receipt(state, 'home_project', prior)
+                    self._save(state)
                 if selection['mode'] == 'switch':
                     record = load_home(self.home)
                     if (not record or 'invalid' in record or record['project_id'] != project_id
@@ -1740,11 +1918,21 @@ class AdminOperations:
                             or record['instance_id'] != reviewed['instance_id'] or record['consent'] != source):
                         raise SetupPending('Switched Home selection changed; recover the exact original switch.')
                 else:
+                    if intent is None:
+                        from datetime import datetime, timezone
+                        intent = {'schema': 1, 'root': str(root), 'project_id': project_id,
+                                  'instance_id': reviewed['instance_id'], 'label': selection['label'],
+                                  'consent': source, 'enabled_at': datetime.now(timezone.utc).isoformat()}
+                        state['home_write_intent'] = intent
+                        self._save(state)
+                    if load_home(self.home) not in (reviewed['current_home'], intent):
+                        raise SetupPending('The local Home selection changed before replacement; preserve both operation receipts.')
                     record = save_home(self.home, root=root, project_id=project_id, instance_id=reviewed['instance_id'],
-                                       label=selection['label'], consent=source)
+                                       label=selection['label'], consent=source, enabled_at=intent['enabled_at'])
             except HomeError as error:
                 raise SetupPending(str(error)) from None
             self._receipt(state, 'home_file', record)
+            self._save(state)
             tag = self._tag_home(state, project_id, source)
             self._receipt(state, 'home_tag', tag)
             state.update(state='completed', outcome={'status': 'ready', 'home': record, 'entity_tag': tag})
@@ -1781,6 +1969,61 @@ class AdminOperations:
         return [blocker for root in self._cleanup_roots() for session in _session_directories(root)
                 for blocker in _sweep_session(root, session, frozenset(ids), ERASED_LOCAL)[1]]
 
+    def _sweep_administration(self, ids, *, current=None, apply=False):
+        """Scrub resolved review copies, never unresolved request/approval evidence."""
+        ids = frozenset(ids)
+
+        def contains_record(value):
+            if isinstance(value, list):
+                return any(contains_record(item) for item in value)
+            if isinstance(value, dict):
+                return value.get('record_id') in ids or any(contains_record(item) for item in value.values())
+            return False
+
+        def scrub(value, content_free=False):
+            if isinstance(value, list):
+                return [scrub(item, content_free) for item in value]
+            if not isinstance(value, dict):
+                return value
+            if value.get('record_id') in ids:
+                return {**{key: value[key] for key in
+                           ('record_id', 'revision', 'expected_revision', 'request_key', 'operation_id',
+                            'receipt_id', 'approval_digest', 'review_digest', 'kind', 'versions')
+                           if key in value}, 'erased': True}
+            content_free = content_free or (value.get('kind') == 'cleanup' and contains_record(value))
+            result = {}
+            for key, item in value.items():
+                if content_free and key in ('source', 'reason', 'actor'):
+                    result[key + '_sha256'] = _digest(item)
+                else:
+                    result[key] = scrub(item, content_free)
+            if content_free and 'review_digest' in value:
+                result['content_redacted'] = True
+            return result
+
+        updates = []
+        for path in sorted(self.directory.glob('*.json')):
+            if current is not None and path == self._path(current['operation_id']):
+                continue
+            document = read_private(path, maximum=64 * 1024 * 1024)
+            cleaned = scrub(document)
+            if cleaned == document:
+                continue
+            original = document.get('original', {}).get('operation', document)
+            if original.get('state') != 'completed' and not (
+                    document.get('completed') is True and original.get('state') == 'abandoned'):
+                raise SetupPending('Administration evidence ' + path.name +
+                                   ' contains unresolved selected work; reconcile it before erasure. Its original request is preserved.')
+            updates.append((path, cleaned))
+        if apply:
+            for path, cleaned in updates:
+                save_json(path, cleaned)
+            if current is not None and current.get('state') == 'completed':
+                cleaned = scrub(current)
+                current.clear()
+                current.update(cleaned)
+        return [str(path) for path, _ in updates]
+
     @staticmethod
     def _cleanup_receipt(state, step):
         return next((receipt['result'] for receipt in reversed(state['receipts']) if receipt['step'] == step), None)
@@ -1813,7 +2056,9 @@ class AdminOperations:
                 'description': '', 'details': ''}
             self._preflight(state, values, 'sql')
             erased = admin.cleanup_erased_ids(config, session)
+            self._sweep_administration(erased, current=state)
             sweep = sweep_erased(self._cleanup_roots(), erased, ERASED_LOCAL)
+            sweep['administration_files_touched'] = self._sweep_administration(erased, current=state, apply=True)
             self._receipt(state, 'cleanup_local_sweep', {**sweep, 'erased_records': len(erased)})
             if action == 'review':
                 found = admin.cleanup_candidates(config, session)
@@ -1821,7 +2066,7 @@ class AdminOperations:
                 for entry in found['candidates']:
                     groups.setdefault(entry['suggested'], []).append(entry)
                 outcome = {
-                    'status': 'ready', 'action': 'review', 'read_only': True,
+                    'status': 'ready', 'action': 'review', 'read_only': False, 'cloud_changed': False,
                     'total': len(found['candidates']), 'truncated': bool(found.get('truncated')),
                     'groups': groups, 'local_sweep': sweep,
                     'next': 'Nothing was changed in the cloud. Propose Forget, Erase or Archive per item and wait '
@@ -1863,6 +2108,7 @@ class AdminOperations:
                                    + ', '.join(erased) + '. Nothing was changed.')
             if action == 'erase':
                 blockers = self._cleanup_blockers(ids)
+                self._sweep_administration(ids, current=state)
                 if blockers:
                     raise SetupPending('Erase refused before review; resolve first:\n' + '\n'.join(blockers))
             records = [described[identifier] for identifier in ids]
@@ -1882,35 +2128,42 @@ class AdminOperations:
             self._review(state, 'cleanup_review', f'Approve {action} of {len(ids)} record(s): exact records, '
                          'versions and caveats', review, 'cleanup_apply')
         elif step == 'cleanup_apply':
+            if state.get('legacy_cleanup_uncertain'):
+                raise SetupPending('This legacy cleanup may have submitted without a stable operation receipt. Preserve its original approval and reconcile that exact legacy receipt before any new cleanup; no replacement request was sent.')
             values, config, session = self._cleanup_admin()
             reviewed = state['approvals'][-1]['review']
             self._approved(state, 'cleanup_review', {**reviewed, 'instance_id': config['instance_id']})
             approval_digest = state['answers']['cleanup_review']['review_digest']
             ids = reviewed['record_ids']
-            current = {entry['record_id']: entry for entry in admin.cleanup_describe(config, session, ids)}
-            changed = [record['record_id'] for record in reviewed['records']
-                       if (current.get(record['record_id']) or {}).get('revision') != record['revision']
-                       or current[record['record_id']].get('kind') != record['kind']]
-            if changed:
-                raise SetupPending('Reviewed candidate changed (' + ', '.join(changed) + '); approval is invalid. '
-                                   'Begin a new clean-up review. Nothing was changed.')
+            request = state.get('cleanup_request')
+            if request is None:
+                current = {entry['record_id']: entry for entry in admin.cleanup_describe(config, session, ids)}
+                changed = [record['record_id'] for record in reviewed['records']
+                           if (current.get(record['record_id']) or {}).get('revision') != record['revision']
+                           or current[record['record_id']].get('kind') != record['kind']]
+                if changed:
+                    raise SetupPending('Reviewed candidate changed (' + ', '.join(changed) + '); approval is invalid. '
+                                       'Begin a new clean-up review. Nothing was changed.')
             actor = (values.get('MAVEN_AWS_EXPECTED_PRINCIPAL') or 'owner') + ' via maven_admin cleanup ' + state['operation_id']
+            if request is None:
+                if action == 'erase':
+                    blockers = self._cleanup_blockers(ids)
+                    self._sweep_administration(ids, current=state)
+                    if blockers:
+                        raise SetupPending('Erase refused; resolve first:\n' + '\n'.join(blockers))
+                request = {'operation_id': state['operation_id'], 'expected_revisions': {
+                               record['record_id']: record['revision'] for record in reviewed['records']},
+                           'actor': actor, 'reason': reviewed['reason'], 'approval_digest': approval_digest}
+                state['cleanup_request'] = request
+                self._save(state)
             if action == 'erase':
-                blockers = self._cleanup_blockers(ids)
-                if blockers:
-                    raise SetupPending('Erase refused; nothing was changed. Resolve first:\n' + '\n'.join(blockers))
-                if all(current[identifier].get('erased') for identifier in ids):
-                    # An interrupted earlier attempt completed in the cloud; never erase twice.
-                    result = {'status': 'already_erased', 'receipt_id': None, 'records': []}
-                else:
-                    result = admin.erase_records(config, session, ids, actor=actor, reason=reviewed['reason'],
-                                                 approval_digest=approval_digest)
+                result = admin.erase_records(config, session, ids, **request)
                 self._receipt(state, 'cleanup_apply', result)
                 state['step'] = 'cleanup_sweep'
+                self._save(state)
                 self._cleanup_sweep(state)
             else:
-                result = admin.forget_records(config, session, ids, restore=action == 'restore', actor=actor,
-                                              reason=reviewed['reason'], approval_digest=approval_digest)
+                result = admin.forget_records(config, session, ids, restore=action == 'restore', **request)
                 self._receipt(state, 'cleanup_apply', result)
                 state.update(state='completed', pending_interaction=None, outcome={
                     'status': 'completed', 'action': action, 'receipt_id': result['receipt_id'],
@@ -1924,12 +2177,15 @@ class AdminOperations:
     def _cleanup_sweep(self, state):
         applied = self._cleanup_receipt(state, 'cleanup_apply')
         reviewed = state['approvals'][-1]['review']
+        self._sweep_administration(reviewed['record_ids'], current=state)
         sweep = sweep_erased(self._cleanup_roots(), reviewed['record_ids'], applied.get('tombstone') or ERASED_LOCAL)
         self._receipt(state, 'cleanup_sweep', sweep)
         state.update(state='completed', pending_interaction=None, outcome={
             'status': 'completed', 'action': 'erase', 'receipt_id': applied.get('receipt_id'),
             'records': applied.get('records', []), 'local_sweep_before': self._cleanup_receipt(state, 'cleanup_local_sweep'),
             'local_sweep': sweep, 'caveats': reviewed['caveats']})
+        touched = self._sweep_administration(reviewed['record_ids'], current=state, apply=True)
+        state['outcome']['local_sweep']['administration_files_touched'] = touched
 
     def _removal_access(self, state, home):
         from tools.memory.environment import load_environment
@@ -1961,13 +2217,10 @@ class AdminOperations:
             identity = inspect_login_identity(values, deploy=True)
         except SetupPending:
             raise
-        except Exception:
-            self._handoff(state, 'Maintenance sign-in is required for this exact cloud removal target. Choose Sign in in the terminal, or run this externally and resume the same operation.',
-                          ['aws', 'login', '--profile', values['MAVEN_DEPLOY_PROFILE'], '--region', values['MAVEN_AWS_REGION']],
-                          environment={'AWS_LOGIN_CACHE_DIRECTORY': values['MAVEN_DEPLOY_LOGIN_CACHE']})
-            state['handoff'].update(type='aws_login', purpose=state['presentation']['purpose'],
-                account=expected_account(values), profile=values['MAVEN_DEPLOY_PROFILE'],
-                expected_principal=values.get('MAVEN_DEPLOY_EXPECTED_PRINCIPAL', 'Unknown'))
+        except Exception as error:
+            if not self._expired_login_handoff(state, error, values=values, deploy=True):
+                raise
+            state['state'] = 'blocked'
             return False
         state['presentation'].update(account=identity['Account'], principal=identity['Arn'], verified=True)
         review = {'identity': identity, 'home': str(home), 'profile': values['MAVEN_DEPLOY_PROFILE'],
@@ -2081,9 +2334,13 @@ class AdminOperations:
                     arguments.extend([flag, plan['confirmations'][key]])
             command = [sys.executable, '-B', str(path.parent / 'runner' / 'run.py'), *arguments]
             required = set(plan['requires'])
-            if plan['machine_homes'] or required & {'harnesses-stopped', 'writers-quiescent'}:
-                self._handoff(state, 'Stop affected harnesses/writers outside this conversation. Only that external owner can attest the required shutdown; append the indicated flags after doing so.', command)
-                state['handoff']['required_external_attestations'] = sorted(required & {'harnesses-stopped', 'writers-quiescent'})
+            attestations = required & {'harnesses-stopped', 'writers-quiescent', 'harness-config-risk'}
+            if plan['machine_homes'] or attestations:
+                self._handoff(state, 'Run the pinned removal externally and supply only truthful required attestations: '
+                              'writers-quiescent means actual writers stopped; harness-config-risk acknowledges that '
+                              'running harnesses may rewrite removed configuration and need restart. A legacy '
+                              'harnesses-stopped requirement still means affected harnesses are closed.', command)
+                state['handoff']['required_external_attestations'] = sorted(attestations)
                 return
             # Never import execute handlers into the process being removed. The pinned
             # runner validates its own snapshot and keeps every per-effect receipt.
@@ -2116,7 +2373,7 @@ class AdminOperations:
             command.extend(['--harness', harness])
         if state['parameters'].get('profile'):
             command.extend(['--skill-dir', state['parameters']['profile']])
-        self._handoff(state, 'Installer changes runtime/harness integrations. Close affected harnesses and run the reviewed installer in an external terminal; no shutdown attestation is accepted from the running harness.', command)
+        self._handoff(state, 'Run the reviewed installer in an external terminal. Review each selected integration target and its actual overwrite/reload or stopped-writer requirements; this conversation supplies no shutdown attestation.', command)
 
     def _recovery(self, state):
         parameters = state['parameters']
@@ -2140,32 +2397,36 @@ class AdminOperations:
                 state.update(state='completed', outcome=observed)
             elif parameters['action'] == 'recover':
                 self._review(state, 'recover', 'Explicit recovery may reconcile original external requests; status alone never retries',
-                             {'selection': parameters, 'observed': observed}, 'recover')
+                             {'selection': parameters, 'observed': observed}, 'recover',
+                             confirmations={} if target else {'workers_stopped': True})
             else:
                 raise SetupPending('Recovery action must be diagnose or recover.')
         elif state['step'] == 'recover':
-            self._approved(state, 'recover', {'selection': parameters, 'observed': observed})
+            if not state.get('recovery_started'):
+                self._approved(state, 'recover', {'selection': parameters, 'observed': observed})
+                state['recovery_started'] = True
+                self._save(state)
             if target:
                 original = self._load(target)
                 if original['kind'] == 'recovery':
                     raise SetupPending('Select the original operation, not another recovery wrapper.')
-                if not original['pending_interaction'] and original['state'] not in ('completed', 'cancelled'):
-                    original['state'] = 'working'
-                    self._save(original)
-                    try:
-                        getattr(self, '_' + original['kind'])(original)
-                    except Exception as error:
-                        original['state'] = 'blocked'
-                        original['error'] = str(error) if isinstance(error, SetupPending) else _error_code(error)
-                    if original['state'] == 'working':
-                        original['state'] = 'pending'
-                    self._save(original)
-                state.update(state='completed', outcome=self.status(target))
+                if original['state'] in ('abandoned', 'cancelled', 'failed'):
+                    raise SetupPending('This original operation is terminal; preserve its receipts. Recovery cannot execute it.')
+                self._advance_locked(original)
+                outcome = self.status(target)
+                state.update(state=outcome['state'] if outcome['state'] in ('blocked', 'uncertain', 'failed') else 'completed',
+                             outcome=outcome)
+                if state['state'] != 'completed':
+                    for key in ('error', 'error_detail', 'handoff', 'recovery'):
+                        if key in outcome:
+                            state[key] = outcome[key]
             else:
                 from tools.memory.lifecycle import SessionService
                 service = SessionService(parameters['root'], parameters['session_id'], env=self.home / '.env')
                 try:
-                    result = service.recover()
+                    result = service.recover(
+                        workers_stopped=state['answers']['recover'].get('confirmations', {}).get('workers_stopped') is True,
+                        writer_tokens=parameters.get('writer_tokens'))
                 finally:
                     service.close()
                 self._receipt(state, 'recover', result)

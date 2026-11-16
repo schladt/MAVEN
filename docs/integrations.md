@@ -26,65 +26,14 @@ compatibility; confirm the actual product/version before choosing an integration
 
 ### Recorded local verification
 
-Local verification on 2026-11-09 ran in separate stages:
+Recorded runtime exercises are limited to OMP 18.18.2 and 18.20.0 with disposable
+profiles and simulated storage. They covered stdio startup, native background-worker
+delivery, and exit-prompt behavior—not live AWS or end-to-end model-driven cloud wrap-up.
 
-| Run | Checks run | Result |
-| --- | --- | --- |
-| Initial focused integration run | 147 | 132 passed; 15 fixture errors |
-| Failed-check rerun after fixture corrections | 15 | Passed |
-| Targeted rerun after the final receipt-identity guard | 4 | Passed |
-| Post-review bug-fix regression run | 147 | Passed |
-
-The receipt-identity guard rerun covered receipt isolation, partial revision-conflict
-reconciliation, delegated task/checkpoint accounting, and the real stdio entry point
-through Python MCP SDK 2.3.0. At that stage the complete focused set was not rerun;
-those three initial stages did not represent a fresh 148-check run.
-
-The subsequent post-review run covered `test_maven_google`, `test_mcp`,
-`test_workflow`, `test_maintenance`, `test_memory_client`, `test_memory_contracts`,
-`test_administration` and `test_tui`. It exercised exact-content Gmail sending through
-simulated transport, credential renewal with mocked STS/controlled time, real stdio
-MCP, isolated Git subprocess input, session/assignment recovery, setup ownership and
-the actual Textual prerequisite modal. This was a targeted run, not the full suite.
-This is a historical verification record, not support for the now-removed Google runtime.
-
-OMP 18.18.2 was exercised with native project MCP configuration, the packaged startup
-guidance, and simulated storage in a disposable non-Git directory. It visibly
-initialized, dispatched a real native reasoning subagent, answered a second scripted
-user turn while that worker's storage write was deliberately held, then delivered
-the result and an explicit universal/project/pending summary. The worker retrieved
-and reconciled an existing plan, preserving its owner and scope; revision 2 was
-verified. The harness and stdio process shut down successfully.
-
-Claude Code, Codex, Copilot CLI and Gemini CLI were not runtime-exercised. No AWS
-resources or separate Python environment were created. SQL migration execution was
-not tested: no local `psql` facility was available. Live service/schema rollout,
-installed harness configuration, and active cloud instructions were not changed.
-
-
-For the lifecycle/folder-switch change, 288 focused offline checks covered startup,
-native hook envelopes, adapter installation/removal, project/Home rebinding,
-administration, real stdio MCP, session recovery/maintenance and Textual flows.
-The initial run passed 283 checks. Five failures were corrected (private-runtime
-directory handling and test-file permissions); all five passed their targeted rerun.
-The complete set was not rerun after those corrections. No AWS resources or separate
-Python environment were created; live installation and active authority were unchanged.
-
-OMP 18.20.0 was also launched in a real PTY with a disposable home, genuine native
-conversation ID and local fixture binding. The three-choice exit prompt rendered;
-its default **Stay** kept OMP open, and explicit **Exit without wrapping up** closed
-it normally. No provider credentials were supplied: startup reported the missing
-provider instead of readiness. End-to-end model-driven cloud wrap-up was not exercised.
-Other harnesses' lifecycle behavior was checked offline, not in their live runtimes.
-
-The subsequent Home-startup/handler-timeout fix passed 21 Python startup/hook checks
-and 14 JavaScript lifecycle checks. Startup fixtures now use the production search
-header and record-read shapes, including existing Home peers and mismatched scope.
-Unresolved model-turn promises exercise all three startup events without holding
-their handlers open; stale callbacks and delivery errors are also covered.
-The real OMP 18.20.0 TUI also ran the rendered extension and local helper with a
-simulated 35-second startup turn; delivery completed without a handler timeout.
-This used a disposable profile, no model/provider request and no cloud changes.
+Claude Code, Codex, Copilot CLI and Gemini CLI have documented configuration paths
+and offline adapter checks, not verified live-runtime interoperability. Offline
+fixtures do not establish deployed SQL behavior, live IAM permissions, cloud rollout,
+or active-instruction correctness.
 
 ### Optional capabilities and honest fallbacks
 
@@ -113,6 +62,11 @@ MAVEN always installs first-eligible-turn guidance; optional lifecycle adapters 
 native events. Neither guarantees that authority is initialized before the first
 user input; readiness still requires the real MCP result and complete context.
 
+Status commands pin the selected `MAVEN_HOME`, including paths with spaces. Active
+status keys include both harness and native conversation ID; a folder fallback is
+explicitly a **last folder hint (not started here)**, not proof of this chat's binding.
+The optional terminal UI supports Textual `>=2.1,<3`.
+
 ### Native lifecycle adapters
 
 The shared local helper stores only exact native-conversation bindings and observed
@@ -124,8 +78,9 @@ cloud session, prove writer death or mark unsaved work saved.
 OMP uses `session_start`/agent context and `session_before_shutdown` in a native
 extension. Startup delivery is deferred through a managed callback, so the startup
 event never waits for a model turn to finish within its 30-second handler budget.
-Callbacks discard stale work after shutdown, conversation changes or workspace changes;
-delivery failures remain visible. For an open exact MAVEN binding, the prompt offers wrap up and exit,
+Callbacks recheck the live session-manager cwd and conversation identity after awaits,
+and fence queued work after workspace changes or shutdown. Delivery failures remain
+visible. For an open exact MAVEN binding, the prompt offers wrap up and exit,
 exit without wrapping up, or stay. Wrap-up cancels immediate shutdown, lets the
 agent reconcile accepted work, then checks the exact finish receipt before exiting.
 Failure leaves the harness open. OMP 18.20.0+ documents this cancellable event; older
@@ -140,19 +95,91 @@ veto. Hook timeout, policy or unsupported versions can suppress delivery. Startu
 still checks retained evidence and offers recovery when an end event was missed.
 Resume only the exact recorded conversation; stale peers are not interchangeable.
 
+An MCP process that never successfully initialized may recover through an explicit
+`maven_startup(action="new")` in the same enabled root, project, instance and harness.
+This also permits attaching the real native conversation ID after an earlier attempt
+had none. `inspect` can diagnose that failed process binding under the supplied native
+identity without adopting it; `continue` still requires the original identity.
+Replacement requires a verified existing cloud project and an exact existence check
+including archived state proving the old session unavailable—not absence from a
+bounded search page. Authentication,
+transport and uncertain read failures remain blockers. An unavailable project is
+reported as a local folder association with `project_check.cloud_verified=false`;
+this does not establish deletion or archival and never creates or rebinds a project.
+Verified cloud project names, including renames, label startup's active project
+without renaming its folder; an unverified folder-name fallback is explicitly marked.
+
+Previously initialized/resumed sessions, cloud sessions, pending requests, receipts,
+checkpoints, closure, assignments, writers or uncertain registrations prevent this
+replacement. Peers are never closed, adopted or marked stopped. The failed binding
+is fenced with `superseded_by`; `failed-start-recovery.json` preserves its original
+binding, registration and native-conversation reservation. Only its exact successor
+may replace that reservation. Existing runtime evidence and definitive rejected
+initial-write request identities remain intact; no old request is replayed.
+After a process restart, select the exact failed attempt with
+`maven_startup(action="new", failed_start_session_id=…)`. Its durable journal resumes
+interrupted cutover at the original boundary; it does not adopt a discovered peer.
+Folder switching recognizes that exact fenced failed-start receipt as a terminal
+local attempt, not a closed cloud session. Its replacement must either have verified
+closure or independently satisfy the reviewed never-initialized proof below.
+Pending work or incomplete retirement still prevents switching.
+
+The official reviewed folder switch can also preserve a never-initialized attempt
+when its old cloud project is unavailable. It requires the exact original MCP
+binding with `initialized:false` and `resume_required:false`, no retained work or
+uncertain effects, and either no registration yet or only its exact memory-only
+`starting` registration without writers or reservations. An exact session read
+with `include_archived:true` must return `record_unavailable`; search absence,
+timeouts, authentication failures and other outages never establish this proof.
+Initialized, abandoned, unknown and session-receipt-only runtimes cannot use this
+never-initialized exception.
+
+The owner's review pins each original binding, registry and native-conversation
+record, retained-file fingerprints and cloud absence proof. Applying that review
+revalidates the originals under the exclusive project gate and native-pointer locks.
+The durable switch journal and sibling preservation archive retain the original
+IDs, request evidence and owner source across interruption. Only after successful
+runtime cutover are the reviewed starting registrations and their exact native
+conversation pointers removed; unrelated registrations and conversations are never
+cleared. The switch barrier remains until cleanup is durable. Resume uses the same
+journal, not a new operation or inferred closure. Fresh native startup then selects
+the new project; an old direct session service remains fenced by its original
+root/project binding. No cloud session is closed or peer automatically declared stopped.
+Before preserving private evidence beside a root, every enclosing Git worktree must
+already exclude the destination. Otherwise the switch refuses before moving data;
+it does not edit parent repositories' ignore rules.
+
+A separate, explicit owner-stopped historical path is available on project/Home
+switch administration operations through `parameters.stopped_session_ids`: an exact,
+duplicate-free list of canonical session UUIDs, not a root-wide bypass. It applies
+only to unregistered historical runtimes with matching `session.json` pointers,
+no pending requests, no unfinished maintenance/checkpoints or closure, no active
+publication, and only definitive rejected requests. Rejection receipts must verify
+either the current request-internal digest or the legacy outer `pending_digest`
+against the exact canonical request; missing, changed or mixed hashes are refused.
+Unknown evidence and MCP-bound runtimes cannot use this path. The full review pins every retained file fingerprint,
+pointer and original registration absence. The owner must separately confirm the
+exact IDs, that those sessions **and their workers** have stopped, and preservation
+without cloud closure, with a truthful source. Generic approval alone is insufficient.
+Apply rechecks the same guards and fingerprints, including after interruption.
+The archive and journal retain originals unchanged and label them `stopped-by-owner`,
+not verified closed or cloud-absent. No cloud request is replayed and no registered
+session or unrelated native pointer is removed by this historical path.
+
+
 ### Installation and update boundaries
 
 The normal local installation includes the official Python SDK (`mcp>=2.3,<3`) on
 Python 3.11+; CLI/TUI recovery remains independent. Installer-owned MCP entries,
 the `maven` and `maven-maintenance` skills,
 and delimited native guidance are tracked for safe removal. Stage/review conflicts
-instead of replacing unrelated configuration. Close affected harnesses before applying
-integration changes; the current chat cannot certify its own shutdown.
+instead of replacing unrelated configuration. Approve exact writes and acknowledge
+running-harness configuration risk separately from any required writer quiescence.
 
 Use `--stage-harnesses PATH` to inspect a staged home layout without changing live
 configuration. Custom profiles use paired `--harness-config NAME=ABSOLUTE_FILE` and
 `--harness-context NAME=ABSOLUTE_FILE`, plus `--skill-dir PATH`. Actual writes require
-the existing stopped-harness approval. Supported native targets are OMP, Claude Code,
+the exact local-change review. Supported native targets are OMP, Claude Code,
 Codex, Copilot CLI and Gemini CLI, not every client accepting a similar skill format.
 
 Native adapters are enabled by default with `--lifecycle-hooks`; disable them with
@@ -161,9 +188,9 @@ integration** checkbox. They require the installed `maven-session-hook` executab
 Review includes the extension/hook configuration and ownership receipts. Hooks,
 status-line and MCP entries sharing one configuration file are removed together
 under a single pinned-file review, preserving unrelated keys and refusing owner edits.
-Custom profile overrides currently require `--no-lifecycle-hooks`: MAVEN refuses to
-guess the hook destination or write default-profile hooks for a custom profile.
-Portable guidance and explicit wrap-up remain available.
+Updates reuse exact recorded custom hook/configuration destinations. Ambiguous legacy
+targets are refused rather than guessed or replaced with default-profile paths.
+Conflicts preserve the affected target without blocking independent safe writes.
 
 Codex integration uses an existing nonempty `AGENTS.override.md` when present,
 otherwise `AGENTS.md`. If Gemini's custom `context.fileName` excludes `GEMINI.md`,
@@ -186,11 +213,10 @@ be explicitly authenticated. No helper discovers another account or logs in for 
 
 ## AWS secrets and encrypted files
 
-The core setup includes a reviewed secrets-store stage: explicitly import existing
-settings, enter selected locators, or approve creation of a private bucket and
-generated wrapping key. It never adopts resources by name. Repair and update preserve
-the selected store and existing keys; read-only verification does not prove write
-permissions. A configured store does not require a Home selection; catalog operations do.
+Secrets setup is optional and separately reviewed: import existing settings, enter
+selected locators, or approve the exact private bucket and generated wrapping key.
+Repair/update preserve selected keys; read-only verification does not prove write
+permissions. Core memory does not depend on this store. Catalog operations require Home.
 
 Small values use `MAVEN_SECRETS_PARAMETER_PREFIX`: SSM Standard `SecureString`
 parameters encrypted with `alias/aws/ssm`, limited to 4 KB of UTF-8. Grant only the
@@ -230,11 +256,11 @@ maven-secrets file put archive-stream --stdin --max-bytes 1073741824 --json < "$
 maven-secrets file get archive-object "$NEW_PRIVATE_DESTINATION"
 ```
 
-Files use authenticated client-side AWS Encryption SDK encryption plus S3 server-side
-encryption. Upload refuses replacing an existing object. Restore refuses an existing
-path and creates a private plaintext file. Use a private parent directory. Loss of a
-wrapping key can make ciphertext unrecoverable. Failed multipart cleanup may need an
-administrator; never claim an upload or deletion succeeded from an attempted request.
+Files use authenticated client-side AWS Encryption SDK encryption and inherit the
+bucket's reviewed server-side encryption policy, including KMS defaults. Upload
+refuses replacement. Restore streams into a private temporary file and publishes
+only after authentication, without overwriting an existing destination. Keep the
+parent private and retain historical wrapping keys. Failed cleanup is not success.
 
 Pipe input is bounded (default 64 GiB), encrypted as a stream without plaintext
 spooling. Receipts contain metadata, not values. `list` pages both providers using
@@ -250,7 +276,7 @@ bound Home/project loads use their actual scope. Discovery does not load authori
 Off and unconfigured modes provide no skill access. Named loading creates no session
 and captures no discussion.
 
-`maven_secrets` provides `list`, `lookup`, `store_and_catalog` and `retry_catalog`.
+`maven_secrets` provides `list`, `lookup`, `store_and_catalog`, `retry_catalog` and `resolve_catalog`.
 `list` returns paged names/metadata only. `lookup(name=...)` uses the narrow exact
 Home secret-setting route, not general memory search. Explicit `store_and_catalog`
 reads an owner-private `source_path` and genuine request `source`; never supply a
@@ -274,6 +300,11 @@ SSM storage and catalog compare-and-swap are separate effects, not an atomic pro
 credential rotation. Storage success with `catalog_pending` is not complete catalog
 success: retain the operation ID and retry **only the catalog**. Never upload again
 to repair that outcome, discard uncertain receipts, or silently choose another store.
+`resolve_catalog` accepts the original operation ID, current expected catalog revision
+and real owner source after a conflict; it performs only a new catalog CAS, not another
+upload. Confirmed storage failure, uncertain storage and catalog-pending are distinct.
+Approved consumers preflight supported immutable SSM versions/encrypted-file references
+before spending a grant. Legacy references require explicit replacement and a new grant.
 
 ### Owner-defined secret adapters
 
@@ -315,6 +346,8 @@ session; then retry the original adapter request unchanged.
 Raw stdout/stderr is withheld from the agent and transcript; only defined nonsecret
 results are returned. This is not a sandbox against misuse by a trusted executable.
 Approve the actual executable, inputs, destination and effects, not merely its name.
+Executable-path approval is not binary attestation or a guarantee of plaintext
+zeroization. The bounded consumer input limit is separate from streaming file restore.
 
 
 ## Workspace originals and metadata
@@ -350,7 +383,7 @@ Other actions accept these request fields:
 
 - `archive-plan`: `record_id`, `revision`, `confirm`, `completed`; optional
   `source_path` and `source_disposition` (`retain` or `archive`). The exact current
-  cloud note must be a completed plan. Its stable ID and prior revisions remain.
+  cloud note must be a completed plan. Its stable ID, category and prior revisions remain; `archived` is the standard tag.
 - `override`: `identifier`, `slug`, `revision`, `content_hash`, `operation` (`record`
   or `revoke`) and `confirm`. This records metadata about an already-approved
   directive; it cannot grant authority.
@@ -363,6 +396,12 @@ Review status readership manually; identifier warnings and secret-pattern scans 
 not proof that content is safe to publish. Mutations serialize the selected session's
 pending cloud journal and retain registered-writer safeguards where applicable.
 Optional Git publication reservations must not be confused with memory-checkpoint cutoffs.
+Intake, archive and status publication journal whole operations. Retry with the same
+`operation_id`; the local `receipt` command inspects evidence without a cloud client.
+The kernel-held `cloud-workspace-v2.lock` is never unlinked to take over. Legacy lock
+recovery requires `recover-lock --writers-quiescent` and preserves original evidence.
+First output publication refuses overwrite; replacement of an existing reviewed
+output and source removal rely on cooperating writers, not a filesystem sandbox.
 
 ## Google removal and independent integrations
 
@@ -381,3 +420,5 @@ unchanged and use a sanitized private snapshot. Receipts under
 `runtime/environment-migrations/` preserve the locator, source/output digests and exact
 review. Resume its original operation after interruption. No cloud authority or
 credential is changed by this migration.
+Reimporting changed source bytes requires a new digest-bound review while preserving
+prior receipts; an unfinished migration retains its original source and operation.

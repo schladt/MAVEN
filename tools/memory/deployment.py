@@ -272,7 +272,7 @@ def build(
             "After separate owner deployment approval, capture the reviewed stack's Outputs array without fetching secret values.",
             "Map exactly output_to_config, convert schema_version to integer 2, and write a fresh private client/admin/approval configuration from reviewed outputs; never silently update an existing runtime configuration.",
             "Explicitly select the human credential profile; assume ClientRoleArn for ordinary calls, ApprovalRoleArn only for owner challenge/activation or activation lookup, and AdminRoleArn only for approved bootstrap/migration.",
-            "Bootstrap or migrate the bundled SQL through the separately approved administrative consumer before ordinary use. Deploy this runtime and migration 012 together before memory-native checkpoints or scoped retrieval. Schema-1 clients must finish pending publication recovery before cutover.",
+            "Bootstrap or migrate the complete bundled SQL set through the separately approved administrative consumer, then deploy its matching runtime. The package manifest binds the exact migration names and hashes; schema version 2 and client protocol 4 are required. Resolve pending older-format publication recovery through its original supported implementation before cutover.",
         ],
     }
     artifacts = {

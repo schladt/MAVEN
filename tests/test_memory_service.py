@@ -116,6 +116,19 @@ class ValidationTests(unittest.TestCase):
             with self.assertRaises(validation.MemoryError):
                 validation.decode_json(body)
 
+    def test_legacy_fact_credentials_are_refused_before_transport(self):
+        for target in ("value", "predicate", "source"):
+            body = change()
+            credential = "AKIA" + "X" * 16
+            if target == "source":
+                body["source"]["excerpt"] = credential
+            else:
+                body["fact"][target] = credential
+            with self.subTest(target=target), self.assertRaises(validation.MemoryError) as error:
+                validation.validate_change(body)
+            self.assertEqual(error.exception.status, "invalid_request")
+            self.assertNotIn(credential, str(error.exception.metadata))
+
 
 class InstructionValidationTests(unittest.TestCase):
     def test_valid_requests_preserve_exact_input(self):
@@ -259,6 +272,16 @@ class InstructionValidationTests(unittest.TestCase):
             validation.validate_resolve(body)
         with self.assertRaises(validation.MemoryError):
             validation.validate_challenge({"proposal_id": EPOCH, "approved": True})
+
+    def test_approval_evidence_credentials_are_refused_before_transport(self):
+        for field in ("origin", "excerpt"):
+            body = resolution()
+            credential = "Bearer " + "x" * 32
+            body["approval_source"][field] = credential
+            with self.subTest(field=field), self.assertRaises(validation.MemoryError) as error:
+                validation.validate_resolve(body)
+            self.assertEqual(error.exception.status, "invalid_request")
+            self.assertNotIn(credential, str(error.exception.metadata))
 
     def test_discovery_and_retrieval_reject_ambiguous_selectors(self):
         for body in [{}, {"slug": "example", "proposal_id": EPOCH},

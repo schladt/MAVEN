@@ -126,7 +126,11 @@ def serve_fixture(arguments):
     selected = ['--home', str(args.home)]
     if args.env is not None:
         selected.extend(['--env', str(args.env)])
-    main(selected, application_factory=lambda **kwargs: fixture_application(cloud, **kwargs))
+    def application(**kwargs):
+        app = fixture_application(cloud, **kwargs)
+        app._unbound_client = cloud
+        return app
+    main(selected, application_factory=application)
 
 
 def fixture_application(cloud, **kwargs):
@@ -237,6 +241,149 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(BoundaryError):
             unknown.initialize(self.root)
         self.assertEqual(len([r for r in self.cloud.records.values() if r['kind'] == 'session']), 1)
+
+    async def test_worker_unbound_home_consultation_stays_in_originating_project(self):
+        _, home_project = self.configure_home()
+        binding = await self.initialize()
+        _, queued = await self.call('maven_maintenance', {
+            'action': 'enqueue', 'intent': 'Bounded consultation', 'source': SOURCE})
+        worker = self.application()
+        worker.initialize(self.root, session_id=binding['session_id'], resume=True,
+                          assignment_id=queued['assignment']['operation_id'])
+        worker._unbound_client = self.cloud
+        server = create_server(worker)
+        for name, arguments in (
+                ('maven_search', {'unbound': True, 'include_home': True}),
+                ('maven_read', {'unbound': True, 'include_home': True, 'record_id': home_project}),
+                ('maven_search', {'unbound': True, 'project_id': home_project})):
+            with patch.object(self.cloud, 'invoke', wraps=self.cloud.invoke) as invoke:
+                rejected, value = await self.call(name, arguments, server=server)
+            self.assertTrue(rejected.is_error, value)
+            self.assertIn('originating-project', value['error'])
+            invoke.assert_not_called()
+        universal = self.app.service.save('note', NOTE['data'], source=SOURCE, scope='universal')
+        allowed, value = await self.call('maven_read', {
+            'unbound': True, 'record_id': universal['record_id']}, server=server)
+        self.assertFalse(allowed.is_error, value)
+        with patch.object(worker, 'home_selection', return_value={'project_id': self.project}):
+            allowed, value = await self.call('maven_search', {
+                'unbound': True, 'include_home': True}, server=server)
+        self.assertFalse(allowed.is_error, value)
+
+    async def test_stdio_worker_rejects_foreign_home_before_unbound_routing(self):
+        _, home_project = self.configure_home()
+        primary = fixture_application(SharedMCPCloud(self.home / 'fixture-cloud'), home=self.home)
+        self.addCleanup(primary.close)
+        binding = primary.initialize(self.root, harness='omp', harness_session='stdio-worker-origin')['binding']
+        queued = primary.maintenance.enqueue('Bounded stdio consultation', source=SOURCE)
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=[str(Path(__file__).resolve()), '--stdio-fixture', '--home', str(self.home)],
+            cwd=str(Path(__file__).resolve().parents[1]),
+            env={'PYTHONPATH': str(Path(__file__).resolve().parents[1])})
+        async with asyncio.timeout(30):
+            async with stdio_client(parameters) as streams:
+                async with ClientSession(*streams) as client:
+                    await client.initialize()
+                    restored = await client.call_tool('maven_initialize', {
+                        'root': str(self.root), 'session_id': binding['session_id'], 'resume': True,
+                        'harness': 'omp', 'harness_session': 'stdio-worker-origin',
+                        'assignment_id': queued['assignment']['operation_id']})
+                    self.assertFalse(restored.is_error, restored)
+                    for name, arguments in (
+                            ('maven_search', {'unbound': True, 'include_home': True}),
+                            ('maven_read', {'unbound': True, 'include_home': True, 'record_id': home_project})):
+                        rejected = await client.call_tool(name, arguments)
+                        self.assertTrue(rejected.is_error)
+                        self.assertIn('originating-project', rejected.structured_content['error'])
+                    universal = await client.call_tool('maven_search', {'scope': 'universal', 'unbound': True})
+                    self.assertFalse(universal.is_error, universal)
+
+    async def test_restore_and_receipt_observation_remain_available_during_mutation_barrier(self):
+        binding = await self.initialize()
+        self.cloud.lose_next = True
+        with self.assertRaises(MemoryClientError):
+            self.app.service.save('note', NOTE['data'], source=SOURCE)
+        prefix = f'.maven/runtime/sessions/{binding["session_id"]}'
+        pending = (self.root / prefix / 'pending-memory.json').read_bytes()
+        marker = self.home / 'runtime/uninstall.json'
+        save_private(self.home, 'runtime/uninstall.json', {
+            'schema': 1, 'whole_home': True, 'project_roots': [], 'actions': {}})
+        restored = self.application()
+        server = create_server(restored)
+        result, value = await self.call('maven_initialize', {
+            'root': str(self.root), 'session_id': binding['session_id'], 'resume': True,
+            'restore_only': True}, server=server)
+        self.assertFalse(result.is_error, value)
+        self.assertEqual(value['status'], 'restored')
+        self.assertFalse(restored.initialized)
+        with patch.object(self.cloud, 'invoke', wraps=self.cloud.invoke) as invoke, \
+                patch.object(self.cloud, 'load_context', side_effect=AssertionError('no authority reload')):
+            for name, arguments in (
+                    ('maven_status', {'summary': True}),
+                    ('maven_diagnose', {'cwd': str(self.root)}),
+                    ('maven_recover', {'observe_only': True})):
+                result, value = await self.call(name, arguments, server=server)
+                self.assertFalse(result.is_error, value)
+        self.assertTrue(all(call.args[0] not in ('/v1/memory/write', '/v1/memory/claim')
+                            for call in invoke.call_args_list))
+        self.assertEqual((self.root / prefix / 'pending-memory.json').read_bytes(), pending)
+        self.assertTrue(marker.exists())
+        rejected, _ = await self.call('maven_save', {'change': NOTE, 'source': SOURCE}, server=server)
+        self.assertTrue(rejected.is_error)
+
+    async def test_pause_drain_completes_accepted_work_without_new_admission(self):
+        await self.initialize()
+        _, queued = await self.call('maven_maintenance', {
+            'action': 'enqueue', 'intent': 'Accepted before wrap-up', 'source': SOURCE})
+        identifier = queued['assignment']['operation_id']
+        paused, value = await self.call('maven_pause', {'drain': True})
+        self.assertFalse(paused.is_error, value)
+        refused, denied = await self.call('maven_maintenance', {
+            'action': 'enqueue', 'intent': 'Too late for cutoff', 'source': SOURCE})
+        self.assertTrue(refused.is_error)
+        self.assertIn('draining', denied['error'])
+        _, claimed = await self.call('maven_maintenance', {
+            'action': 'claim', 'operation_id': identifier, 'worker': 'drain-worker'})
+        token = claimed['assignment']['worker_token']
+        applied, value = await self.call('maven_maintenance', {
+            'action': 'apply', 'operation_id': identifier, 'worker_token': token, 'changes': [NOTE]})
+        self.assertFalse(applied.is_error, value)
+        completed, value = await self.call('maven_maintenance', {
+            'action': 'complete', 'operation_id': identifier, 'worker_token': token, 'summary': 'Accepted work saved'})
+        self.assertFalse(completed.is_error, value)
+        _, checkpoint = await self.call('maven_checkpoint', {'summary': 'Drained original accepted cutoff'})
+        finished, value = await self.call('maven_finish', {'checkpoint_id': checkpoint['checkpoint']['checkpoint_id']})
+        self.assertFalse(finished.is_error, value)
+        self.assertEqual(value['status'], 'closed')
+
+    async def test_memory_recovery_forwards_exact_writer_tokens_only_after_quiescence(self):
+        await self.initialize()
+        tokens = [str(uuid.uuid4())]
+        with patch.object(self.app.service, 'recover', return_value={'status': 'recovered'}) as recover:
+            rejected, _ = await self.call('maven_recover', {'writer_tokens': tokens})
+            self.assertTrue(rejected.is_error)
+            recover.assert_not_called()
+            result, value = await self.call('maven_recover', {'workers_stopped': True, 'writer_tokens': tokens})
+            self.assertFalse(result.is_error, value)
+            recover.assert_called_once_with(workers_stopped=True, writer_tokens=tokens)
+        for field, method in (('operation_id', 'recover'), ('checkpoint_id', 'recover_checkpoint')):
+            identifier = str(uuid.uuid4())
+            with patch.object(self.app.maintenance, method, return_value={'status': 'recovered'}) as recover:
+                result, value = await self.call('maven_recover', {
+                    field: identifier, 'workers_stopped': True, 'writer_tokens': tokens})
+                self.assertFalse(result.is_error, value)
+                recover.assert_called_once_with(identifier, worker_stopped=True, writer_tokens=tokens)
+
+    async def test_unbound_instruction_listing_refuses_repeated_cursor(self):
+        self.app.start('read_only', self.root)
+        self.app._unbound_client = self.cloud
+        result = {'status': 'ready', 'data': {'authority_generation': 1,
+                  'pages': [{'slug': 'same', 'data_scope': 'owner'}], 'next_after_slug': 'same'}}
+        with patch.object(self.cloud, 'invoke', return_value=result) as invoke:
+            rejected, _ = await self.call('maven_instructions')
+        self.assertTrue(rejected.is_error)
+        self.assertEqual(invoke.call_count, 2)
 
     async def test_close_peer_requires_bound_primary_session_and_passes_arguments(self):
         peer = str(uuid.uuid4())
@@ -366,6 +513,25 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(route == '/v1/memory/write' for route, _ in self.cloud.calls))
         bound_only, _ = await self.call('maven_search', {'scope': 'context'})
         self.assertTrue(bound_only.is_error)
+
+    async def test_read_only_warming_progresses_through_shared_client_without_tool_replay(self):
+        from test_memory_client import CONFIG
+        client = MemoryClient(CONFIG, None)
+        self.addCleanup(client.close)
+        self.app._unbound_client = client
+        ready = {'status': 'ready', 'data': {'records': [], 'next_after_id': None}}
+        with patch.object(client, '_post', side_effect=[(503, {'status': 'warming'}), (200, ready)]) as post, \
+                patch('tools.memory.client.time.sleep'):
+            result, value = await self.call('maven_search', {'unbound': True})
+        self.assertFalse(result.is_error, value)
+        self.assertEqual(post.call_count, 2)
+        self.assertTrue(all(call.args[0] == '/v1/memory/search' for call in post.call_args_list))
+        with patch.object(client, '_post', side_effect=MemoryClientError('transport_unavailable')) as post:
+            result, value = await self.call('maven_search', {'unbound': True})
+        self.assertTrue(result.is_error)
+        self.assertNotIn('sign_in', value)
+        post.assert_called_once()
+        self.assertIsNone(self.app.binding)
 
     async def test_named_read_only_skill_load_uses_configured_client_without_session_or_memory(self):
         from test_memory_client import CONFIG
@@ -530,8 +696,10 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         await self.initialize()
         _, bound = await self.call('maven_status', {'cwd': str(scratch)})
         self.assertFalse({'rebind_hint', 'start_hint'} & set(bound))
-        self.assertEqual((bound['active']['mode'], bound['active']['label'], bound['active']['project_id']),
-                         ('project', self.root.name, self.project))
+        self.assertEqual((bound['active']['mode'], bound['active']['project_id']),
+                         ('project', self.project))
+        self.assertEqual(bound['active']['label_source'], 'folder')
+        self.assertFalse(bound['active']['cloud_project_verified'])
 
     async def test_home_initialize_binds_home_from_unrelated_cwd_and_never_rebinds(self):
         from tools.home import last_choice, read_active
@@ -556,7 +724,7 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((ready['active']['mode'], ready['active']['label']), ('home', 'nexus'))
         self.assertIn('Home (nexus)', ready['message'])
         self.assertEqual(last_choice(self.home, scratch), 'home')
-        self.assertEqual(read_active(self.home, harness_session='harness-1')['mode'], 'home')
+        self.assertEqual(read_active(self.home, harness='omp', harness_session='harness-1')['mode'], 'home')
         self.assertEqual(read_active(self.home, folder=scratch)['project_id'], project)
         _, moved = await self.call('maven_status', {'cwd': str(self.root)})
         self.assertEqual(moved['binding']['root'], str(root))
@@ -699,12 +867,14 @@ class MCPBehaviorTests(unittest.IsolatedAsyncioTestCase):
                                         'MAVEN_AWS_REGION="us-east-1"\n')
         (self.home / '.env').chmod(0o600)
         expected = f'AWS_LOGIN_CACHE_DIRECTORY={cache} aws login --profile daily --region us-east-1'
-        with patch.object(self.app, 'unbound_client',
-                          side_effect=MemoryClientError('selected_login_unavailable_or_expired')):
-            _, blocked = await self.call('maven_search', {'query': 'firmware', 'unbound': True})
-        self.assertEqual((blocked['status'], blocked['error']), ('blocked', 'selected_login_unavailable_or_expired'))
-        self.assertEqual(blocked['sign_in']['command'], expected)
-        self.assertIn(expected, blocked['message'])
+        for code in ('selected_login_unavailable_or_expired', 'authentication_required'):
+            with self.subTest(code=code), patch.object(self.app, 'unbound_client',
+                                                       side_effect=MemoryClientError(code)):
+                _, blocked = await self.call('maven_search', {'query': 'firmware', 'unbound': True})
+            self.assertEqual((blocked['status'], blocked['error']), ('blocked', code))
+            self.assertEqual(blocked['sign_in']['command'], expected)
+            self.assertEqual(blocked['sign_in']['environment'], {'AWS_LOGIN_CACHE_DIRECTORY': str(cache)})
+            self.assertIn(expected, blocked['message'])
         _, status = await self.call('maven_status')
         self.assertEqual(status['sign_in']['command'], expected)
 

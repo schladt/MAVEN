@@ -6,6 +6,7 @@ The registry coordinates participating writers, not arbitrary editors.
 from __future__ import annotations
 
 import contextlib
+from contextvars import ContextVar
 import fcntl
 import hashlib
 import os
@@ -26,6 +27,7 @@ class SessionBusy(CoordinationError):
 
 
 SESSION_LOCK_TIMEOUT = 10.0
+_SOURCE_WRITERS = ContextVar('maven_source_writers', default=())
 
 
 def session_uuid(value):
@@ -90,7 +92,7 @@ class SessionRegistry:
         self.home = Path(home) if home is not None else instance_home()
 
     @contextlib.contextmanager
-    def transaction(self):
+    def transaction(self, *, readonly=False):
         with private_lock(self.home, 'runtime/registry.lock'):
             path = private_path(self.home, 'runtime/sessions.json')
             state = read_private(self.home, 'runtime/sessions.json') if path.exists() else {
@@ -98,7 +100,8 @@ class SessionRegistry:
             if state.get('schema') != 1 or not isinstance(state.get('sessions'), dict) or not isinstance(state.get('reservations'), dict):
                 raise CoordinationError('session registry is malformed; preserve it for recovery')
             yield state
-            save_private(self.home, 'runtime/sessions.json', state)
+            if not readonly:
+                save_private(self.home, 'runtime/sessions.json', state)
 
     @staticmethod
     def key(root):
@@ -198,6 +201,8 @@ class SessionRegistry:
         with self.transaction() as state:
             self._allow_work(root)
             item = self._session(state, root, session_id)
+            if private_path(root, f'.maven/runtime/sessions/{session_id}/finish.json').exists():
+                raise CoordinationError('memory closure has begun; this session cannot enter publication')
             reservation = state['reservations'].get(self.key(root))
             if item['writers'] or self.pending(root, session_id) or (
                     reservation and reservation['session_id'] != session_id):
@@ -205,7 +210,7 @@ class SessionRegistry:
             item['memory_only'] = False
 
     def peers(self, root, session_id):
-        with self.transaction() as state:
+        with self.transaction(readonly=True) as state:
             return [dict(item, session_id=identifier) for identifier, item in state['sessions'].items()
                     if item['root'] == self.key(root) and identifier != session_id]
 
@@ -213,6 +218,8 @@ class SessionRegistry:
         key = self.key(root)
         with self.transaction() as state:
             item = self._session(state, root, session_id)
+            if private_path(root, f'.maven/runtime/sessions/{session_id}/finish.json').exists():
+                raise CoordinationError('memory closure has begun; this session cannot reserve publication')
             current = state['reservations'].get(key)
             if current and current['session_id'] != session_id:
                 raise CoordinationError('another session owns the repository reservation')
@@ -273,24 +280,35 @@ class SessionRegistry:
         with self.transaction() as state:
             self._allow_work(root)
             item = self._session(state, root, session_id)
+            if private_path(root, f'.maven/runtime/sessions/{session_id}/finish.json').exists():
+                raise CoordinationError('memory closure has begun; source writes are prohibited')
             if item['state'] != 'active' or self.key(root) in state['reservations'] or self.pending(root, session_id):
                 raise CoordinationError('session is paused or repository is reserved; writes are prohibited')
             item['writers'].append(token)
+        owned = _SOURCE_WRITERS.set((*_SOURCE_WRITERS.get(),
+                                    (os.getpid(), str(self.home.resolve()), self.key(root), session_id, token)))
         try:
             yield token
         finally:
+            _SOURCE_WRITERS.reset(owned)
             with self.transaction() as state:
                 item = self._session(state, root, session_id)
                 item['writers'].remove(token)
 
     @contextlib.contextmanager
-    def memory_writer(self, root, session_id):
+    def memory_writer(self, root, session_id, *, closing=False):
         """Memory writes share the session journal, never a repository reservation."""
         token = str(uuid.uuid4())
         with self.transaction() as state:
             self._allow_work(root)
             item = self._session(state, root, session_id)
-            if item['state'] not in ('active', 'paused') or self.pending(root, session_id):
+            reservation = state['reservations'].get(self.key(root))
+            if closing and reservation and reservation['session_id'] == session_id:
+                raise CoordinationError('release this session Git reservation before closing memory')
+            owned = {entry[4] for entry in _SOURCE_WRITERS.get()
+                     if entry[:4] == (os.getpid(), str(self.home.resolve()), self.key(root), session_id)}
+            if (item['state'] not in ('active', 'paused') or any(token not in owned for token in item['writers'])
+                    or self.pending(root, session_id)):
                 raise CoordinationError('memory session is unavailable or has an unresolved cloud request')
             item['writers'].append(token)
         try:
@@ -321,17 +339,35 @@ class SessionRegistry:
             item['state'] = 'abandoned'
             return True
 
-    def recover_writers(self, root, session_id, tokens):
-        """Owner attests these exact interrupted operations have stopped; never guess."""
+    @contextlib.contextmanager
+    def recovering(self, root, session_id, *, workers_stopped, tokens):
+        """Fence admission until the exact original outcome is reconciled.
+
+        Keep stale tokens on failure. The kernel registry lock excludes competing
+        admissions; it is never a claim that the named processes stopped.
+        """
+        if workers_stopped is not True:
+            raise CoordinationError('recovery requires actual writer quiescence')
         with self.transaction() as state:
             item = self._session(state, root, session_id)
-            if sorted(tokens) != sorted(item['writers']):
+            selected = [] if tokens is None else tokens
+            if (not isinstance(selected, list) or any(not isinstance(token, str) for token in selected)
+                    or len(set(selected)) != len(selected) or sorted(selected) != sorted(item['writers'])):
                 raise CoordinationError('recovery must name the exact complete in-flight writer token set')
+            yield
+            if self.pending(root, session_id):
+                raise CoordinationError('reconcile the original cloud request before releasing writer tokens')
             item['writers'] = []
-            item['state'] = 'paused'
+            if selected and item['state'] == 'active':
+                item['state'] = 'paused'
+
+    def recover_writers(self, root, session_id, tokens, *, workers_stopped=False):
+        """Release exact stopped writer tokens only after original journal reconciliation."""
+        with self.recovering(root, session_id, workers_stopped=workers_stopped, tokens=tokens):
+            pass
 
     def inspect(self, root, session_id):
-        with self.transaction() as state:
+        with self.transaction(readonly=True) as state:
             return {'session': dict(self._session(state, root, session_id)),
                     'reservation': state['reservations'].get(self.key(root))}
 
@@ -356,8 +392,8 @@ class SessionRegistry:
                         'already_released': True, 'token_revocation_claimed': False,
                         'browser_signout_required': True}
             item = self._session(state, root, session_id)
-            if item['writers']:
-                raise CoordinationError('cannot close a session with unfinished writers')
+            if item['writers'] or self.pending(root, session_id):
+                raise CoordinationError('cannot close a session with unfinished writers or cloud receipts')
             reservation = state['reservations'].get(self.key(root))
             if reservation and reservation['session_id'] == session_id:
                 del state['reservations'][self.key(root)]

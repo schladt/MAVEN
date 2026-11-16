@@ -30,7 +30,7 @@ class UninstallApprovalTests(unittest.TestCase):
             result = cli.build_plan(arguments)
             apply = cli.parser().parse_args([
                 'apply', '--plan', result['plan_path'], '--confirm', '0' * 64,
-                '--writers-quiescent', '--harnesses-stopped'])
+                '--writers-quiescent', '--harness-config-risk'])
             with self.assertRaisesRegex(UninstallError, 'reviewed plan digest'):
                 cli.apply(apply, reexec=False)
             self.assertEqual(config.read_bytes(), original)
@@ -63,7 +63,7 @@ class UninstallApprovalTests(unittest.TestCase):
     def _approval(self, result, *extra):
         return cli.parser().parse_args([
             'resume', '--plan', result['plan_path'], '--confirm', result['plan']['plan_digest'],
-            '--writers-quiescent', '--harnesses-stopped', *extra])
+            '--writers-quiescent', '--harness-config-risk', *extra])
 
     def test_pause_between_real_detach_actions_and_resume(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -104,7 +104,7 @@ class UninstallApprovalTests(unittest.TestCase):
                 child = subprocess.run([
                     sys.executable, '-B', str(base / 'operation/runner/run.py'),
                     'resume', '--plan', result['plan_path'], '--confirm', result['plan']['plan_digest'],
-                    '--writers-quiescent', '--harnesses-stopped', '--tui-worker'],
+                    '--writers-quiescent', '--harness-config-risk', '--tui-worker'],
                     input=control, text=True, capture_output=True, timeout=30)
                 self.assertEqual(child.returncode, 3, child.stderr)
                 events = [json.loads(line) for line in child.stdout.splitlines()]

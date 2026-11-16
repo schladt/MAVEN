@@ -135,6 +135,40 @@ def _parameter_metadata(ssm, name):
         seen.add(token)
 
 
+def _retained_wrapping_parameters(ssm, settings, current, *, account, region):
+    """Review historical key decryption permissions without fetching wrapping-key values."""
+    namespace = settings['MAVEN_SECRETS_FILE_KEY_PREFIX']
+    retained = {current['Name']: current}
+    token, seen = None, set()
+    while True:
+        request = {'ParameterFilters': [{'Key': 'Name', 'Option': 'BeginsWith', 'Values': [namespace]}],
+                   'MaxResults': 50}
+        if token:
+            request['NextToken'] = token
+        page = ssm.describe_parameters(**request)
+        for item in page.get('Parameters', []):
+            name = item.get('Name', '')
+            if not isinstance(name, str) or not name.startswith(namespace):
+                raise SetupPending('Wrapping-key discovery returned a parameter outside the selected namespace.')
+            if not re.fullmatch(r'[0-9a-f]{16}', name[len(namespace):]):
+                continue
+            if item.get('Type') != 'SecureString':
+                raise SetupPending('Retained wrapping keys must remain SecureString parameters.')
+            key = item.get('KeyId', '')
+            if key != 'alias/aws/ssm' and (not isinstance(key, str) or not re.fullmatch(
+                    rf'arn:aws:kms:{re.escape(region)}:{account}:key/[A-Za-z0-9-]+', key)):
+                raise SetupPending('Every retained wrapping key must use alias/aws/ssm or an exact same-account regional KMS key ARN.')
+            metadata = {field: item[field] for field in ('Name', 'Type', 'KeyId', 'Version', 'DataType') if field in item}
+            if name != current['Name']:
+                retained[name] = metadata
+        token = page.get('NextToken')
+        if not token:
+            return [retained[name] for name in sorted(retained)]
+        if not isinstance(token, str) or token in seen:
+            raise SetupPending('Wrapping-key discovery pagination did not advance; no complete permission review is available.')
+        seen.add(token)
+
+
 def inspect_store(values, session):
     """Read exact resource metadata only; no parameter value enters a review."""
     settings = validate_settings(values)
@@ -187,9 +221,10 @@ def inspect_store(values, session):
         if key != 'alias/aws/ssm' and not re.fullmatch(
                 rf'arn:aws:kms:{re.escape(region)}:{account}:key/[A-Za-z0-9-]+', key or ''):
             raise SetupPending('Wrapping SecureString encryption must use alias/aws/ssm or an exact same-account regional KMS key ARN.')
+        retained = _retained_wrapping_parameters(ssm, settings, parameter, account=account, region=region)
         return {'bucket': bucket, 'account': account, 'region': location,
                 'public_access_block': block, 'ownership': ownership, 'encryption': default,
-                'wrapping_parameter': parameter}
+                'wrapping_parameter': parameter, 'retained_wrapping_parameters': retained}
     finally:
         s3.close()
         ssm.close()
@@ -205,7 +240,7 @@ def required_policy(values, metadata=None):
         {'Effect': 'Allow', 'Action': ['ssm:GetParameter', 'ssm:GetParameterHistory', 'ssm:PutParameter'],
          'Resource': ssm + selected['MAVEN_SECRETS_PARAMETER_PREFIX'] + '*'},
         {'Effect': 'Allow', 'Action': ['ssm:GetParameter'],
-         'Resource': ssm + selected['MAVEN_SECRETS_FILE_KEY_PREFIX'] + selected['MAVEN_SECRETS_KEY_ID']},
+         'Resource': ssm + selected['MAVEN_SECRETS_FILE_KEY_PREFIX'] + '*'},
         {'Effect': 'Allow', 'Action': ['s3:ListBucket'], 'Resource': bucket,
          'Condition': {'StringLike': {'s3:prefix': selected['MAVEN_SECRETS_OBJECT_PREFIX'] + '*'}}},
         {'Effect': 'Allow', 'Action': ['s3:GetObject', 's3:GetObjectVersion', 's3:PutObject', 's3:AbortMultipartUpload'],
@@ -214,8 +249,11 @@ def required_policy(values, metadata=None):
         {'Effect': 'Allow', 'Action': ['ssm:DescribeParameters'], 'Resource': '*'},
     ]
     metadata = metadata or {}
-    wrapping = metadata.get('wrapping_parameter', {}).get('KeyId', '')
-    if wrapping.startswith('arn:'):
+    # Rotation changes only the current key ID, not the store. Historical references
+    # still need the retained namespace and every reviewed backing KMS key.
+    parameters = [metadata.get('wrapping_parameter', {}), *metadata.get('retained_wrapping_parameters', [])]
+    wrapping_keys = sorted({item['KeyId'] for item in parameters if item.get('KeyId', '').startswith('arn:')})
+    for wrapping in wrapping_keys:
         statements.append({'Effect': 'Allow', 'Action': ['kms:Decrypt'], 'Resource': wrapping,
                            'Condition': {'StringEquals': {'kms:ViaService': f'ssm.{region}.amazonaws.com'}}})
     encryption = metadata.get('encryption', {}).get('KMSMasterKeyID')
@@ -237,6 +275,7 @@ def maintenance_policy(values, operation_id, *, create=False):
          'Resource': bucket},
         {'Effect': 'Allow', 'Action': ['ssm:GetParameter', 'ssm:GetParameterHistory', 'ssm:ListTagsForResource'],
          'Resource': wrapping},
+        {'Effect': 'Allow', 'Action': ['ssm:DescribeParameters'], 'Resource': '*'},
     ]
     if create:
         statements.extend([
@@ -551,7 +590,13 @@ def advance(controller, state, wizard):
                   'create': create, 'daily_required_policy': required_policy(values, metadata),
                   'maintenance_required_policy': policy, 'maintenance_principal': checked['maintenance']['Arn'],
                   'policy_principal': checked['daily']['Arn'], 'iam_effect': 'No IAM policy attachment or broad grants. Account owner grants only reviewed resources to this exact selected principal.',
-                  'permission_checks': 'Read exact resource metadata, decrypt the wrapping key only in process, and list the configured object prefix. No canary writes, object reads or secret rotations. Write access remains unverified; the account owner reviews/grants the exact scoped policy.',
+                  'permission_checks': 'Read exact resource metadata and enumerate the dedicated wrapping-key namespace, decrypt only '
+                                       'the current wrapping key in process, and list the configured object prefix. No canary writes, '
+                                       'object reads or secret rotations. Historical-key decryption and write access remain unverified; '
+                                       'the account owner reviews/grants the scoped policy.',
+                  'key_retention': 'The daily policy retains read access to the dedicated wrapping-key namespace and decryption '
+                                   'under every discovered wrapping-parameter KMS key. Preserve all historical wrapping material '
+                                   'and S3 KMS keys/permissions while references exist; changing the current key ID does not migrate old files.',
                   'retention': 'Secrets bucket stack and wrapping SecureString remain independently retained when memory service is removed. Prefixes are only namespaces. Storage/requests can incur charges.',
                   'template': bucket_template(settings, state['operation_id']) if create else None,
                   'wrapping_creation': 'Generate a 32-byte random base64 SecureString encrypted by alias/aws/ssm, version 1, tagged with this operation. Never persist plaintext or regenerate uncertain writes. Only a definitively rejected permission request may retry creation after external access repair and an exact absence check.' if create else None}

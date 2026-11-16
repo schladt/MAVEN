@@ -15,11 +15,12 @@ UI_REQUIREMENTS = ("textual>=2.1,<3", "packaging>=24,<27")
 
 def ui_available():
     try:
-        return (util.find_spec("textual") is not None
-                and util.find_spec("packaging") is not None
-                and int(metadata.version("textual").split(".")[0]) == 2
-                and 24 <= int(metadata.version("packaging").split(".")[0]) < 27)
-    except (metadata.PackageNotFoundError, ValueError):
+        if util.find_spec("textual") is None or util.find_spec("packaging") is None:
+            return False
+        from packaging.requirements import Requirement
+        return all(metadata.version(requirement.name) in requirement.specifier
+                   for requirement in map(Requirement, UI_REQUIREMENTS))
+    except (ImportError, metadata.PackageNotFoundError, ValueError):
         return False
 
 

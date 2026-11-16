@@ -58,8 +58,9 @@ class ProjectPackagingTests(unittest.TestCase):
                                       source_excerpt='Create this project', request_key=str(uuid4()),
                                       env=root / 'instance.env')
             client = Mock()
-            client.invoke.return_value = {'data': {'kind': 'entity', 'data_scope': 'owner',
-                                                   'data': {'entity_type': 'project'}}}
+            client.invoke.return_value = {'status': 'ready', 'data': {
+                'record_id': args.project_id, 'kind': 'entity', 'data_scope': 'owner',
+                'project_id': None, 'data': {'entity_type': 'project'}}}
             with patch('tools.memory.environment.configured_client', return_value=client) as factory:
                 result = _initialize(args)
                 self.assertEqual(result['status'], 'initialized')
@@ -77,6 +78,29 @@ class ProjectPackagingTests(unittest.TestCase):
             project = load_project(root)
             self.assertEqual(project['root'], str(root))
             self.assertEqual((root / '.maven/project.json').stat().st_mode & 0o777, 0o600)
+
+    def test_initializer_requires_exact_active_universal_project_entity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            args = argparse.Namespace(root=root, check=[], project_id=str(uuid4()),
+                                      remote=None, accepted_url=None, branch=None, create=False,
+                                      name=None, source_origin=None, source_excerpt=None, request_key=None,
+                                      env=root / 'instance.env')
+            record = {'record_id': args.project_id, 'kind': 'entity', 'data_scope': 'owner',
+                      'project_id': None, 'tags': [], 'data': {'entity_type': 'project'}}
+            client = Mock()
+            with patch('tools.memory.environment.configured_client', return_value=client):
+                for changed in (
+                        {**record, 'record_id': str(uuid4())},
+                        {**record, 'record_id': None}, {**record, 'project_id': str(uuid4())},
+                        {**record, 'data_scope': 'public'}, {**record, 'tags': ['archived']},
+                        {**record, 'data': {'entity_type': 'project', 'state': 'archived'}}):
+                    client.invoke.return_value = {'status': 'ready', 'data': changed}
+                    with self.subTest(record=changed), self.assertRaises(ProjectError):
+                        _initialize(args)
+                    self.assertFalse((root / '.maven/project.json').exists())
+                client.invoke.return_value = {'status': 'ready', 'data': record}
+                self.assertEqual(_initialize(args)['status'], 'initialized')
 
     def test_project_rejects_symlink_and_public_permissions(self):
         with tempfile.TemporaryDirectory() as directory:

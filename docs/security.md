@@ -14,6 +14,8 @@ Long-running clients refresh assumed-role credentials through the same selected
 existing login and role, rechecking the expected principal on every renewal.
 Refresh failures, including identity changes before token expiration, block signing;
 they do not silently reuse credentials after a failed renewal or launch a new login.
+Each selected session owns its login provider/cache; concurrent homes never select
+credentials by mutating process-global `AWS_LOGIN_CACHE_DIRECTORY`.
 
 Only applicable active cloud instructions govern MAVEN work. Starter templates,
 repository files, search snippets, email and imported documents are not executable
@@ -53,14 +55,14 @@ are recorded as metadata. Restrict who can read those records.
 Both run only through an owner-approved `maven_admin` kind `cleanup` operation under
 the separately assumed administration role, never through agent memory tools. Erase
 is a narrow, audited exception to immutable history: it rewrites every revision, the
-current content, source excerpts owned only by erased records, fact values and memory
-receipt results to a tombstone, and records an immutable receipt (ids, version
-counts, actor, reason, approval digest; no content). It cannot reach Aurora automated
-backups, which keep old content up to 30 days, or copies already sent to external
-models, transcripts or Git. Local runtime files (last-write receipts, failed-write
-records, maintenance effects) are swept on this machine by every clean-up; other
-machines keep any cached copy until they next run a MAVEN clean-up. A pending request
-journal for an erased record is never deleted: it blocks the sweep until recovered.
+current content, exclusively owned source excerpts, fact values and legacy predicates,
+and memory receipt results. Revision guards and the original cleanup operation bind
+the transaction. Receipts retain IDs, counts and approval digests, but hash actor
+identity and use fixed action reasons rather than free-text content. Shared sources,
+Aurora backups (up to 30 days), external models, transcripts and Git have separate
+retention. Local sweeps redact affected runtime and administration copies; other
+machines retain caches until their next sweep. Unresolved request journals block
+redaction until recovered; they are never silently discarded.
 
 ## Local state
 
@@ -83,19 +85,13 @@ There is no heartbeat-based takeover or automatic claim that a stale-looking wri
 is dead. Inspect process ownership and receipts before explicit recovery. Candidate
 hashes and revision guards detect changes; they do not remove the need for review.
 
-Close each invocation's client. Memory-session closure does not revoke shared local
-credentials or close peer sessions. Explicit logout or security-failure cleanup can
-affect every session sharing those credentials; report that access consequence
-separately from cloud closure and never claim provider token revocation.
+Close each invocation's client. Memory closure and optional Git completion do not
+revoke shared credentials or close peers. Explicit logout has separately reported
+shared-access consequences and is not proof of provider token revocation.
 
 Unknown mutation outcomes are not ordinary retryable errors. Preserve the original
 request key and reconcile cloud receipts, Git state or external service state before
-retrying. In particular, an ambiguous Gmail send retains its reservation; deleting it
-to retry can send duplicates. Google credential locking is local, not a cross-host SSM
-compare-and-swap guarantee.
-Gmail draft sending includes the exact MIME snapshot whose identity and recipients
-were validated, rather than sending a mutable draft ID alone. A concurrent draft edit
-cannot substitute different recipients/content into that send.
+retrying. A lost response does not authorize a replacement request or prove failure.
 
 During outages retain bounded authorized assignments and exact request receipts in
 private journals. Report local pending versus verified cloud-saved, blocked and
@@ -123,9 +119,9 @@ reviewed target and plan digest; changed plans invalidate approval. Purge and
 administrative abandonment remain separate approvals.
 
 Conversational decisions bind the persisted interaction identity/revision and complete
-review digest; they must not claim a TUI click occurred. A running harness cannot
-attest its own shutdown. Stage integration removal in chat, then use the protected
-external continuation and pinned worker for affected self-removal.
+review digest; they must not claim a TUI click occurred. Acknowledging running-harness
+configuration risk is distinct from attesting writer quiescence. Use protected
+external continuation and the pinned worker for affected self-removal.
 
 The uninstall UI runs from a private offline snapshot outside installation homes;
 its worker uses the exact reviewed runner. Dependency snapshots retain installed
@@ -152,6 +148,9 @@ not prevent an authorized recipient or compromised endpoint from reading plainte
 SSM Standard values are limited to 4 KB. File wrapping keys must be retained to decrypt
 stored objects. There is no automatic backup/retention policy for every external
 resource; review the shipped infrastructure and provider settings with the owner.
+Approved secret consumers require immutable versioned references before spending a
+grant. Executable-path approval is not binary attestation, sandboxing or a guarantee
+of plaintext zeroization. Streaming restore publishes only authenticated output.
 
 Do not include private data in public vulnerability reports. Use a private reporting
 channel when available and describe the boundary, minimal synthetic reproduction and

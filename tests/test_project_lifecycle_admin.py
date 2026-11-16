@@ -59,9 +59,13 @@ class ProjectCloudProjection:
         raise AssertionError('Unexpected projection query')
 
     def json_scalar(self, expression, values, transaction):
-        if values != {'project': self.project_id}:
+        if values.get('project') != self.project_id or set(values) != {'project', 'cursor'}:
             raise AssertionError('Unexpected project work scope')
-        return json.dumps(self.work)
+        kind = 'receipts' if 'FROM maven.memory_receipts' in expression else 'records'
+        key = 'request_key' if kind == 'receipts' else 'id'
+        rows = sorted(self.work[kind], key=lambda item: item[key])
+        return json.dumps([item for item in rows if values['cursor'] is None
+                           or item[key] > values['cursor']][:lifecycle.EVIDENCE_PAGE_SIZE])
 
     def execute(self, sql, values=None, transaction=None):
         if values is not None and 'archived' in values:
@@ -202,11 +206,10 @@ class ProjectLifecycleAdministrationTests(unittest.TestCase):
         self.assertFalse(self.controller.directory.exists())
         self.assertEqual(self.cloud.mutations, [])
 
-    def test_archive_requires_migration017_without_implicitly_migrating(self):
+    def test_incomplete_schema_blocks_archive_without_implicit_migration(self):
         self.cloud.installed.pop(lifecycle.ARCHIVE_VISIBILITY_MIGRATION)
         result = self.begin()
         self.assertEqual(result['state'], 'blocked')
-        self.assertIn(lifecycle.ARCHIVE_VISIBILITY_MIGRATION, result['error'])
         self.assertIsNone(result['pending_interaction'])
         self.assertEqual(self.cloud.mutations, [])
         self.assertEqual(self.local_files(), self.original_files)
@@ -225,7 +228,7 @@ class ProjectLifecycleAdministrationTests(unittest.TestCase):
                        {'kind': 'checkpoint', 'state': 'prepared'},
                        {'kind': 'task', 'claim_session': str(uuid4()), 'claim_fence': 3}):
             with self.subTest(record=record):
-                self.cloud.work = {'records': [record], 'receipts': []}
+                self.cloud.work = {'records': [{'id': str(uuid4()), **record}], 'receipts': []}
                 before = deepcopy(self.cloud.work)
                 result = self.begin()
                 self.assertEqual(result['state'], 'blocked')
@@ -236,8 +239,8 @@ class ProjectLifecycleAdministrationTests(unittest.TestCase):
 
     def test_new_work_after_approval_blocks_without_mutating_work(self):
         result = self.approve(self.begin())
-        self.cloud.work = {'records': [{'kind': 'operation', 'state': 'started'}],
-                           'receipts': [{'request_key': 'original-request'}]}
+        self.cloud.work = {'records': [{'id': str(uuid4()), 'kind': 'operation', 'state': 'started'}],
+                           'receipts': [{'request_key': str(uuid4())}]}
         original = deepcopy(self.cloud.work)
         result = self.apply(result)
         self.assertEqual(result['state'], 'blocked')

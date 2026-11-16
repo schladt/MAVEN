@@ -57,7 +57,7 @@ def load_import(home, path):
 
 
 def ensure(controller, path=None):
-    """Return the exact pending migration, or None; never overwrite setup evidence."""
+    """Reuse unfinished evidence; changed completed imports receive a new exact-source review."""
     path = Path(path or controller.home / '.env').expanduser().absolute()
     if not path.exists() and not path.is_symlink():
         return None
@@ -77,7 +77,9 @@ def ensure(controller, path=None):
             for saved in controller.directory.glob('*.json'):
                 candidate = read_private(saved)
                 if (candidate.get('kind') == 'environment_migration'
-                        and candidate.get('parameters', {}).get('path', str(controller.home / '.env')) == str(path)):
+                        and candidate.get('parameters', {}).get('path', str(controller.home / '.env')) == str(path)
+                        and (candidate.get('state') != 'completed' or
+                             candidate.get('outcome', {}).get('source_sha256') == hashlib.sha256(raw).hexdigest())):
                     candidates.append(candidate['operation_id'])
             if len(candidates) > 1:
                 raise SetupPending('Multiple migration records name this source; preserve their original identities and select the exact operation.')
@@ -85,7 +87,20 @@ def ensure(controller, path=None):
             save_json(pointer, {'operation_id': state['operation_id']})
         if state['state'] == 'completed':
             if RETIRED_KEY in values:
-                if path == controller.home / '.env' or state['outcome']['source_sha256'] != hashlib.sha256(raw).hexdigest():
+                if state['outcome']['source_sha256'] != hashlib.sha256(raw).hexdigest():
+                    # Only completed evidence can be superseded; its UUID, review and snapshot stay immutable.
+                    candidates = [read_private(saved) for saved in controller.directory.glob('*.json')]
+                    pending = [candidate for candidate in candidates
+                               if candidate.get('kind') == 'environment_migration'
+                               and candidate.get('state') != 'completed'
+                               and candidate.get('parameters', {}).get('path') == str(path)]
+                    if len(pending) > 1:
+                        raise SetupPending('Multiple unfinished migration records name this source; preserve their original identities.')
+                    state = (controller.status(pending[0]['operation_id']) if pending else
+                             controller.begin('environment_migration', {'path': str(path)}))
+                    save_json(pointer, {'operation_id': state['operation_id']})
+                    return state
+                if path == controller.home / '.env':
                     raise SetupPending('Previously migrated settings changed; original migration evidence is retained.')
             return None
         return state
@@ -146,8 +161,16 @@ def advance(controller, state):
         _, existing = _load_environment(destination, ENV_KEYS, with_raw=True)
         if not receipt_path.exists() or hashlib.sha256(existing).hexdigest() != review['result_sha256']:
             raise SetupPending('Import snapshot destination changed; nothing was overwritten.')
+    original = _directory(controller.home) / (state['operation_id'] + '.source.env')
+    if original.exists() or original.is_symlink():
+        _, retained = _load_environment(original, ENV_KEYS | {RETIRED_KEY}, with_raw=True)
+        if hashlib.sha256(retained).hexdigest() != review['source_sha256']:
+            raise SetupPending('Original migration source snapshot changed; preserve its exact receipt.')
+    else:
+        atomic_private(original, raw.decode('utf-8'))
     receipt = {'operation_id': state['operation_id'], 'source_sha256': current_digest,
-               'destination': str(destination), 'preserved_locator': values[RETIRED_KEY],
+               'destination': str(destination), 'source_snapshot': str(original),
+               'preserved_locator': values[RETIRED_KEY],
                'review': review, 'changed': True}
     # Persist provenance before the replacement; interrupted writes reconcile this receipt.
     save_json(receipt_path, receipt)

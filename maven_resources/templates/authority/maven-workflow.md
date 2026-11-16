@@ -4,7 +4,7 @@ Proposed skill: apply only as current applicable owner-approved cloud authority.
 
 ## Enable and initialize
 
-Confirm the absolute root, selected instance and existing project or authorized creation with genuine source evidence. Reject `/`, `$HOME`, `~/.maven` and the MAVEN checkout; do not auto-register the installation checkout or silently rebind an ambiguous/subdirectory root. Memory requires neither Git nor a no-Git selection. Journal generated identities before mutation and preserve interrupted setup receipts.
+Confirm the absolute root, selected instance and existing project or authorized creation with genuine source evidence. Reject `/`, `$HOME` and the installed MAVEN home itself; never auto-register an installation checkout or silently rebind an ambiguous/subdirectory root. An explicitly selected source-maintenance checkout may be its own project, separate from the installed runtime. Memory requires neither Git nor a no-Git selection. Journal generated identities before mutation and preserve interrupted setup receipts.
 
 ## Start choice and active line
 
@@ -29,7 +29,7 @@ Checkpoint waiting is bounded and may return pending honestly; it does not launc
 
 Wrap-up reconciles required memory work and closes only the selected session after verified persistence and no unresolved closure-blocking memory operations. Unpublished source can be reported as unfinished work without blocking closure. Memory checkpoint/closure never backs up files, commits, pushes, activates instructions, closes peers or revokes shared credentials. Show summaries at checkpoint completion, explicit wrap-up and on request, distinguishing universal promotions/updates, project updates and pending work. Keep routine maintenance successes quiet.
 
-When the owner chooses wrap-up-and-exit, pause new automatic maintenance before draining accepted work. An optional OMP pre-shutdown adapter can cancel exit and ask the agent to checkpoint/finish; automatic exit requires the exact verified closure. Other harness termination hooks cannot guarantee a remaining reasoning turn or veto exit. Best-effort end-event evidence is not a successful handover or proof all workers stopped. Startup offers recovery from original evidence after an unwrapped exit; missing conversation history is disclosed, never fabricated.
+When the owner chooses wrap-up-and-exit, call `maven_pause(drain=true)` to freeze all new assignment admission while accepted workers finish. Explicit resume cancels drain. An optional OMP pre-shutdown adapter can cancel exit and ask the agent to checkpoint/finish; automatic exit requires the exact verified closure. Other harness termination hooks cannot guarantee a remaining reasoning turn or veto exit. Best-effort end-event evidence is not a successful handover or proof all workers stopped. Startup offers recovery from original evidence after an unwrapped exit; missing conversation history is disclosed, never fabricated.
 
 
 ## Pause, resume and outage

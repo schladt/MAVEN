@@ -349,6 +349,7 @@ class SecretAdapters:
                       'catalog_record_id': record['record_id'], 'catalog_revision': record['revision'],
                       'store_id': self.store.store_id}
         validate_invocation(invocation)
+        self._reference(reference)
         _arguments(policy['document'], invocation, 3 if policy['document']['input']['mode'] == 'fd' else None)
         return {'invocation': invocation, 'invocation_digest': invocation_digest(invocation)}
 
@@ -362,10 +363,21 @@ class SecretAdapters:
             document['invocation_digest'] = invocation_digest(invocation)
         return validate_grant(document)
 
+    def _reference(self, reference):
+        try:
+            self.store.validate_reference(reference)
+        except AdapterError:
+            raise
+        except Exception:
+            _fail('adapter_store_mismatch')
+
     def execute(self, *, invocation, grant, grant_revision):
         validate_invocation(invocation)
         if invocation['home_id'] != self.home_id or self.store is None or self.catalog is None:
             _fail('adapter_authority_unavailable')
+        if self.store.store_id != invocation['store_id']:
+            _fail('adapter_store_mismatch')
+        self._reference(invocation['secret_ref'])
         policy = self.policy(invocation['adapter'])
         if policy['revision'] != invocation['adapter_revision']:
             _fail('adapter_revision_changed')

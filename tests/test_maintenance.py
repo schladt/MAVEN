@@ -70,6 +70,140 @@ class MaintenanceTests(unittest.TestCase):
         self.assertIsNone(self.memory.status()['catch_up'])
         self.assertIn('universal', explicit['assignment']['scopes'])
 
+    def test_same_cutoff_checkpoint_head_preserves_explicit_refs_and_legacy_ancestry(self):
+        first_note = self.service.save('note', self.note, source=self.source)
+        second_note = self.service.save('note', dict(self.note, title='Extra reference'), source=self.source)
+        first_ref = {'record_id': first_note['record_id'], 'revision': 1}
+        second_ref = {'record_id': second_note['record_id'], 'revision': 1}
+        with patch('tools.memory.maintenance.now', return_value='2026-01-01T00:00:00+00:00'):
+            first = self.memory.checkpoint(summary='First boundary', refs=[first_ref])['checkpoint']
+            second = self.memory.checkpoint(summary='Additional explicit version', refs=[second_ref])['checkpoint']
+            self.assertEqual(first['cutoff'], second['cutoff'])
+            # A schema-one ledger without the new head still retains its real base chain.
+            state = read_private(self.root, self.memory.path)
+            state.pop('latest_checkpoint')
+            save_private(self.root, self.memory.path, state)
+            third = Maintenance(self.service).checkpoint(summary='Final boundary')['checkpoint']
+        self.assertEqual(third['base'], second['receipt'])
+        self.assertIn(first['receipt'], second['refs'])
+        self.assertIn(second_ref, second['refs'])
+        with self.assertRaises(MaintenanceError):
+            self.memory.finish(first['checkpoint_id'])
+        self.assertEqual(self.memory.finish(third['checkpoint_id'])['status'], 'closed')
+        seen, pending = set(), [third['receipt']]
+        while pending:
+            ref = pending.pop()
+            key = (ref['record_id'], ref['revision'])
+            if key in seen:
+                continue
+            seen.add(key)
+            record = self.cloud.history[key]
+            if record['kind'] == 'checkpoint':
+                pending.extend(record['data']['memory_refs'])
+        self.assertIn((first_ref['record_id'], 1), seen)
+        self.assertIn((second_ref['record_id'], 1), seen)
+
+    def test_overlapping_checkpoint_completion_keeps_both_ancestry_branches(self):
+        operation, token = self.assign()
+        first = self.memory.checkpoint(summary='First pending boundary')['checkpoint']
+        note = self.service.save('note', self.note, source=self.source)
+        extra = {'record_id': note['record_id'], 'revision': 1}
+        second = self.memory.checkpoint(summary='Second pending boundary', refs=[extra])['checkpoint']
+        self.memory.complete(operation, worker_token=token, summary='No changes required', no_changes=True)
+        saved_second = self.memory.advance_checkpoint(second['checkpoint_id'])['checkpoint']
+        saved_first = self.memory.advance_checkpoint(first['checkpoint_id'])['checkpoint']
+        final = self.memory.checkpoint(summary='Join completed boundaries')['checkpoint']
+        self.assertEqual(final['base'], saved_first['receipt'])
+        self.assertIn(saved_second['receipt'], final['refs'])
+        self.assertIn(extra, saved_second['refs'])
+
+    def test_drain_preserves_queued_partial_and_applied_workers_through_finish(self):
+        queued = self.memory.enqueue('Queued work', source=self.source, workstream='queued')['assignment']
+        partial, partial_token = self.assign('Partial work', workstream='partial')
+        applied, applied_token = self.assign('Applied work', workstream='applied')
+        self.memory.apply(applied, worker_token=applied_token, changes=[{'kind': 'note', 'data': self.note}])
+        self.memory.apply_budget = 0
+        result = self.memory.apply(partial, worker_token=partial_token, changes=[
+            {'kind': 'note', 'data': self.note}, {'kind': 'note', 'data': dict(self.note, title='Second effect')}])
+        self.assertTrue(result['continue'])
+        self.memory.pause(anchor='conversation:end')
+        self.assertEqual(self.memory.complete(applied, worker_token=applied_token, summary='Saved')['status'], 'paused')
+        drain = self.memory.pause(drain=True)
+        self.assertEqual(drain['drain_cutoff'], 3)
+        restored = Maintenance(self.service)
+        self.assertEqual(restored.pause(drain=True)['drain_cutoff'], 3)
+        for automatic in (True, False):
+            with self.subTest(automatic=automatic), self.assertRaises(MaintenanceError):
+                restored.enqueue('Too late', source=self.source, automatic=automatic)
+        checkpoint = restored.checkpoint(summary='Drain accepted work')['checkpoint']
+        self.assertEqual(checkpoint['cutoff'], 3)
+        queued_token = restored.claim(queued['operation_id'], worker='draining-worker')['assignment']['worker_token']
+        self.assertEqual(restored.apply(partial, worker_token=partial_token)['status'], 'applied')
+        restored.complete(partial, worker_token=partial_token, summary='Both effects verified')
+        restored.complete(applied, worker_token=applied_token, summary='Saved')
+        restored.complete(queued['operation_id'], worker_token=queued_token, summary='Reviewed, no change', no_changes=True)
+        saved = restored.advance_checkpoint(checkpoint['checkpoint_id'])
+        self.assertEqual(saved['status'], 'checkpointed')
+        self.assertEqual(len([record for record in self.cloud.records.values()
+                              if record['kind'] == 'operation' and record['data']['name'] == 'memory-maintenance']), 3)
+        self.assertEqual(restored.finish(checkpoint['checkpoint_id'])['status'], 'closed')
+
+    def test_resume_cancels_drain_only_with_explicit_resume_evidence(self):
+        self.memory.pause(drain=True)
+        self.assertEqual(self.memory.resume()['status'], 'context_required')
+        self.assertEqual(self.memory.status()['drain_cutoff'], 0)
+        resumed = self.memory.resume(discussion='Actual discussion', source=self.source)
+        self.assertEqual(resumed['status'], 'queued')
+        self.assertIsNone(self.memory.status()['drain_cutoff'])
+        self.assertTrue(self.memory.enqueue('New admission', source=self.source)['accepted'])
+
+    def test_catch_up_state_tracks_normal_and_recovered_completion_after_restart(self):
+        for recover in (False, True):
+            with self.subTest(recover=recover):
+                self.memory.pause()
+                queued = self.memory.resume(discussion='Actual paused discussion', source=self.source)
+                operation = queued['assignment']['operation_id']
+                token = self.memory.claim(operation, worker='catch-up-worker')['assignment']['worker_token']
+                if recover:
+                    self.cloud.lose_next = True
+                    with self.assertRaises(MemoryClientError):
+                        self.memory.complete(operation, worker_token=token, summary='Reviewed discussion', no_changes=True)
+                    self.memory.recover(operation, worker_stopped=True)
+                else:
+                    self.memory.complete(operation, worker_token=token, summary='Reviewed discussion', no_changes=True)
+                restored = Maintenance(self.service)
+                self.assertEqual(restored.status()['catch_up']['state'], 'completed')
+                self.assertEqual(restored.resume()['catch_up']['state'], 'completed')
+                self.assertEqual(restored.status()['pending_count'], 0)
+
+    def test_claim_recovery_keeps_historical_receipt_without_expired_ownership(self):
+        task = self.service.save('task', {'title': 'Task', 'description': '', 'state': 'open'}, source=self.source)
+        operation, token = self.assign()
+        self.cloud.lose_next = True
+        with self.assertRaises(MemoryClientError):
+            self.memory.apply(operation, worker_token=token, changes=[{
+                'kind': 'task', 'task_action': 'claim', 'record_id': task['record_id'],
+                'expected_revision': 1, 'scope': 'project', 'lease_seconds': 60}])
+        self.cloud.records[task['record_id']]['claim'] = None
+        recovered = self.memory.recover(operation, worker_stopped=True)
+        effect = recovered['assignment']['task_effects'][0]
+        self.assertIsNone(effect['claim'])
+        self.assertEqual(effect['claim_receipt']['session_id'], self.session)
+
+    def test_explicit_claim_replay_rechecks_lease_instead_of_returning_cached_ownership(self):
+        task = self.service.save('task', {'title': 'Task', 'description': '', 'state': 'open'}, source=self.source)
+        operation = identifier()
+        arguments = dict(action='claim', expected_revision=1, lease_seconds=60,
+                         source=self.source, operation_id=operation)
+        first = self.memory.claim_task(task['record_id'], **arguments)
+        self.assertEqual(first['claim']['session_id'], self.session)
+        self.cloud.records[task['record_id']]['claim'] = None
+        replay = self.memory.claim_task(task['record_id'], **arguments)
+        self.assertIsNone(replay['claim'])
+        self.assertIsNone(replay['assignment']['task_effects'][0]['claim'])
+        self.assertEqual(replay['claim_receipt'], first['claim_receipt'])
+        self.assertEqual(self.memory.status()['pending_count'], 0)
+
     def test_checkpoint_pins_cutoff_and_later_work_cannot_change_its_manifest(self):
         operation, token = self.assign()
         boundary = self.memory.checkpoint(summary='Before the later change')
@@ -707,8 +841,8 @@ class MaintenanceTests(unittest.TestCase):
         self.assertEqual(self.memory.status()['pending_count'], 0)
 
     def test_finish_recovery_requires_the_original_persisted_closure(self):
-        first = self.memory.checkpoint(summary='Original handover')['checkpoint']['checkpoint_id']
         other = self.memory.checkpoint(summary='Different handover')['checkpoint']['checkpoint_id']
+        first = self.memory.checkpoint(summary='Original handover')['checkpoint']['checkpoint_id']
         with patch.object(self.service, 'finish') as finish:
             with self.assertRaises(MaintenanceError):
                 self.memory.finish(first, recover_only=True)

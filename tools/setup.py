@@ -16,7 +16,7 @@ from tools.interaction import Field, OperationPaused, checkpoint, message, requi
 from tools.setup_common import (
     SetupPending, approve, ask, atomic_private, confirm, private_directory,
     read_private, save_json, setup_lock, verify_authority, expected_account,
-    check_login_identity, permission_preflight,
+    check_login_identity, permission_preflight, inspect_login_identity,
 )
 
 
@@ -67,9 +67,8 @@ class Wizard:
 
     def identity(self, *, deploy=False):
         import boto3
-        from botocore.config import Config
-        from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
-        from tools.memory.environment import selected_aws_session, transport_ca_bundle
+        from tools.memory.client import MemoryClientError
+        from tools.memory.environment import selected_aws_session, authentication_handoff
         prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
         purpose = 'maintenance (CloudFormation or necessary metadata discovery)' if deploy else 'daily-use memory'
         stage('AWS identities')
@@ -107,28 +106,18 @@ class Wizard:
             raise SetupPending('Routine and metadata/deployment login caches must be separate.')
         private_directory(cache)
         self.settings({prefix + 'PROFILE': profile, prefix + 'LOGIN_CACHE': str(cache)})
-        os.environ['AWS_LOGIN_CACHE_DIRECTORY'] = str(cache)
         region = self.values['MAVEN_AWS_REGION']
         for attempt in range(2):
             try:
-                session = boto3.Session(profile_name=profile, region_name=region)
-                credentials = session.get_credentials()
-                if credentials is None:
-                    raise NoCredentialsError()
-                if credentials.method != 'login':
-                    raise SetupPending('Use a named AWS CLI aws login profile for guided setup, not saved static keys '
-                                       'or an implicit credential chain. Select a login-only profile in the private settings and resume.')
-                sts = session.client('sts', verify=transport_ca_bundle(), config=Config(
-                    connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
-                try:
-                    identity = sts.get_caller_identity()
-                finally:
-                    sts.close()
+                identity = inspect_login_identity(self.values, deploy=deploy)
                 break
-            except (BotoCoreError, ClientError):
+            except MemoryClientError as error:
+                if authentication_handoff(error, self.values, deploy=deploy) is None:
+                    raise
                 message(f'Login unavailable for selected profile {profile}. Configure it with your owner-approved AWS login flow.')
                 message('If a VPN/proxy requires a CA, source your installation activate file or set AWS_CA_BUNDLE to your trusted PEM bundle; TLS stays enabled.')
-                command = ['aws', 'login', '--profile', profile, '--region', region]
+                command = ['env', 'AWS_LOGIN_CACHE_DIRECTORY=' + str(cache),
+                           'aws', 'login', '--profile', profile, '--region', region]
                 message('Owner login command: ' + shlex.join(command))
                 message('AWS sign-in may also offer AWS Agent Toolkit skills and an AWS MCP connection.')
                 message('Those are optional AWS integrations, separate from MAVEN; declining them does not block MAVEN setup.')
@@ -378,19 +367,24 @@ class Wizard:
         if len(completed) == len(slugs):
             return
         approved = self.state.get('starter_collection_approval')
+        if approved is not None and approved['review_digest'] != digest(review):
+            if self.state.get('starter_submitted') or completed or self.state.get('submitted_requests'):
+                raise SetupPending('Submitted starter contents or connection changed; restore the original review and requests.')
+            self.state.setdefault('starter_approval_history', []).append(approved)
+            self.state.pop('starter_collection_approval')
+            self.save()
+            approved = None
         if approved is None:
             if not require().review('Install all starter instructions — one approval',
                                     summary(review, len(completed)),
                                     details=json.dumps(review, ensure_ascii=False, indent=2),
                                     identity=digest(review), identity_label='Collection digest'):
                 raise SetupPending('Starter collection approval declined; no remaining instructions were activated.')
-            approved = {'review_digest': digest(review), 'source': {
+            approved = {'review_digest': digest(review), 'review': review, 'source': {
                 'origin': 'owner MAVEN setup TUI',
                 'excerpt': 'Owner approved uploading and activating the complete starter collection / digest ' + digest(review)}}
             self.state['starter_collection_approval'] = approved
             self.save()
-        if approved['review_digest'] != digest(review):
-            raise SetupPending('Starter contents or connection changed; the saved collection approval cannot be reused.')
         for draft in review['pages']:
             checkpoint()
             if digest(collection(directory, self.values)) != approved['review_digest']:
@@ -453,17 +447,6 @@ class Wizard:
     def verify_authority(self, project_id=None):
         return verify_authority(self.env, project_id, values=self.values)
 
-    def secrets_readiness(self):
-        """Legacy setup consumes the same separately journaled administration stage."""
-        from tools.administration import AdminOperations
-        from tools.secret_setup import integration_settings
-        identifier = self.state.get('secrets_operation')
-        result = AdminOperations(self.home).status(identifier) if identifier else {}
-        outcome = result.get('outcome', {})
-        if (result.get('state') != 'completed' or outcome.get('secrets_ready') is not True
-                or outcome.get('settings') != integration_settings(self.values)):
-            raise SetupPending('Required secrets setup is unfinished. Resume maven-setup for this home; its exact secrets administration stage must complete before readiness.')
-        return outcome
 
     def run(self):
         stage('Instance selection')
@@ -491,7 +474,6 @@ class Wizard:
         stage('Verify readiness')
         checkpoint()
         generation = self.verify_authority()
-        self.secrets_readiness()
         self.state['instance_ready'] = True
         self.state['authority_generation'] = generation
         self.save()
@@ -537,7 +519,7 @@ def main(argv=None):
     from tools.tui import run_workflow
     return run_workflow('MAVEN instance setup', [
         'Instance selection', 'AWS identities', 'Deployment review', 'Initialize',
-        'Starter authority', 'Secrets store', 'Verify readiness',
+        'Starter authority', 'Verify readiness',
     ], lambda ui: _present(ui, args, home))
 
 
@@ -592,22 +574,13 @@ def _present(ui, args, home):
         if identifier is None and any(key in saved for key in ('mode', 'prepared', 'submitted_requests', 'project')):
             if args.fresh_operation:
                 raise SetupPending('Legacy setup evidence is unresolved. Resume it without --fresh-operation; no receipts were discarded.')
-            wizard = Wizard(home)
-            secret_operation = wizard.state.get('secrets_operation')
-            if not secret_operation:
-                secret_operation = AdminOperations(home).begin('secrets_setup', {})['operation_id']
-                wizard.state['secrets_operation'] = secret_operation
-                wizard.save()
-            result = present(ui, home, operation_id=secret_operation, kind='secrets_setup')
-            if result != 0:
-                return result
             result = _run(args, home)
             if result == 0:
                 from tools.tui.harness import finish_setup
                 wizard = Wizard(home)
                 return finish_setup(ui, home, {'home': str(home), 'account': expected_account(wizard.values),
                     'region': wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'), 'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
-                    'profile': wizard.values.get('MAVEN_AWS_PROFILE'), 'instance_ready': True, 'secrets_ready': True,
+                    'profile': wizard.values.get('MAVEN_AWS_PROFILE'), 'instance_ready': True,
                     'authority_generation': wizard.state['authority_generation'], 'project_configured': False,
                     'binding': dict(wizard.values)})
             return result
@@ -622,9 +595,6 @@ def _present(ui, args, home):
     if args.mode == 'update' and not args.operation and (not previous or verified):
         # A completed setup is archived; the update is a new reviewed operation. An unfinished
         # operation is resumed below and must itself be an update.
-        identifier = None
-    elif verified and previous.get('outcome', {}).get('secrets_ready') is not True:
-        # Old readiness is retained as history, not treated as the new core contract.
         identifier = None
     elif verified and not args.fresh_operation:
         from tools.tui.harness import completed_setup_outcome, finish_setup

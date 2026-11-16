@@ -32,9 +32,11 @@ function consumer() {
     let sendError;
     let sendResult;
     let startupInspection;
+    let statusInspection;
+    let selection;
     const context = {
         agent: { kind: 'main' }, mode: 'tui', cwd: '/work/project',
-        sessionManager: { getSessionId: () => native },
+        sessionManager: { getSessionId: () => native, getCwd: () => context.cwd },
         hasPendingMessages: () => false,
         setTimeout: (callback, ms) => { assert.equal(ms, 0); timers.push(callback); },
         shutdown: () => calls.push(['shutdown']),
@@ -42,6 +44,7 @@ function consumer() {
             notify: (...args) => calls.push(['notify', ...args]),
             select: async (title, options, settings) => {
                 calls.push(['select', title, options, settings]);
+                await selection;
                 return choice;
             },
         },
@@ -53,6 +56,7 @@ function consumer() {
             if (inspectionError) throw inspectionError;
             const output = args[0] === 'startup' ? { instruction: `Call maven_startup with ${native}` } : state;
             if (args[0] === 'startup') await startupInspection;
+            else await statusInspection;
             return { code: 0, killed: false, stdout: JSON.stringify(output), stderr: '' };
         },
         sendUserMessage: async (...args) => {
@@ -68,9 +72,12 @@ function consumer() {
         choose: (value) => { choice = value; },
         native: (value) => { native = value; },
         failInspection: () => { inspectionError = new Error('offline'); },
+        restoreInspection: () => { inspectionError = undefined; },
         failSend: () => { sendError = new Error('prompt not admitted'); },
         setSendResult: (value) => { sendResult = value; },
         setStartupInspection: (value) => { startupInspection = value; },
+        setStatusInspection: (value) => { statusInspection = value; },
+        setSelection: (value) => { selection = value; },
         emit: async (event, values = {}) => handlers.get(event)?.({ type: event, signal: new AbortController().signal, ...values }, context),
         runTimers: async () => { for (const callback of timers.splice(0)) await callback(); },
     };
@@ -322,4 +329,91 @@ test('already closed and unbound sessions do not demand capture or wrap-up', asy
         assert.equal(host.calls.filter(([name]) => name === 'select').length, 0);
         assert.equal(sends(host).length, 0);
     }
+});
+
+test('failed local startup inspection retries on a later same-conversation event', async () => {
+    const host = consumer();
+    host.failInspection();
+    await host.emit('session_start');
+    assert.equal(sends(host).length, 0);
+    host.restoreInspection();
+    await host.emit('session_switch');
+    await host.runTimers();
+    assert.equal(sends(host).length, 1);
+});
+
+test('ambiguous send rejection never duplicates a possibly admitted startup turn', async () => {
+    const host = consumer();
+    host.failSend();
+    await host.emit('session_start');
+    await host.runTimers();
+    await host.emit('session_branch');
+    await host.runTimers();
+    assert.equal(sends(host).length, 1);
+});
+
+test('shutdown status and dialog awaits are fenced by native identity and cwd', async () => {
+    for (const boundary of ['status', 'dialog']) {
+        for (const change of ['native', 'cwd']) {
+            const host = consumer();
+            const gate = deferred();
+            host.choose('Wrap up and exit');
+            if (boundary === 'status') host.setStatusInspection(gate.promise);
+            else host.setSelection(gate.promise);
+            const quitting = host.emit('session_before_shutdown');
+            // Let exec settle and the dialog begin before changing host state.
+            await new Promise(resolve => setImmediate(resolve));
+            if (change === 'native') host.native('other');
+            else host.context.cwd = '/other';
+            gate.resolve();
+            assert.deepEqual(await quitting, { cancel: true });
+            await host.runTimers();
+            assert.equal(sends(host).length, 0);
+            assert.equal(exits(host), 0);
+        }
+    }
+});
+
+test('deferred wrap-up refuses changed cwd or newly queued work', async () => {
+    for (const change of ['cwd', 'queue']) {
+        const host = consumer();
+        host.choose('Wrap up and exit');
+        await host.emit('session_before_shutdown');
+        if (change === 'cwd') host.context.cwd = '/other';
+        else host.context.hasPendingMessages = () => true;
+        await host.runTimers();
+        assert.equal(sends(host).length, 0);
+    }
+});
+
+test('finish inspection cannot exit after cwd changes or messages queue during await', async () => {
+    for (const change of ['cwd', 'queue']) {
+        const host = consumer();
+        await requestWrap(host);
+        host.setState({ status: 'closed', binding });
+        const gate = deferred();
+        host.setStatusInspection(gate.promise);
+        const settling = host.emit('agent_end');
+        if (change === 'cwd') host.context.cwd = '/other';
+        else host.context.hasPendingMessages = () => true;
+        gate.resolve();
+        await settling;
+        assert.equal(exits(host), 0);
+    }
+});
+
+test('host event cwd is a snapshot: freshness uses the live session manager directory', async () => {
+    const host = consumer();
+    let cwd = host.context.cwd;
+    host.context.sessionManager.getCwd = () => cwd;
+    host.choose('Wrap up and exit');
+    const gate = deferred();
+    host.setStatusInspection(gate.promise);
+    const quitting = host.emit('session_before_shutdown');
+    cwd = '/changed-without-new-event-context';
+    gate.resolve();
+    assert.deepEqual(await quitting, { cancel: true });
+    await host.runTimers();
+    assert.equal(sends(host).length, 0);
+    assert.equal(host.context.cwd, '/work/project', 'the host event snapshot did not change');
 });

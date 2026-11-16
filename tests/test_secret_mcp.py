@@ -107,7 +107,8 @@ class SecretMCPTests(unittest.IsolatedAsyncioTestCase):
         from tools.memory.adapter_contracts import POLICY_ROUTE, CONSUME_ROUTE
         from test_secret_adapters import invocation, policy, ready
         await self.call('maven_start', choice='read_only', cwd=str(self.workspace))
-        request = {**invocation(), 'home_id': HOME_ID}
+        request = {**invocation(), 'home_id': HOME_ID, 'store_id': self.store.store_id,
+                   'secret_ref': {'provider': 'ssm', 'name': '/synthetic/secrets/owner.api:1'}}
         for code, expected in (('claim_conflict', 'invocation_consumed'),
                                ('not_authorized', 'adapter_not_authorized')):
             with self.subTest(code=code):
@@ -135,6 +136,40 @@ class SecretMCPTests(unittest.IsolatedAsyncioTestCase):
         _, completed = await self.call('maven_secrets', action='retry_catalog', operation_id=pending['operation_id'])
         self.assertEqual(completed['state'], 'completed')
         self.assertEqual(len(self.session.parameters.versions['/synthetic/secrets/owner.api']), 1)
+        self.assertIsNone(self.app.binding)
+
+    async def test_reference_corrections_are_returned_before_spending_a_grant(self):
+        from test_secret_adapters import invocation
+        await self.call('maven_start', choice='read_only', cwd=str(self.workspace))
+        for reference, error in (
+                ({'provider': 'ssm', 'name': '/synthetic/secrets/owner.api'}, 'secret_reference_migration_required'),
+                ({'provider': 'secretsmanager', 'name': 'legacy/secret'}, 'unsupported_secret_provider')):
+            request = {**invocation(), 'home_id': HOME_ID, 'store_id': self.store.store_id, 'secret_ref': reference}
+            with self.subTest(error=error), patch.object(self.cloud, 'invoke') as invoke, \
+                    patch.object(self.store, 'read_secret') as read:
+                _, result = await self.call('maven_secret_adapter', action='execute', parameters={
+                    'invocation': request, 'grant': 'secret-grant-fixture', 'grant_revision': 1})
+            self.assertEqual((result['status'], result['error']), ('blocked', error))
+            self.assertIn('catalog', result['next_action'])
+            invoke.assert_not_called()
+            read.assert_not_called()
+
+    async def test_conflict_resolution_uses_reviewed_revision_without_reupload(self):
+        await self.call('maven_start', choice='read_only', cwd=str(self.workspace))
+        await self.call('maven_secrets', action='store_and_catalog', name='owner.api',
+                        source_path=str(self.input), source=SOURCE)
+        self.cloud.fail_before = 'temporarily_unavailable'
+        _, pending = await self.call('maven_secrets', action='store_and_catalog', name='owner.api',
+                                     source_path=str(self.input), source=SOURCE, replace=True)
+        self.cloud.records['owner.api']['revision'] += 1
+        _, conflict = await self.call('maven_secrets', action='retry_catalog', operation_id=pending['operation_id'])
+        self.assertEqual(conflict['state'], 'catalog_conflict')
+        with patch.object(self.store, 'put') as put:
+            _, result = await self.call('maven_secrets', action='resolve_catalog', operation_id=pending['operation_id'],
+                expected_revision=conflict['conflict']['expected_revision'], source=SOURCE)
+        self.assertEqual(result['state'], 'completed')
+        self.assertEqual(result['storage_receipt'], pending['storage_receipt'])
+        put.assert_not_called()
         self.assertIsNone(self.app.binding)
 
 

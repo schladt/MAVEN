@@ -118,7 +118,7 @@ class MemoryBoundary:
             raise BoundaryError('memory record scope or revision mismatch')
         return record
 
-    def _complete_request(self, route, body, result):
+    def _complete_request(self, route, body, result, *, observe_only=False):
         """Verify a reconciled receipt by exact read-back: a lookup proves the key, not this body."""
         record = self.read(body['record_id'], body['expected_revision'] + 1,
                            scope='universal' if route == 'write' and body.get('project_id') is None else 'context')
@@ -132,11 +132,14 @@ class MemoryBoundary:
                     or record.get('tags') != body.get('tags', [])):
                 raise BoundaryError('memory write content does not match read-back')
         else:
-            if record.get('kind') != 'task' or record['data']['state'] != result.get('state'):
+            expected_state = {'claim': 'in_progress', 'complete': 'completed', 'release': 'open'}[body['action']]
+            if (record.get('kind') != 'task' or result.get('state') != expected_state
+                    or record['data']['state'] != expected_state):
                 raise BoundaryError('task claim state does not match exact read-back')
             self._claim_receipt(body, result)
             # Historical versions deliberately omit mutable claims. The exact
             # operation receipt proves the old effect, not ownership of a live lease.
+            record = dict(record, claim=None)
             current = self.read(body['record_id'], scope='context')
             if current['revision'] == result['revision']:
                 claim = current.get('claim')
@@ -148,7 +151,7 @@ class MemoryBoundary:
                     raise BoundaryError('current task claim release does not match read-back')
                 record = current
             record = dict(record, claim_receipt=result)
-        return self._finish_request(route, body, record, result)
+        return record if observe_only else self._finish_request(route, body, record, result)
 
     def _claim_receipt(self, body, result):
         if body['action'] == 'claim':
@@ -158,8 +161,8 @@ class MemoryBoundary:
         elif result.get('session_id') is not None or result.get('fence') != body['fence']:
             raise BoundaryError('task claim release receipt does not match request')
 
-    def _complete_receipt(self, route, body, result, target):
-        """Bind a direct receipt to its exact request without a read-back.
+    def _complete_receipt(self, route, body, result):
+        """Bind direct writes without read-back; verify mutable task claims separately.
 
         The service commits exactly this body under its request key and CAS revision, and
         replays only an identical canonical request; the record is the request applied.
@@ -173,16 +176,9 @@ class MemoryBoundary:
                       'data_scope': body['data_scope'], 'project_id': body.get('project_id'),
                       'data': deepcopy(body['data']), 'tags': list(body.get('tags', []))}
         else:
-            state = {'claim': 'in_progress', 'complete': 'completed', 'release': 'open'}[body['action']]
-            if result.get('state') != state or target.get('kind') != 'task':
-                raise BoundaryError('task claim receipt does not match the requested transition')
-            self._claim_receipt(body, result)
-            claim = ({key: result[key] for key in ('session_id', 'fence', 'expires_at')}
-                     if body['action'] == 'claim' else None)
-            record = {**identity, **{key: deepcopy(target[key]) for key in
-                                     ('kind', 'classification', 'data_scope', 'project_id', 'tags')},
-                      'data': dict(deepcopy(target['data']), state=state), 'claim': claim,
-                      'claim_receipt': result}
+            # Direct idempotent replies also contain historical receipts. Only a
+            # current read can prove that their lease still belongs to this worker.
+            return self._complete_request(route, body, result)
         return self._finish_request(route, body, record, result)
 
     def _finish_request(self, route, body, record, result):
@@ -230,7 +226,7 @@ class MemoryBoundary:
                 and meta.get('boundary_outcome') == 'abandoned-by-owner')
 
     def _submit(self, route, body, *, target=None):
-        target = self._validate_request(route, body, target=target)
+        self._validate_request(route, body, target=target)
         if private_path(self.root, self.pending_path).exists():
             raise BoundaryError('an unresolved cloud request exists; run explicit recover before further writes')
         if self.authority_generation is not None and 'authority_generation' not in body:
@@ -252,7 +248,7 @@ class MemoryBoundary:
             raise BoundaryError('memory service returned no verified result')
         if response.get('reconciled'):
             return result, self._complete_request(route, body, result)
-        return result, self._complete_receipt(route, body, result, target)
+        return result, self._complete_receipt(route, body, result)
 
     def submit(self, route, body):
         """Journal an exact caller-owned request key. Caller holds the session lock/writer guard."""
@@ -277,15 +273,17 @@ class MemoryBoundary:
         _, record = self._submit('write', body)
         return record
 
-    def recover(self):
-        """Reconcile the exact persisted request key; never generate a replacement."""
+    def recover(self, *, observe_only=False, before_replay=None):
+        """Observe or reconcile the original request; authorize replay only when needed."""
         from .client import DEFINITIVE_MUTATION_ERRORS, MemoryClientError
         if not private_path(self.root, self.pending_path).exists():
-            self.restore_pointer()
+            if not observe_only:
+                self.restore_pointer()
             return None
         request = read_private(self.root, self.pending_path)
-        fingerprint = request.pop('digest', None)
-        if request.get('session_id') != self.session_id or fingerprint != digest(request):
+        fingerprint = request.get('digest')
+        if (request.get('session_id') != self.session_id
+                or fingerprint != digest({key: value for key, value in request.items() if key != 'digest'})):
             raise BoundaryError('pending request binding is invalid')
         route, body = request['route'], request['body']
         self._validate_request(route, body)
@@ -298,6 +296,10 @@ class MemoryBoundary:
         except MemoryClientError as error:
             if error.code != 'operation_unavailable':
                 raise
+            if observe_only:
+                return {'route': route, 'request_key': key, 'status': 'pending', 'replayed': False}
+            if before_replay is not None:
+                before_replay()
             try:
                 result = self.invoke(route, body)
             except MemoryClientError as retry:
@@ -306,10 +308,11 @@ class MemoryBoundary:
                                  {'request': request, 'status': retry.code})
                     private_path(self.root, self.pending_path).unlink()
                 raise
-        record = self._complete_request(route, body, result)
-        if record['record_id'] == self.session_id:
+        record = self._complete_request(route, body, result, observe_only=observe_only)
+        if not observe_only and record['record_id'] == self.session_id:
             save_private(self.root, self.SESSION_PATH, self.ref(record))
-        return {'route': route, 'record': self.ref(record), 'result': result}
+        return {'route': route, 'record': self.ref(record), 'result': result,
+                'peer_abandoned': route == 'write' and self._peer_abandonment(body)}
 
     def restore_pointer(self):
         """Recover the known session identity, including a crash before its pointer rename."""
@@ -423,7 +426,8 @@ class MemoryBoundary:
             raise BoundaryError('session already has a cloud pointer; explicitly resume it')
         from .skills import SessionSkills
         skills = SessionSkills(self.client, self.root, self.project_id, self.session_id)
-        prepared = skills.start()
+        prepared = skills.start(loaded=context['instructions'],
+                                authority_generation=context['authority_generation'])
         data = {'state': 'active', 'workflow': 'maven-workflow', 'summary': json.dumps({
             'root': str(self.root), 'harness': self.harness, 'harness_session': self.harness_session,
             'machine': socket.gethostname().split('.')[0] or None,

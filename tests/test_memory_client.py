@@ -156,6 +156,127 @@ class MemoryClientBoundaries(unittest.TestCase):
         self.assertEqual(client.last_generation, 9)
 
 
+class AuthenticationAndWarmupBoundaries(unittest.TestCase):
+    def test_authentication_handoff_uses_exact_selected_profile_cache_and_region(self):
+        from types import MappingProxyType
+        from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError
+        from tools.memory.client import aws_error
+        from tools.memory.environment import authentication_handoff
+        values = MappingProxyType({
+            'MAVEN_AWS_PROFILE': 'daily', 'MAVEN_AWS_LOGIN_CACHE': '/synthetic/home with spaces/daily',
+            'MAVEN_DEPLOY_PROFILE': 'maintenance', 'MAVEN_DEPLOY_LOGIN_CACHE': '/synthetic/maintenance',
+            'MAVEN_AWS_REGION': 'us-west-2'})
+        for deploy, profile, cache in [(False, 'daily', values['MAVEN_AWS_LOGIN_CACHE']),
+                                       (True, 'maintenance', values['MAVEN_DEPLOY_LOGIN_CACHE'])]:
+            with self.subTest(deploy=deploy):
+                handoff = authentication_handoff(NoCredentialsError(), values, deploy=deploy)
+                self.assertEqual(handoff['command'], ['aws', 'login', '--profile', profile,
+                                                       '--region', 'us-west-2'])
+                self.assertEqual(handoff['environment'], {'AWS_LOGIN_CACHE_DIRECTORY': cache})
+                self.assertIn('read-only inspection', handoff['reconnect'])
+        for provider_code, code in [('ExpiredToken', 'selected_login_unavailable_or_expired'),
+                                    ('AccessDenied', 'not_authorized'),
+                                    ('DatabaseResumingException', 'warming'),
+                                    ('PRIVATE PROVIDER CONTENT', 'aws_service_unavailable')]:
+            error = ClientError({'Error': {'Code': provider_code, 'Message': 'PRIVATE MESSAGE'}}, 'Synthetic')
+            with self.subTest(provider_code=provider_code):
+                normalized = aws_error(error)
+                self.assertEqual(normalized.code, code)
+                self.assertNotIn('PRIVATE', str(normalized))
+                self.assertEqual(authentication_handoff(error, values) is not None,
+                                 code == 'selected_login_unavailable_or_expired')
+        for error in [EndpointConnectionError(endpoint_url='https://private.invalid'),
+                      MemoryClientError('unexpected_login_identity'), MemoryClientError('invalid_role_credentials'),
+                      MemoryClientError('selected_login_or_role_unavailable'), MemoryClientError('context_incomplete')]:
+            self.assertIsNone(authentication_handoff(error, values))
+        self.assertIsNone(authentication_handoff(NoCredentialsError(), {}))
+
+    def test_read_only_warmup_is_bounded_and_only_retries_typed_warming(self):
+        from tools.memory.client import wait_for_read_only
+        clock = [0.0]
+        def sleep(duration):
+            clock[0] += duration
+        with patch('tools.memory.client.time.monotonic', side_effect=lambda: clock[0]), \
+                patch('tools.memory.client.time.sleep', side_effect=sleep):
+            probe = MagicMock(side_effect=MemoryClientError('warming'))
+            progress = MagicMock()
+            with self.assertRaisesRegex(MemoryClientError, '^warming$'):
+                wait_for_read_only(probe, budget=3, interval=2, on_warming=progress)
+            self.assertEqual(probe.call_count, 2)
+            self.assertEqual(progress.call_count, 2)
+            self.assertEqual(clock[0], 3)
+            for code in ('transport_unavailable', 'temporarily_unavailable', 'authentication_required',
+                         'outcome_unknown', 'not_authorized'):
+                probe = MagicMock(side_effect=MemoryClientError(code))
+                with self.subTest(code=code), self.assertRaisesRegex(MemoryClientError, '^' + code + '$'):
+                    wait_for_read_only(probe)
+                probe.assert_called_once()
+
+    def test_read_only_warmup_preserves_cancellation_and_success(self):
+        from tools.memory.client import wait_for_read_only
+        probe = MagicMock(side_effect=[MemoryClientError('warming'), {'status': 'ready'}])
+        with patch('tools.memory.client.time.sleep'):
+            self.assertEqual(wait_for_read_only(probe), {'status': 'ready'})
+        probe = MagicMock(side_effect=MemoryClientError('warming'))
+        checkpoint = MagicMock(side_effect=[None, InterruptedError('cancel')])
+        with patch('tools.memory.client.time.sleep'), self.assertRaises(InterruptedError):
+            wait_for_read_only(probe, checkpoint=checkpoint)
+        probe.assert_called_once()
+
+    def test_read_routes_share_warmup_without_replaying_uncertain_mutations(self):
+        client = MemoryClient(CONFIG, None)
+        self.addCleanup(client.close)
+        receipt = {'status': 'ready', 'data': {'request_key': KEY}}
+        with patch.object(client, '_post', side_effect=[
+                (503, {'status': 'warming', 'detail': 'safe'}),
+                (200, {'status': 'ready', 'data': {}})]) as post, patch('tools.memory.client.time.sleep'):
+            self.assertEqual(client.invoke('/v1/memory/search', {})['status'], 'ready')
+            self.assertEqual([call.args[0] for call in post.call_args_list], ['/v1/memory/search'] * 2)
+        with patch.object(client, '_post', side_effect=[
+                MemoryClientError('transport_unavailable'), (503, {'status': 'warming'}),
+                (200, receipt)]) as post, patch('tools.memory.client.time.sleep'):
+            self.assertTrue(client.invoke('/v1/records/change', {'request_key': KEY})['reconciled'])
+            self.assertEqual([call.args[0] for call in post.call_args_list],
+                             ['/v1/records/change', '/v1/operations/lookup', '/v1/operations/lookup'])
+        with patch.object(client, '_post', side_effect=[
+                MemoryClientError('transport_unavailable'),
+                MemoryClientError('selected_login_unavailable_or_expired')]), \
+                patch('tools.memory.client.time.sleep'):
+            with self.assertRaises(MemoryClientError) as failure:
+                client.invoke('/v1/records/change', {'request_key': KEY})
+            self.assertEqual((failure.exception.code, failure.exception.request_key), ('outcome_unknown', KEY))
+
+    def test_database_warmup_only_repeats_the_read_only_probe(self):
+        from tools.setup_common import wait_for_database
+        values = {'synthetic': 'selection'}
+        with patch('tools.setup_common.database_status', side_effect=['warming', 'awake']) as probe, \
+                patch('tools.memory.client.time.sleep'):
+            self.assertEqual(wait_for_database(values), 'awake')
+            self.assertEqual(probe.call_count, 2)
+            probe.assert_called_with(values)
+        with patch('tools.setup_common.database_status', return_value='not_authorized') as probe:
+            self.assertEqual(wait_for_database(values), 'not_authorized')
+            probe.assert_called_once()
+        with patch('tools.setup_common.database_status', return_value='warming') as probe:
+            self.assertEqual(wait_for_database(values, budget=0), 'warming')
+            probe.assert_called_once()
+
+    def test_setup_authority_uses_runtime_scope_without_optional_capabilities(self):
+        from tools.setup_common import SetupPending, verify_authority
+        client = MagicMock()
+        client.load_context.return_value = {'data': {'instructions': [{'page_kind': 'directive'}],
+                                                     'authority_generation': 7}}
+        with patch('tools.memory.environment.configured_client', return_value=client):
+            self.assertEqual(verify_authority(Path('/synthetic/.env'), values={}), 7)
+            client.load_context.assert_called_once_with({'workflow': 'maven-workflow'})
+            client.close.assert_called_once()
+            client.reset_mock()
+            client.load_context.return_value = {'data': {'instructions': [], 'authority_generation': 7}}
+            with self.assertRaises(SetupPending):
+                verify_authority(Path('/synthetic/.env'), values={})
+            client.close.assert_called_once()
+
+
 class RefreshableSessionBoundaries(unittest.TestCase):
     def setUp(self):
         import boto3
@@ -172,6 +293,7 @@ class RefreshableSessionBoundaries(unittest.TestCase):
             'MAVEN_AWS_LOGIN_CACHE': self.directory.name,
         }
         self.source = MagicMock()
+        self.source.get_credentials.return_value.method = 'login'
         self.sts = self.source.client.return_value
         self.sts.get_caller_identity.return_value = {'Arn': self.values['MAVEN_AWS_EXPECTED_PRINCIPAL']}
         self.sts.assume_role.side_effect = lambda **kwargs: self.temporary(
@@ -252,7 +374,8 @@ class RefreshableSessionBoundaries(unittest.TestCase):
                     self.sts.assume_role.return_value = self.temporary('expired', self.clock - timedelta(seconds=1))
                 closes = self.sts.close.call_count
                 with patch.object(client.http, 'post') as post:
-                    with self.assertRaisesRegex(MemoryClientError, '^selected_login_or_role_unavailable$'):
+                    code = 'not_authorized' if mode == 'denied' else 'invalid_role_credentials'
+                    with self.assertRaisesRegex(MemoryClientError, '^' + code + '$'):
                         client._post('/v1/context/load', {}, 10)
                     post.assert_not_called()
                 self.assertEqual(self.sts.close.call_count, closes + 2)
@@ -966,13 +1089,14 @@ class EnvironmentAndDisplayBoundaries(unittest.TestCase):
                       'MAVEN_AWS_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/selected',
                       'MAVEN_AWS_LOGIN_CACHE': root}
             with patch('tools.memory.environment.boto3.Session') as session:
+                session.return_value.get_credentials.return_value.method = 'login'
                 session.return_value.client.return_value.get_caller_identity.return_value = {
                     'Arn': 'arn:aws:iam::123456789012:root'}
                 with self.assertRaisesRegex(MemoryClientError, 'unexpected_login_identity'):
                     selected_aws_session(values)
                 session.assert_called_once_with(profile_name='selected-profile', region_name='us-east-1')
             with patch('tools.memory.environment.boto3.Session') as session:
-                with self.assertRaisesRegex(MemoryClientError, 'selected_login_unavailable_or_expired'):
+                with self.assertRaisesRegex(MemoryClientError, 'selected_login_configuration_unavailable'):
                     selected_aws_session({})
                 session.assert_not_called()
 

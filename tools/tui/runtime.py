@@ -54,11 +54,18 @@ def _matching_python(homes=(), preferred=None):
     return executable
 
 
-def _distributions():
-    # packaging is an explicit UI dependency; core CLI recovery never imports it.
-    from packaging.requirements import Requirement
-    from packaging.utils import canonicalize_name
-    queue = [Requirement("textual>=2.1,<3"), Requirement("packaging>=24,<27")]
+def _distributions(*, ui=True):
+    try:
+        from packaging.requirements import Requirement
+        from packaging.utils import canonicalize_name
+    except ImportError:
+        raise UninstallError('Protected cloud/UI dependency staging requires installed packaging>=24; '
+                             'local stdlib recovery remains available. Repair the supported package dependencies before planning cloud removal.') from None
+    queue = [Requirement("packaging>=24,<27")]
+    if ui:
+        queue.append(Requirement("textual>=2.1,<3"))
+    else:
+        queue.extend([Requirement("boto3[crt]>=1.41,<2"), Requirement("requests>=2,<3")])
     for name in ("boto3[crt]", "aws-encryption-sdk[MPL]", "requests"):
         requirement = Requirement(name)
         try:
@@ -139,7 +146,7 @@ def _verify_runtime(root, plan_digest=None):
     return site
 
 
-def _stage_dependencies(destination, *, plan_digest=None):
+def _stage_dependencies(destination, *, plan_digest=None, ui=True):
     if destination.exists() or destination.is_symlink():
         return _verify_runtime(destination, plan_digest)
     private_directory(destination.parent)
@@ -147,7 +154,7 @@ def _stage_dependencies(destination, *, plan_digest=None):
     try:
         site = private_directory(temporary / "site")
         manifest, versions = {}, {}
-        for name, distribution in _distributions().items():
+        for name, distribution in _distributions(ui=ui).items():
             versions[name] = distribution.version
             files = distribution.files
             if files is None:
@@ -180,6 +187,24 @@ def _stage_dependencies(destination, *, plan_digest=None):
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
+
+
+def cloud_command(plan, directory, arguments):
+    """Use the reviewed external dependencies, never stage replacements on resume."""
+    recovery = plan['cloud_recovery']
+    root = directory / 'cloud-runtime'
+    if file_digest(root / 'manifest.json') != recovery['manifest_sha256']:
+        raise UninstallError('Cloud recovery dependency manifest changed')
+    site = _verify_runtime(root, plan['operation_id'])
+    python = _matching_python(plan['machine_homes'], plan['recovery_python'])
+    environment = _environment()
+    for name, value in recovery.get('external_environment', {}).items():
+        selected = Path(value)
+        if any(selected.resolve().is_relative_to(Path(home)) for home in plan['machine_homes']):
+            raise UninstallError('Reviewed cloud configuration/trust dependency now resolves inside a removal target')
+        environment[name] = value
+    return ([python, '-I', '-B', '-c', _WORKER_START,
+             str(directory / 'runner/run.py'), str(site), *arguments], environment)
 
 
 def launch_uninstaller():
@@ -228,6 +253,8 @@ def worker_command(plan_path, arguments: list[str]):
     if any(location == root or location.is_relative_to(root)
            for root in roots for location in (protected, Path(sys.prefix).absolute())):
         raise UninstallError("the active TUI runtime is inside a removal target; relaunch the protected uninstall dashboard")
+    if plan.get('cloud_recovery'):
+        return cloud_command(plan, path.parent, arguments)
     python = _matching_python(plan["machine_homes"], plan["recovery_python"])
     site = _stage_dependencies(path.parent / "ui-runtime", plan_digest=plan["plan_digest"])
     _verify_runner(plan, path.parent)

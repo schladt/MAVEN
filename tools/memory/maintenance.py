@@ -73,12 +73,13 @@ class Maintenance:
         return state
 
     @contextmanager
-    def _locked(self):
+    def _locked(self, *, observe=False):
         from tools.coordination import project_binding_lock
         from tools.project import load_project
         with project_binding_lock(self.service.home, self.root):
             with private_lock(self.service.home, 'runtime/registry.lock'):
-                self.service.registry._allow_work(self.root)
+                if not observe:
+                    self.service.registry._allow_work(self.root)
                 if load_project(self.root)['project_id'] != self.project_id:
                     raise MaintenanceError('project binding changed; old maintenance cannot enter the new runtime')
             with private_lock(self.root, self.lock):
@@ -116,6 +117,37 @@ class Maintenance:
         if item.get('completion'):
             refs.append(item['completion'])
         return unique_refs(refs)
+
+    @staticmethod
+    def _catch_up(state):
+        result = deepcopy(state['catch_up'])
+        if result and result.get('operation_id') in state['assignments']:
+            result['state'] = state['assignments'][result['operation_id']]['state']
+        return result
+
+    @staticmethod
+    def _paused(state, item):
+        cutoff = state.get('drain_cutoff')
+        return state['paused'] and item['automatic'] and (
+            cutoff is None or item['sequence'] > cutoff)
+
+    @staticmethod
+    def _checkpoint_frontier(state):
+        saved = {key: value for key, value in state['checkpoints'].items() if value['state'] == 'saved'}
+        referenced = {ref['record_id'] for value in saved.values()
+                      for ref in value.get('refs', ([value['base']] if value.get('base') else []))}
+        return [value for key, value in saved.items() if key not in referenced]
+
+    @staticmethod
+    def _checkpoint_head(state):
+        identifier = state.get('latest_checkpoint')
+        if identifier is not None:
+            return state['checkpoints'][identifier]
+        # Schema-one ledgers predate the explicit head. Completion time, not the
+        # assignment cutoff (nor JSON key order), identifies their latest save.
+        return max(Maintenance._checkpoint_frontier(state),
+                   key=lambda value: (value.get('completed_at', value['created_at']),
+                                      value['checkpoint_id']), default=None)
 
     @staticmethod
     def _task_effects(item):
@@ -167,7 +199,7 @@ class Maintenance:
                     'ref_count': len(checkpoint.get('refs', checkpoint['explicit_refs']))}
 
     def status(self, operation_id=None, *, detail=False):
-        with self._locked():
+        with self._locked(observe=True):
             state = self._load()
             if operation_id:
                 item = self._get(state, operation_id)
@@ -177,7 +209,7 @@ class Maintenance:
             result = {'status': 'paused' if state['paused'] else 'ready',
                       'binding': dict(self.binding), 'live_state_checked': False,
                       'automatic_updates': not state['paused'], 'pause_anchor': state['pause_anchor'],
-                      'catch_up': deepcopy(state['catch_up']),
+                      'catch_up': self._catch_up(state), 'drain_cutoff': state.get('drain_cutoff'),
                       'pending_count': sum(item['state'] not in TERMINAL for item in state['assignments'].values())}
             if detail:
                 return {**result, 'assignments': [self._brief(item) for item in state['assignments'].values()],
@@ -212,6 +244,8 @@ class Maintenance:
                 raise MaintenanceError('assignment identity already belongs to different intent')
             return {'status': existing['state'], 'assignment': deepcopy(existing),
                     'cloud_saved': existing['state'] == 'completed'}
+        if state.get('drain_cutoff') is not None:
+            raise MaintenanceError('memory is draining its accepted cutoff; resume explicitly before admitting new work')
         if payload['automatic'] and state['paused']:
             return {'status': 'paused', 'accepted': False, 'cloud_saved': False,
                     'message': 'Automatic memory is paused; no assignment was captured.'}
@@ -239,7 +273,7 @@ class Maintenance:
         context_ref = self.service.authority_ref()
         with self._transaction() as state:
             item = self._get(state, operation_id)
-            if state['paused'] and item['automatic']:
+            if self._paused(state, item):
                 return {'status': 'paused', 'operation_id': operation_id}
             if item['state'] in TERMINAL or item.get('superseded_by'):
                 raise MaintenanceError('assignment was completed or superseded')
@@ -385,7 +419,7 @@ class Maintenance:
             self._worker(item, worker_token)
             if item.get('superseded_by'):
                 raise MaintenanceError('newer intent superseded this assignment')
-            if state['paused'] and item['automatic']:
+            if self._paused(state, item):
                 return {'status': 'paused', 'operation_id': operation_id}
             if item['state'] in ('applying', 'uncertain', 'completing'):
                 raise MaintenanceError('recover the original pending effect instead of replaying apply')
@@ -410,7 +444,7 @@ class Maintenance:
                 if item.get('superseded_by'):
                     item['state'] = 'superseded'
                     return self._result('superseded', item, detail=detail)
-                if state['paused'] and item['automatic']:
+                if self._paused(state, item):
                     item['state'] = 'claimed'
                     return {'status': 'paused', 'operation_id': operation_id}
                 effect = next((effect for effect in item['effects'] if effect['state'] == 'pending'), None)
@@ -476,7 +510,7 @@ class Maintenance:
                 raise MaintenanceError('a superseded assignment cannot claim completion')
             if item['state'] in ('applying', 'uncertain', 'completing'):
                 raise MaintenanceError('reconcile the pending effect before completion')
-            if state['paused'] and item['automatic']:
+            if self._paused(state, item):
                 return {'status': 'paused', 'operation_id': operation_id}
             if any(effect['state'] not in ('saved', 'superseded') for effect in item['effects']):
                 raise MaintenanceError('all effects must have verified outcomes before completion')
@@ -546,7 +580,7 @@ class Maintenance:
                     return item['intent']
         return None
 
-    def recover(self, operation_id, *, worker_stopped):
+    def recover(self, operation_id, *, worker_stopped, writer_tokens=None):
         if worker_stopped is not True:
             raise MaintenanceError('recovery requires the actual worker to be stopped')
         with self._transaction() as state:
@@ -572,11 +606,12 @@ class Maintenance:
                 item['state'] = 'applying'
         if request is None:
             # The effect receipt survived, but the process stopped before complete.
+            self.service.recover(workers_stopped=worker_stopped, writer_tokens=writer_tokens)
             return self.complete(operation_id, worker_token=token, summary=summary)
         # Reconcile the original journal and key, never resubmit the caller's input
         # as a new operation. General semantic assignments still need worker reasoning.
         try:
-            self.service.recover()
+            self.service.recover(workers_stopped=worker_stopped, writer_tokens=writer_tokens)
             record = self._execute(request)
         except Exception as error:
             self._record_failure(operation_id, request, error, completion=effect is None, recovering=True)
@@ -689,21 +724,36 @@ class Maintenance:
             self._explicit(identifier, 'explicit-task', change, reason)
         item = self.status(identifier, detail=True)['assignment']
         effect = next(effect for effect in item['effects'] if effect['state'] == 'saved')
+        if queued['assignment']['state'] == 'completed' and action == 'claim':
+            current = self.service.read_record(record_id)
+            claim = current.get('claim')
+            receipt = effect.get('claim_receipt') or {}
+            effect['claim'] = (claim if current['revision'] == effect['record']['revision']
+                               and isinstance(claim, dict)
+                               and all(claim.get(key) == receipt.get(key)
+                                       for key in ('session_id', 'fence', 'expires_at')) else None)
         return {'status': 'saved', 'cloud_saved': True, 'assignment': self._brief(item),
                 'record': effect['record'], 'claim': effect['claim'], 'task_state': effect['task_state'],
                 'claim_receipt': effect.get('claim_receipt')}
 
-    def pause(self, *, anchor=None):
+    def pause(self, *, anchor=None, drain=False):
         if anchor is not None:
             text(anchor, 2000)
+        if type(drain) is not bool:
+            raise MaintenanceError('drain must be a boolean')
         with self._transaction() as state:
             if not state['paused']:
                 state['catch_up'] = None
                 state['pause_anchor'] = anchor
                 state['paused_at'] = now()
             state['paused'] = True
+            if drain:
+                state.setdefault('drain_cutoff', state['sequence'])
             result = {'status': 'paused', 'automatic_updates': False,
-                      'message': 'MAVEN: automatic memory updates paused. Submitted writes may finish; explicit operations remain available.',
+                      'drain_cutoff': state.get('drain_cutoff'),
+                      'message': ('MAVEN: admission stopped; accepted workers may drain the fixed cutoff. '
+                                  'Resume explicitly before accepting new work.' if state.get('drain_cutoff') is not None else
+                                  'MAVEN: automatic memory updates paused. Submitted writes may finish; explicit operations remain available.'),
                       'pause_anchor': state['pause_anchor'], 'pending_count': sum(
                           item['state'] not in TERMINAL for item in state['assignments'].values())}
         self.service.invalidate(authority=False)
@@ -717,8 +767,9 @@ class Maintenance:
         with self._transaction() as state:
             anchor = state['pause_anchor']
             if not state['paused']:
-                return {'status': 'ready', 'automatic_updates': True, 'catch_up': deepcopy(state['catch_up'])}
+                return {'status': 'ready', 'automatic_updates': True, 'catch_up': self._catch_up(state)}
             if fresh:
+                state.pop('drain_cutoff', None)
                 state.update(paused=False, catch_up=None, pause_anchor=None)
                 self.service.invalidate(authority=False)
                 return {'status': 'ready', 'automatic_updates': True, 'catch_up': None,
@@ -735,6 +786,7 @@ class Maintenance:
                                          for item in state['assignments'].values()):
                 raise MaintenanceError('an earlier catch-up is still pending; complete it before resuming '
                                        'with nothing to record')
+            state.pop('drain_cutoff', None)
             operation_id = str(uuid.uuid4())
             result = self._enqueue(state, operation_id, {
                 'intent': 'Review available paused discussion and reconcile relevant authorized memory changes.',
@@ -752,10 +804,8 @@ class Maintenance:
         token = self.claim(operation_id, worker='resume-catch-up')['assignment']['worker_token']
         completed = self.complete(operation_id, worker_token=token, no_changes=True,
                                   summary='Reviewed the available paused discussion; nothing needed recording.')
-        with self._transaction() as state:
-            if (state['catch_up'] or {}).get('operation_id') == operation_id:
-                state['catch_up']['state'] = 'completed'
-            catch_up = deepcopy(state['catch_up'])
+        with self._locked(observe=True):
+            catch_up = self._catch_up(self._load())
         return {'status': 'ready', 'automatic_updates': True, 'cloud_saved': True, 'catch_up': catch_up,
                 'context_complete': bool(context_complete), 'assignment': completed['assignment'],
                 'message': 'MAVEN: memory resumed; the paused discussion had nothing to record.'}
@@ -771,11 +821,12 @@ class Maintenance:
                 if existing['summary'] != summary or existing['explicit_refs'] != refs:
                     raise MaintenanceError('checkpoint identity is bound to a different cutoff or summary')
             else:
-                base = max((value for value in state['checkpoints'].values() if value['state'] == 'saved'),
-                           key=lambda value: value['cutoff'], default=None)
+                base = self._checkpoint_head(state)
                 base_cutoff = base['cutoff'] if base else 0
                 state['checkpoints'][checkpoint_id] = {
                     'checkpoint_id': checkpoint_id, 'cutoff': state['sequence'], 'state': 'preparing',
+                    'ancestry': [deepcopy(value['receipt']) for value in self._checkpoint_frontier(state)
+                                 if base is None or value['checkpoint_id'] != base['checkpoint_id']],
                     'summary': summary, 'explicit_refs': refs, 'base': deepcopy(base['receipt']) if base else None,
                     'assignments': [item['operation_id'] for item in state['assignments'].values()
                                     if item['sequence'] > base_cutoff], 'created_at': now()}
@@ -809,8 +860,9 @@ class Maintenance:
                         'next_action': 'Complete the included assignments, then advance this exact checkpoint.'}
             if 'refs' not in checkpoint:
                 checkpoint['refs'] = unique_refs(([checkpoint['base']] if checkpoint.get('base') else []) +
-                    checkpoint['explicit_refs'] + [ref for identifier in checkpoint['assignments']
-                    for ref in self._refs(state['assignments'][identifier])])
+                    checkpoint.get('ancestry', []) + checkpoint['explicit_refs'] +
+                    [ref for identifier in checkpoint['assignments']
+                     for ref in self._refs(state['assignments'][identifier])])
             checkpoint['state'] = 'applying'
             request = {'checkpoint_id': checkpoint_id, 'summary': checkpoint['summary'],
                        'refs': deepcopy(checkpoint['refs']), 'cutoff': checkpoint['cutoff']}
@@ -823,10 +875,11 @@ class Maintenance:
             checkpoint = state['checkpoints'][checkpoint_id]
             checkpoint.update(state='saved', receipt=result['checkpoint'], completed_at=now())
             checkpoint.pop('error', None)
+            state['latest_checkpoint'] = checkpoint_id
             return {'status': 'checkpointed', 'cloud_saved': True, 'checkpoint': deepcopy(checkpoint),
                     'memory_summary': self._summary(state, cutoff=checkpoint['cutoff'])}
 
-    def recover_checkpoint(self, checkpoint_id, *, worker_stopped):
+    def recover_checkpoint(self, checkpoint_id, *, worker_stopped, writer_tokens=None):
         if worker_stopped is not True:
             raise MaintenanceError('checkpoint recovery requires its original worker to be stopped')
         checkpoint_id = session_uuid(checkpoint_id)
@@ -838,7 +891,7 @@ class Maintenance:
         pending_path = self.runtime + '/pending-memory.json'
         pending = read_private(self.root, pending_path) if private_path(self.root, pending_path).exists() else None
         try:
-            self.service.recover()
+            self.service.recover(workers_stopped=worker_stopped, writer_tokens=writer_tokens)
         except Exception as error:
             self._checkpoint_failure(checkpoint_id, error, recovering=pending)
             raise
@@ -852,6 +905,7 @@ class Maintenance:
             saved = state['checkpoints'][checkpoint_id]
             saved.update(state='saved', receipt=result['checkpoint'], completed_at=now())
             saved.pop('error', None)
+            state['latest_checkpoint'] = checkpoint_id
             return {'status': 'checkpointed', 'cloud_saved': True, 'checkpoint': deepcopy(saved),
                     'memory_summary': self._summary(state, cutoff=saved['cutoff'])}
 
@@ -901,7 +955,7 @@ class Maintenance:
         return groups
 
     def summary(self):
-        with self._locked():
+        with self._locked(observe=True):
             return {'status': 'ready', 'live_state_checked': False, 'memory_summary': self._summary(self._load())}
 
     def finish(self, checkpoint_id, *, recover_only=False):
@@ -913,6 +967,10 @@ class Maintenance:
                 raise MaintenanceError('session closure requires a verified memory checkpoint')
             if checkpoint['cutoff'] != state['sequence']:
                 raise MaintenanceError('new work exists after this checkpoint; checkpoint it before closure')
+            if not state.get('closure') and (
+                    self._checkpoint_head(state)['checkpoint_id'] != checkpoint_id
+                    or len(self._checkpoint_frontier(state)) != 1):
+                raise MaintenanceError('session closure requires the latest saved checkpoint with all completed ancestry')
             if any(item['state'] not in TERMINAL for item in state['assignments'].values()):
                 raise MaintenanceError('unresolved maintenance prevents session closure')
             receipt, summary = deepcopy(checkpoint['receipt']), checkpoint['summary']

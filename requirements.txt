@@ -1,4 +1,3 @@
 # Normal agentic installation includes the official MCP stdio capability.
 # Core recovery-only installation: python -m pip install .
-# For Google integrations use: python -m pip install '.[mcp,google]'
 .[mcp]

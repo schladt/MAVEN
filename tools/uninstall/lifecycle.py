@@ -11,7 +11,8 @@ from .common import UninstallError, canonical, checked_path, digest, file_digest
 MINIMUM_BARRIER_MIGRATION = 8
 PROJECT_MIGRATION = "011_project_lifecycle.sql"
 ARCHIVE_VISIBILITY_MIGRATION = "017_project_archive_visibility.sql"
-MAX_EVIDENCE = 1000
+EVIDENCE_PAGE_SIZE = 250
+MAX_EVIDENCE_BYTES = 24 * 1024 * 1024
 
 
 def _connection(home, expected=None):
@@ -22,8 +23,9 @@ def _connection(home, expected=None):
     from tools.memory.store import DataAPI, sdk_config
     from tools.memory.validation import authorized_actor
 
-    home = checked_path(home)
-    environment_path = checked_path(home / '.env')
+    home = checked_path(home, exists=not (expected and expected.get('recovery_environment')))
+    environment_path = checked_path(expected['recovery_environment']
+                                    if expected and expected.get('recovery_environment') else home / '.env')
     values = load_environment(environment_path)
     config = memory_config(values)
     environment_hash = file_digest(environment_path)
@@ -81,8 +83,7 @@ def _state(db, config, tx, *, exclusive=False):
 
 def _work(db, tx, project_id=None):
     """Bind unfinished outcomes and live claims; expired claims remain historical."""
-    expression = """(WITH selected AS MATERIALIZED (
-        SELECT r.id, r.kind, r.revision, m.project_id, m.session_id, m.claim_session,
+    selected = """SELECT r.id, r.kind, r.revision, m.project_id, m.session_id, m.claim_session,
                m.claim_fence, m.claim_expires_at, m.data->>'state' AS state,
                v.content_hash, encode(sha256(convert_to(to_jsonb(m)::text,'UTF8')),'hex') AS item_hash
         FROM maven.records r JOIN maven.memory_items m ON m.id=r.id
@@ -91,19 +92,37 @@ def _work(db, tx, project_id=None):
           AND ((r.kind='session' AND m.data->>'state'='active')
             OR (r.kind='operation' AND m.data->>'state' IN ('started','blocked'))
             OR (r.kind='checkpoint' AND m.data->>'state'='prepared')
-            OR (m.claim_session IS NOT NULL AND m.claim_expires_at > transaction_timestamp()))
-        ORDER BY r.id LIMIT 1001
-    ), receipts AS MATERIALIZED (
-        SELECT o.request_key, o.request_hash, o.action, o.record_id, o.revision,
+            OR (m.claim_session IS NOT NULL AND m.claim_expires_at > transaction_timestamp()))"""
+    queries = {
+        'records': ("SELECT * FROM selected WHERE "
+                    "(CAST(:cursor AS uuid) IS NULL OR id > CAST(:cursor AS uuid))", 'id'),
+        'receipts': ("""SELECT o.request_key, o.request_hash, o.action, o.record_id, o.revision,
             encode(sha256(convert_to(o.result::text,'UTF8')),'hex') AS result_hash
-        FROM maven.memory_receipts o JOIN selected s ON s.id=o.record_id
-        ORDER BY o.request_key LIMIT 1001
-    ) SELECT jsonb_build_object(
-        'records',COALESCE((SELECT jsonb_agg(to_jsonb(s) ORDER BY s.id) FROM selected s),'[]'::jsonb),
-        'receipts',COALESCE((SELECT jsonb_agg(to_jsonb(o) ORDER BY o.request_key) FROM receipts o),'[]'::jsonb)))"""
-    evidence = json.loads(db.json_scalar(expression, {'project': project_id}, tx))
-    if any(len(evidence[key]) > MAX_EVIDENCE for key in ('records', 'receipts')):
-        raise UninstallError('unresolved work exceeds bounded inventory; close sessions before planning')
+            FROM maven.memory_receipts o JOIN selected s ON s.id=o.record_id
+            WHERE (CAST(:cursor AS uuid) IS NULL OR o.request_key > CAST(:cursor AS uuid))""", 'request_key'),
+    }
+    evidence, size = {'records': [], 'receipts': []}, 0
+    for kind, (query, key) in queries.items():
+        cursor = None
+        while True:
+            expression = (f"(WITH selected AS MATERIALIZED ({selected}), page AS "
+                          f"({query} ORDER BY {key} LIMIT {EVIDENCE_PAGE_SIZE}) "
+                          f"SELECT COALESCE(jsonb_agg(to_jsonb(p) ORDER BY p.{key}),'[]'::jsonb) FROM page p)")
+            page = json.loads(db.json_scalar(expression, {'project': project_id, 'cursor': cursor}, tx))
+            if not isinstance(page, list) or len(page) > EVIDENCE_PAGE_SIZE:
+                raise UninstallError('Invalid work inventory page; nothing truncated')
+            for item in page:
+                identity = str(UUID(item[key]))
+                if cursor is not None and identity <= cursor:
+                    raise UninstallError('Work inventory cursor did not advance; nothing truncated')
+                cursor = identity
+                size += len(canonical(item))
+                if size > MAX_EVIDENCE_BYTES:
+                    raise UninstallError('Complete work evidence exceeds private plan byte limit; '
+                                         'reconcile work before planning; nothing truncated')
+                evidence[kind].append(item)
+            if len(page) < EVIDENCE_PAGE_SIZE:
+                break
     return evidence
 
 
@@ -286,8 +305,8 @@ def _project_execute(action, progress, save, db, s3):
             if row['archived'] != wanted or row['generation'] != (
                     (previous['lifecycle'] or {}).get('generation', 0) + 1):
                 raise UninstallError('lifecycle replay identity is inconsistent')
-            if direct and ({key: value for key, value in selected.items() if key != 'lifecycle'}
-                           != {key: value for key, value in previous.items() if key != 'lifecycle'}):
+            if ({key: value for key, value in selected.items() if key != 'lifecycle'}
+                    != {key: value for key, value in previous.items() if key != 'lifecycle'}):
                 raise UninstallError('project identity changed since the reviewed lifecycle action')
         elif selected != previous:
             raise UninstallError('project changed since planning; create a new plan')

@@ -12,10 +12,13 @@ import stat
 
 import boto3
 from botocore.config import Config
+from botocore.credentials import CredentialResolver, LoginProvider
+from botocore.utils import JSONFileCache
 from botocore.exceptions import BotoCoreError, ClientError
 
 from tools.project import default_environment
-from .client import CONFIG_KEYS, OPTIONAL_CONFIG_KEYS, MemoryClientError, validate_config
+from .client import (AUTHENTICATION_CODES, CONFIG_KEYS, OPTIONAL_CONFIG_KEYS,
+                     MemoryClientError, aws_error, validate_config)
 
 DEFAULT_ENV = default_environment()
 EXTRA_KEYS = {
@@ -117,33 +120,93 @@ def sign_in(values: dict[str, str], *, deploy: bool = False) -> dict:
     A plain `aws login` writes the AWS default cache, which MAVEN never reads; only this
     command (with AWS_LOGIN_CACHE_DIRECTORY) renews the sign-in MAVEN uses.
     """
-    prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
-    profile = values[prefix + 'PROFILE']
-    cache = str(Path(values[prefix + 'LOGIN_CACHE']).expanduser())
-    argv = ['aws', 'login', '--profile', profile, '--region', values.get('MAVEN_AWS_REGION', 'us-east-1')]
+    profile, cache, region = _login_selection(values, deploy=deploy)
+    cache = str(cache)
+    argv = ['aws', 'login', '--profile', profile, '--region', region]
     return {'purpose': 'Maintenance access' if deploy else 'Daily-use access', 'profile': profile,
             'argv': argv, 'environment': {'AWS_LOGIN_CACHE_DIRECTORY': cache},
             'command': 'AWS_LOGIN_CACHE_DIRECTORY=' + shlex.quote(cache) + ' ' + shlex.join(argv)}
 
 
-def selected_aws_session(values: dict[str, str], *, deploy: bool = False, region: str = 'us-east-1'):
-    """Use only a named existing login and verify its principal; never elevate or login."""
+def authentication_handoff(error, values, *, deploy=False):
+    """Return executable, selected-cache login advice only for typed auth failures."""
+    normalized = aws_error(error)
+    if normalized.code not in AUTHENTICATION_CODES:
+        return None
+    try:
+        exact = sign_in(values, deploy=deploy)
+    except MemoryClientError:
+        return None
+    return {'type': 'aws_login', 'command': exact['argv'], 'environment': exact['environment'],
+            'reason': normalized.code, 'purpose': exact['purpose'], 'profile': exact['profile'],
+            'reconnect': 'After owner sign-in, retry the same read-only inspection or resume the exact '
+                         'retained operation. Do not replace an unresolved request or initialize another session.'}
+
+
+def _login_selection(values, *, deploy=False, region=None):
     prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
     try:
         profile = values[prefix + 'PROFILE']
-        expected = values[prefix + 'EXPECTED_PRINCIPAL']
-        cache = Path(values[prefix + 'LOGIN_CACHE']).expanduser()
-        if (not re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', profile)
-                or not re.fullmatch(r'arn:aws:(?:iam|sts)::[0-9]{12}:[A-Za-z0-9+=,.@_/-]+', expected)):
+        raw_cache = values[prefix + 'LOGIN_CACHE']
+        selected_region = region or values.get('MAVEN_AWS_REGION', 'us-east-1')
+        if (not isinstance(profile, str) or not re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', profile)
+                or not isinstance(raw_cache, str) or not raw_cache
+                or any(ord(char) < 32 for char in raw_cache)
+                or not isinstance(selected_region, str)
+                or not re.fullmatch(r'[a-z]{2}(?:-[a-z]+)+-[0-9]+', selected_region)):
             raise ValueError('selection')
+        cache = Path(raw_cache).expanduser()
+        if not cache.is_absolute():
+            raise ValueError('cache')
+        return profile, cache, selected_region
+    except (KeyError, TypeError, ValueError):
+        raise MemoryClientError('selected_login_configuration_unavailable') from None
+
+
+def login_session(values, *, deploy=False, region=None):
+    """Construct a login-only session with its own cache, including refresh writes.
+
+    The resolver deliberately contains no ambient/static/role fallback. Neither
+    construction nor refresh changes AWS_LOGIN_CACHE_DIRECTORY in the process.
+    Initial setup may inspect a login before selecting its expected principal.
+    """
+    profile, cache, region = _login_selection(values, deploy=deploy, region=region)
+    try:
+        if cache.is_symlink():
+            raise MemoryClientError('login_cache_must_be_owner_private')
         cache.mkdir(parents=True, exist_ok=True, mode=0o700)
         info = cache.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
             raise MemoryClientError('login_cache_must_be_owner_private')
         for name in ('boto3', 'botocore', 'urllib3'):
             logging.getLogger(name).setLevel(logging.WARNING)
-        os.environ['AWS_LOGIN_CACHE_DIRECTORY'] = str(cache)
         session = boto3.Session(profile_name=profile, region_name=region)
+        sdk = session._session
+        provider = LoginProvider(load_config=lambda: sdk.full_config,
+                                 client_creator=sdk.create_client, profile_name=profile,
+                                 token_cache=JSONFileCache(str(cache)))
+        sdk.register_component('credential_provider', CredentialResolver([provider]))
+        credentials = session.get_credentials()
+        if credentials is None or credentials.method != 'login':
+            raise MemoryClientError('selected_profile_requires_login')
+        return session
+    except (BotoCoreError, ClientError) as error:
+        raise aws_error(error) from None
+    except (KeyError, TypeError, ValueError):
+        raise MemoryClientError('invalid_login_cache') from None
+    except OSError:
+        raise MemoryClientError('login_cache_unavailable') from None
+
+
+def selected_aws_session(values: dict[str, str], *, deploy: bool = False, region: str | None = None):
+    """Use only a named existing login and verify its principal; never elevate or login."""
+    prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
+    try:
+        expected = values[prefix + 'EXPECTED_PRINCIPAL']
+        if (not isinstance(expected, str)
+                or not re.fullmatch(r'arn:aws:(?:iam|sts)::[0-9]{12}:[A-Za-z0-9+=,.@_/-]+', expected)):
+            raise MemoryClientError('selected_login_configuration_unavailable')
+        session = login_session(values, deploy=deploy, region=region)
         client = session.client('sts', verify=transport_ca_bundle(),
                                 config=Config(connect_timeout=3, read_timeout=10,
                                               retries={'total_max_attempts': 1}))
@@ -153,8 +216,10 @@ def selected_aws_session(values: dict[str, str], *, deploy: bool = False, region
         finally:
             client.close()
         return session
-    except (KeyError, ValueError, OSError, BotoCoreError, ClientError):
-        raise MemoryClientError('selected_login_unavailable_or_expired') from None
+    except (BotoCoreError, ClientError) as error:
+        raise aws_error(error) from None
+    except (KeyError, ValueError, TypeError):
+        raise MemoryClientError('selected_login_configuration_unavailable') from None
 
 
 def configured_client(path: Path = DEFAULT_ENV, *, admin: bool = False,

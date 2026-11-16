@@ -13,7 +13,7 @@ from pathlib import Path
 import stat
 import sys
 
-from tools.home import ACTIVE_DIRECTORY, _active_name, _enabled_root, active_line
+from tools.home import ACTIVE_DIRECTORY, active_name, _enabled_root, active_line
 
 UNAVAILABLE = 'MAVEN: status unavailable'
 NOT_STARTED = 'MAVEN: not started (ask)'
@@ -26,12 +26,14 @@ LINE_LIMIT = 120
 def _private_json(path: Path) -> dict | None:
     """An owner-private (0600, single regular file, no symlink) JSON object, else None."""
     try:
+        if any(part.is_symlink() for part in (path, *path.parents)):
+            return None
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
     try:
         info = os.fstat(descriptor)
-        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
                 or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > STATE_LIMIT):
             return None
         raw = os.read(descriptor, STATE_LIMIT + 1)
@@ -44,14 +46,17 @@ def _private_json(path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def read_state(home: Path, *, harness_session: str | None, folder: str | None) -> dict | None:
-    """The same lookup as `tools.home.read_active` (session first, then folder), stdlib only."""
+def read_state(home: Path, *, harness: str, harness_session: str | None, folder: str | None) -> dict | None:
+    """Read exact native state, otherwise an explicitly advisory folder hint."""
     directory = Path(home).absolute() / ACTIVE_DIRECTORY
-    for name in (_active_name(harness_session, None), _active_name(None, folder)):
+    for name, advisory in (
+        (active_name(harness=harness, harness_session=harness_session), False),
+        (active_name(folder=folder), True),
+    ):
         if name:
             value = _private_json(directory / name)
             if value is not None:
-                return value
+                return {**value, 'advisory': advisory}
     return None
 
 
@@ -67,10 +72,13 @@ def status_line(home: Path, payload: dict) -> str:
     folder = folder if isinstance(folder, str) and folder else None
     session = payload.get('session_id')
     session = session if isinstance(session, str) and session else None
-    state = read_state(home, harness_session=session, folder=folder)
+    state = read_state(home, harness='claude', harness_session=session, folder=folder)
     if state is not None:
         line = state.get('line')
-        return _clean(line if isinstance(line, str) and line.strip() else active_line(state))
+        line = line if isinstance(line, str) and line.strip() else active_line(state)
+        if state['advisory']:
+            line = 'MAVEN: last folder hint (not started here) — ' + line.removeprefix('MAVEN: ')
+        return _clean(line)
     if folder is None:
         return OFF
     cwd = Path(folder).expanduser()

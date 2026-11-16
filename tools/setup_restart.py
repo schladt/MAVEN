@@ -1,10 +1,10 @@
 """Explicit local setup restart; archives evidence without undoing cloud effects."""
 from contextlib import contextmanager
+from types import SimpleNamespace
 from uuid import uuid4
 
 from tools.administration import AdminOperations, _digest, _source
-from tools.setup import Wizard
-from tools.setup_common import SetupPending, atomic_private, expected_account, private_directory, read_private, save_json, setup_lock
+from tools.setup_common import SetupPending, atomic_private, private_directory, read_private, save_json, setup_lock
 from tools.uninstall.local import _lock, _quiet
 
 
@@ -17,7 +17,17 @@ def _locked(home):
         private_directory(directory)
         with setup_lock(directory), _lock(controller.home / 'runtime/registry.lock'):
             _quiet(controller.home)
-            yield controller, Wizard(controller.home)
+            # Local preservation does not authorize using a connection. Read legacy locators
+            # for the review without forcing their migration or constructing AWS clients.
+            from tools.environment_migrations import inspect
+            env = controller.home / '.env'
+            values = inspect(env)[0] if env.exists() or env.is_symlink() else {}
+            state_path = directory / 'state.json'
+            state = read_private(state_path) if state_path.exists() else {'schema': 1}
+            if state.get('schema') != 1:
+                raise SetupPending('Unsupported setup state; preserve its original evidence.')
+            yield controller, SimpleNamespace(home=controller.home, env=env, directory=directory,
+                                              values=values, state_path=state_path, state=state)
 
 
 def _snapshot(controller, wizard, identifier):
@@ -44,15 +54,15 @@ def _review(controller, wizard, snapshot):
             'saved_step': operation['step'], 'saved_state': operation['state'],
             'receipt_steps': [receipt['step'] for receipt in operation['receipts']],
             'submitted_requests': snapshot['setup'].get('submitted_requests', []),
-            'account': expected_account(wizard.values),
+            'account': wizard.values.get('MAVEN_ACCOUNT_ID', 'Unverified saved account selectors'),
             'stack': wizard.values.get('MAVEN_STACK_NAME'),
             'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
             'snapshot_digest': _digest(snapshot),
-            'effect': 'Archive the old operation, setup state and private .env; clear the memory connection and start fresh choices. Retain the explicitly reviewed portable integration locators, their account and region; revalidate both selected AWS identities before cutover.',
+            'effect': 'Archive the old operation, setup state and private .env; start fresh setup choices while preserving all existing connection and AWS selections as unverified. No sign-in or cloud effect occurs during this local cutover.',
             'retained_integrations': _retained_integrations(wizard, operation),
             'secrets_resources': operation.get('secrets_resources', {}),
             'retained': 'Installed software, AWS sign-in caches, original request artifacts, approvals, receipts, independently retained secrets resources and all other cloud resources remain.',
-            'warning': 'This does not cancel submitted AWS work, roll back resources, refund charges or reconcile unknown outcomes. Existing resources may still incur charges. The retained secrets store must be reviewed and revalidated in the original account; missing values require Repair, not new-store adoption. Projects using this home stay disconnected until setup is completed again.'}
+            'warning': 'This does not cancel submitted AWS work, roll back resources, refund charges or reconcile unknown outcomes. Existing resources may still incur charges. Retained settings are not live readiness evidence; subsequent cloud use must revalidate the selected identity and authority.'}
 
 
 def review_restart(home, identifier):
@@ -83,16 +93,9 @@ def restart(home, identifier, *, confirm_review, source):
             review = _review(controller, wizard, snapshot)
             if _digest(review) != confirm_review:
                 raise SetupPending('Setup or private settings changed since review. Review abandonment again; nothing was reset.')
-            from tools.secret_setup import identities
-            retained = _retained_integrations(wizard, snapshot['operation'])
-            if retained:
-                identity_settings = snapshot['operation'].get('secrets_candidate', {}).get('identity_settings', {})
-                identities({**wizard.values, **identity_settings})
-                retained.update({key: wizard.values[key] for key in ('MAVEN_AWS_REGION', 'MAVEN_ACCOUNT_ID')
-                                 if key in wizard.values})
-                retained['MAVEN_ACCOUNT_ID'] = expected_account(wizard.values)
-            import json
-            retained_environment = ''.join(key + '=' + json.dumps(value) + '\n' for key, value in sorted(retained.items()))
+            # This operation only archives local evidence. Preserve the exact settings bytes;
+            # authentication belongs to the subsequent selected cloud operation.
+            retained_environment = snapshot['environment'] or ''
             successor = str(uuid4())
             replacement = {'schema': 1, 'operation_id': successor, 'kind': 'setup',
                            'home': str(controller.home), 'revision': 0, 'state': 'pending', 'step': 'start',

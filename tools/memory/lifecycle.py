@@ -73,6 +73,10 @@ class SessionService:
             'MAVEN_AWS_PROFILE', 'MAVEN_AWS_EXPECTED_PRINCIPAL', 'MAVEN_AWS_LOGIN_CACHE')}
 
     def _binding(self):
+        mcp_path = self.runtime + '/mcp-binding.json'
+        if (private_path(self.root, mcp_path).exists()
+                and read_private(self.root, mcp_path).get('superseded_by')):
+            raise BoundaryError('failed initialization was superseded; use the replacement binding')
         if load_project(self.root)['project_id'] != self.project_id:
             raise BoundaryError('project binding changed; this session cannot operate on the new project')
         if not private_path(self.root, self.binding_path).exists():
@@ -88,13 +92,14 @@ class SessionService:
         return value
 
     @contextmanager
-    def _session_lock(self, *, shared=False):
+    def _session_lock(self, *, shared=False, observe=False):
         # Keep the root stable before creating/opening any per-project runtime path.
         # Folder switches take this gate exclusively, then the registry lock.
         from tools.coordination import project_binding_lock, private_lock
         with project_binding_lock(self.home, self.root):
             with private_lock(self.home, 'runtime/registry.lock'):
-                self.registry._allow_work(self.root)
+                if not observe:
+                    self.registry._allow_work(self.root)
                 if load_project(self.root)['project_id'] != self.project_id:
                     raise BoundaryError('project binding changed; start a new session for the selected project')
             with session_lock(self.root, self.session_id, shared=shared):
@@ -104,8 +109,15 @@ class SessionService:
         path = self.runtime + '/approval.json'
         if private_path(self.root, path).exists():
             receipt = read_private(self.root, path)
-            if receipt.get('status') not in ('closed', 'checkpointed', 'cancelled', 'approval_cancelled'):
-                raise BoundaryError('pending Git publication receipt: use maven-git recovery; memory cutover is blocked')
+            terminal = receipt.get('status') in ('closed', 'checkpointed', 'cancelled', 'approval_cancelled')
+            candidate = receipt.get('status') == 'approval_required' and not receipt.get('checkpoint_sha')
+            if not terminal and not candidate:
+                raise BoundaryError('submitted Git publication requires exact recovery before session closure')
+        with self.registry.transaction(readonly=True) as state:
+            reservation = state['reservations'].get(self.registry.key(self.root))
+            item = state['sessions'].get(self.session_id)
+            if (reservation and reservation['session_id'] == self.session_id) or item and item['writers']:
+                raise BoundaryError('session closure requires its Git reservation and writers to be released')
 
     def _no_pending(self):
         if private_path(self.root, self.pending_path).exists():
@@ -115,7 +127,6 @@ class SessionService:
         """Local guards run on every call; they never need the network."""
         if self._binding() is None:
             raise BoundaryError('initialize this exact session before using memory')
-        self._publication_guard()
         if not closed and private_path(self.root, self.runtime + '/finish.json').exists():
             raise BoundaryError('session closure has begun; recover its original finish receipt')
 
@@ -133,11 +144,11 @@ class SessionService:
         memory.authority_generation = self._authority['authority_generation']
 
     @contextmanager
-    def _writer(self):
+    def _writer(self, *, closing=False):
         """This session's single memory writer. A write refused because authority changed
         (context_stale) committed nothing; the next governed call reloads authority."""
         from .client import MemoryClientError
-        with self.registry.memory_writer(self.root, self.session_id):
+        with self.registry.memory_writer(self.root, self.session_id, closing=closing):
             try:
                 yield
             except MemoryClientError as error:
@@ -158,7 +169,9 @@ class SessionService:
 
     def _skills(self):
         from .skills import SessionSkills
-        return SessionSkills(self.client, self.root, self.project_id, self.session_id).start()['data']
+        return SessionSkills(self.client, self.root, self.project_id, self.session_id).start(
+            loaded=self._authority['instructions'],
+            authority_generation=self._authority['authority_generation'])['data']
 
     def _loaded_skill_summaries(self, skills):
         from .skills import SessionSkills
@@ -206,7 +219,6 @@ class SessionService:
 
     def initialize(self, *, resume=False):
         with self._session_lock():
-            self._publication_guard()
             self._no_pending()
             if private_path(self.root, self.runtime + '/finish.json').exists():
                 raise BoundaryError('session closure has begun; recover its original finish receipt')
@@ -235,9 +247,10 @@ class SessionService:
                 project = {key: started[key] for key in PROJECT_CONTEXT_KEYS}
             else:
                 session = memory.ref(memory.verified_session(record))
-                skills = self._skills()
                 # Always reload full current authority before reporting readiness.
                 authority = memory.context()
+                self._authority = authority
+                skills = self._skills()
                 project = memory.project_context()
             self._authority, self._session_checked = authority, True
             self.registry.activate(self.root, self.session_id)
@@ -271,7 +284,7 @@ class SessionService:
             self._ready(self._memory(), write=False)
             loaded = {(page['slug'], page['revision']) for page in self._authority['instructions']}
             for _ in range(3):
-                pages, after, generation = [], None, None
+                pages, after, generation, seen = [], None, None, set()
                 while True:
                     request = {'limit': 10} if after is None else {'limit': 10, 'after_slug': after}
                     response = self.client.invoke('/v1/pages/index', request)
@@ -299,8 +312,10 @@ class SessionService:
                     after = data.get('next_after_slug')
                     if after is None:
                         break
-                    if not data['pages']:
-                        raise BoundaryError('memory service returned no verified instruction index')
+                    if (not isinstance(after, str) or after in seen or not data['pages']
+                            or after != data['pages'][-1].get('slug')):
+                        raise BoundaryError('memory service returned no progressing instruction index')
+                    seen.add(after)
                 if generation is not None:
                     return self._observe({'authority_generation': generation, 'pages': pages})
             raise MemoryClientError('context_stale')
@@ -487,6 +502,7 @@ class SessionService:
             raise BoundaryError('a substantive session handover is required')
         with self._session_lock():
             self._guard(closed=True)
+            self._publication_guard()
             memory = self._memory()
             # Closure needs the exact current session revision for its CAS.
             session = memory.session(closed=True)
@@ -519,7 +535,7 @@ class SessionService:
                         or meta.get('phase') != 'closed' or meta.get('boundary_outcome') != 'memory-saved'):
                     raise BoundaryError('closed session differs from requested handover')
             else:
-                with self._writer():
+                with self._writer(closing=True):
                     import datetime
                     meta.update(summary=summary, phase='closed', last_checkpoint=checkpoint_ref,
                                 boundary_outcome='memory-saved',
@@ -533,23 +549,35 @@ class SessionService:
             save_private(self.root, path, result)
             return result
 
-    def recover(self):
-        with self._session_lock():
+    def recover(self, *, workers_stopped=False, writer_tokens=None, observe_only=False):
+        if not observe_only and workers_stopped is not True:
+            raise BoundaryError('recovery requires actual writer quiescence')
+        with self._session_lock(observe=True):
             if self._binding() is None:
                 raise BoundaryError('recover requires the original explicit session binding')
-            self._publication_guard()
+            if observe_only and not private_path(self.root, self.pending_path).exists():
+                return self._report('observed', recovery=None, live_checked=False, replayed=False)
             memory = self._memory()
-            if self._authority is None or self._stale:
-                self._authority = memory.context()
-                self._stale = False
-            # Recovery may complete a session closure or other lifecycle write.
+            if observe_only:
+                return self._report('observed', recovery=memory.recover(observe_only=True),
+                                    live_checked=True, replayed=False)
+
+            def before_replay():
+                # The registry lock is held by recovering. Receipt observation is
+                # independent of mutation admission and current authority.
+                self.registry._allow_work(self.root)
+                if self._authority is None or self._stale:
+                    self._authority = memory.context()
+                    self._stale = False
+
+            with self.registry.recovering(self.root, self.session_id,
+                                         workers_stopped=workers_stopped, tokens=writer_tokens):
+                result = memory.recover(before_replay=before_replay)
             self._session_checked = False
-            result = memory.recover()
-            record = (result or {}).get('record') or {}
-            if (result or {}).get('route') == 'write' and record.get('record_id') not in (None, self.session_id):
-                # The only lifecycle write for another session is an owner-confirmed peer close.
-                self.registry.abandon(record['record_id'])
-            return self._report('recovered', recovery=result, next_action='Resume the original operation or initialize this session')
+            if result and result.get('peer_abandoned'):
+                self.registry.abandon(result['record']['record_id'])
+            return self._report('recovered', recovery=result,
+                                next_action='Resume the original operation or initialize this session')
 
     def close(self):
         self.invalidate()

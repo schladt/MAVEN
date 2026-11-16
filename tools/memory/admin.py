@@ -23,7 +23,8 @@ MIGRATION_FILES = ("001_foundation.sql", "002_fact_change.sql", "003_current_ver
                    "014_authority_guard.sql", "015_home_context.sql", "016_cleanup.sql",
                    "017_project_archive_visibility.sql", "018_skill_discovery.sql",
                    "019_secret_catalog.sql", "020_secret_adapter_grants.sql",
-                   "021_secret_adapter_scope_guard.sql")
+                   "021_secret_adapter_scope_guard.sql", "022_reviewed_cleanup.sql",
+                   "023_retired_work_visibility.sql", "024_immutable_secret_consumption.sql")
 CLEANUP_LIMIT = 200
 _CLEANUP_REFUSAL = re.compile(r"cleanup_refused:([a-z_]{1,40})")
 
@@ -337,6 +338,17 @@ def _cleanup_approval(actor, reason, approval_digest):
     return {"actor": actor, "reason": reason, "digest": approval_digest}
 
 
+def _cleanup_review(record_ids, operation_id, expected_revisions):
+    ids = _cleanup_ids(record_ids)
+    operation_id = uuid_string(operation_id, name="operation_id")
+    if (not isinstance(expected_revisions, dict) or set(expected_revisions) != set(record_ids)
+            or any(type(revision) is not int or not 1 <= revision <= 2147483647
+                   for revision in expected_revisions.values())):
+        raise MemoryError("cleanup_refused", 409, detail="expected_revisions")
+    return {"ids": ids, "operation_id": operation_id,
+            "expected_revisions": canonical(expected_revisions)}
+
+
 def _cleanup_error(error):
     response = getattr(error, "response", {})
     message = response.get("Error", {}).get("Message", "")
@@ -347,7 +359,7 @@ def _cleanup_error(error):
     return safe_provider_error(error)
 
 
-def _cleanup(config, session, expression, values=None):
+def _cleanup(config, session, expression, values=None, *, reviewed=False):
     """One clean-up statement under the administration role; agents' memory tools never reach it."""
     previous_logging = logging.root.manager.disable
     logging.disable(logging.CRITICAL)
@@ -361,6 +373,13 @@ def _cleanup(config, session, expression, values=None):
         _check_logging(db)
         with db.transaction() as tx:
             _identity(_state(db, tx), config)
+            if reviewed and db.scalar(
+                    "SELECT to_regprocedure('maven.forget_records(uuid[],boolean,uuid,jsonb,text,text,text)') IS NOT NULL "
+                    "AND to_regprocedure('maven.erase_records(uuid[],uuid,jsonb,text,text,text)') IS NOT NULL",
+                    transaction=tx) is not True:
+                raise MemoryError(
+                    "cleanup_upgrade_required", 409,
+                    detail="Review and apply the memory schema update before cleanup; ordinary memory remains available.")
             raw = db.json_scalar(expression, values, tx)
         return json.loads(raw)
     except MemoryError:
@@ -390,16 +409,23 @@ def cleanup_erased_ids(config, session):
     return _cleanup(config, session, "maven.cleanup_erased_ids()")["record_ids"]
 
 
-def forget_records(config, session, record_ids, *, restore=False, actor, reason, approval_digest):
-    """Owner-approved Forget (or restore): visibility only, with one immutable receipt."""
+def forget_records(config, session, record_ids, *, operation_id, expected_revisions,
+                   restore=False, actor, reason, approval_digest):
+    """Replayable reviewed Forget/restore; the original UUID and revision manifest are required."""
     if type(restore) is not bool:
         raise MemoryError("cleanup_refused", 409, detail="restore")
-    values = {"ids": _cleanup_ids(record_ids), "restore": restore,
+    values = {**_cleanup_review(record_ids, operation_id, expected_revisions), "restore": restore,
               **_cleanup_approval(actor, reason, approval_digest)}
-    return _cleanup(config, session, f"maven.forget_records({_ID_ARRAY}, :restore, :actor, :reason, :digest)", values)
+    return _cleanup(config, session,
+                    f"maven.forget_records({_ID_ARRAY}, :restore, CAST(:operation_id AS uuid), "
+                    "CAST(:expected_revisions AS jsonb), :actor, :reason, :digest)", values, reviewed=True)
 
 
-def erase_records(config, session, record_ids, *, actor, reason, approval_digest):
-    """Owner-approved Erase: every version and the current data become one fixed tombstone."""
-    values = {"ids": _cleanup_ids(record_ids), **_cleanup_approval(actor, reason, approval_digest)}
-    return _cleanup(config, session, f"maven.erase_records({_ID_ARRAY}, :actor, :reason, :digest)", values)
+def erase_records(config, session, record_ids, *, operation_id, expected_revisions,
+                  actor, reason, approval_digest):
+    """Replayable reviewed Erase; never substitute a new operation or a fresh revision snapshot."""
+    values = {**_cleanup_review(record_ids, operation_id, expected_revisions),
+              **_cleanup_approval(actor, reason, approval_digest)}
+    return _cleanup(config, session,
+                    f"maven.erase_records({_ID_ARRAY}, CAST(:operation_id AS uuid), "
+                    "CAST(:expected_revisions AS jsonb), :actor, :reason, :digest)", values, reviewed=True)
