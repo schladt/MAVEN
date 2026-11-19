@@ -2,8 +2,10 @@
 
 Requires psql, MAVEN_MEMORY_TEST_DSN, and the explicit isolated-cluster opt-in
 MAVEN_MEMORY_TEST_ALLOW_CREATE_DATABASE=1. The role must have CREATEDB. Tests
-create/drop only their own UUID-named database, never the supplied database.
+create/drop only their own UUID-named database. The application-verifier test
+instead uses a transaction rolled back on disconnect in a disposable `maven` database.
 """
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -48,13 +50,15 @@ def run_sql(dsn, sql):
 
 class Connection:
     """Persistent psql pipe with explicit completion markers and bounded I/O."""
-    def __init__(self, dsn):
+    def __init__(self, dsn, *, helpers=True):
         self.errors = tempfile.TemporaryFile()
         self.process = subprocess.Popen([PSQL, '-d', dsn, '-X', '-qAt', '-v', 'ON_ERROR_STOP=1'],
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.errors)
         self.pending = None
         self.buffer = b''
         self.pid = int(self.query('SELECT pg_backend_pid();')[-1])
+        if not helpers:
+            return
         self.query("SET maven.client_protocol='4'; SET statement_timeout='15s'; SET lock_timeout='12s';"
                    + SQL_HELPERS + SQL_ADAPTER_HELPERS + r"""
 CREATE FUNCTION pg_temp.try_sql(statement text) RETURNS jsonb LANGUAGE plpgsql AS $$
@@ -118,6 +122,56 @@ def cleanup_expression(body, operation, revision, action='erase', reason='Fixtur
             + f"'{operation}'::uuid,{literal({body['record_id']: revision})},'fixture-owner',"
             + "'" + reason.replace("'", "''") + "',repeat('d',64)")
     return f'maven.{action}_records({args})'
+
+
+class VerificationConnection(Connection):
+    """Run the installer's scalar queries under the real application role."""
+    @contextmanager
+    def transaction(self):
+        self.query('SAVEPOINT verify; SET LOCAL ROLE maven_app;')
+        try:
+            yield self
+        finally:
+            self.query('ROLLBACK TO verify; RELEASE verify;')
+
+    def scalar(self, sql, *, transaction):
+        return transaction.json(f'(SELECT to_jsonb(value) FROM ({sql}) AS result(value))')
+
+
+@unittest.skipUnless(ENABLED, 'requires an explicitly disposable PostgreSQL cluster and psql')
+class ApplicationVerificationTests(unittest.TestCase):
+    def test_post_migration_cleanup_privileges(self):
+        dsn = os.environ['MAVEN_MEMORY_TEST_DSN']
+        if run_sql(dsn, 'SELECT current_database();') != 'maven':
+            self.skipTest('verifier checks privileges on database maven by name')
+        db = VerificationConnection(dsn, helpers=False)
+        self.addCleanup(db.close)  # Disconnect rolls back all DDL and role grants.
+        db.query('BEGIN; CREATE SCHEMA maven; CREATE ROLE maven_app;')
+        for _, _, statements in admin.migrations():
+            db.query(';\n'.join(statements) + ';')
+        config = {'instance_id': str(uuid4()), 'recovery_epoch': str(uuid4()), 'app_secret_arn': 'fixture'}
+        db.query(f"""
+            INSERT INTO maven.service_state(singleton,instance_id,recovery_epoch,schema_version,data_scope,
+              state,app_secret_arn,app_secret_version) VALUES(true,'{config["instance_id"]}',
+              '{config["recovery_epoch"]}',{admin.SCHEMA_VERSION},'{admin.ROLLOUT_SCOPE}','maintenance','fixture','1');
+            REVOKE ALL ON DATABASE maven FROM PUBLIC;
+            REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+            GRANT CONNECT ON DATABASE maven TO maven_app;
+            GRANT USAGE ON SCHEMA maven TO maven_app;
+            GRANT SELECT ON maven.service_state, maven.record_versions TO maven_app;
+            GRANT EXECUTE ON FUNCTION maven.change_fact(jsonb,text,text), maven.instruction_read(jsonb) TO maven_app;
+        """)
+        admin._verify_application(db, config)
+        for privilege in ('EXECUTE ON FUNCTION maven.forget_records(uuid[],boolean,uuid,jsonb,text,text,text)',
+                          'EXECUTE ON FUNCTION maven.erase_records(uuid[],uuid,jsonb,text,text,text)',
+                          'EXECUTE ON FUNCTION maven.cleanup_mutate(text,uuid[],uuid,jsonb,text,text,text)',
+                          'SELECT ON maven.cleanup_operations'):
+            with self.subTest(privilege=privilege):
+                db.query(f'SAVEPOINT bad_grant; GRANT {privilege} TO maven_app;')
+                with self.assertRaises(admin.MemoryError) as denied:
+                    admin._verify_application(db, config)
+                self.assertEqual(denied.exception.status, 'bootstrap_refused')
+                db.query('ROLLBACK TO bad_grant; RELEASE bad_grant;')
 
 
 @unittest.skipUnless(ENABLED, 'requires explicit isolated PostgreSQL DSN/create-database opt-in and psql')

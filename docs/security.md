@@ -64,6 +64,10 @@ retention. Local sweeps redact affected runtime and administration copies; other
 machines retain caches until their next sweep. Unresolved request journals block
 redaction until recovered; they are never silently discarded.
 
+Before marking an upgraded database ready, the installer checks that `maven_app`
+cannot execute the reviewed Forget/Erase functions or their shared mutation helper,
+and cannot read, insert, update, or delete cleanup receipts or operation records.
+
 ## Local state
 
 Keep instance and project private configuration owner-owned and inaccessible to other

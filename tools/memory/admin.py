@@ -247,9 +247,11 @@ def _verify_application(db, config):
                             "AND NOT has_table_privilege(current_user, 'maven.pages', 'INSERT,UPDATE,DELETE') "
                             "AND NOT has_table_privilege(current_user, 'maven.instruction_proposals', 'INSERT,UPDATE,DELETE') "
                             "AND NOT has_function_privilege(current_user, 'maven.change_fact_foundation(jsonb,text,text)', 'EXECUTE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.forget_records(uuid[],boolean,text,text,text)', 'EXECUTE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.erase_records(uuid[],text,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(current_user, 'maven.forget_records(uuid[],boolean,uuid,jsonb,text,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(current_user, 'maven.erase_records(uuid[],uuid,jsonb,text,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(current_user, 'maven.cleanup_mutate(text,uuid[],uuid,jsonb,text,text,text)', 'EXECUTE') "
                             "AND NOT has_table_privilege(current_user, 'maven.cleanup_receipts', 'SELECT,INSERT,UPDATE,DELETE') "
+                            "AND NOT has_table_privilege(current_user, 'maven.cleanup_operations', 'SELECT,INSERT,UPDATE,DELETE') "
                             "AND has_function_privilege(current_user, 'maven.instruction_read(jsonb)', 'EXECUTE') "
                             "FROM pg_roles WHERE rolname = current_user", transaction=tx)
         if allowed is not True:
