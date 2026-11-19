@@ -1,0 +1,25 @@
+#!/bin/sh
+# The lifecycle checks use only the stdlib and the selected installation's MAVEN code.
+# Do not run pip's install-time interpreter or source an activation script here.
+set -f
+IFS=:
+for dir in ${PATH:-}; do
+    case "$dir" in /*) ;; *) continue ;; esac
+    python=$dir/python3
+    [ -x "$python" ] || continue
+    if "$python" -I -S -c 'import sys; sys.exit(sys.version_info < (3, 11))' </dev/null >/dev/null 2>&1; then
+        exec "$python" -I -S -c '
+from pathlib import Path
+import sys
+root = Path(sys.argv.pop(1)).resolve().parent.parent
+hooks = list(root.glob("lib/python*/site-packages/tools/session_hooks.py"))
+if len(hooks) != 1:
+    sys.exit("MAVEN lifecycle check unavailable: installed MAVEN package missing or ambiguous.")
+sys.path.append(str(hooks[0].parents[1]))
+from tools.session_hooks import main
+sys.exit(main())
+' "$0" "$@"
+    fi
+done
+printf '%s\n' 'MAVEN lifecycle check unavailable: need a working Python 3.11 or newer (python3 on PATH).' >&2
+exit 1

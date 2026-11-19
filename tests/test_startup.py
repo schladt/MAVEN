@@ -3,6 +3,10 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -64,6 +68,40 @@ class StartupTests(unittest.TestCase):
 
     def inspect_exit(self, conversation='conversation-a'):
         return inspect_shutdown(self.home, self.root, harness='omp', harness_session=conversation)
+
+    def test_hook_checks_same_session_after_install_python_disappears(self):
+        app = self.application()
+        binding = self.startup(app)['binding']
+        venv = self.home / 'venv'
+        bin_dir = venv / 'bin'
+        bin_dir.mkdir(parents=True)
+        source = Path(__file__).resolve().parents[1]
+        launcher = bin_dir / 'maven-session-hook'
+        shutil.copy2(source / 'maven_resources/maven-session-hook', launcher)
+        packages = venv / 'lib/python3.11/site-packages'
+        packages.mkdir(parents=True)
+        (packages / 'tools').symlink_to(source / 'tools', target_is_directory=True)
+        (bin_dir / 'python3').symlink_to(self.base / 'removed-interpreter')
+        replacement = self.base / 'replacement python'
+        replacement.mkdir()
+        (replacement / 'python3').symlink_to(sys.executable)
+        cmd = [str(launcher), 'status', '--home', str(self.home), '--cwd', str(self.root),
+               '--harness', 'omp', '--harness-session', 'conversation-a']
+        def check(expected):
+            result = subprocess.run(cmd, cwd=self.base, capture_output=True, text=True, timeout=5,
+                                    env={**os.environ, 'PATH': os.pathsep.join(map(str, (bin_dir, replacement)))})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            status = json.loads(result.stdout)
+            self.assertEqual(status['status'], expected)
+            self.assertEqual(status['binding']['session_id'], binding['session_id'])
+
+        check('open')
+        checkpoint = app.maintenance.checkpoint(summary='Completed local verification')
+        app.maintenance.finish(checkpoint['checkpoint']['checkpoint_id'])
+        check('closed')
+        missing = subprocess.run(cmd, env={**os.environ, 'PATH': str(bin_dir)}, capture_output=True, text=True)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn('Python 3.11 or newer', missing.stderr)
 
     def failed_initialization(self, conversation=None, *, before_registration=False):
         app = self.application()

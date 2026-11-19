@@ -17,6 +17,9 @@ Memory works without Git; publication is optional and separately approved.
 - **macOS or Linux**, or **Windows through WSL**. Run all commands inside WSL, not
   native Windows Python.
 - **Python 3.11 or newer**, with `venv` and pip support.
+  Native session hooks look for a working `python3` on the harness's `PATH` each
+  time they run. Upgrading Python during a session does not change its identity or
+  bypass the exit check: the hook still needs the original session's finish receipt.
 - **Git** to clone this repository and for Git-backed projects. A downloaded source
   archive and a no-Git project are also supported.
 - **AWS CLI v2 with `aws login` support** (2.32.0 or newer), an AWS account, and an
