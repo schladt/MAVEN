@@ -51,7 +51,9 @@ class CloudContractTests(unittest.TestCase):
         values = {'MAVEN_MEMORY_SCHEMA_VERSION': '1'}
         session = Mock()
         memory = Mock()
-        memory.load_context.return_value = {'data': {'authority_generation': 4, 'minimum_client_protocol': 3}}
+        memory.config = self.config()
+        identity = {key: CONFIG[key] for key in ('instance_id', 'recovery_epoch')}
+        memory.invoke.return_value = {'status': 'ready', 'data': {**identity, 'capability': 'project_reconcile_v1'}}
         with patch('tools.memory.environment.memory_config', return_value=self.config()) as load, \
                 patch.object(bootstrap, 'selected_session', return_value=session), \
                 patch.object(bootstrap, 'MemoryClient', return_value=memory), \
@@ -60,7 +62,8 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual(load.call_args.args[0]['MAVEN_MEMORY_SCHEMA_VERSION'], '2')
         self.assertEqual(values['MAVEN_MEMORY_SCHEMA_VERSION'], '1')
         migrate.assert_called_once_with(self.config(), session)
-        self.assertEqual(result['minimum_client_protocol'], 3)
+        self.assertEqual(result['capability'], 'project_reconcile_v1')
+        memory.invoke.assert_called_once_with('/v1/reconcile/status', identity)
         memory.close.assert_called_once()
 
     def test_old_control_is_accepted_only_for_explicit_upgrade(self):
@@ -82,7 +85,7 @@ class CloudContractTests(unittest.TestCase):
                                              '018_skill_discovery.sql', '019_secret_catalog.sql',
                                              '020_secret_adapter_grants.sql', '021_secret_adapter_scope_guard.sql',
                                              '022_reviewed_cleanup.sql', '023_retired_work_visibility.sql',
-                                             '024_immutable_secret_consumption.sql'])
+                                             '024_immutable_secret_consumption.sql', '025_project_reconciliation.sql'])
         installed = {name: digest for name, digest, _ in bundle[:first_new]}
         old = {**store.control_document(CONFIG, 'ready'), 'schema_version': 1,
                'app_secret_arn': CONFIG['app_secret_arn'], 'app_secret_version': 'fixture-version'}
@@ -98,7 +101,13 @@ class CloudContractTests(unittest.TestCase):
             for statement in statements:
                 database.execute.assert_any_call(statement, transaction='tx')
         executed = [call.args[0] for call in database.execute.call_args_list]
-        self.assertTrue(any('maven.memory_request(text,jsonb,text,text,text,integer) TO maven_app' in sql for sql in executed))
+        grants = '\n'.join(sql for sql in executed if sql.startswith('GRANT EXECUTE ON FUNCTION'))
+        self.assertIn('maven.memory_request(text,jsonb,text,text,text,integer)', grants)
+        self.assertIn('maven.reconcile_request(text,jsonb)', grants)
+        revocations = '\n'.join(sql for sql in executed if sql.startswith('REVOKE EXECUTE') and 'FROM maven_app' in sql)
+        for obsolete in ('maven.memory_request_before_reconcile(text,jsonb,text,text,text,integer)',
+                         'maven.memory_write(text,jsonb,text,text)', 'maven.change_fact(jsonb,text,text)'):
+            self.assertIn(obsolete, revocations)
         self.assertIn("ALTER ROLE maven_app SET statement_timeout = '5s'", executed)
         self.assertIn("ALTER ROLE maven_app SET lock_timeout = '1s'", executed)
 

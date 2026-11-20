@@ -173,6 +173,9 @@ def plan_project(root, home, *, archive=False, reactivate=False):
     project = _binding(root)
     db, s3, details = _connection(home)
     with closing(db.client), closing(s3):
+        if project.get('schema') == 2:
+            from tools.project import require_binding
+            require_binding(project, details['config'])
         from tools.memory.store import fetch_control
         control, _ = fetch_control(s3, details['config'], allow_maintenance=True)
         if control['state'] != 'ready':
@@ -229,7 +232,7 @@ def plan_project_id(home, project_id, *, action, operation_id):
             'target': project_id, 'stage': 10, 'details': details}
 
 
-def plan_cloud(home, *, abandon=False):
+def plan_cloud(home):
     db, s3, details = _connection(home)
     with closing(db.client), closing(s3):
         from tools.memory.store import fetch_control
@@ -244,21 +247,17 @@ def plan_cloud(home, *, abandon=False):
                 raise UninstallError('database has unrelated maintenance')
             schema = _schema(db, tx)
             work = _work(db, tx)
-    if work['records'] and not abandon:
-        raise UninstallError('active cloud sessions or unresolved work remain; close normally or explicitly approve abandonment')
-    details.update(migrations=schema, work=work, abandon=bool(abandon),
-                   control=control, control_etag=etag)
+    if work['records'] or work['receipts']:
+        raise UninstallError('Unresolved legacy cloud work remains. No retirement was planned; preserve its evidence.')
+    details.update(migrations=schema, work=work, control=control, control_etag=etag)
     details['barrier_token'] = control.get('uninstall') or digest(details)
     action = {'handler': 'lifecycle', 'kind': 'cloud-freeze', 'target': details['instance_id'],
               'stage': 20, 'details': details}
     warnings = ['Cloud maintenance blocks new work across hosts; local unknown receipts remain untouched.']
-    if abandon:
-        warnings.append('Administrative abandonment preserves unfinished session and request evidence verbatim; '
-                        'it neither closes sessions normally nor recovers unsaved work.')
     return _fragment(action, warnings=warnings,
                      retained=[{'kind': 'session-and-request-evidence', 'target': details['instance_id'],
                                 'sha256': digest(work)}],
-                     requires=['writers-quiescent'] + (['abandon-sessions'] if abandon else []))
+                     requires=['writers-quiescent'])
 
 
 def _project_execute(action, progress, save, db, s3):
@@ -374,14 +373,13 @@ def _freeze(action, progress, save, db, s3):
         progress['inventory_changed'] = True
         save()
         raise UninstallError('cloud is frozen but unfinished-work evidence changed; create a new plan against this barrier')
-    if work['records'] and not details['abandon']:
-        raise UninstallError('cloud is frozen; clean session closure was not established')
+    if work['records'] or work['receipts']:
+        raise UninstallError('Cloud is frozen but unresolved legacy work remains; no removal was performed.')
     control, _ = fetch_control(s3, config, allow_maintenance=True)
     if control.get('uninstall') != token:
         raise UninstallError('persistent retirement marker changed; preserve all recovery evidence')
     result = {'status': 'frozen', 'instance_id': details['instance_id'],
               'recovery_epoch': details['recovery_epoch'], 'barrier_token': token,
-              'administratively_abandoned': bool(details['abandon'] and work['records']),
               'unfinished_evidence_sha256': digest(work),
               'session_records_modified': False, 'unknown_receipts_preserved': True,
               'unsaved_work_recovered': False, 'normal_cloud_closure': not work['records']}

@@ -34,6 +34,7 @@ OPTIONAL_CONFIG_KEYS = {'skill_bucket'}
 DEFINITIVE_MUTATION_ERRORS = frozenset({
     'revision_conflict', 'invalid_request', 'not_authorized', 'claim_conflict',
     'project_archived', 'idempotency_conflict', 'setting_conflict',
+    'project_unavailable', 'view_conflict', 'erased_record', 'snapshot_incomplete',
     'reference_unavailable', 'session_unavailable', 'context_stale',
     'database_statement_rejected',
 })
@@ -266,7 +267,7 @@ class MemoryClient:
                 content = bytearray()
                 for chunk in response.iter_content(8192):
                     content.extend(chunk)
-                    if len(content) > MAX_RESPONSE:
+                    if len(content) > (655360 if route == '/v1/reconcile/read' else MAX_RESPONSE):
                         raise MemoryClientError('invalid_service_response')
                 try:
                     result = json.loads(content)
@@ -308,6 +309,8 @@ class MemoryClient:
                     raise MemoryClientError('outcome_unknown' if uncertain else error.code,
                                             request_key=request_key,
                                             detail=None if uncertain else error.detail) from None
+                if route == '/v1/reconcile/apply':
+                    raise MemoryClientError('outcome_unknown') from None
                 if request_key:
                     uncertain = True
                 else:
@@ -320,6 +323,9 @@ class MemoryClient:
                     # A lookup receipt proves only that this key committed, not that it
                     # committed this body; callers verify reconciled writes by read-back.
                     return {**result, 'reconciled': True} if uncertain else result
+                if route == '/v1/reconcile/apply' and (status >= 500 or status == 200):
+                    # There is no request journal. Rediscover actual state on the next reconcile.
+                    raise MemoryClientError('outcome_unknown')
                 if uncertain and status == 404:
                     # Absence may race an in-flight commit. Preserve the key for explicit same-request retry.
                     raise MemoryClientError('outcome_unknown', request_key=request_key)

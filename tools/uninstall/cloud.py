@@ -314,14 +314,14 @@ def _optional(cloud, selector, instance, account, region):
     raise UninstallError('Unknown optional selector; use s3:BUCKET, ssm:/prefix/, or secret:ARN.')
 
 
-def plan_cloud(home, *, mode='retire', abandon=False, optional=(), retained_resources=()):
+def plan_cloud(home, *, mode='retire', optional=(), retained_resources=()):
     if mode not in ('retire', 'purge'):
         raise UninstallError('Cloud mode must be retire or purge.')
     home = str(checked_path(home))
     values = _load(home)
     cloud = _Cloud(values)
     try:
-        return _plan(cloud, values, home, mode, abandon, optional, retained_resources)
+        return _plan(cloud, values, home, mode, optional, retained_resources)
     except UninstallError:
         raise
     except Exception as error:
@@ -330,7 +330,7 @@ def plan_cloud(home, *, mode='retire', abandon=False, optional=(), retained_reso
         cloud.close()
 
 
-def _plan(cloud, values, home, mode, abandon, optional, retained_resources):
+def _plan(cloud, values, home, mode, optional, retained_resources):
     from . import lifecycle
     config_identity = _identity(values)
     cf = cloud.client('cloudformation')
@@ -485,7 +485,7 @@ def _plan(cloud, values, home, mode, abandon, optional, retained_resources):
         if mode == 'retire' and metadata['KeyState'] != 'Enabled':
             raise UninstallError('Recovery requires an enabled encryption key: ' + metadata['Arn'])
         retained.append({'target': metadata['Arn'], 'status': 'retained', 'reason': 'Encryption keys are never deleted; recovery or other resources may depend on them.'})
-    lifecycle_fragment = lifecycle.plan_cloud(home, abandon=abandon)
+    lifecycle_fragment = lifecycle.plan_cloud(home)
     details = {'home': home, 'identity': config_identity, 'instance_id': instance,
                'recovery_epoch': outputs['RecoveryEpoch'], 'mode': mode, 'stack_id': stack_id,
                'account': account, 'region': region, 'resources': resources, 'template': template,

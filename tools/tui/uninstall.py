@@ -23,9 +23,8 @@ HARNESS_WARNING = (
     'entry back. After closing each harness, reopen it and confirm MAVEN is no longer listed.')
 NO_ARCHIVE_WARNING = (
     'No archive directory was given. Machine removal permanently deletes each selected installation '
-    'folder, including its private settings (.env), saved AWS sign-in caches, unfinished setup state '
-    'and session records. Exact detached registrations remain in the private external recovery directory; '
-    'login caches are never archived. A folder is kept only when it cannot be proven safe to delete.\n\n'
+    'folder, including its private settings (.env), saved AWS sign-in caches and unfinished setup state. '
+    'Login caches are never archived. A folder is kept when it cannot be proven safe to delete.\n\n'
     'Go Back to enter an archive directory and keep an optional copy of settings and runtime records.')
 
 
@@ -80,11 +79,10 @@ def _wizard(ui):
             Field('cloud_mode', 'Cloud removal policy', 'retire', kind='select',
                   choices=(('Retire — preserve recoverable data (default)', 'retire'),
                            ('Purge — remove explicitly selected data', 'purge'))),
-            _boolean('abandon_sessions', 'Administratively abandon unreachable sessions'),
             _optional('optional_resource', 'Dedicated resource selectors: s3:BUCKET, ssm:/prefix/, secret:ARN (one per line)', multiline=True),
             _optional('retained_resource', 'Previously retained resource ARNs (one per line)', multiline=True)],
-         'Retirement is the default. Purge and session abandonment require separate '
-         'instance confirmations after full resource review. Unselected/shared resources remain.'),
+         'Retirement is the default. Purge requires separate instance confirmation '
+         'after full resource review. Unselected/shared resources remain.'),
         ('Recovery', None, [
             _optional('export', 'Archive directory for settings and records (blank: machine removal deletes '
                                 'them with the installation folder; project files stay in place)'),

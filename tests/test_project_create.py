@@ -28,14 +28,14 @@ class ProjectCreateTests(unittest.TestCase):
         save_json(self.root / '.maven/runtime/evidence.json', {'unfinished': True})
         save_json(self.home / 'home.json', {'root': str(self.root), 'project_id': self.old_id})
         self.original = {path: path.read_bytes() for path in self.base.rglob('*') if path.is_file()}
-        self.binding = {'connection': {'instance_id': self.instance_id, 'recovery_epoch': 1,
+        self.binding = {'connection': {'instance_id': self.instance_id, 'recovery_epoch': str(uuid4()),
                                        'region': 'us-east-1', 'endpoint': 'https://example.invalid'},
                         'environment': {'MAVEN_ACCOUNT_ID': '123456789012', 'MAVEN_AWS_REGION': 'us-east-1'}}
         self.records, self.receipts, self.writes, self.calls = {}, {}, [], []
         self.lose_response = self.fail_before_commit = False
         self.client = Mock()
         self.client.invoke.side_effect = self.invoke
-        self.authority = self.enter_patch('tools.project_create.verify_authority', return_value=7)
+        self.connection = self.enter_patch('tools.project_create.verify_connection')
         self.enter_patch('tools.project_create.configured_client', return_value=self.client)
         self.source = {'origin': 'owner-conversation', 'excerpt': 'Create maven-code in this instance; leave local evidence untouched.'}
 
@@ -98,13 +98,13 @@ class ProjectCreateTests(unittest.TestCase):
         self.assertEqual(len(self.records), 1)
         self.assertEqual(self.writes[0]['expected_revision'], 0)
         self.assertEqual(self.writes[0]['source'], self.source)
-        self.authority.assert_called_with(self.home / '.env', values=self.binding['environment'])
+        self.connection.assert_called_with(self.home / '.env', values=self.binding['environment'])
         self.assert_local_unchanged()
 
-    def test_stale_authority_refuses_submission(self):
+    def test_changed_instance_refuses_submission(self):
         candidate = self.candidate()
-        self.authority.return_value = 8
-        with self.assertRaisesRegex(SetupPending, 'Authority changed'):
+        self.binding['connection']['instance_id'] = str(uuid4())
+        with self.assertRaisesRegex(SetupPending, 'binding changed'):
             self.apply(candidate)
         self.assertEqual(self.writes, [])
 
@@ -124,7 +124,6 @@ class ProjectCreateTests(unittest.TestCase):
         self.assertEqual(saved[0]['request'], self.writes[0])
         progress = deepcopy(saved[-1])
         self.calls.clear()
-        self.authority.return_value = 8  # Committed receipt can still be reconciled.
         result = self.apply(deepcopy(candidate), progress)
         self.assertEqual(self.calls[0][0], '/v1/operations/lookup')
         self.assertEqual(len(self.writes), 1)

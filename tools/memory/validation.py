@@ -13,50 +13,29 @@ MAX_SKILL_DESCRIPTION = 500
 MAX_MEMORY_REQUEST_BYTES = 196608
 MAX_SEARCH_TERMS = 8
 MAX_SEARCH_OFFSET = 1000
-MAX_REVISION_IDS = 100
 MAX_DETAIL = 200
 MEMORY_KINDS = {"entity", "fact", "relationship", "task", "decision", "risk",
                 "note", "session", "operation", "setting", "checkpoint"}
-MEMORY_ROUTES = {"/v1/memory/" + action for action in ("write", "read", "search", "context", "claim",
-                                                       "project_context", "revisions", "secret_lookup", "secret_catalog",
+MEMORY_ROUTES = {"/v1/memory/" + action for action in ("write", "read", "search", "context",
+                                                       "secret_lookup", "secret_catalog",
                                                        "secret_adapter_policy", "secret_adapter_consume")}
+RECONCILE_ROUTES = {"/v1/reconcile/" + action for action in ("status", "inventory", "read", "apply")}
 APPROVAL_ROUTES = {"/v1/proposals/challenge", "/v1/proposals/resolve"}
-MUTATION_ROUTES = {"/v1/records/change", "/v1/proposals/create", "/v1/proposals/resolve",
-                   "/v1/memory/write", "/v1/memory/claim", "/v1/memory/secret_catalog"}
-ROUTES = {"/v1/records/change", "/v1/records/query", "/v1/operations/lookup",
-          "/v1/proposals/create", "/v1/pages/index", "/v1/pages/read"} | APPROVAL_ROUTES | MEMORY_ROUTES
+MUTATION_ROUTES = {"/v1/proposals/create", "/v1/proposals/resolve", "/v1/reconcile/apply",
+                   "/v1/memory/write", "/v1/memory/secret_catalog"}
+ROUTES = ({"/v1/records/query", "/v1/operations/lookup", "/v1/proposals/create", "/v1/pages/index",
+           "/v1/pages/read"} | APPROVAL_ROUTES | MEMORY_ROUTES | RECONCILE_ROUTES)
 
 # Version 2 requires migration 012 and memory-native checkpoint/scope contracts.
 SCHEMA_VERSION = 2
 # Version 4 requires migration 013: one dispatcher call per request and ranked retrieval.
 CLIENT_PROTOCOL = 4
 
-# One table drives request validation and client-facing field discovery.
-_DATA_SCHEMAS = {
-    "entity": ({"entity_type", "name", "aliases"}, set()),
-    "fact": ({"subject_id", "predicate", "value"}, set()),
-    "relationship": ({"subject_id", "predicate", "object_id"}, set()),
-    "task": ({"title", "description", "state"}, {"subject_id"}),
-    "decision": ({"title", "body_markdown", "state"}, {"subject_id"}),
-    "risk": ({"title", "body_markdown", "state"}, {"subject_id"}),
-    "note": ({"title", "body_markdown", "category"}, set()),
-    "session": ({"state", "summary"}, {"workflow", "operation"}),
-    "operation": ({"session_id", "name", "state", "summary"}, set()),
-    "setting": ({"key", "value", "scope"}, {"secret_ref"}),
-    "checkpoint": ({"session_id", "cutoff", "memory_refs", "state"}, {"summary"}),
-}
-# Git-linked checkpoints are written by the boundary, never discovered as an agent form.
-_GIT_CHECKPOINT_SCHEMA = ({"session_id", "candidate_digest", "git_base", "memory_refs", "state"},
-                          {"final_commit", "summary"})
-MEMORY_DATA_FIELDS = {kind: {"required": sorted(required), "optional": sorted(optional)}
-                      for kind, (required, optional) in _DATA_SCHEMAS.items()}
-_STATES = {"task": {"open", "in_progress", "blocked", "completed", "cancelled"},
-           "decision": {"proposed", "accepted", "superseded"}, "risk": {"open", "mitigated", "closed"},
-           "session": {"active", "closed", "abandoned"},
-           "operation": {"started", "completed", "failed", "blocked"}}
 
 
 def request_limit(route):
+    if route == "/v1/reconcile/apply":
+        return 1024 * 1024
     if route in ("/v1/memory/write", "/v1/memory/secret_catalog", "/v1/memory/secret_adapter_consume"):
         return MAX_MEMORY_REQUEST_BYTES
     return MAX_PROPOSAL_REQUEST_BYTES if route == "/v1/proposals/create" else MAX_REQUEST_BYTES
@@ -338,61 +317,23 @@ def reject_secrets(value):
 
 
 def _memory_data(kind, data, request):
-    if not isinstance(data, dict):
-        invalid(f"{kind} data must be an object")
-    git_checkpoint = kind == "checkpoint" and "cutoff" not in data
-    fields(data, *(_GIT_CHECKPOINT_SCHEMA if git_checkpoint else _DATA_SCHEMAS[kind]), name=f"{kind} data")
-    if len(canonical(data).encode("utf-8")) > 147456:
-        invalid(f"{kind} data exceeds 147456 bytes")
-    for key, maximum in {"title": 240, "name": 240, "description": 16000, "summary": 16000,
-                         "predicate": 80, "category": 80, "workflow": 80, "operation": 80, "key": 160}.items():
-        if key in data:
-            text(data[key], maximum, empty=key in {"description", "summary"}, name=f"data.{key}")
-    for key in ("subject_id", "object_id", "session_id"):
-        if key in data:
-            uuid_string(data[key], name=f"data.{key}")
-    if "body_markdown" in data:
-        text(data["body_markdown"], MAX_BODY_BYTES, empty=True, name="data.body_markdown")
-        if len(data["body_markdown"].encode("utf-8")) > MAX_BODY_BYTES:
-            invalid(f"data.body_markdown exceeds {MAX_BODY_BYTES} UTF-8 bytes")
-    states = _STATES.get(kind)
-    if kind == "checkpoint":
-        states = {"prepared", "committed", "aborted"} if git_checkpoint else {"prepared", "saved", "aborted"}
-    if states and (not isinstance(data["state"], str) or data["state"] not in states):
-        invalid(f"{kind} data.state must be one of {', '.join(sorted(states))}")
+    """Only project identity administration and the separate secret catalog still use this shape."""
     if kind == "entity":
-        if data["entity_type"] not in ("person", "organization", "project", "topic"):
-            invalid("data.entity_type must be one of organization, person, project, topic")
+        fields(data, {"entity_type", "name", "aliases"}, name="project entity")
+        if data["entity_type"] != "project" or "project_id" in request:
+            invalid("expected an unscoped project identity")
+        text(data["name"], 240, name="data.name")
         string_list(data["aliases"], 32, 240, name="data.aliases")
-    if kind == "operation":
-        text(data["name"], 160, name="data.name")
-    if kind == "setting":
-        if data["scope"] not in ("global", "project"):
-            invalid("data.scope must be global or project")
-        if (data["scope"] == "project") != ("project_id" in request):
-            invalid("project settings require project_id and global settings forbid it")
-        if "secret_ref" in data:
-            validate_secret_ref(data["secret_ref"])
-    if kind == "checkpoint":
-        if not git_checkpoint:
-            nonnegative_integer(data["cutoff"], name="data.cutoff")
-        else:
-            if not isinstance(data["candidate_digest"], str) or not re.fullmatch(r"[0-9a-f]{64}", data["candidate_digest"]):
-                invalid("data.candidate_digest must be 64 lowercase hex characters")
-            for key in ("git_base", "final_commit"):
-                if key in data and (not isinstance(data[key], str) or not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", data[key])):
-                    invalid(f"data.{key} must be a 40- or 64-character lowercase hex commit")
-            if (data["state"] == "committed") != ("final_commit" in data):
-                invalid("data.final_commit is required exactly when state is committed")
-        refs = data["memory_refs"]
-        if not isinstance(refs, list) or len(refs) > 100:
-            invalid("data.memory_refs must be a list of at most 100 references")
-        for ref in refs:
-            fields(ref, {"record_id", "revision"}, name="data.memory_refs item")
-            uuid_string(ref["record_id"], name="data.memory_refs.record_id")
-            revision(ref["revision"], name="data.memory_refs.revision")
-        if len({(ref["record_id"], ref["revision"]) for ref in refs}) != len(refs):
-            invalid("data.memory_refs must not repeat a reference")
+    elif kind == "setting":
+        fields(data, {"key", "value", "scope", "secret_ref"}, name="secret catalog setting")
+        text(data["key"], 160, name="data.key")
+        if data["scope"] != "project" or "project_id" not in request:
+            invalid("secret catalog settings require a project")
+        validate_secret_ref(data["secret_ref"])
+    else:
+        invalid("ordinary project writes require reconciliation")
+    if len(canonical(data).encode("utf-8")) > 147456:
+        invalid("data exceeds 147456 bytes")
 
 
 def _memory_kind(value):
@@ -477,41 +418,6 @@ def _memory(route, value):
                 text(value[key], 80, name=key)
         if "skill_slug" in value:
             slug(value["skill_slug"], name="skill_slug")
-    elif action == "project_context":
-        fields(value, {"project_id", "session_id"})
-        uuid_string(value["project_id"], name="project_id")
-        uuid_string(value["session_id"], name="session_id")
-    elif action == "revisions":
-        fields(value, {"record_ids"})
-        identifiers = value["record_ids"]
-        if not isinstance(identifiers, list) or len(identifiers) > MAX_REVISION_IDS:
-            invalid(f"record_ids must be a list of at most {MAX_REVISION_IDS} record ids")
-        for identifier in identifiers:
-            uuid_string(identifier, name="record_ids item")
-        if len(set(identifiers)) != len(identifiers):
-            invalid("record_ids must not repeat a record id")
-    else:
-        fields(value, {"request_key", "record_id", "expected_revision", "session_id", "action", "source", "change_reason"},
-               {"lease_seconds", "fence", "authority_generation"})
-        for key in ("request_key", "record_id", "session_id"):
-            uuid_string(value[key], name=key)
-        revision(value["expected_revision"], name="expected_revision")
-        if "authority_generation" in value:
-            nonnegative_integer(value["authority_generation"], name="authority_generation")
-        source(value["source"])
-        text(value["change_reason"], 240, name="change_reason")
-        reject_secrets(value)
-        if value["action"] == "claim":
-            if "fence" in value:
-                invalid("claim does not accept fence")
-            if type(value.get("lease_seconds")) is not int or not 30 <= value["lease_seconds"] <= 3600:
-                invalid("claim requires lease_seconds from 30 to 3600")
-        elif value["action"] in ("release", "complete"):
-            if "lease_seconds" in value:
-                invalid(f"{value['action']} does not accept lease_seconds")
-            revision(value.get("fence"), name="fence")
-        else:
-            invalid("action must be one of claim, complete, release")
 
 
 def validate(route, value):
@@ -519,13 +425,17 @@ def validate(route, value):
     if route not in ROUTES:
         invalid("unknown route")
     maximum = request_limit(route)
-    _json_value(value, maximum=maximum)
+    if route not in RECONCILE_ROUTES:
+        _json_value(value, maximum=maximum)
     try:
         if len(canonical(value).encode("utf-8")) > maximum:
             invalid(f"request exceeds {maximum} bytes")
     except UnicodeError:
         invalid("request is not valid UTF-8")
-    if route in ("/v1/memory/secret_lookup", "/v1/memory/secret_catalog"):
+    if route in RECONCILE_ROUTES:
+        from .reconcile_transport import validate_request
+        validate_request(route, value)
+    elif route in ("/v1/memory/secret_lookup", "/v1/memory/secret_catalog"):
         from .secrets_contract import validate_secret_request
         validate_secret_request(route, value)
     elif route in ("/v1/memory/secret_adapter_policy", "/v1/memory/secret_adapter_consume"):
@@ -536,6 +446,8 @@ def validate(route, value):
             invalid("adapter request does not satisfy its declarative policy contract")
     elif route in MEMORY_ROUTES:
         _memory(route, value)
+        if route == "/v1/memory/write" and (value["kind"] != "entity" or value["data_scope"] != "owner"):
+            invalid("only owner project identity administration is supported here")
     elif route == "/v1/operations/lookup":
         fields(value, {"request_key"})
         uuid_string(value["request_key"], name="request_key")
@@ -544,31 +456,6 @@ def validate(route, value):
         uuid_string(value["record_id"], name="record_id")
         if "revision" in value:
             revision(value["revision"])
-    elif route == "/v1/records/change":
-        fields(value, {"request_key", "action", "record_id", "classification",
-                       "data_scope", "fact", "source", "change_reason"},
-               {"expected_revision"})
-        uuid_string(value["request_key"], name="request_key")
-        uuid_string(value["record_id"], name="record_id")
-        if value["classification"] != "Sensitive" or value["data_scope"] != "synthetic":
-            invalid("legacy facts require Sensitive classification and synthetic data_scope")
-        if value["action"] == "correct_fact":
-            revision(value.get("expected_revision"), name="expected_revision")
-        elif value["action"] != "create_fact" or "expected_revision" in value:
-            invalid("action must be create_fact without expected_revision or correct_fact with it")
-        fact = value["fact"]
-        fields(fact, {"predicate", "value_type", "value"}, name="fact")
-        text(fact["predicate"], 80, name="fact.predicate")
-        types = {"string": str, "number": (int, float), "boolean": bool,
-                 "object": dict, "array": list, "null": type(None)}
-        kind = fact["value_type"]
-        if not isinstance(kind, str) or kind not in types:
-            invalid(f"fact.value_type must be one of {', '.join(sorted(types))}")
-        if not isinstance(fact["value"], types[kind]) or (kind == "number" and type(fact["value"]) is bool):
-            invalid("fact.value does not match fact.value_type")
-        source(value["source"], approval=False)
-        text(value["change_reason"], 240, name="change_reason")
-        reject_secrets(value)
     else:
         _instruction(route, value)
     return value
@@ -591,8 +478,6 @@ def authorized_actor(event, role_arn):
     return actor
 
 
-def validate_change(body):
-    return validate("/v1/records/change", body)
 
 
 def validate_query(body):

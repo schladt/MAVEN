@@ -1,0 +1,7 @@
+# Select or enable a project
+
+1. Call `maven_orient(cwd)` in the actual workspace. Use the nearest explicitly enabled folder, not a matching repository name. Read the local brief and its annotated references. A missing brief is not proof that cloud memory is empty. Outside an enabled root, do not capture or fall back to Home. A malformed or legacy binding needs a reviewed repair or switch; do not edit it by hand.
+2. Only when asked to create, connect or switch, use the project operation in the discovered `maven_admin` schema. Distinguish creating a new cloud project from connecting to an existing ID and from changing an existing folder binding. Show the exact review, including the absolute folder, instance and project identities, old/new selection, and any preservation path or Home change. Never merge similar names or assume that installation enabled this folder.
+3. Use the owner's genuine response for the same operation, interaction and revision. Resume that operation after an uncertain result, not a replacement. After a binding change, call `maven_orient(cwd)` again and check the resulting selection against the reviewed project before saving there. Report a mismatch; do not silently choose another project.
+
+Home is an explicit, separately configured selection for personal knowledge. Use the reviewed Home operation only when asked to configure or change it; use `use_home=true` consistently for explicit Home memory requests. Neither binding nor orientation configures Git, publishes files or authorizes secret use.

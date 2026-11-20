@@ -1,15 +1,6 @@
 # Getting started
 
-Install/connect the selected instance once, then ask your assistant to enable MAVEN
-for an explicitly chosen folder. Project enablement is not part of installation.
-Supported sessions initialize visibly through native guidance and stdio MCP. No manually
-assembled UUIDs, JSON requests or lifecycle commands are needed for ordinary work.
-
-Start with the [README prerequisites](../README.md#before-you-start). A source
-checkout does not supply a configured virtual environment, private `.env`, or your
-project's `.maven` directory. The installer creates the private installation home;
-project state is created separately through explicit harness enablement. Installing
-tools in a checkout does not register that checkout as a project.
+Install/connect the selected instance, then enable the intended folder. The installer creates the private installation home; it never automatically registers its source checkout. See the [prerequisites](../README.md#before-you-start). Once a folder is enabled, reading its brief and saving local work do not require AWS to be online.
 
 ## Guided first-time setup
 
@@ -33,10 +24,7 @@ Python is never modified.
 
 **Optional secrets-store selection**
 
-Core memory readiness requires the selected identity, instance and current applicable
-authority, not a secrets store or Git configuration. When secrets are wanted, import
-locators from an explicit private `.env` or approved record, enter existing settings,
-or approve the exact private S3 bucket and generated SSM wrapping key.
+Ordinary project memory does not depend on a secrets store or Git configuration. When secrets are wanted, import reviewed locators, enter existing settings, or approve the exact private S3 bucket and generated SSM wrapping key.
 Prefixes are namespaces, not resources to discover or adopt by name. The review pins
 identity, resources and effects; plaintext never belongs in reviews, journals or chat.
 
@@ -108,11 +96,7 @@ installation's `.env` as an optional override. Importing settings does not impor
 credentials. If MAVEN has not been deployed, choose **Create a new MAVEN instance**
 using a separate unused private home.
 
-The wizard derives locators from the imported file or actual stack outputs and asks
-you to confirm instance and principal identities. Neither method redeploys,
-initializes an existing database, or activates replacement authority. Existing
-authority must already be available; missing authority is a blocker, not permission
-to reset it.
+The wizard derives locators from the imported file or actual stack outputs and asks you to confirm the instance and principal identities. Connecting to an existing instance is not permission to redeploy, initialize a database or change policy. A missing reconcile capability requires a separately reviewed update.
 
 **New instance:** sign in and confirm the discovered account/principal, then provide
 the stack/instance name, notification email and two comma-separated availability zones
@@ -130,23 +114,7 @@ change-set preview; it does not deploy billable resources. The next approval bin
 billable execution to the exact generated package and change-set digest. Database
 initialization remains a separate consequential approval.
 
-Starter instructions are prepared locally without an extra confirmation. **One
-collection approval replaces separate per-page submission/activation approvals**:
-it authorizes uploading and activating the exact reviewed instruction collection,
-in dependency order. The review explains what “authority” means, lists page titles, and provides
-complete contents under **Technical details**. Progress reports the current page
-and completed count. This is not an all-or-nothing cloud transaction: completed
-pages remain active after a pause or failure. Resume preserves the approval and
-original request identifiers; changed contents or connections cannot reuse it.
-Older individual starter prompts advance to one collection review without replaying
-already completed pages. Unknown outcomes always reconcile the original request.
-
-The default flow removes duplicate new-instance region confirmation, separate
-preview-creation approval, local starter-preparation approval and per-page approvals.
-Actual AWS identity confirmation, billable execution, SQL initialization/migration,
-the starter collection, and changed local harness files retain meaningful approvals.
-Expandable technical details provide deeper inspection without a second granular
-review mode. Destructive removal confirmations remain separate.
+Verify the selected instance through its signed service. The local project workflow does not require activating cloud instructions. Installing a skill, approving a database migration or seeing a ready stack grants no authority to execute external actions.
 
 Current-step context is inside the bordered panel; its overflow is scrollable in
 small terminals. A bottom status bar distinguishes **Waiting…**, **Awaiting input**,
@@ -169,8 +137,7 @@ without that choice. A failed login offers manual recovery, not a readiness clai
 MAVEN keeps its own private AWS sign-in caches inside the installation home
 (`runtime/aws-login-cache` for daily use, `runtime/aws-deploy-login-cache` for
 maintenance). A plain `aws login --profile …` writes the AWS default cache, which MAVEN
-does not read. When sign-in expires, the **current stopping screen** repeats the
-exact cache, profile and region command, also available in `maven_status`, for example:
+does not read. When sign-in expires, run the exact command returned for the selected cache, profile and region in your own terminal, for example:
 
 ```sh
 AWS_LOGIN_CACHE_DIRECTORY=~/.maven/runtime/aws-login-cache aws login --profile maven-interactive --region us-east-1
@@ -197,8 +164,7 @@ The actual returned principal is verified before any subsequent cloud action.
 
 ### Optional harness connection and project enablement
 
-After verified cloud access and complete applicable authority, optionally configure
-OMP, Claude Code, Codex, Copilot or Gemini. Approve the exact local file changes and
+After verified cloud access, optionally configure OMP, Claude Code, Codex, Copilot CLI or Gemini CLI. Approve the exact local file changes and
 acknowledge the risk of changing running harness configuration; this is not a claim
 that writers stopped. Actual writer quiescence is checked separately where required.
 Identical integrations need no rewrite. Conflicting targets are preserved without
@@ -212,34 +178,20 @@ New installs use a safe package-install umask and record safe launcher permissio
 
 Completion distinguishes **cloud verified**, **harness files written/skipped/conflict**,
 **restart needed**, and **harness MCP connection not yet verified**.
-Open the actual project in a new selected-harness session and ask:
-**“Enable MAVEN for this project.”** Review the root, instance and scope before approval.
+Open the actual project folder in the selected harness and ask **“Enable MAVEN for this project.”** Review the root, instance and cloud project ID before approval.
 The installer never chooses a project folder or binds its source checkout.
 
 Project enablement can select an existing cloud project or create a named one with
 genuine source evidence. Memory needs no Git configuration; optional Git assistance
 is separate. Project selection does not commit, push, pull or switch branches.
 
-To change only a cloud project's name, ask **“Rename this project to NAME.”**
-Use the existing project administration form's **rename** mode with the enabled
-folder's absolute `root`, exact `project_id`, and new `name`. Approve the full review:
-old/new names, project and instance UUIDs, account/region, and the naming impact on
-all machines. The revisioned entity update preserves the UUID, history, aliases,
-tags, folder, local binding, Home selection, Git and infrastructure. A missing or
-unavailable project is refused, never recreated. A changed project or authority
-requires a fresh exact review. If a response is lost, advance that same operation:
-MAVEN reconciles its original request and verifies the updated cloud record before
-reporting completion; do not replace an uncertain request with a new operation.
+New bindings use `project.json` schema 2 to pin the signed service's instance ID and recovery epoch with the project ID. To change destinations, or if the folder has an older schema-1 binding, ask **“Switch this folder to the existing project …”** and review the full old/new identities, preservation path and any Home change. Use the reviewed switch even if the destination project ID is unchanged. Never update the schema number by hand.
 
-To create a cloud project without changing an already-enabled folder, select
-**create_cloud** in the project administration form, supply its absolute existing
-`root` and new `name`, and leave `project_id` empty. Review the exact generated UUID,
-request key, account, region, instance and current root. Approval creates only the
-cloud entity: project config, Home selection and runtime evidence stay untouched.
-Connecting the folder requires a separately reviewed **switch** operation.
-An unavailable old project does not prevent this universal creation. Resume the
-same administration operation after an uncertain response; its original request
-and receipt are reconciled and exact cloud content is read back before completion.
+For a Home switch, the replacement review lists other tagged Home projects across all discovery pages. If discovery cannot finish or a candidate changes while it is being read, the switch does not proceed.
+
+Switch preserves the old `.maven` directory, including unsynced local knowledge, at the reviewed private sibling path. Resolve outstanding external operations first. If interrupted, resume the same administrative operation. No cloud project is merged or erased. Other machines' selections do not change.
+
+To rename an existing cloud project, review its exact ID and old/new name. Renaming changes the label for other machines too; it is not a new project or a local folder rename. Creating a cloud project without rebinding the current folder is likewise separate from switching that folder to it. Resume the original creation or rename operation after a lost reply; verify the actual cloud entity before reporting completion.
 
 ### Resume instance setup
 
@@ -261,28 +213,7 @@ and reports its saved phase. Back only revises safe, unsubmitted choices.
 Unknown outcomes must be reconciled before retrying mutations; existing infrastructure
 must never be reinitialized to recover onboarding.
 
-Older installers could stop with `KeyError` after signing in when an existing-instance
-connection was left blank without saved settings. Pause with Ctrl+Q and restart
-the updated installer, then choose **Resume unfinished setup**. The same operation
-now reconfirms maintenance access and searches AWS for the missing target, followed
-by explicit stack selection and connection review. Historical approvals and receipts
-remain intact. Do not delete settings or receipts to recover.
-
-`maven-setup` opens the same setup screens and reads existing receipts. Guided
-installation continues directly into cloud setup; if paused, activate that home and
-run `maven-setup` when ready. `--mode existing|new` selects the task without asking
-again. **Completed, verified setup resumes optional harness configuration by default**,
-including an explicit `--operation` for that completed record. No new operation or
-cloud checks are started when its exact saved settings still match. The installer
-offers **Continue / configure coding harnesses** for that state.
-
-Starting a new check/repair after completion is explicit: choose that task or use
-`--fresh-operation`. This never discards an unfinished or unverified operation.
-If an older installer already started another connection check, it remains unfinished
-and resumes its current checkpoint—not the earlier completed starter installation.
-If recorded readiness lacks a recoverable exact binding or settings changed,
-restore the original settings or explicitly request a fresh check; readiness is
-not inferred from today's settings.
+Completed verified setup can continue local harness configuration without repeating cloud approvals if its recorded settings still match. To request a fresh connection check after completion choose **Check/repair**. Do not discard an unfinished operation or infer current AWS availability from a saved readiness receipt.
 
 To abandon the current unfinished setup, rerun `python3 install.py` and choose
 **Abandon unfinished setup and start over**. Review the exact operation and type its
@@ -296,10 +227,7 @@ displayed confirmation prefix. Declining leaves it unchanged. Approved abandonme
   setup with fresh approvals and an isolated artifact directory. It does not silently
   switch identity, delete the connection or require AWS access just to restart locally.
 
-Setup locks prevent abandoning an actively running setup. Relevant sessions and
-reservations must be resolved before effects that change their binding. If local
-tools were removed, use the reviewed software-only restoration. An interrupted
-restart resumes its journaled replacement operation without repeating completed work.
+Setup locks prevent abandoning an actively running setup. If local tools were removed, use the reviewed software-only restoration. An interrupted restart resumes its journaled replacement operation without repeating completed work.
 
 **Abandonment is not cloud rollback:** submitted AWS work may continue and resources
 may still incur charges. Unknown effects remain unresolved. Reconnect to existing
@@ -308,124 +236,15 @@ The recovery CLI is `maven-setup --home PATH --restart-operation UUID`, using th
 actual home and original operation ID. Unlike `--fresh-operation`, this is an explicit
 reviewed abandonment; it cannot be combined with `--mode` or `--operation`.
 
-Instance completion requires verified daily-use cloud access and complete applicable
-authority. Project enablement is separate. For an interrupted project operation,
-preserve its `.maven/runtime` receipts and resume its original `maven-project setup`
-choices. Legacy installer project receipts are retained, not executed or deleted
-by the redesigned installer; unresolved submitted effects require reconciliation.
-
-The `maven_admin` Back action exposes the same safe navigation to harnesses: it
-returns a fresh editable interaction while retaining historical approvals and
-receipts. It refuses to cross submitted or unresolved effects.
-
-Conversational setup preserves a durable operation identity. The agent records a
-response, then advances one explicit phase; recording consent alone does not execute
-the next external action. `maven-setup --operation UUID` resumes that exact saved
-operation (use its actual returned identity). Reviews retain the full digest and real
-owner source evidence, not invented TUI approval provenance.
-
-For a later reviewed configuration or migration, the assistant can begin a new
-`maven_admin` setup operation after the previous setup completed with verified
-instance readiness. The old wizard state and receipts are preserved, and new
-preparation artifacts are isolated. Ordinary new operations cannot take over unresolved,
-cancelled or unverifiable setup. Use original receipts for recovery, or explicitly
-review abandonment through the installer; abandonment does not resolve cloud effects.
-External-prerequisite screens show the command, required environment and exact resume
-command inside the review modal. Decline to pause safely while completing the handoff.
+Instance readiness checks the signed reconcile capability. Project and Home selections require separate review. For an interrupted setup, binding change, or external handoff, resume its original operation. The assistant presents the complete review and records your actual response against its identity and revision; recording approval is not execution. A changed target or artifact requires a fresh review.
 
 ### First use and everyday work
 
-Configure the selected harness to launch the installed `maven-mcp` stdio entrypoint
-and load its thin startup/intent guidance. See the [capability matrix](integrations.md#harness-capability-matrix)
-for configuration formats and limitations; availability is not permission to capture.
+Read the brief locally. Ask “Remember this decision” to save useful evidence on this machine or “Reconcile this project” to compare it with the cloud. Outside an enabled root, the assistant does not capture. There is no mandatory cloud check on opening or closing the harness. See the [project workflow](workflow.md) and [reconcile procedure](../maven_resources/templates/skills/maven/references/reconcile.md).
 
-Ask **“Enable MAVEN for this project.”** Confirm the root, instance, project and
-authorized scope. Later sessions reuse that project selection, establish a distinct
-work-session binding and load complete current authority, handover, tasks and blockers.
-The visible initializing/ready/blocked messages report actual readiness, not merely
-server startup. Where startup guidance cannot run reliably, ask **“Initialize MAVEN.”**
+### MAVEN Home
 
-Ask to save or consult memory, reconcile a plan, checkpoint, pause/resume or wrap up.
-Routine maintenance stays quiet and uses native background reasoning where available,
-otherwise foreground reconciliation. Explicit saves confirm verified cloud receipts.
-Universal/current-project retrieval is the default; other-project consultation is
-explicit. Ordinary checkpoints have a cutoff and exact revisions, not Git effects.
-“Checkpoint and wait” synchronizes; “resume” catches up from available discussion,
-while “resume fresh” does not. See [workflow](workflow.md) for these boundaries.
-
-After restarting a harness, the assistant checks `maven_status` before claiming a
-connection; an unbound process lists the active registered sessions for the folder and
-resumes only the exact one. Outside an enabled project, see the start choice below.
-
-**Optional keep-warm:** set `MAVEN_KEEP_WARM=1` in the private `.env` (or the MCP
-process environment) to have an initialized MCP process ping the instruction index every
-240 seconds, keeping Aurora from auto-pausing (5 minutes idle) during active sessions.
-It is off by default: each ping is a billed Lambda/Data API request, and a database kept
-awake accrues compute charges for as long as the session stays bound. Leave it off when
-cold-start latency is acceptable.
-
-Additional projects only need their own explicit enablement, not another instance
-deployment. A new/forked session gets its own identity; explicit resume preserves the
-original. Cwd changes, transport reconnection and newest receipts never select a new
-project/session implicitly. Missing access blocks dependent work, not unrelated chat.
-
-### MAVEN Home and the start choice
-
-At the start of each session the assistant calls `maven_status` with its workspace
-folder. Inside an enabled project it initializes that project as before. Anywhere
-else it asks one line, every time:
-
-```text
-MAVEN: no project here — Start Home, Create Project, or Read Only?
-```
-
-- **Start Home** initializes your MAVEN Home (offered only when Home is configured).
-- **Create Project** runs normal enablement for a folder; `$HOME`, `/`, `~/.maven` and
-  the MAVEN checkout are refused.
-- **Read Only** (also the result of not answering) creates no session and captures
-  nothing. When you ask, the assistant consults universal knowledge, and Home if you
-  want it, read-only.
-
-The answer is recorded locally only. Subagents and maintenance workers inherit the
-choice and never ask. Nothing is captured without a project or Home choice, and a cwd
-change never rebinds a session. The assistant prints the active line, such as
-`MAVEN: Home (<label>)`, `MAVEN: project <name>` or `MAVEN: read-only`, at start and
-whenever it changes.
-
-**MAVEN Home** is an optional, per-machine project for your life, personal and work
-tasks, and awareness of people and organizations (for example tag `client:<slug>`).
-Set it up, change it or disable it with **“Set up or change MAVEN Home”** in the
-installer, or ask the assistant (`maven_admin` kind `home`). Disabling leaves cloud
-data untouched. Home is the one explicit, owner-configured exception to MAVEN never
-choosing a root by itself. A Home session also starts with a short **project index**:
-up to 100 non-archived projects' names and last activity, with no project details,
-so the assistant knows what exists and which project to open. Archived projects
-appear only when you explicitly request archived-history discovery.
-
-To use the same Home knowledge on another machine, select the **same existing cloud
-project ID** during Home setup. Names are labels, not identity. For a folder already
-bound to the wrong project, ask **“Switch this folder to my existing Home project.”**
-The project/Home administration form has an explicit **switch** mode; it reviews
-old/new identities and local preservation before changing anything. Finish local
-sessions first. Old cloud data and other machines remain unchanged; no cleanup or
-merge is implied. The project index's `is_current_context` flag identifies the
-current view, not a globally unique Home project.
-
-Optional startup adapters supply the genuine native conversation identity. MAVEN
-resumes that exact open session, keeps paused mode, or creates a distinct session for
-a new conversation. Stale/unfinished peers offer recovery, new work without takeover,
-or Read Only; no peer is automatically closed. Ask **“Review MAVEN recovery”** for
-diagnosis without replaying writes.
-
-OMP's optional exit guard offers wrap-up/exit-anyway/stay for an open mapped session.
-It waits for verified MAVEN closure before automatically exiting. Other supported
-harness end hooks are best-effort notices, not exit prevention. Forced termination
-can bypass every hook; next-start recovery remains necessary.
-
-Scoping: **universal** holds preferences, instructions and general lessons only;
-nothing specific to one customer or project, because universal records appear in every
-project. **Home** holds the owner-level material above. **Project** holds that
-project's detail. When unsure, the assistant chooses Home, not universal.
+Home is an optional, per-machine selection for personal tasks and people or organization knowledge. Use the installer's **Set up or change MAVEN Home** or explicitly ask the assistant to configure it. To share Home, select the same cloud project ID on each machine; names alone do not establish identity. Disabling the pointer is not deletion. Request Home explicitly: unrelated folders do not silently switch to it.
 
 ### Installer options and harnesses
 
@@ -434,41 +253,18 @@ Use it for a package-only installation; downloads still require network access o
 appropriate package cache, and it does not establish cloud readiness. `--home PATH`
 chooses another private home, and `--harness NAME`
 selects a harness (repeat for several). `--skill-dir PATH` explicitly selects a custom
-destination. Running harnesses do not block interactive skill installation: they load
-the change after a restart, and a harness that saves its own configuration while running
-can overwrite the MAVEN entry, so confirm it is listed afterward. A noninteractive
-`--local-only` install still requires `--harness-stopped` when selecting harness files.
-Conflicting files are preserved; interactive setup can continue without changing them.
-Start a new harness afterward to discover the generic skills.
+destination. Prefer closing the affected harnesses before updating them. Only pass
+`--harness-stopped` if they are actually stopped. Running clients keep their loaded
+skills and can overwrite configuration when they save; restart them and verify
+discovery after the update. Conflicting files are preserved and reported.
+Start a new harness afterward to discover the `maven` skill.
 
-The installed generic skills are `maven` (intent front door), `maven-maintenance`
-(bounded semantic worker) and `maven-update` (updates MAVEN itself; see
-[Existing-instance upgrade](#existing-instance-upgrade)). An installer-owned skill
-you have not edited is upgraded when MAVEN updates; edited or shared copies are kept.
-Native startup guidance and an owned MCP configuration
-entry complement them. They are bootstrap routing, not cached cloud authority.
-Unrelated user configuration is preserved; conflicts or modified owned content require
-review rather than overwrite. Stage changes and close affected harnesses before
-applying them; a running assistant cannot truthfully attest it has stopped.
-
-Custom profiles need an explicit destination. Client configuration, trust, startup,
-background execution and transcript access differ; consult the
-[integration matrix](integrations.md#harness-capability-matrix). No native OMP extension
-is required. Hosted clients need separately provisioned access and are not covered by
-local stdio installation.
+The installer ships one [MAVEN skill](../maven_resources/templates/skills/maven/SKILL.md) with four local procedures: **maven project**, **maven reconcile**, **maven secrets** and **maven update**. Ask in plain language; these are not shell commands. Edited or shared copies are preserved. A client-launched stdio MCP entry and standing guidance complement the skill. Review conflicts rather than overwriting unrelated configuration. See the [integration matrix](integrations.md#harness-capability-matrix); hosted clients are not covered by local stdio installation.
 
 To stage selected integrations without live writes, use `--stage-harnesses PATH`.
 For custom profiles, pair `--harness-config NAME=ABSOLUTE_FILE` with
 `--harness-context NAME=ABSOLUTE_FILE` and an explicit `--skill-dir PATH`. Actual
-integration changes still require stopped-harness approval. Normal installation
-includes `ui,mcp`; Google libraries and CLI are no longer part of core.
-
-Native startup/shutdown integration is enabled by default for selected harnesses.
-Uncheck **Install native MAVEN startup and shutdown integration** or pass
-`--no-lifecycle-hooks` to keep only portable startup guidance and explicit wrap-up.
-Custom profile overrides require that flag until an explicit native hook destination
-is supported; the installer will not guess or alter the wrong profile. Staging
-includes lifecycle files when enabled. Restart the selected harness after applying.
+integration changes require review. Restart the affected harnesses and verify discovery; the installer does not restart an existing MCP process.
 
 ### Optional AWS Agent Toolkit
 
@@ -508,13 +304,7 @@ must include the trusted roots needed by your network; obtain it from your admin
 No corporate roots ship in MAVEN, and TLS verification stays enabled. Do not accept
 an unverified certificate merely to get past an error.
 
-## Advanced manual reference
-
-Conversation through MCP is the normal operating path. The remaining sections retain
-CLI/TUI administration and recovery references, not routine memory prerequisites.
-Use the installed release's help for exact argument contracts. All shell variables below
-mean actual owner-reviewed values: define them from private settings and command results.
-MAVEN provides no preconfigured account, endpoint, credentials or owner authority.
+## Cloud setup reference
 
 ### Deployment limitations and costs
 
@@ -560,208 +350,13 @@ are not spending caps and tagging/reporting may undercount or lag. Retained reso
 old versions and deletion protection mean deleting the stack is not full teardown;
 resource disposal requires separate review and approval.
 
-### Prepare, review and apply an exact deployment
-
-Choose a private output directory that does not already contain an installation
-package. Preparation is offline:
-
-```sh
-maven-memory install prepare --output "$PACKAGE_DIRECTORY"
-```
-
-Review its manifest, rendered template, parameters, permission details, runtime code
-and digests. Resolve every required input. Preparation is not evidence that the engine,
-account, zone or permissions are available in AWS.
-
-After owner approval to create a CloudFormation change set:
-
-```sh
-maven-memory install plan --package "$PACKAGE_DIRECTORY" \
-  --review "$PRIVATE_REVIEW_FILE" --type CREATE
-```
-
-This command contacts AWS and creates a change set; it does **not** execute it. Review
-the exact resource changes, capabilities, role trust, target, parameters, costs and
-returned `review_sha256`. After separate explicit execution approval:
-
-```sh
-maven-memory install apply --package "$PACKAGE_DIRECTORY" \
-  --review "$PRIVATE_REVIEW_FILE" --confirm-review "$REVIEW_SHA256"
-```
-
-Apply rejects changed review/package content, executes the exact reviewed change set,
-reconciles its result and writes confirmed connection outputs to the private `.env`.
-Do not manually invent output ARNs. The `--budget` options on plan/apply are bounded
-**wait durations in seconds**, not monetary budgets. Preserve `.pending` and review
-receipts after timeouts; an unknown outcome is not permission to create another stack.
-
-For an existing approved stack, `maven-memory install connect --confirm-instance
-"$INSTANCE_ID"` validates its ready outputs before connecting. Updates use `--type
-UPDATE` and retain the existing instance/recovery identifiers. Reinspect every update;
-old approval does not cover changed artifacts.
-
-After approval to initialize the selected database/schema:
-
-```sh
-maven-memory install init --confirm-instance "$INSTANCE_ID"
-```
-
-The caller binding is established by the reviewed IAM principal and role trust;
-initialization establishes the service schema/state, not a new arbitrary identity.
-Use `install migrate --confirm-instance "$INSTANCE_ID"` only for a separately reviewed
-migration to an existing deployment. Initialization does not activate starter authority.
-
-### Review and activate a complete starter authority
-
-Starter preparation is offline and creates new proposal/page UUIDs, bodies and a
-manifest with dependency-safe `activation_order`:
-
-```sh
-maven-memory starter prepare --output "$STARTER_DIRECTORY" \
-  --source-origin "$OWNER_SOURCE" --source-excerpt "$OWNER_REQUEST"
-```
-
-Supply genuine owner source evidence, not the literal example variable names. Read
-all proposed bodies. The catalog contains the core directive and memory, setup,
-connection, skill-loading, workflow, secrets and workspace skills.
-They are proposals only; even the generic root directive requires owner activation.
-The bundled secrets skill covers usage, not setup/import or scanning.
-
-For **each selected page in dependency order**, review its complete generated JSON
-and body, then submit the proposal and obtain the exact owner-approval challenge:
-
-```sh
-maven-memory instruction draft "$STARTER_DIRECTORY/$SLUG.json"
-maven-memory instruction challenge --proposal-id "$PROPOSAL_ID"
-```
-
-Use the actual proposal ID from the manifest/response. Save the complete challenge JSON
-in an owner-private file (mode `0600`) without editing its identity, hash or revision.
-The challenge requires the separate approval role and expires after ten minutes.
-After the owner reviews the exact candidate and supplies approval evidence:
-
-```sh
-maven-memory starter approval --draft "$STARTER_DIRECTORY/$SLUG.json" \
-  --challenge "$CHALLENGE_FILE" --output "$APPROVAL_FILE" \
-  --approval-origin "$OWNER_APPROVAL_SOURCE" --approval-excerpt "$OWNER_APPROVAL"
-maven-memory instruction activate "$APPROVAL_FILE" --confirm-candidate "$CANDIDATE_HASH"
-maven-memory instruction read --slug "$SLUG"
-```
-
-The builder validates the matching challenge/draft, current candidate hash, revision
-and expiry; it neither submits nor activates. Use the candidate hash from the actual
-challenge. Never manufacture approval text, reuse an expired challenge or automatically
-approve the entire catalog. Activate every selected page's dependencies first. If a
-write outcome is unknown, reconcile the exact request key with `maven-memory lookup
---request-key "$REQUEST_KEY"` (add `--approval` for activation) before repeating it.
-
-### Select the project manually
-
-Use `maven-project setup --root "$PROJECT_ROOT"` for interactive project onboarding.
-For an agent that has obtained the owner choices, the shared project controller safely
-generates identities and preserves an existing selection. `maven-project init`
-remains a low-level explicit-ID API, not the ordinary first-use path. Manual starts
-also require an explicit root and complete authority; retain the returned MAVEN
-session UUID, distinct from any optional harness identity.
-
-Review [Security and privacy](security.md) before sharing retrieved context with an
-external model. Review [integrations](integrations.md) for the required secrets store
-and optional workspace features. Google is not required or included in core.
-
 ## Existing-instance upgrade
 
-Local code/templates do not update live AWS resources, schema or active authority by
-themselves. The guided update applies them as one resumable setup operation in mode
-`update` (`maven-setup --mode update`, **Update MAVEN** in `python3 install.py`, the
-`maven-update` skill, or `maven_admin` begin kind `setup` with `{"mode": "update"}`):
+Ask **“Update MAVEN”** or choose **Update MAVEN** in `python3 install.py`. The [update procedure](../maven_resources/templates/skills/maven/references/update.md) describes the resumable operation. Review the selected checkout and installation, run any local software handoff in a separate terminal, then restart the affected harness and resume the same operation. Installation updates preserve modified or shared skills rather than replacing them silently.
 
-For the secrets/Google cutover, use the installer update with affected harness
-sessions stopped. It installs local software/harness files first, then presents any
-required legacy environment migration before strict settings loading. The update
-operation applies the bundled additive migrations through **SQL024**, then the
-matching service/IAM change set and optional owner-reviewed instruction changes.
-Secrets remain optional. Installing files does not enable a new MCP session:
-restart the harness after the update and load current authority. Existing MCP
-connections are not restarted or refreshed automatically.
+For cloud activation, review the exact ordered database migrations (including `025_project_reconciliation.sql`) and the matching service change set against the selected instance. Updates that remove or replace a database, secret, bucket or key are refused. Do not clear a maintenance barrier or mark an uncertain database operation complete; preserve its journal, inspect the outcome, and obtain fresh approval for changed SQL. Confirm the signed service reports the expected instance, recovery epoch and `project_reconcile_v1` capability before reporting cloud readiness. A package, local check or installed harness entry proves none of this.
 
-Before any host receives the removed Google runtime, inspect live instruction
-dependencies and obtain separate owner approval to revoke its cloud skill.
-Removing a bundled template is not revocation. Stored Google credentials remain
-untouched SSM values; Magic Workspace is independent. Legacy environment migration
-cannot be postponed until after cloud setup because the new strict loader rejects
-the retired key. No separate manual SQL or CloudFormation rollout is required.
-
-For only the one-time local legacy-locator migration, use:
-
-```sh
-maven-setup --home "$MAVEN_HOME" --migrate-environment
-```
-
-This presents a separate exact review, not a deployment. The retired
-`MAVEN_GOOGLE_PARAMETER_PREFIX` is retained in a private receipt; every other setting
-is preserved. An imported `.env` remains untouched and produces a sanitized private
-snapshot. Guided setup presents the same prerequisite automatically. Through MCP,
-begin `maven_admin` kind `environment_migration` with `{}` for this home's `.env`,
-or `{"path": "<absolute private import path>"}`. If an existing operation returns
-`prerequisite_operation`, complete that exact review first, then advance the original
-operation UUID. Nothing here activates/revokes authority or touches stored credentials.
-
-| Stage | What it compares | What it does when different |
-| --- | --- | --- |
-| Local | Actual installed bytes, launchers and package metadata against recorded package inputs; harness skills checked separately | Reviewed reinstall when proof is absent or differs; preserves edited/shared skills and recorded custom targets |
-| Schema | `maven.schema_migrations` vs the bundled ordered migrations (admin role, read-only) | Separately reviewed forward migration; a non-prefix history is reported, not bypassed |
-| Service | Deployed template vs the current template built from the live stack's parameters (maintenance access) | Reviewed `UPDATE` change set; removal/replacement of RDS, Secrets Manager, S3 or KMS resources is refused before review; reconnects from the updated outputs |
-| Instructions | Active page content hashes vs the bundled catalog | Optional; one collection approval proposes and activates new and changed pages at their current revisions |
-
-Instruction updates preserve an active skill's owner-approved `description` when
-the bundle omits that field, including when updating its body. An explicit bundled
-description is part of the reviewed replacement. **Technical details** shows exact
-before/after metadata differences as well as body changes, even when the body is
-unchanged. Approval still covers the whole proposed collection; leave the update
-unchecked to retain the active instructions.
-
-Local installation builds from a fresh temporary copy of the package sources and
-metadata. Existing checkout `build/` and `*.egg-info` directories are left untouched
-and cannot reintroduce files removed from the source. If setup is waiting at
-**Update local software**, complete the local installer handoff and restart setup
-with the same operation ID; that prerequisite is not an AWS sign-in request.
-
-Normal handoff uses the installed interpreter with `-I`, a neutral working directory
-and verified distribution/module origins, not checkout imports or `PYTHONPATH`.
-Interrupted runtime, skill and activation changes retain their original intent and
-phase inventory; unknown changes require exact-tree review, not silent adoption.
-Emergency checkout recovery is a separate explicit choice. Currency evidence does
-not certify dependency health or that a remote release is newest.
-
-Each stage that is already current passes without a question. A change set is created
-only to review it; execution needs approval. First inspect pending publication, setup
-and removal receipts. Resolve incompatible operations through their original supported
-recovery implementation; never reinterpret an old publication checkpoint as a new
-memory checkpoint or discard unknown outcomes. Historical record provenance remains
-intact. Reload active authority after instruction changes. Schema approval is not
-policy approval; installing templates is neither.
-
-If a migration statement fails, setup reports its filename, statement number and SQLSTATE
-without exposing provider messages, SQL parameters or credentials. A confirmed
-transaction rollback is a blocked step: none of that transaction's migrations
-committed. If rollback cannot be confirmed, the outcome remains uncertain and
-requires inspection before retrying. The external maintenance flag remains set;
-do not clear it manually to bypass an incomplete upgrade.
-
-After installing corrected migration code, resume the **same operation**. Changed
-SQL requires a fresh exact SQL review before execution; prior approvals and receipts
-remain preserved. Already-applied migration hashes must still match the bundle's
-ordered prefix—resuming does not overwrite or reinterpret migration history.
-
-The current contract is schema 2 / client protocol 4; `012_agentic_memory.sql`
-established the memory-native foundation, with additive migrations through 024.
-Ordinary schema-1 use is rejected. Both `maven-memory migrate --confirm-instance
-"$INSTANCE_ID"` and `maven-memory install migrate --confirm-instance "$INSTANCE_ID"`
-accept a schema-1 binding solely for the separately approved administrator migration.
-They do not rewrite it to claim runtime readiness. SQL migration alone is not service
-deployment: deploy the matching reviewed service and reconnect from actual upgraded
-stack outputs.
-See [architecture](architecture.md#rollout-and-authority) for version/cutover boundaries.
+This is a software and infrastructure update, **not a legacy memory import or purge**. Any one-time Home migration, verification, cleanup of legacy clients and destructive removal need separate exact-target approval; they are not part of ordinary reconcile. Secure grants and cloud policy activation remain independent. For the separately reviewed migration of a retired Google environment locator, see [integrations](integrations.md#google-removal-and-independent-integrations).
 
 ## Uninstall and retirement
 
@@ -806,7 +401,7 @@ the selected targets. All paths and identifiers below mean your actual selection
 | Selection passed to `maven-uninstall plan` | Effect |
 | --- | --- |
 | `--project "$PROJECT_ROOT"` | Detach that checkout; retain cloud memory |
-| `--machine --home "$MAVEN_HOME"` | Remove attributable tools/integration, then delete that whole installation folder (settings, sign-in caches, setup and session records); leave project bindings and cloud resources |
+| `--machine --home "$MAVEN_HOME"` | Remove attributable tools/integration, then the reviewed installation folder including private settings and caches; leave project folders and cloud resources |
 | `--cloud --home "$MAVEN_HOME"` | Retire the configured cloud instance; leave local installations and project files |
 
 Combine selectors to request more than one scope. Repeat `--project` or machine
@@ -852,11 +447,6 @@ Changed plans invalidate approvals. Writer quiescence and running-harness config
 risk are separate acknowledgements: a harness may later write removed entries back,
 but accepting that risk is not an assertion that its writers stopped.
 
-Registered local sessions with no in-flight writers do not block planning: the plan
-warns, and the barrier detaches their registrations and retains the exact entries as
-private evidence. A session with in-flight writers still blocks; recover it, or use
-`--offline` after confirming those writers stopped.
-
 Ctrl+Q/Ctrl+C stops dispatching new actions at the next saved action boundary, then
 closes the UI without a persistent background worker. In-flight remote operations
 may continue; resume reconciles the same plan. Do not delete its journal or start a
@@ -897,30 +487,7 @@ external recovery prerequisites are preserved. Resume the original operation.
 
 ### Project memory and local originals
 
-Ask **“Archive cloud project …”** or **“Reactivate cloud project …”** in your harness.
-The assistant resolves the exact project ID and uses `maven_admin` kind
-`project_lifecycle`, with `action` (`archive` or `reactivate`) and `project_id`.
-No local folder, temporary project binding or uninstall is required.
-
-The review identifies the AWS account, region, instance, administration identity,
-project name/ID, current state and all-machines impact. Actual stopped-writer
-confirmation and exact approval are required; active sessions, live claims and
-unresolved operations block the transition. Original receipts survive interruption.
-No folder, local binding, Home selection or cloud resource is removed.
-
-Archival preserves history but hides the project and its contents from normal
-discovery, reads and Home's project list, and blocks new project work. Ask explicitly
-to consult archived history; reactivation is a separate reviewed action. Neither
-action restores forgotten/erased content or erases already-loaded conversations.
-
-Existing installations need **Update MAVEN**, including approved database migration
-`017_project_archive_visibility.sql` and service/validator deployment. Direct archive
-refuses to proceed without the migration; it never migrates implicitly.
-
-The existing uninstall options `--archive-project` and `--reactivate-project` remain
-available for their separately reviewed removal workflows and preserved plans.
-Reactivation restores cloud eligibility, not local attachment; select the project
-again through project setup when needed.
+Detaching a project is not erasing a record or reconciling offline changes. Before removal, review the local project records and protected artifacts in the actual inventory. Preserve any needed unsynced knowledge privately; a cloud snapshot cannot contain work that never reached the cloud. Archiving or reactivating a cloud project, if separately selected in a removal plan, does not move or erase its local files.
 
 Project removal preserves originals, receipts, and ignore protection by default.
 Machine removal deletes the whole installation folder as its final step, after
@@ -932,17 +499,11 @@ foreign-owned entry. Anything added or changed after review stops the deletion.
 Without `--export`, no optional originals archive is made; required recovery evidence is still preserved.
 `--export "$PRIVATE_EXPORT_DIRECTORY"` produces verified private ZIP archives first,
 moving resolved originals/settings only after verification. Archives contain
-`inventory.json` and `data/` entries; sign-in caches, locks and detached session
-records are not archived. Project recovery evidence and a minimal detached project
-binding remain in place; the report distinguishes copies from moves.
+`inventory.json` and `data/` entries. Inspect the report to distinguish copies from moves and items not selected for export.
 Credential caches are not included in recovery exports. Do not remove ignore rules
 while protected `.maven` artifacts remain.
 
-`--offline` permits local detachment when cloud access or packages are unavailable.
-After actual local writers stop, it archives exact selected local session/lease
-evidence and invalidates those local registrations. It does **not** close cloud
-sessions, archive cloud projects, or recover unsaved work. Offline mode cannot
-perform cloud removal, archival, or reactivation.
+`--offline` permits local detachment after affected writers have stopped. It cannot remove cloud resources, archive or reactivate a cloud project, or verify that local work ever reached AWS.
 
 ### Machine ownership and legacy installations
 
@@ -987,11 +548,6 @@ confirmed; it is not reported as immediate erasure.
 `--wait-seconds` is bounded from 0 to 300; a seven-day provider window remains
 `pending-provider`, not a failed deletion or a reason to start another operation.
 
-Clean session closure is the default. `--abandon-sessions` is a separate reviewed
-choice for unreachable clients. It preserves unfinished session/request evidence,
-blocks new cloud writes across machines, and makes no normal-closure or unsaved-work
-recovery claim. Bootstrap/migrate cannot silently clear this retirement barrier.
-
 Optional resources outside the stack are preserved unless individually selected:
 
 - `--optional-resource s3:BUCKET`
@@ -1016,7 +572,4 @@ permission to start a replacement operation.
 
 ### Verification limits
 
-Local tests cover temporary-file recovery, simulated provider/package boundaries,
-Textual interactions and terminal smoke checks. Optional isolated PostgreSQL tests
-exercise migrations and competing transactions. None of these certifies live IAM,
-AWS teardown/restoration, or every harness host's lifecycle behavior.
+Temporary-file, simulated-provider and isolated database checks exercise different boundaries. None establishes that an installation has been updated, a cloud resource has been removed, a snapshot restores successfully, or all harness versions interoperate.

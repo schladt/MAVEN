@@ -25,7 +25,8 @@ class ProjectRenameTests(unittest.TestCase):
         self.project_id = str(uuid4())
         self.instance_id = str(uuid4())
         self.operation_id = str(uuid4())
-        self.local = {'schema': 1, 'project_id': self.project_id, 'root': str(self.root),
+        self.local = {'schema': 2, 'instance_id': self.instance_id, 'recovery_epoch': str(uuid4()),
+                      'project_id': self.project_id, 'root': str(self.root),
                       'git_enabled': False, 'remote': None, 'accepted_url': None,
                       'branch': None, 'checks': []}
         save_json(self.root / '.maven/project.json', self.local)
@@ -33,7 +34,7 @@ class ProjectRenameTests(unittest.TestCase):
                                           'label': 'Personal Home'})
         self.original_files = {path: path.read_bytes() for path in
                                (self.root / '.maven/project.json', self.home / 'home.json')}
-        self.binding = {'connection': {'instance_id': self.instance_id, 'recovery_epoch': 1,
+        self.binding = {'connection': {'instance_id': self.instance_id, 'recovery_epoch': self.local['recovery_epoch'],
                                        'region': 'us-east-1', 'endpoint': 'https://example.invalid'},
                         'environment': {'MAVEN_ACCOUNT_ID': '123456789012', 'MAVEN_AWS_REGION': 'us-east-1'}}
         self.record = {'record_id': self.project_id, 'revision': 4, 'kind': 'entity',
@@ -49,7 +50,7 @@ class ProjectRenameTests(unittest.TestCase):
         self.hide_record = False
         self.client = Mock()
         self.client.invoke.side_effect = self.invoke
-        self.authority = self.enter_patch('tools.project_rename.verify_authority', return_value=7)
+        self.enter_patch('tools.project_rename.verify_connection')
         self.enter_patch('tools.project_rename.configured_client', return_value=self.client)
         self.source = {'origin': 'owner-conversation', 'excerpt': 'Rename MAVEN to maven-code, preserving its UUID and history.'}
 
@@ -103,7 +104,7 @@ class ProjectRenameTests(unittest.TestCase):
         self.assertEqual(self.record, {**self.original, 'revision': 5,
                                       'data': {**self.original['data'], 'name': 'maven-code'}})
         self.assertEqual(self.writes[0]['source'], self.source)
-        self.assertEqual(self.writes[0]['authority_generation'], 7)
+        self.assertNotIn('authority_generation', self.writes[0])
         self.assertEqual(self.writes[0]['expected_revision'], 4)
         for path, contents in self.original_files.items():
             self.assertEqual(path.read_bytes(), contents)
@@ -120,10 +121,10 @@ class ProjectRenameTests(unittest.TestCase):
             self.apply(candidate)
         self.assertEqual(self.writes, [])
 
-    def test_stale_authority_refused_before_submission(self):
+    def test_changed_epoch_refused_before_submission(self):
         candidate = self.candidate()
-        self.authority.return_value = 8
-        with self.assertRaisesRegex(SetupPending, 'Authority changed after review'):
+        self.binding['connection']['recovery_epoch'] = str(uuid4())
+        with self.assertRaisesRegex(SetupPending, 'binding changed'):
             self.apply(candidate)
         self.assertEqual(self.writes, [])
 

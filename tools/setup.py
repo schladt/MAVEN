@@ -15,7 +15,7 @@ from tools.interaction import Field, OperationPaused, checkpoint, message, requi
 
 from tools.setup_common import (
     SetupPending, approve, ask, atomic_private, confirm, private_directory,
-    read_private, save_json, setup_lock, verify_authority, expected_account,
+    read_private, save_json, setup_lock, verify_connection, expected_account,
     check_login_identity, permission_preflight, inspect_login_identity,
 )
 
@@ -38,20 +38,6 @@ class Wizard:
     def save(self):
         save_json(self.state_path, self.state)
 
-    def before_request(self, client, request_key):
-        """Reconcile an explicitly resumed write before retrying its original request."""
-        checkpoint()
-        from tools.memory.client import MemoryClientError
-        submitted = self.state.setdefault('submitted_requests', [])
-        if request_key in submitted:
-            try:
-                client.invoke('/v1/operations/lookup', {'request_key': request_key})
-            except MemoryClientError as exc:
-                if exc.code != 'operation_unavailable':
-                    raise
-        else:
-            submitted.append(request_key)
-            self.save()
 
     def settings(self, updates):
         from tools.memory.environment import load_environment, ENV_KEYS
@@ -320,7 +306,6 @@ class Wizard:
             bootstrap.initialize(self.values, confirm_instance=config['instance_id'])
             self.state['initialized'] = True
             self.save()
-        self.starter()
 
     @staticmethod
     def package_review(package, manifest, template, parameters):
@@ -341,111 +326,9 @@ class Wizard:
                 sections.append(name + '\n' + (package / name).read_text(encoding='utf-8'))
         return '\n\n'.join(sections)
 
-    def starter(self):
-        from tools.memory import onboarding
-        stage('Starter authority')
-        from tools.memory.environment import configured_client
-        from tools.memory.validation import digest, validate_resolve
-        from tools.setup_starter import collection, prepare, summary
-        self.preflight('routine')
-        self.preflight('authority')
-        directory = self.directory / 'starter'
-        if directory.exists() and not (directory / 'manifest.json').exists():
-            if self.state.get('starter_submitted'):
-                raise SetupPending('Starter manifest is missing after submission. Restore the original private artifacts; new proposal/request IDs must not replace unknown outcomes.')
-            private_directory(directory)
-            archived = self.directory / ('starter.incomplete.' + str(uuid4()))
-            approve(f'Offline starter preparation was interrupted before submission. Preserve {directory} as {archived} and prepare a fresh, unsubmitted review set?', 'REBUILD OFFLINE')
-            directory.rename(archived)
-        if not directory.exists():
-            prepare(directory)
-        review = collection(directory, self.values)
-        completed = self.state.setdefault('starter_completed', [])
-        slugs = [page['candidate']['slug'] for page in review['pages']]
-        if completed != slugs[:len(completed)]:
-            raise SetupPending('Saved starter progress differs from the ordered collection; preserve the original receipts.')
-        if len(completed) == len(slugs):
-            return
-        approved = self.state.get('starter_collection_approval')
-        if approved is not None and approved['review_digest'] != digest(review):
-            if self.state.get('starter_submitted') or completed or self.state.get('submitted_requests'):
-                raise SetupPending('Submitted starter contents or connection changed; restore the original review and requests.')
-            self.state.setdefault('starter_approval_history', []).append(approved)
-            self.state.pop('starter_collection_approval')
-            self.save()
-            approved = None
-        if approved is None:
-            if not require().review('Install all starter instructions — one approval',
-                                    summary(review, len(completed)),
-                                    details=json.dumps(review, ensure_ascii=False, indent=2),
-                                    identity=digest(review), identity_label='Collection digest'):
-                raise SetupPending('Starter collection approval declined; no remaining instructions were activated.')
-            approved = {'review_digest': digest(review), 'review': review, 'source': {
-                'origin': 'owner MAVEN setup TUI',
-                'excerpt': 'Owner approved uploading and activating the complete starter collection / digest ' + digest(review)}}
-            self.state['starter_collection_approval'] = approved
-            self.save()
-        for draft in review['pages']:
-            checkpoint()
-            if digest(collection(directory, self.values)) != approved['review_digest']:
-                raise SetupPending('Starter collection changed during execution; preserve its original approval and requests.')
-            slug = draft['candidate']['slug']
-            draft_path = directory / (slug + '.json')
-            candidate_hash = digest(draft['candidate'])
-            if slug in completed:
-                continue
-            stage(f'Install starter instructions — {len(completed) + 1}/{len(slugs)}: ' + draft['candidate']['title'])
-            self.state['starter_submitted'] = True
-            self.save()
-            client = configured_client(self.env, values=self.values)
-            try:
-                self.before_request(client, draft['request_key'])
-                client.invoke('/v1/proposals/create', draft)
-                actual = client.read_full({'proposal_id': draft['proposal_id']})['data']
-                if actual.get('content_hash') != candidate_hash:
-                    raise SetupPending('Cloud proposal does not match the reviewed candidate.')
-            finally:
-                client.close()
-            selection = self.state.setdefault('starter_approvals', {})
-            name = selection.get(slug, slug + '.approval.json')
-            if Path(name).name != name:
-                raise SetupPending('Invalid saved approval artifact path.')
-            approval_path = directory / name
-            approval_client = configured_client(self.env, approval=True, values=self.values)
-            try:
-                from tools.memory.client import MemoryClientError
-                for attempt in range(2):
-                    if not approval_path.exists():
-                        challenge = approval_client.invoke('/v1/proposals/challenge', {'proposal_id': draft['proposal_id']})
-                        challenge_path = approval_path.with_suffix('.challenge.json')
-                        save_json(challenge_path, challenge)
-                        onboarding.approval(draft_path, challenge_path, approval_path,
-                                            approval_origin=approved['source']['origin'],
-                                            approval_excerpt=approved['source']['excerpt'])
-                    selection[slug] = approval_path.name
-                    self.save()
-                    request = validate_resolve(read_private(approval_path))
-                    if request['candidate_hash'] != candidate_hash or request['proposal_id'] != draft['proposal_id']:
-                        raise SetupPending('Saved activation does not match this exact candidate.')
-                    try:
-                        # Unknown outcomes always keep the same request, even after expiry.
-                        self.before_request(approval_client, request['request_key'])
-                        approval_client.invoke('/v1/proposals/resolve', request)
-                        break
-                    except MemoryClientError as exc:
-                        if exc.code != 'approval_invalid' or attempt:
-                            raise
-                        approval_path = directory / (slug + '.approval.' + str(uuid4()) + '.json')
-                        # Save the next artifact name before creating it; never lose an approval request.
-                        selection[slug] = approval_path.name
-                        self.save()
-            finally:
-                approval_client.close()
-            completed.append(slug)
-            self.save()
 
-    def verify_authority(self, project_id=None):
-        return verify_authority(self.env, project_id, values=self.values)
+    def verify_connection(self):
+        return verify_connection(self.env, values=self.values)
 
 
     def run(self):
@@ -473,9 +356,8 @@ class Wizard:
             raise SetupPending('Invalid saved setup mode; preserve and inspect the state.')
         stage('Verify readiness')
         checkpoint()
-        generation = self.verify_authority()
+        self.state['connection_verified'] = self.verify_connection()
         self.state['instance_ready'] = True
-        self.state['authority_generation'] = generation
         self.save()
         message('\nInstance ready; no project was enabled by installer setup.')
         if self.state.get('project') and not self.state.get('ready_project'):
@@ -519,7 +401,7 @@ def main(argv=None):
     from tools.tui import run_workflow
     return run_workflow('MAVEN instance setup', [
         'Instance selection', 'AWS identities', 'Deployment review', 'Initialize',
-        'Starter authority', 'Verify readiness',
+        'Verify readiness',
     ], lambda ui: _present(ui, args, home))
 
 
@@ -551,7 +433,7 @@ def _present(ui, args, home):
             approved = ui.review('Abandon unfinished setup and start over?',
                 f'Home: {home}\nOperation: {review["operation_id"]}\nSaved step: {review["saved_step"]}\n\n' +
                 review['effect'] + '\n\n' + review['retained'] + '\n\n' + review['warning'] +
-                '\n\nStop any harness sessions using this home first. The old operation becomes read-only; its exact evidence remains archived.',
+                '\n\nThe old operation becomes read-only; its exact evidence remains archived.',
                 details=json.dumps(review, indent=2), identity=review['operation_id'],
                 destructive=True, accept='Abandon and start over')
             if not approved:
@@ -581,7 +463,7 @@ def _present(ui, args, home):
                 return finish_setup(ui, home, {'home': str(home), 'account': expected_account(wizard.values),
                     'region': wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'), 'instance_id': wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'),
                     'profile': wizard.values.get('MAVEN_AWS_PROFILE'), 'instance_ready': True,
-                    'authority_generation': wizard.state['authority_generation'], 'project_configured': False,
+                    'connection_verified': wizard.state['connection_verified'], 'project_configured': False,
                     'binding': dict(wizard.values)})
             return result
     previous = AdminOperations(home).status(identifier) if identifier else None

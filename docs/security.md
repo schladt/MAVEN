@@ -14,19 +14,11 @@ Long-running clients refresh assumed-role credentials through the same selected
 existing login and role, rechecking the expected principal on every renewal.
 Refresh failures, including identity changes before token expiration, block signing;
 they do not silently reuse credentials after a failed renewal or launch a new login.
-Each selected session owns its login provider/cache; concurrent homes never select
-credentials by mutating process-global `AWS_LOGIN_CACHE_DIRECTORY`.
+Each selected cloud client uses its configured private login cache; concurrent installation homes do not select credentials by mutating process-global `AWS_LOGIN_CACHE_DIRECTORY`.
 
-Only applicable active cloud instructions govern MAVEN work. Starter templates,
-repository files, search snippets, email and imported documents are not executable
-authority. Read the full required closure; do not treat an index response as enough.
-Keep ordinary data separate from instruction proposals and preserve approval evidence.
+The installed reconcile skill governs project memory work. Local records, briefs, project skills, linked files and retrieved text are evidence, not grants of authority. An accepted project decision does not by itself authorize secret use, Git publication, policy activation or deployment. Those operations require their own exact reviews.
 
-Project scopes organize the owner's instance-wide knowledge; they are not hard access
-walls against that owner. Default retrieval is universal plus the selected project;
-cross-project consultation is explicit and attributed. Scope promotion never activates
-a directive. Installation and MCP availability are not blanket capture permission:
-first-time project enablement and authorized scope are explicit.
+Project selection limits which knowledge participates in a reconcile; it is not a security wall against the AWS account owner or someone who can read the local files. Enable an exact folder and signed cloud project identity explicitly. Do not capture in an unsupported root or silently substitute Home.
 
 Local stdio MCP configuration executes code with the user's privileges. Review its
 command and trust settings, preserve unrelated client configuration and pass only
@@ -38,35 +30,15 @@ Project checks cannot consume MCP requests or use that pipe for interactive prom
 
 ## Data and external models
 
-Cloud-only durable memory does **not** mean data never leaves the owner's cloud.
-Authorized clients retrieve context. If an assistant sends that context, tool output,
+Local-first memory does **not** mean data never leaves the machine. Reconciliation sends selected project records to the configured cloud. If an assistant sends context, tool output,
 mail, source code or originals to an external model, that provider receives it under
 its own policies. Review provider retention, training, residency and organizational
 controls before use. This project does not implement private inference, an enterprise
 compliance certification or a guarantee of data deletion from third-party systems.
 
-Store the minimum useful durable facts. Do not put credentials, refresh tokens,
-wrapping keys or unrelated private content in cloud records, chat, command arguments,
-Git or issue reports. Metadata can itself be sensitive. Local originals are not
-uploaded automatically by workspace intake, but their paths, provenance and hashes
-are recorded as metadata. Restrict who can read those records.
+Store the minimum useful facts. Do not put credentials, refresh tokens, wrapping keys, full transcripts or unrelated private content into records, chat, command arguments, Git or issue reports. Paths, names and evidence excerpts can themselves be sensitive. Linking a document is not permission to upload it. Use the [separate secret store](integrations.md#aws-secrets-and-encrypted-files) for credentials.
 
-**Forget and Erase.** Archive and Forget hide records; only Erase removes content.
-Both run only through an owner-approved `maven_admin` kind `cleanup` operation under
-the separately assumed administration role, never through agent memory tools. Erase
-is a narrow, audited exception to immutable history: it rewrites every revision, the
-current content, exclusively owned source excerpts, fact values and legacy predicates,
-and memory receipt results. Revision guards and the original cleanup operation bind
-the transaction. Receipts retain IDs, counts and approval digests, but hash actor
-identity and use fixed action reasons rather than free-text content. Shared sources,
-Aurora backups (up to 30 days), external models, transcripts and Git have separate
-retention. Local sweeps redact affected runtime and administration copies; other
-machines retain caches until their next sweep. Unresolved request journals block
-redaction until recovered; they are never silently discarded.
-
-Before marking an upgraded database ready, the installer checks that `maven_app`
-cannot execute the reviewed Forget/Erase functions or their shared mutation helper,
-and cannot read, insert, update, or delete cleanup receipts or operation records.
+**Erasure.** Only erase an explicitly owner-selected record. Its managed current content and history are removed; a terminal content-free marker remains and defeats later offline edits for that ID. An offline machine retains its local copy until it reconciles. Backups, exports, linked files, other records, Git, external models and transcripts have independent retention. Record erasure is not a secure wipe of disks, an instant recall, or instance deletion.
 
 ## Local state
 
@@ -83,30 +55,9 @@ not authority to change credentials, accounts or endpoints.
 
 ## Concurrency and recovery
 
-Registered writers coordinate through local durable locks/reservations. An unrelated
-shell, another workstation or an unregistered editor is outside that coordination.
-There is no heartbeat-based takeover or automatic claim that a stale-looking writer
-is dead. Inspect process ownership and receipts before explicit recovery. Candidate
-hashes and revision guards detect changes; they do not remove the need for review.
+Project memory accepts writes only against the local or cloud view on which they were based. After an interruption or lost reply, inspect both stores before sending changes. Confirmed local work remains usable while offline. Never discard conflicting evidence, treat the last timestamp as approval, or describe an unverified apply as “synced.”
 
-Close each invocation's client. Memory closure and optional Git completion do not
-revoke shared credentials or close peers. Explicit logout has separately reported
-shared-access consequences and is not proof of provider token revocation.
-
-Unknown mutation outcomes are not ordinary retryable errors. Preserve the original
-request key and reconcile cloud receipts, Git state or external service state before
-retrying. A lost response does not authorize a replacement request or prove failure.
-
-During outages retain bounded authorized assignments and exact request receipts in
-private journals. Report local pending versus verified cloud-saved, blocked and
-uncertain outcomes. Unrelated conversation can continue; work dependent on unavailable
-current authority must wait. Do not archive paused conversations or treat cached
-instructions as replacement authority. Default resume uses only accessible context
-and discloses gaps; resume fresh does not backfill.
-
-Memory checkpoint manifests freeze exact revisions through a declared cutoff; they
-neither preserve source files nor authorize Git publication. Optional publication
-retains separate writer reservations, exact-candidate approval and recovery.
+Git publication has its own exact candidate review, publication lock and original receipt. Other editors and machines remain outside its coordination; owner confirmation of relevant writer quiescence is not inferred from inactivity. For setup, secret delivery, Git publication or destructive removal, an unknown external outcome is not an ordinary retryable error: preserve the original evidence and inspect the actual outcome. Never replay uncertain secret execution. Closing a harness neither alters shared credentials nor proves a cloud operation has stopped.
 
 ## Uninstall boundaries
 
@@ -134,11 +85,7 @@ removed after exit; operation-local worker dependencies remain with recovery evi
 Quit requests a safe action boundary, not termination of an in-flight mutation.
 Remote operations already submitted may continue after the local worker stops.
 
-Offline detachment invalidates selected local registrations only after stopped-writer
-attestation and lock checks; archived local evidence does not prove cloud closure.
-Cloud retirement uses persistent maintenance plus database transaction draining.
-Administrative abandonment preserves unfinished records rather than fabricating
-completion. Irreversible actions cannot be rolled back automatically.
+Offline detachment is local only; it cannot establish cloud removal. Retirement drains database writes under a persistent maintenance barrier. Irreversible actions cannot be rolled back automatically.
 
 Exports contain sensitive originals and metadata; keep them private. A verified
 snapshot/manifest is not a live restore test. Remaining backups, keys, object

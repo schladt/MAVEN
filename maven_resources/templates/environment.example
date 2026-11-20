@@ -45,8 +45,8 @@
 # MAVEN_INSTANCE_ID=
 # MAVEN_RECOVERY_EPOCH=
 
-# Required independent secrets-store binding, configured by reviewed setup / Repair.
-# All five locators are required before core readiness. Never put secret values here.
+# Optional, independent secrets store. Review its binding before secret operations;
+# no secret-store locator is required for ordinary project memory.
 # Prefixes are namespaces, not separately provisioned resources. The wrapping key
 # is FILE_KEY_PREFIX + KEY_ID: a base64 32-byte SecureString, never regenerated on repair.
 # The private bucket and wrapping parameter are retained independently of memory.

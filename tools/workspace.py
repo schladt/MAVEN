@@ -1,24 +1,19 @@
-"""DB-backed workspace metadata with private originals and explicit dispositions.
-
-Commands never promote reference text into instructions. Override authority is an
-already approved DB directive, not the derived setting written by this helper.
-"""
+"""Project-local artifact metadata, private originals and explicit dispositions."""
 from __future__ import annotations
 
-import argparse
 import contextlib
-from copy import deepcopy
 import datetime as dt
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
-import shlex
 import tempfile
 import uuid
 
-from tools.memory.boundary import BoundaryError, MemoryBoundary, digest, private_path, read_private, save_private
+from tools.memory.boundary import BoundaryError, private_path, read_private, save_private
+from tools.memory.validation import MemoryError as CredentialError, reject_secrets
+from tools.reconcile_records import digest as fingerprint, make_change, record_uuid
 
 SECTIONS = ('Progress', 'Milestones', 'Blockers', 'Next Steps', 'Client Actions')
 
@@ -37,22 +32,10 @@ def identity(path):
 
 
 @contextlib.contextmanager
-def workspace_lock(root, *, blocking=False, writers_quiescent=False):
-    """Kernel-held cooperative lock; legacy existence locks require explicit recovery."""
+def workspace_lock(root):
+    """Serialize cooperating artifact writers; process exit releases the lock."""
     from tools.coordination import private_lock
-    with private_lock(root, '.maven/runtime/cloud-workspace-v2.lock', blocking=blocking):
-        legacy = private_path(root, '.maven/runtime/cloud-workspace.lock')
-        if legacy.exists():
-            if not writers_quiescent:
-                raise BoundaryError('legacy workspace lock has ambiguous ownership; stop its writers and run '
-                                    f'maven-workspace --root {shlex.quote(str(root))} recover-lock --writers-quiescent')
-            # Do not reinterpret an old process's existence lock as a kernel lock.
-            # Preserve the evidence and require the caller's actual quiescence.
-            evidence = read_private(root, '.maven/runtime/cloud-workspace-legacy.json') if private_path(
-                root, '.maven/runtime/cloud-workspace-legacy.json').exists() else {}
-            evidence.update(recovered=True, writers_quiescent=True, identity=list(identity(legacy)))
-            save_private(root, '.maven/runtime/cloud-workspace-legacy.json', evidence)
-            legacy.unlink()
+    with private_lock(root, '.maven/runtime/workspace.lock', blocking=False):
         yield
 
 
@@ -81,32 +64,35 @@ def copy_original(root, source, target, expected, initial):
     return target
 
 
-class WorkspaceMemory(MemoryBoundary):
-    """Keep workspace receipts inside the same maintenance cutoff as ordinary notes."""
-    def __init__(self, service):
-        from tools.memory.maintenance import Maintenance
-        super().__init__(service.client, service.root, service.project_id, service.session_id)
-        self.service = service
-        self.maintenance = Maintenance(service)
+class WorkspaceMemory:
+    def __init__(self, store):
+        self.store = store
+        self.root = store.root
+        self.project_id = store.project_id
 
-    def write(self, kind, data, *, record_id=None, expected_revision=0, tags=(),
-              reason='Record managed work', source=None, scope='project', request_key=None):
-        from tools.memory.boundary import digest
-        record_id = record_id or str(uuid.uuid4())
-        source = source if source is not None else {
-            'origin': 'governed-workspace', 'excerpt': 'Explicit workspace operation: ' + reason}
-        operation_id = str(uuid.uuid5(uuid.UUID(self.session_id), 'workspace-write:' + digest({
-            'record_id': record_id, 'expected_revision': expected_revision, 'kind': kind,
-            'data': data, 'tags': list(tags), 'source': source, 'reason': reason, 'scope': scope,
-            'request_key': request_key})))
-        result = self.maintenance.save(
-            kind, data, source=source, record_id=record_id, expected_revision=expected_revision,
-            tags=tags, reason=reason, scope=scope, request_key=request_key, operation_id=operation_id)
-        refs = [ref for ref in result['assignment']['saved_refs'] if ref['record_id'] == record_id]
-        if result.get('cloud_saved') is not True or len(refs) != 1:
-            raise BoundaryError('workspace memory mutation has no exact verified receipt')
-        return self.service.read_record(record_id, revision=refs[0]['revision'], scope=scope,
-                                        include_archived='archived' in tags)
+    def snapshot(self, record_id):
+        record_uuid(record_id)
+        inventory = self.store.inventory()
+        token = inventory['token']
+        if any(item['id'] == record_id for item in inventory['items']):
+            return token, self.store.read([record_id], token)[0]
+        return token, None
+
+    def read(self, record_id):
+        _, envelope = self.snapshot(record_id)
+        if not envelope or envelope['record'].get('erased'):
+            raise BoundaryError('local workspace record unavailable')
+        return self.view(envelope)
+
+    @staticmethod
+    def view(envelope):
+        record = envelope['record']
+        return {'record_id': record['id'], 'digest': fingerprint(envelope),
+                'kind': record['kind'], 'data': record['data']}
+
+    @staticmethod
+    def ref(record):
+        return {key: record[key] for key in ('record_id', 'digest')}
 
 
 class Workspace:
@@ -116,14 +102,18 @@ class Workspace:
 
 
     def _begin(self, name, request, operation_id):
-        from tools.coordination import session_uuid
-        session_id = self.memory.session()['record_id']
-        key = session_uuid(operation_id) if operation_id is not None else digest(
-            {'session_id': session_id, 'name': name, 'request': request})
-        path = '.maven/runtime/workspace/' + key + '.json'
+        try:
+            # authorization is the owner's disposition explanation, not an HTTP header.
+            reject_secrets(list(request.values()))
+        except CredentialError as exc:
+            raise BoundaryError('workspace request contains possible credential material') from exc
+        key = record_uuid(operation_id) if operation_id is not None else fingerprint(
+            {'project_id': self.memory.project_id, 'name': name, 'request': request})
+        directory = Path('.maven/runtime/workspace') / self.memory.project_id
+        path = str(directory / (key + '.json'))
         if operation_id is not None and not private_path(self.root, path).exists():
             matches = []
-            for candidate in private_path(self.root, '.maven/runtime/workspace').glob('*.json'):
+            for candidate in private_path(self.root, directory).glob('*.json'):
                 if read_private(self.root, candidate.relative_to(self.root)).get('operation_id') == operation_id:
                     matches.append(str(candidate.relative_to(self.root)))
             if len(matches) > 1:
@@ -132,12 +122,12 @@ class Workspace:
                 path = matches[0]
         if private_path(self.root, path).exists():
             journal = read_private(self.root, path)
-            if (journal.get('project_id') != self.memory.project_id or journal.get('session_id') != session_id
+            if (journal.get('project_id') != self.memory.project_id
                     or journal.get('name') != name or journal.get('request') != request):
                 raise BoundaryError('workspace operation identity belongs to a different exact request')
         else:
             journal = {'operation_id': operation_id or str(uuid.uuid4()), 'project_id': self.memory.project_id,
-                       'session_id': session_id, 'name': name, 'request': request, 'phase': 'prepared', 'effects': {}}
+                       'name': name, 'request': request, 'phase': 'prepared', 'effects': {}}
             save_private(self.root, path, journal)
         return path, journal
 
@@ -145,39 +135,44 @@ class Workspace:
         journal.update(fields, phase=phase)
         save_private(self.root, path, journal)
 
-    def _effect(self, path, journal, step, kind, data, **kwargs):
-        """Persist each exact request before submission and replay through the original receipt."""
+    def _effect(self, path, journal, step, kind, data, *, record_id, expected, reason):
+        token, previous = self.memory.snapshot(record_id)
+        actual = fingerprint(previous) if previous else None
         effects = journal['effects']
         if step not in effects:
-            kwargs.setdefault('record_id', str(uuid.uuid4()))
-            kwargs.setdefault('expected_revision', 0)
-            effects[step] = deepcopy({'kind': kind, 'data': data, 'kwargs': kwargs})
+            if actual != expected:
+                raise BoundaryError('workspace record changed before the reviewed effect')
+            envelope = make_change(previous, kind, data, reason, record_id=record_id)
+            effects[step] = {'before': expected, 'envelope': envelope}
             save_private(self.root, path, journal)
         effect = effects[step]
-        if 'record' in effect:
-            return effect['record']
-        # WorkspaceMemory derives the same maintenance UUID and request key from
-        # these retained bytes. Never infer success merely from similar current data.
-        record = self.memory.write(effect['kind'], effect['data'], **effect['kwargs'])
-        effect['record'] = record
-        save_private(self.root, path, journal)
-        return record
+        target = effect['envelope']
+        if actual != fingerprint(target):
+            if actual != effect['before']:
+                raise BoundaryError('local record changed; preserve files and inspect the receipt')
+            token = self.memory.store.apply([target], token)['token']
+        if self.memory.store.read([record_id], token)[0] != target:
+            raise BoundaryError('workspace effect has no exact local read-back')
+        return self.memory.view(target)
 
     def _store(self, path, journal, step, key, value):
         previous = None if step in journal['effects'] else self.setting(key)
         return self._effect(path, journal, step, 'setting',
             {'key': key, 'value': value, 'scope': 'project'}, record_id=self.setting_id(key),
-            expected_revision=previous['revision'] if previous else 0,
-            tags=['workspace-metadata'], reason='Record explicitly governed workspace metadata')
+            expected=previous['digest'] if previous else None,
+            reason='Record explicitly governed workspace metadata')
 
     def _operation(self, path, journal, state, metadata):
         summary = json.dumps(metadata, sort_keys=True)
         if len(summary) > 16000:
             raise BoundaryError('workspace operation metadata exceeds bounded receipt size')
-        return self._effect(path, journal, state, 'operation',
-            {'session_id': journal['session_id'], 'name': journal['name'], 'state': state,
-             'summary': summary}, record_id=journal['operation_id'],
-            expected_revision=0 if state == 'started' else 1, tags=['workspace-operation'],
+        if state == 'started' and 'completed' in journal['effects']:
+            return
+        started = journal['effects'].get('started')
+        return self._effect(path, journal, state, 'action',
+            {'name': journal['name'], 'state': state, 'summary': summary},
+            record_id=journal['operation_id'],
+            expected=fingerprint(started['envelope']) if state == 'completed' else None,
             reason='Record governed local source disposition')
 
     def _finish(self, path, journal, metadata, result):
@@ -189,21 +184,16 @@ class Workspace:
         return str(uuid.uuid5(uuid.UUID(self.memory.project_id), 'workspace:' + key))
 
     def setting(self, key):
-        from tools.memory.client import MemoryClientError
-        try:
-            record = self.memory.read(self.setting_id(key))
-        except MemoryClientError as error:
-            if error.code == 'record_unavailable':
-                return None
-            raise
+        _, envelope = self.memory.snapshot(self.setting_id(key))
+        if envelope is None:
+            return None
+        if envelope['record'].get('erased'):
+            raise BoundaryError('workspace metadata was erased')
+        record = self.memory.view(envelope)
         if record['kind'] != 'setting' or record['data']['key'] != key:
             raise BoundaryError('workspace setting identity conflicts with existing DB metadata')
         return record
 
-    def store(self, key, value, previous=None):
-        return self.memory.write('setting', {'key': key, 'value': value, 'scope': 'project'},
-            record_id=self.setting_id(key), expected_revision=previous['revision'] if previous else 0,
-            tags=['workspace-metadata'], reason='Record explicitly governed workspace metadata')
 
 
     def pending(self):
@@ -232,7 +222,8 @@ class Workspace:
             raise BoundaryError('one explicit supported classification is required before opening the source')
         if not origin.strip() or not authorization.strip() or disposition not in ('retain', 'archive', 'delete'):
             raise BoundaryError('explicit provenance, authorization and disposition are required')
-        if disposition != 'retain' and not confirm or disposition == 'delete' and not reviewed:
+        if (type(confirm) is not bool or type(reviewed) is not bool or
+                disposition != 'retain' and not confirm or disposition == 'delete' and not reviewed):
             raise BoundaryError('source disposition requires owner approval and deletion requires completed review')
         request = dict(path=path, kind=kind, origin=origin, sensitivity=sensitivity, authorization=authorization,
                        disposition=disposition, confirm=confirm, reviewed=reviewed)
@@ -269,7 +260,8 @@ class Workspace:
         if not stored.is_file() or sha(stored) != value['sha256']:
             raise BoundaryError('preserved original changed; disposition cannot resume')
         self._operation(journal_path, journal, 'started', value)
-        receipt = self._store(journal_path, journal, 'acquired', journal['key'], value)
+        if 'disposed' not in journal['effects']:
+            receipt = self._store(journal_path, journal, 'acquired', journal['key'], value)
         if disposition != 'retain':
             if source.exists():
                 if list(identity(source)) != journal['initial'] or sha(source) != value['sha256']:
@@ -284,23 +276,23 @@ class Workspace:
         return self._finish(journal_path, journal, value,
             {'status': 'ready', 'receipt': self.memory.ref(receipt), 'disposition': value['state']})
 
-    def archive_plan(self, *, record_id, revision, confirm, completed, source_path=None,
+    def archive_plan(self, *, record_id, digest, confirm, completed, source_path=None,
                      source_disposition='retain', operation_id=None):
-        if not confirm or not completed:
+        if confirm is not True or completed is not True:
             raise BoundaryError('named plan archival requires actual completion and owner approval')
         if source_disposition not in ('retain', 'archive'):
             raise BoundaryError('optional plan original requires an explicit retain or archive disposition')
         if source_path is None and source_disposition != 'retain':
             raise BoundaryError('source disposition requires an explicitly selected local original')
-        request = dict(record_id=record_id, revision=revision, confirm=confirm, completed=completed,
+        request = dict(record_id=record_id, digest=digest, confirm=confirm, completed=completed,
                        source_path=source_path, source_disposition=source_disposition)
         path, journal = self._begin('archive-plan', request, operation_id)
         if journal.get('result'):
             return journal['result']
         if 'metadata' not in journal:
             plan = self.memory.read(record_id)
-            if plan['revision'] != revision or plan['kind'] != 'note' or plan['data']['category'] != 'plan':
-                raise BoundaryError('archive requires the exact current DB plan note revision')
+            if plan['digest'] != digest or plan['kind'] != 'plan' or plan['data'].get('state') == 'archived':
+                raise BoundaryError('archive requires the exact current local plan')
             metadata = {'plan': self.memory.ref(plan), 'owner_confirmed': True,
                         'actual_completion_attested': True, 'state': 'archive-authorized',
                         'source_disposition': source_disposition,
@@ -329,11 +321,11 @@ class Workspace:
             self._phase(path, journal, 'preserved')
         self._operation(path, journal, 'started', metadata)
         plan = journal['plan']
-        updated = self._effect(path, journal, 'archive', 'note', dict(plan['data'], category='archived-plan'),
-            record_id=record_id, expected_revision=revision, tags=list(dict.fromkeys([*plan['tags'], 'archived'])),
-            reason='Archive completed plan; stable DB links and history retained')
+        updated = self._effect(path, journal, 'archive', 'plan', dict(plan['data'], state='archived'),
+            record_id=record_id, expected=digest, reason='Archive completed plan; retain history')
         key = 'archive-' + record_id
-        self._store(path, journal, 'authorized', key, metadata)
+        if 'archived' not in journal['effects']:
+            self._store(path, journal, 'authorized', key, metadata)
         if source is not None and source_disposition == 'archive' and source != stored:
             if source.exists():
                 if list(identity(source)) != journal['initial'] or sha(source) != metadata['sha256']:
@@ -348,40 +340,17 @@ class Workspace:
         return self._finish(path, journal, metadata,
             {'status': 'ready', 'receipt': self.memory.ref(receipt), 'plan': self.memory.ref(updated)})
 
-    def override(self, *, identifier, slug, revision, content_hash, operation, confirm):
-        if not confirm or not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)*', identifier):
-            raise BoundaryError('override metadata requires exact owner confirmation and a stable slug')
-        page = self.memory.client.read_full({'slug': slug, 'expected_revision': revision})['data']
-        state = 'active' if operation == 'record' else 'revoked'
-        if (page.get('page_kind') != 'directive' or page.get('revision') != revision
-                or page.get('content_hash') != content_hash or page.get('authority_state') != state
-                or page.get('candidate_authority_state') != state or page.get('data_scope') != 'owner'):
-            raise BoundaryError('override requires the exact already-approved current directive state')
-        if state == 'active':
-            context = self.memory.context()
-            if not any(item['slug'] == slug and item['revision'] == revision and item['content_hash'] == content_hash
-                       for item in context['instructions']):
-                raise BoundaryError('override directive is not applicable to this project context')
-        key = 'override-' + identifier
-        previous = self.setting(key)
-        if previous and previous['data']['value']['slug'] != slug:
-            raise BoundaryError('override identifier belongs to a different approved directive')
-        if state == 'revoked' and (not previous or previous['data']['value']['state'] != 'active'):
-            raise BoundaryError('override is not active; no metadata revocation performed')
-        value = {'slug': slug, 'revision': revision, 'content_hash': content_hash, 'state': state,
-                 'operative': False, 'authority': 'Only the current approved directive governs; this setting grants no permission'}
-        receipt = self.store(key, value, previous)
-        return {'status': 'ready', 'receipt': self.memory.ref(receipt), 'authority': value}
-
-    def status(self, *, record_id, revision, output=None, check=False, operation_id=None):
+    def status(self, *, record_id, digest, output=None, check=False, operation_id=None):
+        if type(check) is not bool:
+            raise BoundaryError('status check must be a boolean')
         journal = None
         if output is not None and not check:
             if output != 'team-status.md':
                 raise BoundaryError('external status output must use the governed team-status.md path')
-            path, journal = self._begin('status', dict(record_id=record_id, revision=revision, output=output), operation_id)
-        record = journal['source_record'] if journal and 'source_record' in journal else self.memory.read(record_id)
+            path, journal = self._begin('status', dict(record_id=record_id, digest=digest, output=output), operation_id)
+        record = self.memory.read(record_id)
         value = record['data'].get('value', {})
-        if (record['revision'] != revision or record['kind'] != 'setting' or record['data']['key'] != 'project-status'
+        if (record['digest'] != digest or record['kind'] != 'setting' or record['data'].get('key') != 'project-status'
                 or value.get('external_status_enabled') is not True):
             raise BoundaryError('external status is disabled or its current DB source receipt is stale')
         fields = value.get('publishable')
@@ -403,7 +372,12 @@ class Workspace:
         previous = self.setting('team-status-receipt')
         before = target.read_bytes() if target.exists() and target.is_file() else None
         output_hash = hashlib.sha256(rendered.encode()).hexdigest()
-        owned = previous and previous['data']['value'].get('output_sha256') == hashlib.sha256(before or b'').hexdigest()
+        prior = previous['data']['value'] if previous else {}
+        owned = False
+        if before is not None and prior.get('output_sha256') == hashlib.sha256(before).hexdigest():
+            saved = self.receipt(operation_id=prior.get('operation_id'))
+            owned = (saved.get('name') == 'status' and saved.get('phase') == 'completed'
+                     and saved['result'].get('receipt') == self.memory.ref(previous))
         installed = bool(journal and journal['phase'] in ('installing', 'installed', 'completed')
                          and before == rendered.encode())
         if target.exists() and not owned and not installed:
@@ -414,13 +388,14 @@ class Workspace:
             return dict(result, current=current)
         if journal.get('result'):
             return dict(journal['result'], current=current)
-        metadata = {'source': self.memory.ref(record), 'output_path': output, 'output_sha256': output_hash}
-        if 'source_record' not in journal:
-            self._phase(path, journal, 'prepared', source_record=record,
+        metadata = {'source': self.memory.ref(record), 'output_path': output, 'output_sha256': output_hash,
+                    'operation_id': journal['operation_id']}
+        if 'before_sha256' not in journal:
+            self._phase(path, journal, 'prepared',
                         before_sha256=hashlib.sha256(before).hexdigest() if before is not None else None)
         self._operation(path, journal, 'started', metadata)
         if not installed:
-            if self.memory.read(record_id)['revision'] != revision:
+            if self.memory.read(record_id)['digest'] != digest:
                 raise BoundaryError('DB status source changed during generation')
             before_hash = hashlib.sha256(before).hexdigest() if before is not None else None
             if before_hash != journal['before_sha256']:
@@ -452,80 +427,11 @@ class Workspace:
         return self._finish(path, journal, metadata, dict(result, receipt=self.memory.ref(receipt), current=True))
 
 
-def main(argv=None):
-    from tools.memory.client import MemoryClientError, read_json
-    from tools.memory.environment import configured_client
-    from tools.project import default_environment
-    from tools.coordination import SessionRegistry
-    from tools.memory.lifecycle import SessionService
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--root', type=Path, required=True)
-    parser.add_argument('--session', help='exact MAVEN session UUID; required except for recover-lock')
-    parser.add_argument('--env', type=Path, default=default_environment())
-    parser.add_argument('action', choices=('intake-pending', 'intake', 'archive-plan', 'override', 'status',
-                                          'receipt', 'recover-lock'))
-    parser.add_argument('--request', type=Path, help='owner-private JSON object with explicit action fields')
-    parser.add_argument('--operation-id', help='original workspace operation UUID for local receipt diagnosis')
-    parser.add_argument('--writers-quiescent', action='store_true', help='attest legacy workspace writers have stopped')
-    args = parser.parse_args(argv)
-    client = None
-    try:
-        root = args.root.resolve()
-        if args.action == 'recover-lock':
-            if not args.writers_quiescent:
-                raise BoundaryError('legacy workspace lock recovery requires --writers-quiescent')
-            with workspace_lock(root, writers_quiescent=True):
-                print(json.dumps({'status': 'ready', 'legacy_lock_recovered': True}))
-            return 0
-        if not args.session:
-            raise BoundaryError('an exact --session UUID is required')
-        if args.action == 'receipt':
-            from tools.coordination import session_uuid
-            identifier = session_uuid(args.operation_id) if args.operation_id else None
-            directory = private_path(root, '.maven/runtime/workspace')
-            matches = []
-            for candidate in directory.glob('*.json'):
-                journal = read_private(root, candidate.relative_to(root))
-                if journal.get('session_id') == args.session and (
-                        identifier is None or journal.get('operation_id') == identifier):
-                    matches.append(journal)
-            if identifier is not None and len(matches) != 1:
-                raise BoundaryError('exact workspace operation receipt is unavailable or ambiguous')
-            report = {'status': 'ready', 'operations': [
-                {key: journal[key] for key in ('operation_id', 'name', 'phase')} for journal in matches]}
-            if identifier is not None:
-                report['operation'] = matches[0]
-            print(json.dumps(report, sort_keys=True))
-            return 0
-        client = configured_client(args.env)
-        service = SessionService(root, args.session, env=args.env, client=client)
-        workspace = Workspace(WorkspaceMemory(service))
-        if args.action == 'intake-pending':
-            report = workspace.pending()
-        else:
-            if args.request is None:
-                raise BoundaryError('an explicit private request is required')
-            info = args.request.lstat()
-            if not args.request.is_file() or args.request.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077:
-                raise BoundaryError('workspace request must be an owner-private regular file')
-            body = read_json(args.request)
-            if args.action == 'status' and (body.get('check') or body.get('output') is None):
-                report = workspace.status(**body)
-            else:
-                with SessionRegistry(args.env.expanduser().resolve().parent).writer(root, args.session), workspace_lock(root):
-                    report = getattr(workspace, args.action.replace('-', '_'))(**body)
-        print(json.dumps(report, indent=2, sort_keys=True))
-        return 0 if report.get('current', True) else 2
-    except (BoundaryError, MemoryClientError) as error:
-        print(json.dumps({'status': 'blocked', 'issues': [str(error)]}))
-        return 2
-    except (OSError, ValueError, KeyError, TypeError):
-        print(json.dumps({'status': 'blocked', 'issues': ['workspace I/O or metadata failure; preserve sources and receipts']}))
-        return 2
-    finally:
-        if client is not None:
-            client.close()
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())
+    def receipt(self, *, operation_id):
+        record_uuid(operation_id)
+        directory = Path('.maven/runtime/workspace') / self.memory.project_id
+        for candidate in private_path(self.root, directory).glob('*.json'):
+            journal = read_private(self.root, candidate.relative_to(self.root))
+            if journal['operation_id'] == operation_id and journal['project_id'] == self.memory.project_id:
+                return {key: journal[key] for key in ('operation_id', 'name', 'phase', 'result') if key in journal}
+        raise BoundaryError('exact workspace receipt unavailable')

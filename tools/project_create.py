@@ -6,7 +6,7 @@ from uuid import UUID, uuid5
 from tools.memory.client import MemoryClientError
 from tools.memory.environment import configured_client
 from tools.memory.validation import validate
-from tools.setup_common import SetupPending, expected_account, verify_authority
+from tools.setup_common import SetupPending, expected_account, verify_connection
 
 
 def _root(root):
@@ -23,10 +23,10 @@ def _fields(record):
 def prepare_create(home, root, name, operation_id, binding):
     _root(root)
     # Creation is universal: the current folder may refer to an unavailable project.
-    generation = verify_authority(Path(home) / '.env', values=binding['environment'])
+    verify_connection(Path(home) / '.env', values=binding['environment'])
     project_id = str(uuid5(UUID(operation_id), 'cloud-project'))
     request = {'record_id': project_id, 'request_key': str(uuid5(UUID(operation_id), 'cloud-project-create')),
-               'expected_revision': 0, 'authority_generation': generation,
+               'expected_revision': 0,
                'kind': 'entity', 'classification': 'Sensitive', 'data_scope': 'owner',
                'data': {'entity_type': 'project', 'name': name, 'aliases': []}, 'tags': [],
                'change_reason': 'Create the owner-selected cloud project without changing local association'}
@@ -36,7 +36,7 @@ def prepare_create(home, root, name, operation_id, binding):
             'instance_id': binding['connection']['instance_id'],
             'recovery_epoch': binding['connection']['recovery_epoch'],
             'region': binding['connection']['region'], 'account': expected_account(binding['environment']),
-            'authority_generation': generation, 'request': request,
+            'request': request,
             'local_binding_changed': False,
             'unchanged': 'Current root association, project config, Home and runtime remain unchanged. '
                          'Associating this project requires a separately reviewed switch.'}
@@ -47,7 +47,7 @@ def apply_create(home, candidate, binding, source, progress, persist):
     _root(candidate['root'])
     if any(binding['connection'][key] != candidate[key] for key in ('instance_id', 'recovery_epoch', 'region')):
         raise SetupPending('Creation instance binding changed after review; restore its original connection.')
-    generation = verify_authority(Path(home) / '.env', values=binding['environment'])
+    verify_connection(Path(home) / '.env', values=binding['environment'])
     request = {**deepcopy(candidate['request']), 'source': deepcopy(source)}
     validate('/v1/memory/write', request)
     if progress.get('request') is not None and progress['request'] != request:
@@ -62,13 +62,9 @@ def apply_create(home, candidate, binding, source, progress, persist):
                 if error.code != 'operation_unavailable':
                     raise
         else:
-            if generation != candidate['authority_generation']:
-                raise SetupPending('Authority changed after review; a fresh exact creation review is required.')
             progress.update(request=request, submitted=True)
             persist()
         if result is None:
-            if generation != candidate['authority_generation']:
-                raise SetupPending('Authority changed after review; preserve the original creation request for reconciliation.')
             result = client.invoke('/v1/memory/write', request)['data']
         progress['receipt'] = result
         persist()

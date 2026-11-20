@@ -6,8 +6,8 @@ from uuid import UUID, uuid5
 from tools.memory.client import MemoryClientError
 from tools.memory.environment import configured_client
 from tools.memory.validation import validate
-from tools.project import load_project
-from tools.setup_common import SetupPending, expected_account, verify_authority
+from tools.project import load_project, require_binding
+from tools.setup_common import SetupPending, expected_account, verify_connection
 
 
 def _local(root, project_id):
@@ -41,7 +41,8 @@ def _fields(record):
 
 def prepare_rename(home, root, project_id, name, operation_id, binding):
     local = _local(root, project_id)
-    generation = verify_authority(Path(home) / '.env', project_id, values=binding['environment'])
+    require_binding(local, binding['connection'])
+    verify_connection(Path(home) / '.env', values=binding['environment'])
     client = configured_client(Path(home) / '.env', values=binding['environment'])
     try:
         record = _record(client, project_id)
@@ -51,7 +52,6 @@ def prepare_rename(home, root, project_id, name, operation_id, binding):
         raise SetupPending('The project already has that exact name; no rename is needed.')
     request = {**_fields(record), 'record_id': project_id, 'expected_revision': record['revision'],
                'request_key': str(uuid5(UUID(operation_id), 'project-rename')),
-               'authority_generation': generation,
                'change_reason': 'Rename the owner-selected cloud project; retain its identity and history'}
     request['data']['name'] = name
     # Validate the actual entity schema before presenting a review. Approval supplies real provenance.
@@ -61,7 +61,7 @@ def prepare_rename(home, root, project_id, name, operation_id, binding):
             'recovery_epoch': binding['connection']['recovery_epoch'],
             'account': expected_account(binding['environment']), 'region': binding['connection']['region'],
             'old_name': record['data']['name'], 'new_name': name,
-            'expected_revision': record['revision'], 'authority_generation': generation,
+            'expected_revision': record['revision'],
             'affects_all_machines': True, 'local_project': local, 'original': _fields(record),
             'request': request,
             'unchanged': 'Project UUID, folder, local binding, aliases, tags, memory/history, Home selection, Git and cloud infrastructure.'}
@@ -73,7 +73,7 @@ def apply_rename(home, candidate, binding, source, progress, persist):
         raise SetupPending('Local project selection changed after review; rename was not submitted.')
     if any(binding['connection'][key] != candidate[key] for key in ('instance_id', 'recovery_epoch', 'region')):
         raise SetupPending('Rename instance binding changed after review; restore its original connection.')
-    generation = verify_authority(Path(home) / '.env', candidate['project_id'], values=binding['environment'])
+    verify_connection(Path(home) / '.env', values=binding['environment'])
     request = {**deepcopy(candidate['request']), 'source': deepcopy(source)}
     validate('/v1/memory/write', request)
     if progress.get('request') is not None and progress['request'] != request:
@@ -88,8 +88,6 @@ def apply_rename(home, candidate, binding, source, progress, persist):
                 if error.code != 'operation_unavailable':
                     raise
         else:
-            if generation != candidate['authority_generation']:
-                raise SetupPending('Authority changed after review; a fresh exact rename review is required.')
             current = _record(client, candidate['project_id'])
             if (current['revision'] != candidate['expected_revision']
                     or _fields(current) != candidate['original']):

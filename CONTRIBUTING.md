@@ -8,10 +8,7 @@ publication, durable records or concurrency before changing their contracts.
 
 For first-time use, follow the [guided installer](README.md#install-and-set-up):
 `python3 install.py` creates its own private environment and offers instance setup.
-The project step is optional: enable an explicitly chosen folder in your supported
-assistant. Configured projects retain their selection; new work sessions get distinct
-MAVEN identities. Conversation through stdio MCP is the normal path; CLI/TUI remain
-recovery surfaces. Memory checkpoints and closure never implicitly publish source.
+Project enablement is separate: review the intended root and cloud identity in the harness. Work from the local brief and use the [reconcile procedure](maven_resources/templates/skills/maven/references/reconcile.md) for synchronization. Memory work never implicitly publishes source.
 
 No preexisting `.venv` or project `.maven` directory is required. The MAVEN source
 checkout is not automatically a development project: explicitly choose/approve that
@@ -24,16 +21,15 @@ Use the existing Python 3.11+ environment with the required optional extras. Ins
 behavior. Do not create a separate test environment or deploy cloud resources merely
 to verify changes. Core recovery must not import MCP, UI or model dependencies.
 
+The installed-wheel regression in `test_packaging_project` builds offline without
+build isolation. Its test interpreter needs pip and the build requirements from
+`pyproject.toml` (`setuptools>=77` and `wheel`); the runtime itself does not.
+
 Keep a separate private `MAVEN_HOME` for any explicitly authorized manual work.
 The repository must not contain your environment file, credentials, runtime state,
 project receipts or downloaded originals.
 
-For onboarding changes, keep smoke checks small: install into a disposable home,
-verify native skill discovery, defer project setup, then configure/revisit two
-disposable project roots. Exercise two sessions in one root and a session in the
-other, including handover isolation and mismatched-resume rejection. Simulate cloud
-boundaries for this local smoke; it is not proof of live AWS deployment or an
-end-to-end model-driven chat.
+For onboarding changes, use a disposable installation and explicitly selected test roots. Exercise project isolation, explicit Home, no capture in an unsupported folder, and rejection of legacy or mismatched bindings. Simulate cloud boundaries; this is not proof of live AWS or end-to-end model-driven operation.
 
 For uninstall changes, use the existing interpreter and focused offline checks:
 
@@ -61,22 +57,16 @@ work using system Python without importing Textual or AWS packages.
 
 ## Change requirements
 
-- Preserve explicit project/session selection and complete cloud-authority loading.
-- Keep bootstrap guidance intent-based and thin over shared controllers via MCP.
-  Bind root and returned MAVEN identity to the work session across cwd changes;
-  no global current-session file, guessed harness identity or implicit resume.
-- Preserve non-Git memory, explicit scope selection, source-linked promotion,
-  assignment supersession, checkpoint cutoffs and both resume modes. Native background
-  reasoning is a harness capability, not an MCP or deterministic-worker feature.
-- Keep service/schema rollout and exact active-policy approval separate from local
-  implementation. Preserve historical checkpoints and pending recovery implementations.
+- Preserve offline orientation and durable local capture. Do not add a work-session lifecycle, implicit project selection or cloud dependency on harness open/exit.
+- Keep semantic reasoning in the installed `maven` skill’s reconcile procedure. Compare whole-project views, fetch details selectively, guard writes on both sides, and verify convergence. Preserve competing evidence and never resurrect erased content.
+- Keep record ownership clear: a project skill carries steps **or** a repository link; a link does not authorize reading secrets, uploading the file, running code or publishing.
+- Keep service/schema rollout and sensitive external approvals separate from local implementation. Preserve pending setup, Git and removal recovery evidence.
 - Keep instance setup separate from additional-project setup. Noninteractive
   creation needs explicit owner choices and genuine source evidence, and generated
   IDs must be journaled before mutation. Preserve legacy pending-request identities.
 - Edit only generic source templates, never an active installation's skills or
   private cloud instruction bodies. Existing skill conflicts remain protected;
-  stage/review separately and activate only after affected harnesses stop. Template
-  changes are not approval to activate cloud authority.
+  stage and review local changes separately. Templates do not activate cloud policy.
 - Keep runtime credentials distinct from setup/admin credentials. Never add ambient
   profile fallback, silent login, relaxed TLS verification or unreviewed activation.
 - Update callers, relevant behavioral tests and the focused public documentation

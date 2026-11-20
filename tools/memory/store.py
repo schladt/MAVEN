@@ -8,7 +8,7 @@ import json
 import re
 import time
 
-from .validation import (MEMORY_ROUTES, MemoryError, MUTATION_ROUTES, SCHEMA_VERSION, canonical, decode_json, digest,
+from .validation import (MEMORY_ROUTES, MemoryError, MUTATION_ROUTES, RECONCILE_ROUTES, SCHEMA_VERSION, canonical, decode_json, digest,
                          fields, uuid_string)
 
 CONTROL_KEYS = {"instance_id", "recovery_epoch", "schema_version", "state", "data_scope"}
@@ -166,7 +166,7 @@ class DataAPI:
             if type(total) is not int or total < 1 or not isinstance(checksum, str) or len(checksum) != 64:
                 raise ValueError
             if total > MAX_JSON_RESULT_BYTES:
-                raise MemoryError(overflow_status, 409 if overflow_status == "context_incomplete" else 503)
+                raise MemoryError(overflow_status, 409 if overflow_status.endswith("_incomplete") else 503)
             if len(rows) != (total + JSON_CHUNK_BYTES - 1) // JSON_CHUNK_BYTES:
                 raise ValueError
             document = bytearray()
@@ -185,6 +185,8 @@ class DataAPI:
                 raise ValueError
             return document.decode("utf-8")
         except (KeyError, IndexError, TypeError, ValueError, binascii.Error, UnicodeError):
+            if overflow_status == "snapshot_incomplete":
+                raise MemoryError("snapshot_incomplete", 409) from None
             raise MemoryError("temporarily_unavailable") from None
 
     @contextmanager
@@ -261,7 +263,8 @@ ROUTE_STATUSES = {"revision_conflict", "idempotency_conflict", "record_unavailab
                   "approval_invalid", "invalid_request", "claim_conflict", "setting_conflict",
                   "reference_unavailable", "session_unavailable", "client_incompatible",
                   "context_incomplete", "dependency_unavailable", "dependency_conflict", "context_stale",
-                  "project_archived", "not_authorized"}
+                  "project_archived", "project_unavailable", "view_conflict", "erased_record",
+                  "snapshot_incomplete", "not_authorized"}
 DISPATCH = ("maven.memory_request(:route, CAST(:request AS jsonb), :request_hash, :candidate_hash, "
             ":actor, CAST(:protocol AS integer))")
 
@@ -350,8 +353,11 @@ class Store:
         """Return (result, authority_generation) for one validated request."""
         mutation = route in WRITE_ROUTES
         expected = self.control(fresh=mutation)
+        if route in RECONCILE_ROUTES:
+            from .reconcile_transport import perform
+            return perform(self, route, request, expected)
         if route not in DISPATCHED_ROUTES:
-            return self._legacy(route, request, actor, expected, client_protocol, mutation)
+            return self._legacy(route, request, expected, client_protocol)
         values = {"route": route, "request": canonical(request),
                   "request_hash": digest(request) if mutation else None,
                   "candidate_hash": digest(request["candidate"]) if "candidate" in request else None,
@@ -371,7 +377,7 @@ class Store:
                 raise MemoryError("context_stale")
         return result, generation
 
-    def _legacy(self, route, request, actor, expected, client_protocol, mutation):
+    def _legacy(self, route, request, expected, client_protocol):
         with self.db.transaction() as tx:
             _, generation = self.envelope(
                 self.db.scalar("SELECT maven.memory_service_state()::text", transaction=tx), expected)
@@ -379,10 +385,7 @@ class Store:
                             {"protocol": str(client_protocol)}, tx)
             if not self.db.scalar("SELECT maven.memory_protocol_allowed()", transaction=tx):
                 raise MemoryError("client_incompatible", 409)
-            if route == "/v1/records/change":
-                raw = self.db.scalar("SELECT maven.change_fact(CAST(:request AS jsonb), :hash, :actor)::text",
-                                     {"request": canonical(request), "hash": digest(request), "actor": actor}, tx)
-            elif route == "/v1/records/query":
+            if route == "/v1/records/query":
                 raw = self.db.scalar(QUERY, {"record_id": request["record_id"],
                                              "revision": request.get("revision")}, tx)
                 if raw is None:
@@ -397,6 +400,4 @@ class Store:
                 if raw is None:
                     raise MemoryError("operation_unavailable", 404)
             result = route_result(json.loads(raw))
-            if mutation and self.control() != expected:
-                raise MemoryError("context_stale")
         return result, generation

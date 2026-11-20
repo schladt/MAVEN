@@ -1,4 +1,4 @@
-"""Offline boundaries for private originals and cloud-only workspace metadata."""
+"""Private artifact boundaries exercised with real local records."""
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -8,48 +8,21 @@ from unittest.mock import patch
 import uuid
 
 from tools.memory.boundary import BoundaryError
-from tools.memory.environment import MemoryClientError
-from tools.workspace import SECTIONS, Workspace
+from tools.reconcile_local import LocalStore
+from tools.reconcile_records import make_change
+from tools.workspace import SECTIONS, Workspace, WorkspaceMemory
 
 
-class Memory:
-    """Revision-aware test double; production always uses the cloud boundary."""
-    project_id = '11111111-1111-4111-8111-111111111111'
+def memory_at(root):
+    return WorkspaceMemory(LocalStore(root, str(uuid.uuid4())))
 
-    def __init__(self, root):
-        self.root = root
-        self.records = {}
-        self.requests = {}
 
-    def session(self):
-        return {'record_id': '22222222-2222-4222-8222-222222222222'}
-
-    def read(self, identifier, revision=None, *, include_archived=False):
-        if identifier not in self.records:
-            raise MemoryClientError('record_unavailable')
-        versions = self.records[identifier]
-        if revision is not None and revision > len(versions):
-            raise MemoryClientError('record_unavailable')
-        return deepcopy(versions[-1] if revision is None else versions[revision - 1])
-
-    def write(self, kind, data, *, record_id=None, expected_revision=0, tags=None, reason=None):
-        identifier = record_id or str(uuid.uuid4())
-        request = (identifier, expected_revision, json.dumps(
-            {'kind': kind, 'data': data, 'tags': tags or [], 'reason': reason}, sort_keys=True))
-        if request in self.requests:
-            return deepcopy(self.requests[request])
-        versions = self.records.setdefault(identifier, [])
-        if len(versions) != expected_revision:
-            raise MemoryClientError('revision_conflict')
-        record = dict(record_id=identifier, revision=len(versions) + 1,
-                      kind=kind, data=deepcopy(data), tags=tags or [])
-        versions.append(record)
-        self.requests[request] = deepcopy(record)
-        return deepcopy(record)
-
-    @staticmethod
-    def ref(record):
-        return {key: record[key] for key in ('record_id', 'revision')}
+def seed(memory, kind, data, record_id=None):
+    record_id = record_id or str(uuid.uuid4())
+    token, previous = memory.snapshot(record_id)
+    envelope = make_change(previous, kind, data, 'Owner-reviewed fixture', record_id=record_id)
+    memory.store.apply([envelope], token)
+    return memory.read(record_id)
 
 
 class WorkspaceTests(unittest.TestCase):
@@ -57,7 +30,7 @@ class WorkspaceTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        self.memory = Memory(self.root)
+        self.memory = memory_at(self.root)
         self.workspace = Workspace(self.memory)
 
     def source(self, relative, text):
@@ -80,7 +53,23 @@ class WorkspaceTests(unittest.TestCase):
         self.assertEqual(stored.read_text(), 'synthetic private original')
         self.assertEqual(stored.stat().st_mode & 0o777, 0o600)
         self.assertFalse(source.exists())
-        self.assertNotIn('synthetic private original', json.dumps(self.memory.records))
+        view = self.memory.store.inventory()
+        records = self.memory.store.read([item['id'] for item in view['items']], view['token'])
+        self.assertNotIn('synthetic private original', json.dumps(records))
+
+    def test_unsafe_intake_preserves_source_and_rejects_credentials_before_journaling(self):
+        source = self.source('.maven/incoming/original', 'private')
+        fields = dict(path='.maven/incoming/original', kind='reference', sensitivity='Sensitive',
+                      authorization='approved', disposition='delete', confirm=True, reviewed=True)
+        with self.assertRaises(BoundaryError):
+            self.workspace.intake(**fields, origin='Bearer ' + 'A' * 32)
+        self.assertFalse((self.root / '.maven/runtime/workspace').exists())
+        (source.parent / 'alias').symlink_to(source)
+        with self.assertRaises(BoundaryError):
+            self.workspace.intake(**dict(fields, path='.maven/incoming/alias', origin='fixture'))
+        with self.assertRaises(BoundaryError):
+            self.workspace.intake(**dict(fields, confirm='yes', origin='fixture'))
+        self.assertEqual(source.read_text(), 'private')
 
     def test_pending_does_not_open_source_content(self):
         self.source('.maven/incoming/item.txt', 'unread fixture')
@@ -90,33 +79,36 @@ class WorkspaceTests(unittest.TestCase):
         self.assertFalse(result['contents_opened'])
 
     def test_status_excludes_internal_fields_and_preserves_unowned_output(self):
-        record = self.memory.write('setting', dict(key='project-status', scope='project', value={
+        record = seed(self.memory, 'setting', dict(key='project-status', scope='project', value={
             'external_status_enabled': True, 'internal': 'synthetic private detail',
             'publishable': {section: 'Approved update.' for section in SECTIONS}}))
-        result = self.workspace.status(record_id=record['record_id'], revision=1)
+        result = self.workspace.status(**self.memory.ref(record))
         self.assertNotIn('synthetic private detail', json.dumps(result))
+        token = self.memory.store.inventory()['token']
+        self.assertFalse(self.workspace.status(**self.memory.ref(record), output='team-status.md', check=True)['current'])
+        self.assertFalse((self.root / 'team-status.md').exists())
+        self.assertEqual(self.memory.store.inventory()['token'], token)
         target = self.source('team-status.md', 'unrelated bytes')
         with self.assertRaises(BoundaryError):
-            self.workspace.status(record_id=record['record_id'], revision=1, output='team-status.md')
+            self.workspace.status(**self.memory.ref(record), output='team-status.md')
         self.assertEqual(target.read_text(), 'unrelated bytes')
 
-    def test_cloud_plan_archive_preserves_identity_and_history(self):
-        plan = self.memory.write('note', dict(title='Plan', body_markdown='Completed.', category='plan'))
-        result = self.workspace.archive_plan(record_id=plan['record_id'], revision=1,
-                                             confirm=True, completed=True)
+    def test_local_plan_archive_preserves_identity_and_history(self):
+        plan = seed(self.memory, 'plan', dict(title='Plan', body='Completed.'))
+        result = self.workspace.archive_plan(**self.memory.ref(plan), confirm=True, completed=True)
         self.assertEqual(result['plan']['record_id'], plan['record_id'])
-        self.assertEqual(self.memory.read(plan['record_id'])['data']['category'], 'archived-plan')
-        self.assertIn('archived', self.memory.read(plan['record_id'])['tags'])
-        self.assertEqual(self.memory.read(plan['record_id'], 1)['data']['category'], 'plan')
+        self.assertEqual(self.memory.read(plan['record_id'])['data']['state'], 'archived')
+        _, envelope = self.memory.snapshot(plan['record_id'])
+        self.assertEqual(envelope['history'][0]['record']['data'], plan['data'])
         self.assertFalse((self.root / '.maven/planning').exists())
 
-    def test_operations_resume_every_cloud_effect_with_original_identity(self):
+    def test_operations_resume_every_local_effect_with_original_identity(self):
         for action, writes in (('intake', 4), ('archive_plan', 5), ('status', 3)):
             for fail_at in range(1, writes + 1):
                 for after in (False, True):
                     with self.subTest(action=action, fail_at=fail_at, after=after), tempfile.TemporaryDirectory() as directory:
                         root = Path(directory)
-                        memory = Memory(root)
+                        memory = memory_at(root)
                         workspace = Workspace(memory)
                         operation_id = str(uuid.uuid4())
                         if action == 'intake':
@@ -127,13 +119,13 @@ class WorkspaceTests(unittest.TestCase):
                                              sensitivity='Sensitive', authorization='owner reviewed', disposition='delete',
                                              confirm=True, reviewed=True)
                         elif action == 'archive_plan':
-                            plan = memory.write('note', dict(title='Plan', body_markdown='Completed.', category='plan'))
-                            arguments = dict(record_id=plan['record_id'], revision=1, confirm=True, completed=True)
+                            plan = seed(memory, 'plan', dict(title='Plan', body='Completed.'))
+                            arguments = dict(memory.ref(plan), confirm=True, completed=True)
                         else:
-                            record = memory.write('setting', dict(key='project-status', scope='project', value={
+                            record = seed(memory, 'setting', dict(key='project-status', scope='project', value={
                                 'external_status_enabled': True, 'publishable': {section: 'Approved.' for section in SECTIONS}}))
-                            arguments = dict(record_id=record['record_id'], revision=1, output='team-status.md')
-                        write = memory.write
+                            arguments = dict(memory.ref(record), output='team-status.md')
+                        write = memory.store.apply
                         count = 0
                         def interrupted(*args, **kwargs):
                             nonlocal count
@@ -144,24 +136,24 @@ class WorkspaceTests(unittest.TestCase):
                             if count == fail_at and after:
                                 raise OSError('lost response after submission')
                             return result
-                        with patch.object(memory, 'write', side_effect=interrupted), self.assertRaises(OSError):
+                        with patch.object(memory.store, 'apply', side_effect=interrupted), self.assertRaises(OSError):
                             getattr(workspace, action)(**arguments, operation_id=operation_id)
                         result = getattr(Workspace(memory), action)(**arguments, operation_id=operation_id)
                         self.assertEqual(result['operation_id'], operation_id)
                         self.assertEqual(memory.read(operation_id)['data']['state'], 'completed')
-                        self.assertEqual(len(memory.records[operation_id]), 2)
-                        before = deepcopy(memory.records)
+                        self.assertEqual(len(memory.snapshot(operation_id)[1]['history']), 1)
+                        before = memory.store.inventory()
                         self.assertEqual(getattr(Workspace(memory), action)(**arguments, operation_id=operation_id), result)
-                        self.assertEqual(memory.records, before)
+                        self.assertEqual(memory.store.inventory(), before)
                         if action == 'intake':
                             self.assertFalse(source.exists())
                         elif action == 'archive_plan':
-                            self.assertIn('archived', memory.read(plan['record_id'])['tags'])
+                            self.assertEqual(memory.read(plan['record_id'])['data']['state'], 'archived')
                         else:
                             self.assertIn('Approved.', (root / 'team-status.md').read_text())
 
     def test_status_new_output_never_overwrites_racing_editor(self):
-        record = self.memory.write('setting', dict(key='project-status', scope='project', value={
+        record = seed(self.memory, 'setting', dict(key='project-status', scope='project', value={
             'external_status_enabled': True, 'publishable': {section: 'Approved.' for section in SECTIONS}}))
         import os
         link = os.link
@@ -169,29 +161,20 @@ class WorkspaceTests(unittest.TestCase):
             Path(target).write_text('external editor')
             return link(source, target)
         with patch('tools.workspace.os.link', side_effect=competing_writer), self.assertRaises(FileExistsError):
-            self.workspace.status(record_id=record['record_id'], revision=1, output='team-status.md')
+            self.workspace.status(**self.memory.ref(record), output='team-status.md')
         self.assertEqual((self.root / 'team-status.md').read_text(), 'external editor')
         with self.assertRaises(BoundaryError):
-            self.workspace.status(record_id=record['record_id'], revision=1, output='team-status.md')
+            self.workspace.status(**self.memory.ref(record), output='team-status.md')
 
-    def test_kernel_lock_persists_and_legacy_lock_requires_quiescence(self):
+    def test_workspace_writers_are_serialized(self):
         from tools.workspace import workspace_lock
         from tools.coordination import private_lock
         with workspace_lock(self.root):
             with self.assertRaises(BoundaryError):
-                with private_lock(self.root, '.maven/runtime/cloud-workspace-v2.lock', blocking=False):
+                with private_lock(self.root, '.maven/runtime/workspace.lock', blocking=False):
                     self.fail('concurrent lock acquired')
         with workspace_lock(self.root):
             pass
-        legacy = self.root / '.maven/runtime/cloud-workspace.lock'
-        legacy.touch(mode=0o600)
-        with self.assertRaises(BoundaryError):
-            with workspace_lock(self.root):
-                self.fail('legacy lock silently adopted')
-        with workspace_lock(self.root, writers_quiescent=True):
-            pass
-        self.assertFalse(legacy.exists())
-        self.assertTrue((legacy.parent / 'cloud-workspace-legacy.json').exists())
 
     def test_crashed_workspace_owner_does_not_leave_kernel_lock_held(self):
         import subprocess
@@ -218,8 +201,8 @@ class WorkspaceTests(unittest.TestCase):
                     arguments = dict(path=relative, kind='reference', origin='fixture', sensitivity='Sensitive',
                                      authorization='reviewed', disposition='delete', confirm=True, reviewed=True)
                 else:
-                    plan = self.memory.write('note', dict(title='Plan', body_markdown='Done.', category='plan'))
-                    arguments = dict(record_id=plan['record_id'], revision=1, confirm=True, completed=True,
+                    plan = seed(self.memory, 'plan', dict(title='Plan', body='Done.'))
+                    arguments = dict(self.memory.ref(plan), confirm=True, completed=True,
                                      source_path=relative, source_disposition='archive')
                 phase = self.workspace._phase
                 def interrupt(path, journal, state, **kwargs):
@@ -229,46 +212,40 @@ class WorkspaceTests(unittest.TestCase):
                 with patch.object(self.workspace, '_phase', side_effect=interrupt), self.assertRaises(OSError):
                     getattr(self.workspace, action)(**arguments)
                 self.assertFalse(source.exists())
-                journals = list((self.root / '.maven/runtime/workspace').glob('*.json'))
+                journals = list((self.root / '.maven/runtime/workspace' / self.memory.project_id).glob('*.json'))
                 original = next(json.loads(path.read_text()) for path in journals
                                 if json.loads(path.read_text())['name'] == action.replace('_', '-'))
                 result = getattr(Workspace(self.memory), action)(**arguments, operation_id=original['operation_id'])
                 self.assertEqual(result['operation_id'], original['operation_id'])
-                self.assertEqual(self.memory.read(original['operation_id'])['revision'], 2)
+                self.assertEqual(self.memory.read(original['operation_id'])['data']['state'], 'completed')
 
     def test_status_existing_output_resumes_after_rename_before_receipt(self):
         import os
-        record = self.memory.write('setting', dict(key='project-status', scope='project', value={
+        record = seed(self.memory, 'setting', dict(key='project-status', scope='project', value={
             'external_status_enabled': True, 'publishable': {section: 'First.' for section in SECTIONS}}))
-        self.workspace.status(record_id=record['record_id'], revision=1, output='team-status.md')
+        self.workspace.status(**self.memory.ref(record), output='team-status.md')
         data = deepcopy(record['data'])
         data['value']['publishable']['Progress'] = 'Second.'
-        self.memory.write('setting', data, record_id=record['record_id'], expected_revision=1)
+        record = seed(self.memory, 'setting', data, record_id=record['record_id'])
         replace = os.replace
         def interrupted(source, target):
             replace(source, target)
             if Path(target).name == 'team-status.md':
                 raise OSError('interrupted after rename')
         with patch('tools.workspace.os.replace', side_effect=interrupted), self.assertRaises(OSError):
-            self.workspace.status(record_id=record['record_id'], revision=2, output='team-status.md')
-        result = Workspace(self.memory).status(record_id=record['record_id'], revision=2, output='team-status.md')
+            self.workspace.status(**self.memory.ref(record), output='team-status.md')
+        result = Workspace(self.memory).status(**self.memory.ref(record), output='team-status.md')
         self.assertTrue(result['current'])
         self.assertIn('Second.', (self.root / 'team-status.md').read_text())
 
-    def test_receipt_diagnosis_does_not_connect_or_register_writer(self):
-        import io
-        from contextlib import redirect_stdout
-        from tools.workspace import main
+    def test_receipt_is_local_and_project_scoped(self):
         self.source('.maven/incoming/item', 'original')
         result = self.workspace.intake(path='.maven/incoming/item', kind='reference', origin='fixture',
                                        sensitivity='Sensitive', authorization='reviewed', disposition='retain')
-        with patch('tools.memory.environment.configured_client', side_effect=AssertionError('cloud connection')), \
-                patch('tools.coordination.SessionRegistry.writer', side_effect=AssertionError('writer registration')), \
-                redirect_stdout(io.StringIO()) as output:
-            code = main(['--root', str(self.root), '--session', self.memory.session()['record_id'],
-                         'receipt', '--operation-id', result['operation_id']])
-        self.assertEqual(code, 0)
-        self.assertEqual(json.loads(output.getvalue())['operation']['phase'], 'completed')
+        identifier = result['operation_id']
+        self.assertEqual(self.workspace.receipt(operation_id=identifier)['phase'], 'completed')
+        with self.assertRaises(BoundaryError):
+            Workspace(memory_at(self.root)).receipt(operation_id=identifier)
 
 
 if __name__ == '__main__':

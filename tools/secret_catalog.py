@@ -26,6 +26,10 @@ class SecretCatalog:
         selected = load_home(self.home)
         if not selected or selected.get('invalid'):
             raise StoreError('select a valid MAVEN Home before using its secret catalog')
+        for field in ('instance_id', 'recovery_epoch'):
+            if not selected.get(field) or self.values.get('MAVEN_MEMORY_' + field.upper()) != selected[field]:
+                raise StoreError('Home secret catalog does not match the selected instance and recovery epoch')
+        self.recovery_epoch = selected['recovery_epoch']
         self.home_id = selected['project_id']
         self.instance_id = selected['instance_id']
         self.store = store or SecretStore(self.values)
@@ -68,6 +72,7 @@ class SecretCatalog:
     def _load(self, operation_id):
         state = read_private(self.home, self._path(operation_id))
         if (state.get('schema') != 1 or state.get('operation_id') != operation_id
+                or state.get('recovery_epoch') != self.recovery_epoch
                 or state.get('home_id') != self.home_id or state.get('instance_id') != self.instance_id
                 or state.get('store_id') != self.store.store_id):
             raise StoreError('secret operation belongs to a different Home, instance or store')
@@ -146,6 +151,7 @@ class SecretCatalog:
                         if provider == 'encrypted-file' and replace else name)
             state = {'schema': 1, 'operation_id': operation_id, 'home_id': self.home_id,
                      'instance_id': self.instance_id, 'store_id': self.store.store_id,
+                     'recovery_epoch': self.recovery_epoch,
                      'name': name, 'physical_name': physical, 'intent': intent, 'prior': prior,
                      'state': 'storing', 'catalog_attempt': 0}
             # Verify current skill authority before storing anything. This path fetches

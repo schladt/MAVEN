@@ -281,8 +281,8 @@ def initialize(values, *, confirm_instance, upgrade=False, verify_service=True):
         return {**result, 'service_verified': False}
     client = MemoryClient(config, selected_session(config, environment=values))
     try:
-        context = client.load_context()
+        from .reconcile_cloud import status
+        capability = status(client)
     finally:
         client.close()
-    return {**result, 'authority_generation': context['data']['authority_generation'],
-            'minimum_client_protocol': context['data']['minimum_client_protocol']}
+    return {**result, 'service_verified': True, 'capability': capability['capability']}

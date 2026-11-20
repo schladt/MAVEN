@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import Mock, patch
 from uuid import uuid4
 
-from tools.coordination import CoordinationError, SessionRegistry, private_lock
+from tools.coordination import CoordinationError, ensure_available, private_lock, project_binding_lock
 from tools.memory import admin, store, validation
 from tools.memory.boundary import save_private as save_pointer
 from tools.uninstall import lifecycle
@@ -32,57 +32,34 @@ class RegistryBarrierTests(unittest.TestCase):
         self.root.mkdir(mode=0o700)
         self.other = Path(self.temporary.name) / 'other'
         self.other.mkdir(mode=0o700)
-        self.registry = SessionRegistry(self.home)
-        self.session = str(uuid4())
-        self.registry.register(self.root, str(uuid4()), self.session, {})
-        self.registry.activate(self.root, self.session)
 
     def marker(self, *, whole_home=False):
         with private_lock(self.home, 'runtime/registry.lock'):
             save_pointer(self.home, 'runtime/uninstall.json', {
-                'schema': 1, 'whole_home': whole_home, 'project_roots': [str(self.root)],
-                'actions': {'a' * 64: {'root': None if whole_home else str(self.root)}}})
+                'schema': 1, 'whole_home': whole_home, 'project_roots': [str(self.root.resolve())],
+                'actions': {'a' * 64: {'root': None if whole_home else str(self.root.resolve())}}})
 
-    def test_selected_root_blocks_every_writer_entry_but_preserves_status(self):
+    def test_selected_root_blocks_access_even_after_restart_but_not_other_roots(self):
         self.marker()
-        with self.assertRaises(CoordinationError):
-            self.registry.register(self.root, str(uuid4()), str(uuid4()), {})
-        with self.assertRaises(CoordinationError):
-            self.registry.activate(self.root, self.session)
-        with self.assertRaises(CoordinationError):
-            self.registry.release(self.root, self.session, activate=True)
-        with self.assertRaises(CoordinationError):
-            with self.registry.writer(self.root, self.session):
-                self.fail('writer entered an uninstalled root')
-        self.assertEqual(self.registry.inspect(self.root, self.session)['session']['writers'], [])
-        other_session = str(uuid4())
-        self.registry.register(self.other, str(uuid4()), other_session, {})
-        self.registry.activate(self.other, other_session)
-        with self.registry.writer(self.other, other_session):
-            pass
-        relative = f'.maven/runtime/sessions/{self.session}/pending-memory.json'
-        save_pointer(self.root, relative, {'request_key': str(uuid4()), 'outcome': 'unknown'})
-        before = (self.root / relative).read_bytes()
-        with self.assertRaises(CoordinationError):
-            self.registry.activate(self.root, self.session)
-        self.registry.inspect(self.root, self.session)
-        self.assertEqual((self.root / relative).read_bytes(), before)
+        with project_binding_lock(self.home, self.root), self.assertRaises(CoordinationError):
+            ensure_available(self.home, self.root)
+        with project_binding_lock(self.home, self.other):
+            ensure_available(self.home, self.other)
+        self.assertFalse((self.home / 'runtime/sessions.json').exists())
 
-    def test_whole_home_blocks_other_roots_and_existing_writer_can_drain(self):
-        with self.registry.writer(self.root, self.session):
-            self.marker(whole_home=True)
-            with self.assertRaises(CoordinationError):
-                self.registry.register(self.other, str(uuid4()), str(uuid4()), {})
-        self.assertEqual(self.registry.inspect(self.root, self.session)['session']['writers'], [])
-        self.registry.pause(self.root, self.session)
-        self.assertEqual(self.registry.inspect(self.root, self.session)['session']['state'], 'paused')
+    def test_removal_waits_for_real_access_then_blocks_all_roots(self):
+        with project_binding_lock(self.home, self.root):
+            with self.assertRaises(CoordinationError), private_lock(self.home, 'runtime/registry.lock', blocking=False):
+                self.fail('Removal crossed a held project-access gate')
+        self.marker(whole_home=True)
+        with self.assertRaises(CoordinationError):
+            ensure_available(self.home, self.other)
 
     def test_malformed_marker_fails_closed_without_blocking_inspection(self):
         save_pointer(self.home, 'runtime/uninstall.json', {'schema': 1, 'whole_home': False,
                                                          'project_roots': ['relative']})
         with self.assertRaises(CoordinationError):
-            self.registry.activate(self.root, self.session)
-        self.registry.inspect(self.root, self.session)
+            ensure_available(self.home, self.root)
 
 
 class LifecycleIdentityTests(unittest.TestCase):
@@ -248,13 +225,13 @@ class ControlObject:
 
 
 class CloudFreezeTests(unittest.TestCase):
-    def run_freeze(self, planned, observed=None, *, abandon=False, lose_response=False):
+    def run_freeze(self, planned, observed=None, *, lose_response=False):
         progress, saves = {}, []
         control = store.control_document(CONFIG, 'ready')
         details = {'home': '/selected-home', 'config': CONFIG, 'instance_id': CONFIG['instance_id'],
                    'recovery_epoch': CONFIG['recovery_epoch'], 'control': control,
                    'control_etag': 'initial', 'barrier_token': 'a' * 64,
-                   'migrations': {}, 'work': deepcopy(planned), 'abandon': abandon}
+                   'migrations': {}, 'work': deepcopy(planned)}
         action = {'handler': 'lifecycle', 'kind': 'cloud-freeze', 'details': details}
         s3 = ControlObject(control, saves)
         s3.lose_response = lose_response
@@ -267,9 +244,8 @@ class CloudFreezeTests(unittest.TestCase):
         return action, progress, saves, s3, db, save, patches
 
     def test_lost_control_response_reconciles_without_rewriting_or_losing_evidence(self):
-        work = {'records': [{'id': str(uuid4()), 'state': 'active', 'content_hash': 'b' * 64}],
-                'receipts': [{'request_key': str(uuid4()), 'request_hash': 'c' * 64}]}
-        action, progress, saves, s3, db, save, patches = self.run_freeze(work, abandon=True, lose_response=True)
+        work = EMPTY_WORK
+        action, progress, saves, s3, db, save, patches = self.run_freeze(work, lose_response=True)
         with patches[0], patches[1], patches[2], patches[3]:
             with self.assertRaises(UninstallError):
                 lifecycle.execute(action, progress, save)
@@ -277,17 +253,15 @@ class CloudFreezeTests(unittest.TestCase):
             result = lifecycle.execute(action, progress, save)
         self.assertEqual(s3.writes, 1)
         self.assertEqual(action['details']['work'], work)
-        self.assertTrue(result['administratively_abandoned'])
         self.assertFalse(result['session_records_modified'])
-        self.assertFalse(result['normal_cloud_closure'])
         self.assertFalse(result['unsaved_work_recovered'])
         self.assertTrue(result['unknown_receipts_preserved'])
         self.assertNotIn('outcome_unresolved', progress)
         self.assertEqual(s3.closed, 2)
 
-    def test_changed_work_keeps_barrier_and_refuses_to_extend_abandonment(self):
+    def test_changed_work_keeps_barrier_and_refuses_purge(self):
         observed = {'records': [{'id': str(uuid4()), 'state': 'active'}], 'receipts': []}
-        action, progress, saves, s3, db, save, patches = self.run_freeze(EMPTY_WORK, observed, abandon=True)
+        action, progress, saves, s3, db, save, patches = self.run_freeze(EMPTY_WORK, observed)
         with patches[0], patches[1], patches[2], patches[3], self.assertRaises(UninstallError):
             lifecycle.execute(action, progress, save)
         self.assertEqual(s3.document['state'], 'maintenance')

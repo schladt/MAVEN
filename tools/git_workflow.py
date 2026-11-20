@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import datetime as dt
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -14,17 +14,20 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tempfile
+import stat
 import uuid
 from typing import Any
 from urllib.parse import urlsplit
+
+from tools.project import ProjectError, instance_home, load_project, require_binding
+from tools.uninstall.common import UninstallError, private_directory, read_private, save_private
 
 SCHEMA = 1
 
 EXIT_OK = 0
 EXIT_BLOCKED = 2
 EXIT_APPROVAL_REQUIRED = 3
-EXIT_ERROR = 4
-EXIT_UNSYNCHRONIZED = 5
+EXIT_UNCERTAIN = 5
 SECRET_PATTERNS = (
     ("private-key", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
     ("aws-access-key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
@@ -37,18 +40,10 @@ SECRET_PATTERNS = (
         ),
     ),
 )
-APPROVAL_CODE_RE = re.compile(
-    r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)-"
-    r"(?P<fingerprint>[0-9A-F]{4}-[0-9A-F]{4})$"
-)
 
 
-class WorkflowFailure(Exception):
-    """Expected safe workflow stop."""
-
-    def __init__(self, issue: str):
-        super().__init__(issue)
-        self.issue = issue
+class WorkflowFailure(ProjectError):
+    """Safe publication stop; subprocess output and credential values are excluded."""
 
 
 def git_environment():
@@ -56,7 +51,7 @@ def git_environment():
     for key in ('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
                 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE'):
         env.pop(key, None)
-    env.update(GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0')
+    env.update(GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0', GIT_NO_REPLACE_OBJECTS='1')
     return env
 
 
@@ -79,6 +74,7 @@ def run(
             env=env,
             check=False,
             timeout=timeout,
+            stdin=subprocess.DEVNULL if input_data is None else None,
             input=input_data,
         )
     except subprocess.TimeoutExpired:
@@ -148,25 +144,21 @@ def validate_remote(root: Path, policy: dict[str, Any]) -> tuple[str, str]:
     return remote, actual
 
 
-def git_path(root: Path, name: str) -> Path:
-    value = git(root, "rev-parse", "--git-path", name).stdout.strip()
-    path = Path(value)
-    return path.resolve() if path.is_absolute() else (root / path).resolve()
+def index_file(root: Path) -> Path:
+    value = Path(git(root, 'rev-parse', '--git-path', 'index').stdout.strip())
+    path = value if value.is_absolute() else root / value
+    if path.resolve() != path.absolute() or not path.is_file():
+        raise WorkflowFailure('Git index must be a regular file without symlink components')
+    return path
 
-def other_git_locks(root: Path) -> list[str]:
-    git_dir_value = git(root, "rev-parse", "--git-dir").stdout.strip()
-    git_dir = Path(git_dir_value)
-    if not git_dir.is_absolute():
-        git_dir = (root / git_dir).resolve()
-    found: list[str] = []
-    for candidate in git_dir.rglob("*.lock"):
-        if candidate.name == "maven-workflow.lock":
-            continue
-        try:
-            found.append(str(candidate.relative_to(git_dir)))
-        except ValueError:
-            found.append(candidate.name)
-    return sorted(found)
+
+def busy_repository(root):
+    """An in-progress merge, sequencer or ordinary Git lock is not a quiescent checkout."""
+    directory = Path(git(root, 'rev-parse', '--absolute-git-dir').stdout.strip())
+    if any((directory / name).exists() for name in
+           ('MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer')):
+        return True
+    return next(directory.rglob('*.lock'), None) is not None
 
 
 def sha256_file(path: Path) -> str:
@@ -374,24 +366,6 @@ def canonical_digest(value: Any) -> str:
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
-def approval_code(proposal: dict[str, Any]) -> str:
-    timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    digest = canonical_digest(proposal)[:8].upper()
-    fingerprint = "-".join(digest[index : index + 4] for index in range(0, len(digest), 4))
-    return f"{timestamp}-{fingerprint}"
-
-
-def approval_code_matches(proposal: dict[str, Any], code: str) -> bool:
-    match = APPROVAL_CODE_RE.fullmatch(code)
-    if match is None:
-        return False
-    try:
-        dt.datetime.strptime(match.group("timestamp"), "%Y-%m-%dT%H:%M:%SZ")
-    except ValueError:
-        return False
-    digest = canonical_digest(proposal)[:8].upper()
-    expected = "-".join(digest[index : index + 4] for index in range(0, len(digest), 4))
-    return match.group("fingerprint") == expected
 
 
 def candidate_digest(root: Path, paths: list[str]) -> str:
@@ -437,16 +411,16 @@ def run_project_checks(root: Path, policy: dict[str, Any]) -> list[dict[str, Any
         results.append({"command": command, "returncode": completed.returncode, "passed": completed.returncode == 0})
     return results
 
-def checkpoint_matches_proposal(root: Path, checkpoint_sha: str, proposal: dict[str, Any]) -> bool:
-    parent = git(root, "rev-parse", f"{checkpoint_sha}^", check=False)
-    if parent.returncode != 0 or parent.stdout.strip() != proposal["base_head"]:
+def commit_matches_proposal(root: Path, commit: str, proposal: dict[str, Any]) -> bool:
+    parent = git(root, "log", "-1", "--format=%P", commit, check=False)
+    if parent.returncode or parent.stdout.strip() != proposal["base_head"]:
         return False
-    if changed_between(root, proposal["base_head"], checkpoint_sha) != proposal["paths"]:
+    if changed_between(root, proposal["base_head"], commit) != proposal["paths"]:
         return False
-    message = git(root, "log", "-1", "--format=%B", checkpoint_sha, check=False)
+    message = git(root, "log", "-1", "--format=%B", commit, check=False)
     if message.returncode != 0 or message.stdout.rstrip("\n") != proposal["commit_message"]:
         return False
-    return canonical_digest(commit_snapshot(root, checkpoint_sha, proposal["paths"])) == proposal["candidate_digest"]
+    return canonical_digest(commit_snapshot(root, commit, proposal["paths"])) == proposal["candidate_digest"]
 
 def commit_snapshot(root: Path, commit: str, paths: list[str]) -> dict[str, str]:
     """Compare immutable commit bytes and modes, not only its paths and message."""
@@ -458,28 +432,29 @@ def commit_snapshot(root: Path, commit: str, paths: list[str]) -> dict[str, str]
             continue
         entries = raw.rstrip(b"\0").split(b"\0")
         if len(entries) != 1:
-            raise WorkflowFailure("checkpoint tree contains ambiguous path entries")
+            raise WorkflowFailure("commit tree contains ambiguous path entries")
         metadata, actual = entries[0].split(b"\t", 1)
         mode, kind, object_id = metadata.split()
         if actual != os.fsencode(path) or kind != b"blob":
-            raise WorkflowFailure("checkpoint tree contains an unsupported object")
+            raise WorkflowFailure("commit tree contains an unsupported object")
         data = git(root, "cat-file", "blob", object_id.decode(), text=False).stdout
         if mode == b"120000":
             result[path] = "symlink:120000:" + os.fsdecode(data)
         elif mode in (b"100644", b"100755"):
             result[path] = f"file:{mode.decode()}:" + hashlib.sha256(data).hexdigest()
         else:
-            raise WorkflowFailure("checkpoint tree contains an unsupported mode")
+            raise WorkflowFailure("commit tree contains an unsupported mode")
     return result
 
 
-def load_policy(root, project):
+def load_policy(project):
     from maven_resources import resource_path
     policy = load_json(resource_path('config/workflow.json'), 'installed workflow policy')
-    if policy.get('schema') != SCHEMA or policy.get('memory', {}).get('mode') != 'cloud':
+    if policy.get('schema') != SCHEMA:
         raise WorkflowFailure('installed workflow policy is invalid')
     policy['project_id'] = project['project_id']
-    policy['git_enabled'] = project.get('git_enabled', project.get('remote') is not None)
+    policy['instance_id'] = project['instance_id']
+    policy['recovery_epoch'] = project['recovery_epoch']
     policy['project_checks'] = project['checks']
     policy['repository'] = {
         'branch_policy': 'explicit-current', 'remote': project['remote'],
@@ -488,42 +463,63 @@ def load_policy(root, project):
 
 
 def workflow_digest():
-    from tools.memory import boundary, client, environment
-    from tools import coordination, project
-    paths = [Path(__file__), *(Path(module.__file__) for module in (boundary, client, environment, coordination, project))]
+    from tools import project
+    paths = [Path(__file__), Path(project.__file__), Path(__file__).parent / 'mcp' / 'publication.py']
     return canonical_digest({path.name: sha256_file(path) for path in paths})
 
 
-def receipt_path(session_id):
-    from tools.coordination import session_uuid
-    return f'.maven/runtime/sessions/{session_uuid(session_id)}/approval.json'
+def publication_directory(root):
+    return root / '.maven' / 'git-publication'
 
 
-def receipt(root, report):
-    from tools.memory.boundary import save_private
-    save_private(root, receipt_path(report['session_id']), report)
+@contextlib.contextmanager
+def publication_lock(root):
+    """Serialize only explicit Git operations; no process or harness registration."""
+    directory = private_directory(publication_directory(root))
+    descriptor = os.open(directory / 'lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise WorkflowFailure('Git publication lock must be an owner-private regular file')
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise WorkflowFailure('another Git operation is in progress') from None
+        yield
+    finally:
+        os.close(descriptor)
 
 
-def load_receipt(root, session_id):
-    from tools.memory.boundary import read_private
-    value = read_private(root, receipt_path(session_id))
-    if value.get('schema') != SCHEMA or value.get('session_id') != session_id or value.get('root') != str(root):
-        raise WorkflowFailure('approval receipt project or session binding is invalid')
-    return value
+def receipt(root, report, **changes):
+    # Advance in-memory status only after the durable write. An error saving a
+    # terminal read-back must still be reported as an uncertain operation.
+    save_private(publication_directory(root) / 'receipt.json', {**report, **changes})
+    report.update(changes)
 
 
-def maybe_receipt(root, session_id):
-    from tools.memory.boundary import private_path
-    return load_receipt(root, session_id) if private_path(root, receipt_path(session_id)).exists() else None
+def load_receipt(root):
+    path = publication_directory(root) / 'receipt.json'
+    if not path.exists() and not path.is_symlink():
+        return None
+    report = read_private(path)
+    if (not isinstance(report, dict) or report.get('schema') != SCHEMA
+            or report.get('root') != str(root) or report.get('status') not in
+            ('approval_required', 'installing', 'unverified', 'published', 'cancelled')):
+        raise WorkflowFailure('invalid Git publication receipt; preserve it for inspection')
+    return report
 
 
-def base_report(action, root, session_id):
-    return {'schema': SCHEMA, 'action': action, 'root': str(root), 'session_id': session_id,
-            'status': 'blocked', 'issues': [], 'warnings': [], 'changed_paths': [], 'checks': []}
+def require_no_pending(root):
+    prior = load_receipt(root)
+    if prior and prior['status'] not in ('published', 'cancelled'):
+        raise WorkflowFailure('resolve the existing Git publication before replacing its review or destination')
 
 
-def head(root, policy):
-    return git(root, 'rev-parse', 'HEAD').stdout.strip() if policy['git_enabled'] else None
+
+
+def head(root):
+    return git(root, 'rev-parse', 'HEAD').stdout.strip()
 
 
 def candidate_paths(root):
@@ -533,8 +529,6 @@ def candidate_paths(root):
 
 
 def inspect_git(root, policy):
-    if not policy['git_enabled']:
-        return {'git_enabled': False, 'head': None, 'changed_paths': []}
     if Path(git(root, 'rev-parse', '--show-toplevel').stdout.strip()).resolve() != root:
         raise WorkflowFailure('selected project root is not the exact Git checkout root')
     branch = current_branch(root)
@@ -542,83 +536,16 @@ def inspect_git(root, policy):
     if branch != policy['repository']['branch']:
         raise WorkflowFailure('current branch differs from the explicitly configured destination branch')
     return {'git_enabled': True, 'branch': branch, 'remote': remote, 'remote_url': url,
-            'head': head(root, policy), 'upstream': upstream_ref(root), 'changed_paths': candidate_paths(root),
+            'head': head(root), 'upstream': upstream_ref(root), 'changed_paths': candidate_paths(root),
             'remote_sha': remote_branch_sha(root, remote, branch)}
 
 
-def parse_refs(values):
-    result = []
-    for value in values:
-        try:
-            identifier, revision = value.rsplit(':', 1)
-            item = {'record_id': str(uuid.UUID(identifier)), 'revision': int(revision)}
-            if item['revision'] < 1:
-                raise ValueError
-        except (ValueError, AttributeError):
-            raise WorkflowFailure('memory reference must be UUID:positive-revision') from None
-        if item not in result:
-            result.append(item)
-    return result
 
-
-def ensure_no_pending(memory):
-    from tools.memory.boundary import private_path
-    if private_path(memory.root, memory.pending_path).exists():
-        raise WorkflowFailure('cloud outcome is unresolved; explicitly recover the exact stored request first')
-
-
-def start_work(root, policy, memory, registry, *, resume=False):
-    report = base_report('start', root, memory.session_id)
-    # Inspection never merges, pulls, resets, switches, or requires MAVEN provenance for external commits.
-    report.update(inspect_git(root, policy))
-    if resume:
-        ensure_no_pending(memory)
-        stored = maybe_receipt(root, memory.session_id)
-        if stored and stored['status'] in ('preparing', 'approval_required', 'applying', 'unsynchronized', 'synchronized', 'memory_ready'):
-            raise WorkflowFailure('a checkpoint receipt is still pending; apply, cancel or recover it before resume')
-        record = memory.session()
-        meta = memory.metadata(record)
-        if memory.harness is not None and memory.harness != meta.get('harness'):
-            raise WorkflowFailure('resume harness does not match the bound session')
-        if memory.harness_session is not None and memory.harness_session != meta.get('harness_session'):
-            raise WorkflowFailure('resume harness identity does not match the bound session')
-        # Activation refuses a live reservation, even if it belongs to this requester.
-        registry.activate(root, memory.session_id)
-        try:
-            memory.reconcile(report['head'])
-        except Exception:
-            registry.pause(root, memory.session_id)
-            raise
-        report['memory'] = memory.refresh()
-    else:
-        report['memory'] = memory.start(report['head'])
-        registry.activate(root, memory.session_id)
-    report['local_peers'] = registry.peers(root, memory.session_id)
-    report['status'] = 'ready'
-    report['next_action'] = 'Use cloud authority and current tasks. Startup inspected but did not synchronize Git.'
-    return report
-
-
-def summarize(root, policy, memory, registry, summary, refs):
-    reservation = registry.reserve(root, memory.session_id)
-    registry.quiescent(root, memory.session_id, reservation['reservation_id'])
-    current = inspect_git(root, policy)
-    paths = current['changed_paths']
-    candidate = candidate_digest(root, paths) if policy['git_enabled'] else canonical_digest({})
-    ref = memory.summarize(summary=summary, refs=refs, git_base=current['head'],
-                           candidate_digest=candidate, reservation_id=reservation['reservation_id'])
-    # A writer outside the registry cannot be trusted to honor the pause; compare again.
-    if policy['git_enabled'] and (candidate_paths(root) != paths or head(root, policy) != current['head']
-                                  or candidate_digest(root, paths) != candidate):
-        raise WorkflowFailure('repository changed during summary; obtain a fresh summary after writers stop')
-    return {'session': ref, 'reservation': reservation}
-
-
-def checkpoint_issues(root, policy):
+def publication_issues(root, policy):
     issues = validate_structure(root, policy)
     entries = parse_status(root)
-    if other_git_locks(root):
-        issues.append('repository has active Git lock files')
+    if busy_repository(root):
+        issues.append('repository has an active Git operation or lock')
     if any(entry['kind'] == 'u' or 'U' in entry['xy'] for entry in entries):
         issues.append('worktree contains unresolved conflicts')
     if index_paths(root):
@@ -630,48 +557,39 @@ def checkpoint_issues(root, policy):
     return issues
 
 
-def inspect_checkpoint(root, policy, memory, registry, *, action, message=None):
-    report = base_report(action, root, memory.session_id)
-    reservation = registry.reserve(root, memory.session_id)
-    report['reservation'] = reservation
-    registry.quiescent(root, memory.session_id, reservation['reservation_id'])
-    ensure_no_pending(memory)
-    prior = maybe_receipt(root, memory.session_id)
-    if prior and prior['status'] in ('preparing', 'approval_required', 'applying', 'unsynchronized', 'synchronized', 'memory_ready'):
-        raise WorkflowFailure('existing approval must be applied, explicitly cancelled, or recovered; it cannot be overwritten')
-    report.update(inspect_git(root, policy))
+def inspect_publication(root, policy, message):
+    require_no_pending(root)
+    report = {'schema': SCHEMA, 'root': str(root), 'project_id': policy['project_id'],
+              **inspect_git(root, policy)}
     paths = report['changed_paths']
+    before = candidate_digest(root, paths)
     report['control_plane_changes'] = [path for path in paths if is_control_plane(path, policy)]
-    issues = memory.freshness_issues(root, paths, git_enabled=policy['git_enabled'],
-                                     reservation_id=reservation['reservation_id'])
-    if policy['git_enabled']:
-        issues.extend(checkpoint_issues(root, policy))
-        if report['remote_sha'] != report['head']:
-            issues.append('destination must already equal HEAD; pre-existing local commits are never published')
+    issues = publication_issues(root, policy)
+    if report['remote_sha'] != report['head']:
+        issues.append('destination must already equal HEAD; pre-existing local commits are never published')
     if issues:
+        report['status'] = 'blocked'
         report['issues'] = sorted(set(issues))
         return report
-    if not policy['git_enabled'] or not paths:
-        report['status'] = 'memory_ready'
-        report['git_outcome'] = 'not_applicable' if not policy['git_enabled'] else 'unchanged'
-        return report
-    message = message or f"checkpoint: preserve {report['branch']} work state"
-    maximum = policy['checkpoint']['max_commit_message_chars']
-    if not message.strip() or '\n' in message or '\r' in message or len(message) > maximum:
+    if not paths:
+        return {**report, 'status': 'unchanged'}
+    if not isinstance(message, str):
+        raise WorkflowFailure('supply the exact commit message for owner review')
+    maximum = policy['max_commit_message_chars']
+    if (not message.strip() or any(ord(char) < 32 for char in message) or len(message) > maximum
+            or any(pattern.search(message) for _, pattern in SECRET_PATTERNS)):
         raise WorkflowFailure(f'commit message must be one nonempty line of at most {maximum} characters')
-    before = candidate_digest(root, paths)
     checks = run_project_checks(root, policy)
     report['checks'] = checks
     report['check_policy'] = ('Exact owner approval may publish failing checks; rerun results must '
                               'equal these reviewed results. Approval is not integration readiness.')
     report['failed_checks'] = [check for check in checks if not check['passed']]
     if (candidate_paths(root) != paths or candidate_digest(root, paths) != before
-            or head(root, policy) != report['head'] or index_paths(root)):
+            or head(root) != report['head'] or index_paths(root)):
         raise WorkflowFailure('repository changed during inspection; no approval was created')
-    registry.quiescent(root, memory.session_id, reservation['reservation_id'])
     proposal = {
-        'action': action, 'session_id': memory.session_id, 'project_id': memory.project_id,
-        'reservation_id': reservation['reservation_id'], 'root': str(root), 'paths': paths,
+        'operation_id': str(uuid.uuid4()), 'project_id': policy['project_id'],
+        'root': str(root), 'paths': paths,
         'commit_message': message, 'remote': report['remote'], 'branch': report['branch'],
         'remote_url': report['remote_url'], 'base_head': report['head'],
         'expected_remote_sha': report['remote_sha'], 'candidate_digest': before,
@@ -679,66 +597,51 @@ def inspect_checkpoint(root, policy, memory, registry, *, action, message=None):
         'checks': checks, 'integration_ready': all(check['passed'] for check in checks),
         'would_push_existing_commits': False,
     }
-    # Save the planned checkpoint identity before its cloud mutation so crash recovery can bind it.
-    proposal['memory'] = {'record_id': str(uuid.uuid5(uuid.UUID(reservation['reservation_id']), 'checkpoint')),
-                          'revision': 1}
-    report.update(status='preparing', proposed=proposal)
-    receipt(root, report)
-    proposal['memory'] = memory.prepare_checkpoint(root, paths, report['head'], reservation['reservation_id'])
-    proposal['approval_code'] = approval_code(proposal)
-    report.update(status='approval_required', proposed=proposal)
-    report['next_action'] = f"Review exact proposal{' INCLUDING FAILED CHECKS' if report['failed_checks'] else ''}, then maven-git {action} --root ROOT --session {memory.session_id} --writers-quiescent --apply {proposal['approval_code']}"
+    report.update(status='approval_required', proposed=proposal, candidate=canonical_digest(proposal))
+    report['next_action'] = ('Review the exact changes, destination, message and check results. '
+                             'Only explicit owner approval of this candidate permits publication.')
     receipt(root, report)
     return report
 
 
-def proposal_from_receipt(stored, code):
+def review_candidate(stored, candidate):
+    if not stored:
+        raise WorkflowFailure('no Git publication receipt is available')
     proposal = stored.get('proposed')
-    if stored.get('status') not in ('approval_required', 'applying', 'unsynchronized', 'synchronized'):
-        raise WorkflowFailure('no applicable exact approval receipt is available')
-    if not isinstance(proposal, dict) or proposal.get('approval_code') != code:
-        raise WorkflowFailure('approval code does not match this session receipt')
-    unsigned = dict(proposal)
-    unsigned.pop('approval_code', None)
-    if not approval_code_matches(unsigned, code):
-        raise WorkflowFailure('approval fingerprint does not match the complete proposal')
-    paths = proposal.get('paths')
-    if (not isinstance(paths, list) or not paths or paths != sorted(set(paths))
-            or any(not isinstance(path, str) or Path(path).is_absolute() or '..' in Path(path).parts
-                   or path.startswith('.git/') or path == '.git' for path in paths)):
-        raise WorkflowFailure('approval contains invalid candidate paths')
-    if (proposal.get('session_id') != stored['session_id'] or proposal.get('root') != stored['root']
-            or proposal.get('action') != stored['action']
+    if (not isinstance(proposal, dict) or stored.get('candidate') != candidate
+            or canonical_digest(proposal) != candidate or proposal.get('root') != stored['root']
+            or proposal.get('project_id') != stored['project_id']
             or proposal.get('would_push_existing_commits') is not False
             or proposal.get('expected_remote_sha') != proposal.get('base_head')):
-        raise WorkflowFailure('approval session, action or publication binding is invalid')
+        raise WorkflowFailure('candidate does not match the exact retained publication')
+    paths = proposal.get('paths')
+    if (not isinstance(paths, list) or not paths
+            or any(not isinstance(path, str) or not path or PurePosixPath(path).as_posix() != path
+                   or path.startswith('/') or '..' in PurePosixPath(path).parts
+                   or '.git' in (part.casefold() for part in PurePosixPath(path).parts) for path in paths)
+            or paths != sorted(set(paths))):
+        raise WorkflowFailure('Git approval contains invalid candidate paths')
     return proposal
 
 
-def validate_approval(root, policy, memory, registry, proposal, *, committed=False):
-    ensure_no_pending(memory)
-    registry.quiescent(root, memory.session_id, proposal['reservation_id'])
-    if not policy['git_enabled']:
-        raise WorkflowFailure('Git approval cannot be used for a memory-only project')
+def validate_approval(root, policy, proposal, *, committed=False):
     if canonical_digest(policy) != proposal['policy_digest'] or workflow_digest() != proposal['workflow_digest']:
         raise WorkflowFailure('installed workflow, project destination or policy changed after approval')
     current = inspect_git(root, policy)
     if (current['branch'] != proposal['branch'] or current['remote'] != proposal['remote']
             or current['remote_url'] != proposal['remote_url']):
         raise WorkflowFailure('explicit Git destination changed after approval')
-    memory.verify_checkpoint(proposal, resume=committed)
-    issues = checkpoint_issues(root, policy)
+    issues = publication_issues(root, policy)
     if committed:
-        if candidate_paths(root):
-            issues.append('checkpoint recovery requires a clean worktree and index')
+        if current['changed_paths']:
+            issues.append('publication recovery requires a clean worktree and index')
     else:
         if current['head'] != proposal['base_head'] or current['changed_paths'] != proposal['paths']:
             issues.append('branch base or complete candidate path set changed after approval')
         if candidate_digest(root, proposal['paths']) != proposal['candidate_digest']:
             issues.append('candidate bytes or modes changed after approval')
-        issues.extend(memory.freshness_issues(root, proposal['paths'], reservation_id=proposal['reservation_id']))
         if current['remote_sha'] != proposal['expected_remote_sha']:
-            issues.append('remote advanced after approval; no checkpoint will be created')
+            issues.append('remote advanced after approval; no commit will be created')
     if issues:
         raise WorkflowFailure('; '.join(sorted(set(issues))))
 
@@ -748,15 +651,16 @@ def git_with_index(root, index, *arguments, input_data=None):
     env['GIT_INDEX_FILE'] = str(index)
     try:
         completed = subprocess.run(['git', *arguments], cwd=root, env=env, capture_output=True,
+                                   stdin=subprocess.DEVNULL if input_data is None else None,
                                    input=input_data, timeout=120, check=False)
     except (OSError, subprocess.TimeoutExpired):
-        raise WorkflowFailure('isolated checkpoint index command failed') from None
+        raise WorkflowFailure('isolated publication index command failed') from None
     if completed.returncode:
-        raise WorkflowFailure('isolated checkpoint index could not reproduce approved content')
+        raise WorkflowFailure('isolated publication index could not reproduce approved content')
     return completed.stdout.decode().strip()
 
 
-def create_checkpoint(root, policy, memory, registry, report, proposal):
+def install_commit(root, policy, report, proposal):
     """Build an isolated index, then atomically advance only the approved branch base.
 
     The ordinary index is locked for the final transition. A pre-transition durable
@@ -766,15 +670,17 @@ def create_checkpoint(root, policy, memory, registry, report, proposal):
     checks = run_project_checks(root, policy)
     if checks != proposal['checks']:
         raise WorkflowFailure('project check results changed; cancel and obtain a new approval')
-    validate_approval(root, policy, memory, registry, proposal)
-    index = git_path(root, 'index')
+    validate_approval(root, policy, proposal)
+    index = index_file(root)
     lock_path = index.with_name(index.name + '.lock')
     try:
         descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
-        raise WorkflowFailure('Git index became locked; no checkpoint was created') from None
+        raise WorkflowFailure('Git index became locked; no commit was created') from None
+    info = os.fstat(descriptor)
+    lock_identity = [info.st_dev, info.st_ino]
     try:
-        with tempfile.TemporaryDirectory(prefix='maven-checkpoint-', dir=index.parent) as directory:
+        with tempfile.TemporaryDirectory(prefix='maven-publication-', dir=index.parent) as directory:
             isolated = Path(directory) / 'index'
             git_with_index(root, isolated, 'read-tree', proposal['base_head'])
             git_with_index(root, isolated, '--literal-pathspecs', 'add', '-A',
@@ -783,19 +689,16 @@ def create_checkpoint(root, policy, memory, registry, report, proposal):
             tree = git_with_index(root, isolated, 'write-tree')
             commit = git(root, '-c', 'core.hooksPath=/dev/null', 'commit-tree', tree,
                          '-p', proposal['base_head'], '-m', proposal['commit_message']).stdout.strip()
-            if not checkpoint_matches_proposal(root, commit, proposal):
+            if not commit_matches_proposal(root, commit, proposal):
                 raise WorkflowFailure('isolated commit bytes or modes differ from exact approval')
-            if (current_branch(root) != proposal['branch'] or head(root, policy) != proposal['base_head']
+            if (current_branch(root) != proposal['branch'] or head(root) != proposal['base_head']
                     or candidate_paths(root) != proposal['paths'] or index_paths(root)
                     or candidate_digest(root, proposal['paths']) != proposal['candidate_digest']):
-                raise WorkflowFailure('repository changed before checkpoint installation')
-            registry.quiescent(root, memory.session_id, proposal['reservation_id'])
-            memory.verify_checkpoint(proposal)
-            lock_info = os.fstat(descriptor)
-            report.update(status='applying', checkpoint_sha=commit,
-                          index_lock_identity=[lock_info.st_dev, lock_info.st_ino],
-                          index_base_tree=git(root, 'rev-parse', proposal['base_head'] + '^{tree}').stdout.strip())
-            receipt(root, report)
+                raise WorkflowFailure('repository changed before commit installation')
+            if validate_remote(root, policy) != (proposal['remote'], proposal['remote_url']):
+                raise WorkflowFailure('Git destination changed during commit preparation')
+            receipt(root, report, status='installing', commit_sha=commit, index_lock_identity=lock_identity,
+                    base_index_sha=sha256_file(index), approved_index_sha=sha256_file(isolated))
             with os.fdopen(descriptor, 'wb') as target, isolated.open('rb') as source:
                 descriptor = None
                 shutil.copyfileobj(source, target)
@@ -804,404 +707,217 @@ def create_checkpoint(root, policy, memory, registry, report, proposal):
             git(root, '-c', 'core.hooksPath=/dev/null', 'update-ref',
                 f"refs/heads/{proposal['branch']}", commit, proposal['base_head'])
             os.replace(lock_path, index)
-            report.update(status='unsynchronized', head=commit)
-            receipt(root, report)
+            receipt(root, report, status='unverified', head=commit)
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        lock_path.unlink(missing_ok=True)
-    return report['checkpoint_sha']
+        if report['status'] != 'installing':
+            release_index_lock(lock_path, lock_identity)
 
 
-def finish_checkpoint_push(root, policy, memory, registry, report, proposal):
-    commit = report['checkpoint_sha']
-    if head(root, policy) != commit or not checkpoint_matches_proposal(root, commit, proposal):
-        raise WorkflowFailure('local checkpoint no longer equals exact approved commit; preserve receipt')
-    validate_approval(root, policy, memory, registry, proposal, committed=True)
-    memory.link_checkpoint(proposal, commit, None)
+def publish_commit(root, policy, report, proposal):
+    commit = report['commit_sha']
+    if head(root) != commit or not commit_matches_proposal(root, commit, proposal):
+        raise WorkflowFailure('local HEAD no longer equals the approved commit; preserve receipt')
+    validate_approval(root, policy, proposal, committed=True)
     remote_sha = remote_branch_sha(root, proposal['remote'], proposal['branch'])
     if remote_sha != commit:
         if remote_sha != proposal['expected_remote_sha']:
-            raise WorkflowFailure('remote branch advanced; checkpoint preserved, force push is prohibited')
-        registry.quiescent(root, memory.session_id, proposal['reservation_id'])
-        if head(root, policy) != commit or current_branch(root) != proposal['branch'] or candidate_paths(root):
-            raise WorkflowFailure('checkout changed before publication; preserve the checkpoint and new work')
+            raise WorkflowFailure('remote branch advanced; commit preserved, history replacement is prohibited')
+        if head(root) != commit or current_branch(root) != proposal['branch'] or candidate_paths(root):
+            raise WorkflowFailure('checkout changed before publication; preserve the commit and new work')
         # Push the immutable approved object, never a possibly concurrently changed HEAD.
+        reference = f"refs/heads/{proposal['branch']}"
+        # The single-parent object is already verified as a direct fast-forward from
+        # this exact base. CAS also rejects a concurrent deletion or rewind.
+        # A raw URL may be subject to unrelated pushInsteadOf rules even when
+        # the selected named remote has an explicit push URL. Use exactly the
+        # single push destination validated for the named remote.
+        destination, url = validate_remote(root, policy)
+        if (destination, url) != (proposal['remote'], proposal['remote_url']):
+            raise WorkflowFailure('Git destination changed before publication')
         result = git(root, '-c', 'core.hooksPath=/dev/null', '-c', 'push.followTags=false',
-                     'push', '--porcelain', proposal['remote'],
-                     f"{commit}:refs/heads/{proposal['branch']}", check=False)
+                     '-c', f'remote.{destination}.mirror=false', '-c', 'push.pushOption=',
+                     'push', '--porcelain', '--recurse-submodules=no',
+                     f"--force-with-lease={reference}:{proposal['expected_remote_sha']}",
+                     '--', destination, f"{commit}:{reference}", check=False)
         if result.returncode:
             raise WorkflowFailure('push failed or rejected; retain exact receipt for explicit recovery')
         remote_sha = remote_branch_sha(root, proposal['remote'], proposal['branch'])
+    if validate_remote(root, policy) != (proposal['remote'], proposal['remote_url']):
+        raise WorkflowFailure('Git destination changed during publication; preserve the receipt')
     if remote_sha != commit:
-        raise WorkflowFailure('remote SHA is not the approved checkpoint; no synchronization claim')
-    if head(root, policy) != commit or current_branch(root) != proposal['branch'] or candidate_paths(root):
-        raise WorkflowFailure('checkout changed during publication; do not close the session or discard new work')
-    memory.link_checkpoint(proposal, commit, remote_sha)
-    report.update(status='synchronized', remote_sha=remote_sha)
-    receipt(root, report)
+        raise WorkflowFailure('remote SHA is not the approved commit; publication is unverified')
+    if head(root) != commit or current_branch(root) != proposal['branch'] or candidate_paths(root):
+        raise WorkflowFailure('checkout changed during publication; preserve the receipt and new work')
+    receipt(root, report, status='published', remote_sha=remote_sha)
     return report
 
 
-def apply_checkpoint(root, policy, memory, registry, *, action, code):
-    report = load_receipt(root, memory.session_id)
-    proposal = proposal_from_receipt(report, code)
-    if proposal['action'] != action:
-        raise WorkflowFailure('approval action differs; use the lifecycle command that created it')
-    if report['status'] == 'applying':
-        raise WorkflowFailure('interrupted commit installation requires explicit recover first')
-    if report['status'] == 'approval_required':
-        validate_approval(root, policy, memory, registry, proposal)
-        create_checkpoint(root, policy, memory, registry, report, proposal)
-    return finish_checkpoint_push(root, policy, memory, registry, report, proposal)
-
-
-def complete_boundary(root, policy, memory, registry, report):
-    close = report['action'] == 'stop-work'
-    proposal = report.get('proposed')
-    registry.quiescent(root, memory.session_id, report['reservation']['reservation_id'])
-    if proposal:
-        memory.verify_checkpoint(proposal, resume=True)
-    if report['status'] == 'memory_ready':
-        session = memory.session(closed=True)
-        if session['data']['state'] == 'active' and memory.metadata(session).get('phase') != 'checkpointed':
-            issues = memory.freshness_issues(root, [], git_enabled=policy['git_enabled'],
-                                             reservation_id=report['reservation']['reservation_id'])
-            if policy['git_enabled'] and candidate_paths(root):
-                issues.append('worktree changed before memory-only finalization')
-            if issues:
-                raise WorkflowFailure('; '.join(issues))
-        report['memory_checkpoint'] = memory.memory_checkpoint(report['reservation']['reservation_id'])
-        receipt(root, report)
-    report['session'] = memory.complete(report['status'], close=close,
-                                        checkpoint=proposal['memory'] if proposal else report.get('memory_checkpoint'))
-    report['status'] = 'closed' if close else 'checkpointed'
-    receipt(root, report)
-    if close:
-        report['local_access_cleanup'] = registry.close(root, memory.session_id, logout_cache)
-    else:
-        registry.release(root, memory.session_id, activate=True)
-    return report
-
-
-def logout_cache(item):
-    """Release a cache only while the registry proves no remaining session uses it."""
-    cache = Path(item['cache'])
+def release_index_lock(path, identity):
     try:
-        if (not cache.is_absolute() or cache.is_symlink()
-                or cache.exists() and (cache.stat().st_uid != os.getuid() or cache.stat().st_mode & 0o077)):
-            raise OSError
-        env = os.environ.copy()
-        env['AWS_LOGIN_CACHE_DIRECTORY'] = str(cache)
-        for key in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
-                    'AWS_SECURITY_TOKEN', 'AWS_PROFILE', 'AWS_DEFAULT_PROFILE'):
-            env.pop(key, None)
-        result = subprocess.run(['aws', 'logout', '--profile', item['profile']], env=env,
-                                capture_output=True, timeout=30, check=False)
-        if result.returncode or cache.exists() and any(cache.iterdir()):
-            return ['last-session AWS logout or cache-absence verification failed']
-    except (OSError, subprocess.SubprocessError):
-        return ['last-session local credential cleanup failed; explicit recovery is required']
-    return []
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode) or [info.st_dev, info.st_ino] != identity:
+        raise WorkflowFailure('unknown Git index lock must be preserved')
+    path.unlink()
 
 
-def cancel_work(root, policy, memory, registry, *, approval_only=False):
-    ensure_no_pending(memory)
-    stored = maybe_receipt(root, memory.session_id)
-    if stored and stored['status'] in ('applying', 'unsynchronized', 'synchronized', 'memory_ready'):
-        raise WorkflowFailure('commit or publication may exist; recover exact receipt instead of cancelling it')
-    if stored and stored.get('proposed') and stored['status'] in ('preparing', 'approval_required'):
-        proposal = stored['proposed']
-        if head(root, policy) != proposal['base_head']:
-            raise WorkflowFailure('HEAD changed since approval; recover before cancelling')
-        memory.abort_checkpoint(proposal)
-        stored['status'] = 'approval_cancelled'
-        receipt(root, stored)
-    if approval_only:
-        memory.reconcile(head(root, policy))
-        registry.release(root, memory.session_id, activate=True)
-        return {**base_report('cancel', root, memory.session_id), 'status': 'ready',
-                'next_action': 'Approval cancelled; session remains active and work memory is retained.'}
-    record = memory.cancel() if memory.restore_pointer() is not None else None
-    report = {**base_report('cancel', root, memory.session_id), 'status': 'cancelled', 'session': record}
-    receipt(root, report)
-    report['local_access_cleanup'] = registry.close(root, memory.session_id, logout_cache)
-    return report
-
-
-def recover_work(root, policy, memory, registry, *, code=None, writer_tokens=None):
-    report = base_report('recover', root, memory.session_id)
-    report['reconciled_request'] = memory.recover()
-    if writer_tokens is not None:
-        registry.recover_writers(root, memory.session_id, writer_tokens, workers_stopped=True)
-    stored = maybe_receipt(root, memory.session_id)
-    if stored and stored['status'] == 'memory_ready':
-        return complete_boundary(root, policy, memory, registry, stored)
-    if not stored:
-        report.update(status='ready', coordination=registry.inspect(root, memory.session_id))
-        report['next_action'] = 'Exact cloud request reconciled. Explicitly resume or cancel this session.'
-        return report
-    if stored['status'] in ('closed', 'cancelled'):
-        report['local_access_cleanup'] = registry.close(root, memory.session_id, logout_cache)
-        report['status'] = stored['status']
-        return report
-    if stored['status'] == 'preparing':
-        # The checkpoint mutation may have completed before the approval code was saved.
-        proposal = stored['proposed']
-        from tools.memory.client import MemoryClientError
+def recover_installation(root, policy, report, proposal):
+    if (canonical_digest(policy) != proposal['policy_digest'] or workflow_digest() != proposal['workflow_digest']
+            or current_branch(root) != proposal['branch']):
+        raise WorkflowFailure('branch, workflow or destination differs from the interrupted installation')
+    commit = report['commit_sha']
+    actual = head(root)
+    if actual not in (proposal['base_head'], commit) or not commit_matches_proposal(root, commit, proposal):
+        raise WorkflowFailure('unexpected interrupted commit or HEAD; preserve the receipt')
+    index = index_file(root)
+    lock_path = index.with_name(index.name + '.lock')
+    if actual == commit and index_paths(root):
+        if sha256_file(index) != report['base_index_sha']:
+            raise WorkflowFailure('index differs from recorded transition; preserve staging')
+        # Finish the exact interrupted rename, never rebuild or clear unknown staging.
         try:
-            memory.verify_checkpoint(proposal)
-        except MemoryClientError as error:
-            if error.code != 'record_unavailable':
-                raise
-            registry.quiescent(root, memory.session_id, proposal['reservation_id'])
-            memory.prepare_checkpoint(root, proposal['paths'], proposal['base_head'], proposal['reservation_id'])
-            memory.verify_checkpoint(proposal)
-        proposal['approval_code'] = approval_code(proposal)
-        stored['status'] = 'approval_required'
-        receipt(root, stored)
-        return stored
-    if stored['status'] == 'checkpointed':
-        registry.release(root, memory.session_id, activate=True)
-        return stored
-    if not code:
-        report.update(status='ready', approval_status=stored['status'], coordination=registry.inspect(root, memory.session_id))
-        report['next_action'] = 'Review retained receipt; use recover --apply CODE to retry only that exact approval.'
-        return report
-    proposal = proposal_from_receipt(stored, code)
-    if stored['status'] == 'applying':
-        registry.quiescent(root, memory.session_id, proposal['reservation_id'])
-        lock_path = git_path(root, 'index').with_name('index.lock')
-        if lock_path.exists():
             info = lock_path.lstat()
-            if lock_path.is_symlink() or [info.st_dev, info.st_ino] != stored.get('index_lock_identity'):
-                raise WorkflowFailure('unknown index lock must be preserved; inspect concurrent Git activity')
-            lock_path.unlink()
-        commit = stored['checkpoint_sha']
-        actual_head = head(root, policy)
-        if actual_head == proposal['base_head']:
-            stored['status'] = 'approval_required'
-            stored.pop('checkpoint_sha', None)
-            receipt(root, stored)
-        elif actual_head == commit and checkpoint_matches_proposal(root, commit, proposal):
-            # A crash can occur after atomic ref update but before index replacement.
-            # Only restore the exact recorded pre-transition index, never unknown staging.
-            if index_paths(root):
-                if git(root, 'write-tree').stdout.strip() != stored.get('index_base_tree'):
-                    raise WorkflowFailure('index differs from recorded transition; preserve it for manual reconciliation')
-                git(root, 'read-tree', commit)
-            stored['status'] = 'unsynchronized'
-            receipt(root, stored)
-        else:
-            raise WorkflowFailure('interrupted commit has an unexpected HEAD; preserve all receipts')
-    result = apply_checkpoint(root, policy, memory, registry, action=proposal['action'], code=code)
-    return complete_boundary(root, policy, memory, registry, result)
-
-
-def parser(action=None):
-    from tools.project import default_environment
-    value = argparse.ArgumentParser(description=__doc__)
-    if action is None:
-        commands = value.add_subparsers(dest='action', required=True)
-        parsers = [(name, commands.add_parser(name)) for name in
-                   ('start', 'checkpoint', 'stop-work', 'refresh-context', 'session-summary', 'pause', 'resume', 'cancel', 'recover', 'status', 'logout')]
+        except FileNotFoundError:
+            raise WorkflowFailure('interrupted index lock missing; restore the index explicitly') from None
+        if (not stat.S_ISREG(info.st_mode) or [info.st_dev, info.st_ino] != report['index_lock_identity']
+                or sha256_file(lock_path) != report['approved_index_sha']):
+            raise WorkflowFailure('interrupted index differs from the approved tree; preserve staging')
+        os.replace(lock_path, index)
     else:
-        value.set_defaults(action=action)
-        parsers = [(action, value)]
-    for name, command in parsers:
-        command.add_argument('--root', type=Path, required=True)
-        command.add_argument('--env', type=Path, default=default_environment())
-        command.add_argument('--json', action='store_true')
-        if name == 'start':
-            command.add_argument('--resume', metavar='SESSION_UUID')
-            command.add_argument('--harness')
-            command.add_argument('--harness-session')
-        else:
-            command.add_argument('--session', required=True, metavar='SESSION_UUID')
-        if name in ('checkpoint', 'stop-work', 'session-summary', 'pause', 'recover'):
-            command.add_argument('--writers-quiescent', action='store_true',
-                                 help='attest relevant repository and session-memory writers have stopped')
-        if name in ('checkpoint', 'stop-work', 'session-summary'):
-            command.add_argument('--summary', required=name == 'session-summary')
-            command.add_argument('--memory-ref', action='append', default=[], metavar='UUID:REVISION')
-        if name in ('checkpoint', 'stop-work'):
-            mode = command.add_mutually_exclusive_group()
-            mode.add_argument('--message')
-            mode.add_argument('--apply', metavar='APPROVAL_CODE')
-        if name == 'pause':
-            command.add_argument('--reservation', metavar='RESERVATION_UUID')
-        if name == 'cancel':
-            command.add_argument('--approval-only', action='store_true')
-        if name == 'recover':
-            command.add_argument('--apply', metavar='APPROVAL_CODE')
-            command.add_argument('--writer-token', action='append', default=None,
-                                 help='exact interrupted writer token; requires explicit writer-quiescence attestation')
-    return value
+        release_index_lock(lock_path, report['index_lock_identity'])
+    receipt(root, report, status='approval_required' if actual == proposal['base_head'] else 'unverified')
 
 
-def status_exit(status):
-    if status in ('ready', 'closed', 'checkpointed', 'cancelled'):
-        return EXIT_OK
-    if status == 'approval_required':
-        return EXIT_APPROVAL_REQUIRED
-    if status == 'unsynchronized':
-        return EXIT_UNSYNCHRONIZED
-    return EXIT_BLOCKED if status == 'blocked' else EXIT_ERROR
-
-
-def render_human(report):
-    # Human mode retains the same complete context/receipts as JSON; no hidden approval fields.
-    return 'MAVEN WORKFLOW ' + report['action'] + ' ' + report['status'] + '\n' + json.dumps(report, indent=2, sort_keys=True)
-
-
-def _main(argv=None, *, action=None):
-    from tools.project import load_project, project_values
-    from tools.memory.boundary import BoundaryError, MemoryBoundary
-    from tools.memory.client import MemoryClientError
-    from tools.memory.environment import configured_client, load_environment
-    from tools.coordination import SessionRegistry, session_lock, session_uuid
-    args = parser(action).parse_args(argv)
-    root = args.root.expanduser().resolve()
-    identifier = getattr(args, 'session', None) or getattr(args, 'resume', None) or str(uuid.uuid4())
-    report = base_report(args.action, root, identifier)
-    client = None
-    registry = SessionRegistry(args.env.expanduser().resolve().parent)
+def validate_owner(approval, candidate):
+    from tools.memory.validation import MemoryError, reject_secrets, source
+    if (not isinstance(approval, dict) or set(approval) != {'approved', 'candidate', 'source'}
+            or approval['approved'] is not True or approval['candidate'] != candidate):
+        raise WorkflowFailure('actual owner approval of this exact candidate is required')
     try:
-        session_uuid(identifier)
-        project = load_project(root)
-        if not project['git_enabled'] and args.action not in ('status', 'recover', 'cancel', 'logout'):
-            raise WorkflowFailure('optional Git is not configured; use maven-project git after enabling memory')
-        values = project_values(load_environment(args.env), project)
-        policy = load_policy(root, project)
-        if args.action in ('checkpoint', 'stop-work', 'session-summary', 'pause') and not args.writers_quiescent:
-            raise WorkflowFailure('explicit relevant-writer quiescence attestation is required')
-        if args.action == 'recover' and not args.writers_quiescent:
-            raise WorkflowFailure('exact-request recovery requires explicit relevant-writer quiescence attestation')
-        if args.action in ('checkpoint', 'stop-work') and args.apply and (args.summary or args.memory_ref):
-            raise WorkflowFailure('apply cannot rewrite the approved session summary or memory references')
-        with session_lock(root, identifier, shared=args.action == 'status'):
-            if args.action == 'start' and not args.resume:
-                if args.harness_session and not args.harness:
-                    raise WorkflowFailure('--harness-session requires explicit --harness')
-                registry.register(root, project['project_id'], identifier, values,
-                                  harness=args.harness, harness_session=args.harness_session)
-            else:
-                try:
-                    registered = registry.inspect(root, identifier)['session']
-                except BoundaryError:
-                    terminal = maybe_receipt(root, identifier)
-                    if args.action not in ('status', 'recover') or not terminal or terminal['status'] not in ('closed', 'cancelled'):
-                        raise
-                    registered = None
-                if registered is not None and (
-                        registered['project_id'] != project['project_id'] or registered['caches'] != registry.caches(values)):
-                    raise WorkflowFailure('selected project or shared credential binding differs from this session')
-            if args.action in ('checkpoint', 'stop-work', 'session-summary'):
-                from tools.memory.boundary import private_path
-                if private_path(root, f'.maven/runtime/sessions/{identifier}/lifecycle.json').exists():
-                    from tools.memory.lifecycle import SessionService
-                    from tools.memory.maintenance import Maintenance
-                    bound = SessionService(root, identifier, env=args.env)
-                    if Maintenance(bound).status()['pending_count']:
-                        raise WorkflowFailure('complete or resolve accepted memory maintenance before optional Git publication')
-                registry.use_git(root, identifier)
-            stored_receipt = maybe_receipt(root, identifier)
-            if args.action == 'status':
-                report.update(status='ready', coordination=registry.inspect(root, identifier) if registered else None,
-                              peers=registry.peers(root, identifier), approval=stored_receipt)
-            elif args.action == 'pause':
-                report.update(status='ready', coordination=registry.pause(root, identifier, args.reservation))
-            elif args.action == 'logout':
-                report.update(status='ready', local_access_cleanup=registry.revoke(root, identifier, logout_cache))
-            elif (args.action == 'recover' and stored_receipt
-                  and stored_receipt['status'] in ('closed', 'cancelled') and not registry.pending(root, identifier)):
-                # Terminal cloud read-back was persisted before cleanup; local logout needs no fresh login.
-                report.update(status=stored_receipt['status'],
-                              local_access_cleanup=registry.close(root, identifier, logout_cache))
-            else:
-                client = configured_client(args.env, values=values)
-                memory = MemoryBoundary(client, root, project['project_id'], identifier,
-                                        harness=getattr(args, 'harness', None),
-                                        harness_session=getattr(args, 'harness_session', None))
-                if args.action in ('start', 'resume'):
-                    report = start_work(root, policy, memory, registry,
-                                        resume=args.action == 'resume' or bool(args.resume))
-                elif args.action == 'refresh-context':
-                    report.update(status='ready', memory=memory.refresh(), peers=registry.peers(root, identifier))
-                elif args.action == 'session-summary':
-                    ensure_no_pending(memory)
-                    stored = maybe_receipt(root, identifier)
-                    if stored and stored['status'] in ('preparing', 'approval_required', 'applying', 'unsynchronized', 'synchronized', 'memory_ready'):
-                        raise WorkflowFailure('cancel or recover pending approval before replacing its summary')
-                    report.update(status='ready', **summarize(root, policy, memory, registry,
-                                                             args.summary, parse_refs(args.memory_ref)))
-                elif args.action in ('checkpoint', 'stop-work'):
-                    if args.apply:
-                        report = apply_checkpoint(root, policy, memory, registry, action=args.action, code=args.apply)
-                    else:
-                        if args.summary:
-                            ensure_no_pending(memory)
-                            stored = maybe_receipt(root, identifier)
-                            if stored and stored['status'] in ('preparing', 'approval_required', 'applying', 'unsynchronized', 'synchronized', 'memory_ready'):
-                                raise WorkflowFailure('pending approval cannot be overwritten by a new summary')
-                            summarize(root, policy, memory, registry, args.summary, parse_refs(args.memory_ref))
-                        report = inspect_checkpoint(root, policy, memory, registry, action=args.action, message=args.message)
-                    if report['status'] in ('memory_ready', 'synchronized'):
-                        # Durable terminal intent also covers a crash after a memory-only close.
-                        receipt(root, report)
-                        report = complete_boundary(root, policy, memory, registry, report)
-                elif args.action == 'cancel':
-                    report = cancel_work(root, policy, memory, registry, approval_only=args.approval_only)
-                elif args.action == 'recover':
-                    report = recover_work(root, policy, memory, registry, code=args.apply, writer_tokens=args.writer_token)
-    except (WorkflowFailure, BoundaryError, MemoryClientError, OSError, ValueError) as error:
-        # Never overwrite an approval or uncertain receipt with a generic error report.
-        report['status'] = 'blocked'
-        report.setdefault('issues', []).append(str(error))
-        report['next_action'] = 'Inspect this session status; preserve receipts and use explicit cancel or recover.'
-        from tools.memory.client import AUTHENTICATION_CODES
-        if isinstance(error, MemoryClientError) and error.code in AUTHENTICATION_CODES:
-            from tools.memory.environment import authentication_handoff
-            with contextlib.suppress(MemoryClientError, OSError, ValueError):
-                handoff = authentication_handoff(error, load_environment(args.env))
-                if handoff:
-                    report['authentication'] = handoff
-                    report['next_action'] = handoff['reconnect']
-        with contextlib.suppress(Exception):
-            report['coordination'] = registry.inspect(root, identifier)
-            stored = maybe_receipt(root, identifier)
-            if stored and stored['status'] in ('applying', 'unsynchronized', 'synchronized'):
-                report['status'] = 'unsynchronized'
-                report['retained_approval'] = stored
-    finally:
-        if client is not None:
-            try:
-                client.close()
-            except Exception:
-                report.setdefault('issues', []).append('invocation memory client could not be closed')
-                report['status'] = 'blocked'
-    cleanup = report.get('local_access_cleanup')
-    if cleanup and cleanup['issues']:
-        report['issues'].extend(cleanup['issues'])
-        report['status'] = 'blocked'
-    print(json.dumps(report, indent=2, sort_keys=True) if args.json else render_human(report))
-    return status_exit(report['status'])
+        source(approval['source'], approval=True)
+        reject_secrets(approval['source'])
+        if any(pattern.search(value) for value in approval['source'].values() for _, pattern in SECRET_PATTERNS):
+            raise WorkflowFailure('owner approval must not contain credentials')
+    except MemoryError:
+        raise WorkflowFailure('owner approval requires a non-secret origin and owner excerpt') from None
 
 
-def start_main(argv=None):
-    return _main(argv, action='start')
+def publication_project(root, home):
+    from tools.memory.client import MemoryClientError
+    from tools.memory.environment import load_environment
+    project = load_project(root)
+    try:
+        values = load_environment(home / '.env')
+    except MemoryClientError:
+        raise WorkflowFailure('Git requires the selected installation’s private project binding settings') from None
+    require_binding(project, {key: values.get('MAVEN_MEMORY_' + key.upper())
+                              for key in ('instance_id', 'recovery_epoch')})
+    return project
 
 
-def checkpoint_main(argv=None):
-    return _main(argv, action='checkpoint')
+def publication(root, action, *, home=None, **options):
+    from tools.coordination import ensure_available, project_binding_lock
+    from tools.reconcile import select_project
+    root = Path(root).expanduser().resolve(strict=True)
+    home = home or instance_home()
+    with project_binding_lock(home, root):
+        ensure_available(home, root)
+        selection = select_project(root, home)
+        if not selection or Path(selection['root']) != root:
+            raise WorkflowFailure('--root must be the exact enabled project checkout')
+        return bound_publication(root, action, home=home, project_id=selection['project_id'], **options)
 
 
-def stop_main(argv=None):
-    return _main(argv, action='stop-work')
+def bound_publication(root, action, *, writers_quiescent=False, message=None, approval=None,
+                      candidate=None, home, project_id):
+    """Caller holds the project binding gate; serialize only this project's publication."""
+    if action not in ('inspect', 'apply', 'recover', 'status', 'cancel'):
+        raise WorkflowFailure('unknown Git publication action')
+    if (message is not None and action != 'inspect' or approval is not None and action not in ('apply', 'recover')
+            or candidate is not None and action != 'cancel'):
+        raise WorkflowFailure('unexpected arguments for the selected Git operation')
+    if action not in ('status', 'recover') or approval is not None:
+        if writers_quiescent is not True:
+            raise WorkflowFailure('attest all relevant repository writers have stopped')
+    with publication_lock(root):
+        project = publication_project(root, home)
+        if project['project_id'] != project_id:
+            raise WorkflowFailure('selected project changed before Git operation')
+        if not project['git_enabled']:
+            raise WorkflowFailure('optional Git publication is not configured in the selected project')
+        policy = load_policy(project)
+        if action == 'inspect':
+            return inspect_publication(root, policy, message)
+        stored = load_receipt(root)
+        if stored and stored.get('project_id') != project['project_id']:
+            raise WorkflowFailure('publication receipt belongs to a different project')
+        if action == 'status' or action == 'recover' and approval is None:
+            return {'status': 'observed', 'publication': stored}
+        code = (approval or {}).get('candidate') if action != 'cancel' else candidate
+        proposal = review_candidate(stored, code)
+        if action == 'cancel':
+            if stored['status'] != 'approval_required':
+                raise WorkflowFailure('only an unapplied review can be cancelled; preserve uncertain outcomes')
+            receipt(root, stored, status='cancelled')
+            return stored
+        validate_owner(approval, code)
+        if stored.get('approval', approval) != approval:
+            raise WorkflowFailure('owner evidence differs from the original approval')
+        if action == 'recover' and stored['status'] == 'published':
+            return {**stored, 'replayed': True, 'message': 'Retained verified result; no new push was attempted.'}
+        if stored['status'] in ('cancelled', 'published'):
+            raise WorkflowFailure('this publication is already terminal; inspect status')
+        if action == 'apply' and stored['status'] != 'approval_required':
+            raise WorkflowFailure('interrupted Git publication requires explicit recovery')
+        try:
+            if stored['status'] == 'installing':
+                recover_installation(root, policy, stored, proposal)
+            if stored['status'] == 'approval_required':
+                validate_approval(root, policy, proposal)
+                stored['approval'] = approval
+                install_commit(root, policy, stored, proposal)
+            return publish_commit(root, policy, stored, proposal)
+        except (WorkflowFailure, OSError, UninstallError) as error:
+            if stored['status'] not in ('installing', 'unverified'):
+                raise
+            return {'status': 'uncertain', 'candidate': code, 'issue': str(error),
+                    'next_action': 'Inspect the retained publication; recover only this exact approval.'}
 
 
 def main(argv=None):
-    return _main(argv)
+    from tools.memory.boundary import BoundaryError
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='action', required=True)
+    for action in ('inspect', 'status', 'apply', 'recover', 'cancel'):
+        command = commands.add_parser(action)
+        command.add_argument('--root', type=Path, required=True)
+        if action != 'status':
+            command.add_argument('--writers-quiescent', action='store_true')
+        if action == 'inspect':
+            command.add_argument('--message', required=True)
+        if action in ('apply', 'recover', 'cancel'):
+            command.add_argument('--candidate', required=action != 'recover')
+        if action in ('apply', 'recover'):
+            command.add_argument('--approval-origin', required=action == 'apply')
+            command.add_argument('--approval-excerpt', required=action == 'apply')
+    args = parser.parse_args(argv)
+    candidate = getattr(args, 'candidate', None)
+    approval = None
+    try:
+        if args.action in ('apply', 'recover') and (candidate or args.approval_origin or args.approval_excerpt):
+            approval = {'approved': True, 'candidate': candidate,
+                        'source': {'origin': args.approval_origin, 'excerpt': args.approval_excerpt}}
+        result = publication(args.root, args.action, writers_quiescent=getattr(args, 'writers_quiescent', False),
+                             candidate=candidate if args.action == 'cancel' else None,
+                             message=getattr(args, 'message', None), approval=approval)
+    except (ValueError, OSError, BoundaryError) as error:
+        result = {'status': 'blocked', 'issue': str(error)}
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return {'blocked': EXIT_BLOCKED, 'approval_required': EXIT_APPROVAL_REQUIRED,
+            'uncertain': EXIT_UNCERTAIN}.get(result['status'], EXIT_OK)
 
 
 if __name__ == '__main__':

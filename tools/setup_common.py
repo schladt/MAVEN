@@ -1,4 +1,4 @@
-"""Shared private setup artifacts, prompts and authority verification."""
+"""Shared private setup artifacts, prompts and connection verification."""
 from contextlib import contextmanager
 import fcntl
 import json
@@ -123,20 +123,20 @@ def setup_lock(directory):
         os.close(fd)
 
 
-def verify_authority(env, project_id=None, *, values=None):
+def verify_connection(env, project_id=None, *, values=None):
     from tools.memory.environment import configured_client
-    from tools.memory.client import authority_scope
+    from tools.memory.reconcile_cloud import status
     client = configured_client(env, values=values)
     try:
-        context = client.load_context(authority_scope(project_id))
-        if not any(page.get('page_kind') == 'directive' for page in context['data']['instructions']):
-            raise SetupPending('Routine cloud access succeeded, but applicable approved MAVEN authority is missing. Ask the instance owner to approve complete authority, then resume.')
+        verified = status(client)
         if project_id:
             record = client.invoke('/v1/memory/read', {'record_id': project_id})['data']
-            if (record.get('kind') != 'entity' or record.get('data_scope') != 'owner'
-                    or record.get('data', {}).get('entity_type') != 'project'):
-                raise SetupPending('The selected cloud record is not an owner project entity.')
-        return context['data']['authority_generation']
+            if (record.get('record_id') != project_id or record.get('project_id') is not None
+                    or record.get('kind') != 'entity' or record.get('data_scope') != 'owner'
+                    or record.get('data', {}).get('entity_type') != 'project'
+                    or 'archived' in record.get('tags', []) or record.get('data', {}).get('state') == 'archived'):
+                raise SetupPending('The selected cloud record is not an active owner project entity.')
+        return verified
     finally:
         client.close()
 
@@ -290,31 +290,26 @@ def permission_preflight(values, task):
                     checks.append({'check': 'Infrastructure IAM simulation', 'status': 'Could not verify',
                                    'reason': 'The selected principal is not an IAM user; no role ARN is guessed from an STS session.'})
                 limits.append('Simulation covers representative infrastructure actions against *, not every template dependency, resource condition, SCP, boundary, service quota, or runtime policy. Implicit denials at wildcard scope and inability to call IAM simulation mean Could not verify, not proof of missing target access. It cannot guarantee deployment/removal.')
-    else:
+    elif task == 'sql':
         from tools.memory.client import selected_session
         config = migration_config(values)
-        role = 'admin' if task == 'sql' else 'approval' if task == 'authority' else 'client'
+        role = 'admin'
         try:
-            session = selected_session(config, admin=role == 'admin', approval=role == 'approval', environment=values)
+            session = selected_session(config, admin=True, environment=values)
             checks.append({'check': 'Assume exact ' + role + ' role from daily-use login', 'status': 'Passed'})
         except Exception as error:
             checks.append({'check': 'Assume exact ' + role + ' role from daily-use login',
                            'status': 'Could not verify', 'reason': getattr(error, 'code', type(error).__name__)})
         else:
-            if task == 'sql':
-                probe('Read database through the existing SQL administration role', lambda: call(
-                    session, 'rds-data', 'execute_statement', resourceArn=config['cluster_arn'],
-                    secretArn=config['admin_secret_arn'], database=config['database'], sql='SELECT 1'))
-            else:
-                from tools.memory.environment import configured_client
-                def read_context():
-                    client = configured_client(values=values)
-                    try:
-                        client.load_context()
-                    finally:
-                        client.close()
-                probe('Read current memory context through the daily-use role', read_context)
-        limits.append('Role assumption and reads do not prove write/DDL or authority activation permissions. Existing role trusts are unchanged; SQL admin and approval use the selected daily-use principal.')
+            probe('Read database through the existing SQL administration role', lambda: call(
+                session, 'rds-data', 'execute_statement', resourceArn=config['cluster_arn'],
+                secretArn=config['admin_secret_arn'], database=config['database'], sql='SELECT 1'))
+        limits.append('Role assumption and reads do not prove write/DDL permissions. Existing role trusts are unchanged; SQL administration uses the selected daily-use principal.')
+    elif task == 'routine':
+        probe('Verify signed project reconciliation capability through the daily-use role',
+              lambda: verify_connection(None, values=values))
+    else:
+        raise SetupPending('Unknown permission preflight.')
     status = ('Missing access' if any(item['status'] == 'Missing access' for item in checks) else
               'Could not verify' if any(item['status'] == 'Could not verify' for item in checks) else 'Passed')
     return {'status': status, 'task': task, 'checks': checks, 'limitations': limits,

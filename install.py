@@ -20,8 +20,8 @@ import tempfile
 from uuid import UUID, uuid4
 from tools.interaction import Field, OperationPaused, checkpoint, current, message, require, stage
 from tools.harness import (
-    HARNESS_PATHS as INTEGRATIONS, SKILLS, apply_integration, integration_plan,
-    skill_plan, retired_skill_plan, retire_skills, validate_default_profiles,
+    HARNESS_PATHS as INTEGRATIONS, SKILL_FILES, apply_reviewed_integration, integration_plan,
+    skill_cutover_plan, retire_skills, validate_default_profiles,
     launcher_permission_plan, repair_launcher_permissions,
 )
 
@@ -123,7 +123,7 @@ def _activation(home: Path, ca_bundle: Path | None) -> list[str]:
     target = home / 'activate'
     from tools.update import apply_owned_skills
     apply_owned_skills(home, Path(__file__).resolve().parent,
-                       [] if target.exists() or target.is_symlink() else [(target, body.encode(), None)], [])
+                       [] if target.exists() or target.is_symlink() else [(target, body.encode(), None)], [], activation=True)
     if target.exists() or target.is_symlink():
         _private_file(target)
         if ca_bundle and target.read_text() != body:
@@ -211,10 +211,6 @@ def main(argv=None) -> int:
     parser.add_argument('--claude-statusline', action='store_true',
                         help="With --harness claude: show the active MAVEN project in Claude Code's status line "
                              '(an owned statusLine entry; an existing different status line is preserved)')
-    parser.add_argument('--lifecycle-hooks', action=argparse.BooleanOptionalAction, default=True,
-                        help='Install native startup/end adapters with selected default/staged harnesses '
-                             '(default enabled; OMP 18.20+ also offers cancellable wrap-up then exit). '
-                             'Custom profiles refresh only previously recorded lifecycle destinations.')
     parser.add_argument('--local-only', action='store_true',
                         help='Install local tools only; no prompts, login, cloud setup, or project initialization')
     args = parser.parse_args(argv)
@@ -456,20 +452,34 @@ def _advanced_options(args):
               help='For custom harness profiles or inactive staging, not your project folder.'),
         Field('stage_harnesses', 'Inactive staging home', str(args.stage_harnesses or ''), required=False,
               help='Write explicitly selected integrations away from live harness configuration.'),
-        Field('lifecycle_hooks', 'Install native harness lifecycle integration', args.lifecycle_hooks,
-              kind='bool', help='Only selected default/staged profiles. Startup checks, not readiness; '
-                                'OMP 18.20+ offers wrap-up before exit. Other end hooks cannot veto exit.'),
     ], description='These affect local software only. No AWS account, login or cloud resources are changed.',
        back=True)
     if selected is not None:
         args.ca_bundle = Path(selected['ca']) if selected['ca'] else None
         args.skill_dir = [Path(line.strip()) for line in selected['skill_dirs'].splitlines() if line.strip()]
         args.stage_harnesses = Path(selected['stage_harnesses']) if selected['stage_harnesses'] else None
-        args.lifecycle_hooks = selected['lifecycle_hooks']
+
+
+def _update_targets(args, home):
+    """Refresh recorded destinations unless this invocation explicitly selected different ones."""
+    if (getattr(args, 'harness', None) or getattr(args, 'skill_dir', None)
+            or getattr(args, 'stage_harnesses', None)):
+        return
+    from tools.harness import installed_targets
+    recorded = installed_targets(home)
+    args.harness = list(recorded['paths'])
+    args.harness_config = [f'{name}={pair[0]}' for name, pair in recorded['paths'].items()]
+    args.harness_context = [f'{name}={pair[1]}' for name, pair in recorded['paths'].items()]
+    args.skill_dir = recorded['skill_roots']
+    args.claude_statusline = recorded['statusline'] and 'claude' in args.harness
+    if recorded['unresolved']:
+        _notify('Ambiguous recorded destinations preserved. Select explicit profile paths to update: '
+                + ', '.join(recorded['unresolved']))
 
 
 def _options(args):
     ui = require()
+    args.refresh_integrations = False
     args.uninstall = False
     args.restart_operation = None
     args.home_action = None
@@ -491,8 +501,8 @@ def _options(args):
                   if not pending else []),
                 *([('Abandon unfinished setup and start over — preserve receipts and cloud resources', 'restart')]
                   if pending else []),
-                *([('Update MAVEN — local software and harness skills, then cloud service, database schema '
-                    'and instructions, each separately reviewed', 'upgrade')] if completed and not pending else []),
+                *([('Update MAVEN — local software and harness skills, then database schema '
+                    'and cloud service, each separately reviewed', 'upgrade')] if completed and not pending else []),
                 *([('Set up or change MAVEN Home — choose, change or turn off the Home project', 'home')]
                   if completed and not pending else []),
                 ('Update local MAVEN software — preserve cloud settings; no AWS login or cloud changes', 'update'),
@@ -519,14 +529,11 @@ def _options(args):
             args.setup_mode, args.setup_operation, args.setup_fresh = 'existing', None, False
             return
         if task == 'upgrade':
-            from tools.update import local_report
             from tools.uninstall.common import read_private
             from tools.uninstall.local import MANIFEST
             source = read_private(home / MANIFEST).get('source') if (home / MANIFEST).exists() else None
-            # The installer itself is the checkout; its harnesses are the ones this home configured.
-            report = local_report(home, Path(__file__).resolve().parent)
             args.home, args.local_only, args.check_existing = home, False, False
-            args.harness = report['harnesses']
+            args.refresh_integrations = True
             args.setup_mode, args.setup_operation, args.setup_fresh = 'update', None, False
             if source and Path(source).resolve() != Path(__file__).resolve().parent:
                 message(f'This installation was installed from {source}; updating it from {Path(__file__).resolve().parent}.')
@@ -602,6 +609,7 @@ def _options(args):
             pending = None
         args.home = chosen
         args.local_only = task in ('local', 'update')
+        args.refresh_integrations = task == 'update'
         args.check_existing = task == 'existing' and existing and chosen == home and not separate
         args.setup_mode = 'new' if task == 'new' else 'existing'
         args.setup_operation = pending if args.check_existing else None
@@ -651,6 +659,9 @@ def _package_source(source):
 def _install(args, handoff=None):
     installation_locks = contextlib.ExitStack()
     try:
+        if getattr(args, 'refresh_integrations', False):
+            args = argparse.Namespace(**vars(args))
+            _update_targets(args, args.home)
         if current() is None:
             _notify('\nStep 1/4 — Check prerequisites')
         else:
@@ -696,20 +707,19 @@ def _install(args, handoff=None):
                     'can overwrite the reviewed integration; unrelated configuration is preserved.')
         skill_conflicts = []
         from tools.update import pending_owned_skills
-        pending_skills = pending_owned_skills(home)
         try:
-            plan = skill_plan(roots, home, conflicts=skill_conflicts)
+            plan, retired_skills, ready_roots = skill_cutover_plan(home, roots, conflicts=skill_conflicts)
             integrations = integration_plan(home, selected_harnesses,
                                             user_home=integration_home, ca_bundle=ca_bundle, paths=custom,
-                                            statusline=getattr(args, 'claude_statusline', False),
-                                            lifecycle=getattr(args, 'lifecycle_hooks', True))
-            retired_skills = retired_skill_plan(home, roots, conflicts=skill_conflicts)
+                                            statusline=getattr(args, 'claude_statusline', False))
         except ValueError as exc:
             if current() is None:
                 raise
             message(str(exc))
-            deferred, roots, plan, integrations, retired_skills = True, [], [], [], []
+            deferred, roots, ready_roots, plan, integrations, retired_skills = True, [], [], [], [], []
             selected_harnesses, require_stopped = [], False
+        pending_targets = [home / 'activate', *(root / name for root in ready_roots for name in SKILL_FILES)]
+        pending_skills = pending_owned_skills(home, pending_targets)
         if current() is not None:
             stage('Review installation')
             body = '\n'.join([
@@ -729,13 +739,11 @@ def _install(args, handoff=None):
                 'Exact owned legacy skills to retire:\n' + ('\n'.join(
                     str(path) for path, _ in retired_skills) or '(none)'),
                 f'Integration mode: {"inactive staging" if staging else "live"}',
-                f'Native lifecycle integration: {"enabled" if getattr(args, "lifecycle_hooks", True) else "not added or changed"}; '
-                'OMP 18.20+ quit dialog is optional; forced exits and other harnesses cannot guarantee wrap-up.',
+                'Startup uses local project orientation. No startup or shutdown hooks are installed.',
                 'Exact MAVEN integration content (unrelated configuration preserved):\n' + ('\n'.join(
                     (f'Conflict, not changed: {change.receipt["conflict"]}' if change.receipt.get('conflict')
-                     else f'{change.path}\n{change.receipt["value"]}' +
-                     ('\nAlso create top-level JSON schema field: "version": 1'
-                      if change.receipt.get('created_version') else '')) for change in integrations
+                     else ('Remove exact legacy hook: ' if change.receipt.get('retired') else '')
+                     + f'{change.path}\n{change.receipt["value"]}') for change in integrations
                     if change.receipt is not None) or '(none)'),
             ])
             summary = (f'Install/update MAVEN software in {home}.\n'
@@ -759,7 +767,7 @@ def _install(args, handoff=None):
         _private_directory(home)
         from tools.uninstall.local import _lock, reinstall_marker, finish_reinstallation
         installation_locks.enter_context(_lock(home / 'runtime/registry.lock'))
-        if pending_owned_skills(home) != pending_skills:
+        if pending_owned_skills(home, pending_targets) != pending_skills:
             raise ValueError('Pending file installation intents changed after review; review the original intents again.')
         completed_marker = reinstall_marker(home)
         new_caches = [home / 'runtime' / name for name in ('aws-login-cache', 'aws-deploy-login-cache')
@@ -780,7 +788,6 @@ def _install(args, handoff=None):
         if ownership and (ownership.get('schema') != 1 or ownership.get('home') != str(home)):
             raise ValueError('Installer ownership receipt does not match this home; preserved for review.')
         own_runtime = not installation.exists() or str(installation) in ownership.get('owned', {})
-        own_activation = not (home / 'activate').exists()
         if current() is None:
             _notify('\nStep 3/4 — Create/reuse the virtual environment and install MAVEN')
         else:
@@ -796,7 +803,7 @@ def _install(args, handoff=None):
         if not python.is_file():
             raise ValueError(f'Existing virtual environment is incomplete: {installation}. '
                              'Preserve it for review and choose another --home, or repair that environment.')
-        from tools.update import apply_owned_skills, record_package_inputs, _checkout_files, _packaging_inputs
+        from tools.update import install_skill_bundle, record_package_inputs, _checkout_files, _packaging_inputs
         with _runtime_effect(runtime_intent, home, 'package installation'):
             pip_ready = subprocess.run([str(python), '-I', '-m', 'pip', '--version'], capture_output=True, text=True)
             if pip_ready.returncode:
@@ -809,36 +816,27 @@ def _install(args, handoff=None):
                 _install_command([str(python), '-I', '-m', 'pip', 'install', '--upgrade', package])
                 record_package_inputs(home, package_source)
             # pip derives entry-point mode from its umask; repair only reviewed owned launchers.
-            for name in ('maven-mcp', 'maven-session-hook'):
-                launcher_repair = launcher_permission_plan(home, name=name)
-                if launcher_repair is not None:
-                    repair_launcher_permissions(home, launcher_repair, name=name)
+            launcher_repair = launcher_permission_plan(home)
+            if launcher_repair is not None:
+                repair_launcher_permissions(home, launcher_repair)
         if not environment.exists():
             body = (source / 'maven_resources' / 'templates' / 'environment.example').read_bytes()
             fd = os.open(environment, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0), 0o600)
             with os.fdopen(fd, 'wb') as stream:
                 stream.write(body)
-        apply_owned_skills(home, source, plan,
-                           [root / name / 'SKILL.md' for root in roots for name in SKILLS])
+        install_skill_bundle(home, source, ready_roots, plan, retired_skills)
         activation = _activation(home, ca_bundle)
-        owned_paths = [target for target, _, _ in plan]
-        if own_runtime:
-            owned_paths.append(installation)
-        if own_activation:
-            owned_paths.append(home / 'activate')
-        record_installation(home, source, owned_paths,
-                            [root / name / 'SKILL.md' for root in roots for name in SKILLS],
-                            cache_roots=new_caches)
+        # Skill and activation writes already have exact, per-file receipts; never re-inventory them.
+        record_installation(home, source, [installation] if own_runtime else [], [],
+                            cache_roots=new_caches, skill_roots=roots)
         from tools.uninstall.common import save_private
         runtime_intent[1]['completed'] = True
         save_private(runtime_intent[0], runtime_intent[1])
         # Journal exact ownership before mutation: interruption leaves either an
         # absent entry or a safely removable exact entry, never an orphan.
         for change in integrations:
-            if change.receipt is not None and not change.receipt.get('conflict'):
-                record_installation(home, source, [], [], integrations=[change.receipt])
-            apply_integration(change)
-        retire_skills(retired_skills)
+            apply_reviewed_integration(home, source, change)
+        retire_skills(home, retired_skills)
         finish_reinstallation(home, completed_marker)
         installation_locks.close()
         if current() is not None:
@@ -858,9 +856,7 @@ def _install(args, handoff=None):
                 _notify(f'Inactive integration staged under {integration_home}; live harness configuration unchanged. '
                         'Review and install against the selected profile after affected harnesses stop.')
             else:
-                _notify('Start a new harness session to load startup guidance and native lifecycle integration. '
-                        'Hooks check identity; MCP connection alone is not project readiness. '
-                        'Only supported interactive OMP exits offer a wrap-up gate; forced exits bypass it.')
+                _notify('Restart affected harnesses to load local project orientation and the maven skill.')
         elif deferred:
             _notify('Harness integration is pending. Stage with --stage-harnesses, or rerun after closing '
                     'affected harnesses with --harness-stopped.')
@@ -874,11 +870,13 @@ def _install(args, handoff=None):
                        [str(change.path) for change in integrations if change.before != change.after
                         and not (change.receipt and change.receipt.get('conflict'))] +
                        [str(target) for target, _ in retired_skills])
+            conflicts = [*skill_conflicts, *(
+                {'target': str(change.path), 'status': 'conflict', 'reason': change.receipt['conflict']}
+                for change in integrations if change.receipt.get('conflict'))]
             handoff['integration'] = {
-                'status': ('partial' if changed else 'conflict') if skill_conflicts or any(
-                    change.receipt and change.receipt.get('conflict') for change in integrations) else
+                'status': ('partial' if changed else 'conflict') if conflicts else
                     'written' if changed else 'unchanged' if selected_harnesses else 'skipped',
-                'selected': selected_harnesses, 'written': changed, 'conflicts': skill_conflicts,
+                'selected': selected_harnesses, 'written': changed, 'targets': conflicts,
                 'reconciled': [saved['intent']['target'] for saved in pending_skills],
                 'reason': ('Harness integration deferred; live files were not changed.' if deferred else
                            'Cloud access was not checked during this software installation.'),

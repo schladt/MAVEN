@@ -2,6 +2,9 @@
 import argparse
 import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -17,11 +20,55 @@ class ProjectPackagingTests(unittest.TestCase):
     def test_resources_are_contained(self):
         self.assertTrue(resource_path('templates/environment.example').is_file())
         self.assertTrue(resource_path('templates/harness/startup.md').is_file())
-        self.assertTrue(resource_path('templates/skills/maven/SKILL.md').is_file())
-        self.assertTrue(resource_path('templates/skills/maven-maintenance/SKILL.md').is_file())
+        skills = resource_path('templates/skills')
+        self.assertEqual(list(skills.rglob('SKILL.md')), [skills / 'maven/SKILL.md'])
+        router = (skills / 'maven/SKILL.md').read_text()
+        for name in ('project', 'reconcile', 'secrets', 'update'):
+            relative = f'references/{name}.md'
+            self.assertIn(relative, router)
+            self.assertTrue((skills / 'maven' / relative).read_text().strip())
         for value in ('../pyproject.toml', '/etc/passwd', ''):
             with self.assertRaises(ValueError):
                 resource_path(value)
+
+    def test_installed_wheel_provisions_complete_bundle_outside_checkout(self):
+        checkout = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'
+            source.mkdir()
+            for name in ('pyproject.toml', 'README.md'):
+                shutil.copy2(checkout / name, source / name)
+            for name in ('maven_resources', 'tools'):
+                shutil.copytree(checkout / name, source / name,
+                                ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+            pip = [sys.executable, '-m', 'pip', '--disable-pip-version-check']
+            subprocess.run([*pip, 'wheel', '--no-deps', '--no-index', '--no-build-isolation',
+                            '--wheel-dir', str(root), str(source)], cwd=root, check=True)
+            wheel, = root.glob('*.whl')
+            subprocess.run([*pip, 'install', '--no-index', '--no-deps', '--target', 'installed',
+                            str(wheel)], cwd=root, check=True)
+            shutil.rmtree(source)
+            subprocess.run([sys.executable, '-I', '-c', '''
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path('installed').resolve()))
+from maven_resources import resource_path
+from tools.harness import skill_plan, write_skill
+packaged = resource_path('templates/skills')
+assert packaged.is_relative_to(Path('installed').resolve())
+root = Path('custom profile/skills').resolve()
+for target, body, expected in skill_plan([root]):
+    write_skill(target, body, expected)
+files = {'maven/SKILL.md', *('maven/references/' + name + '.md'
+                             for name in ('project', 'reconcile', 'secrets', 'update'))}
+for tree in (packaged, root):
+    assert {p.relative_to(tree).as_posix() for p in tree.rglob('*') if p.is_file()} == files
+for name in files:
+    assert (root / name).read_bytes() == (packaged / name).read_bytes()
+    if name != 'maven/SKILL.md':
+        assert name.removeprefix('maven/') in (root / 'maven/SKILL.md').read_text()
+'''], cwd=root, check=True)
 
     def test_git_destinations_cannot_embed_credentials(self):
         for value in (
@@ -61,14 +108,19 @@ class ProjectPackagingTests(unittest.TestCase):
             client.invoke.return_value = {'status': 'ready', 'data': {
                 'record_id': args.project_id, 'kind': 'entity', 'data_scope': 'owner',
                 'project_id': None, 'data': {'entity_type': 'project'}}}
-            with patch('tools.memory.environment.configured_client', return_value=client) as factory:
+            config = {'instance_id': str(uuid4()), 'recovery_epoch': str(uuid4())}
+            with patch('tools.memory.environment.load_environment', return_value={}), \
+                    patch('tools.memory.environment.memory_config', return_value=config), \
+                    patch('tools.memory.reconcile_cloud.status') as signed_status, \
+                    patch('tools.memory.environment.configured_client', return_value=client) as factory:
                 result = _initialize(args)
                 self.assertEqual(result['status'], 'initialized')
                 self.assertEqual(client.invoke.call_args_list[0].args[1]['request_key'], args.request_key)
+                signed_status.assert_called_once_with(client)
                 client.close.assert_called_once()
                 before = (root / '.maven/project.json').read_bytes()
                 self.assertEqual(_initialize(args)['status'], 'unchanged')
-                factory.assert_called_once_with(args.env, values=None)
+                factory.assert_called_once_with(args.env, values={})
                 self.assertEqual((root / '.maven/project.json').read_bytes(), before)
                 self.assertEqual((root / '.gitignore').read_text(), 'existing-pattern\n/.maven/\n')
                 args.project_id = str(uuid4())
@@ -89,7 +141,11 @@ class ProjectPackagingTests(unittest.TestCase):
             record = {'record_id': args.project_id, 'kind': 'entity', 'data_scope': 'owner',
                       'project_id': None, 'tags': [], 'data': {'entity_type': 'project'}}
             client = Mock()
-            with patch('tools.memory.environment.configured_client', return_value=client):
+            config = {'instance_id': str(uuid4()), 'recovery_epoch': str(uuid4())}
+            with patch('tools.memory.environment.load_environment', return_value={}), \
+                    patch('tools.memory.environment.memory_config', return_value=config), \
+                    patch('tools.memory.reconcile_cloud.status'), \
+                    patch('tools.memory.environment.configured_client', return_value=client):
                 for changed in (
                         {**record, 'record_id': str(uuid4())},
                         {**record, 'record_id': None}, {**record, 'project_id': str(uuid4())},

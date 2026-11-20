@@ -31,10 +31,10 @@ CONFIG = {"cluster_arn": "arn:aws:rds:us-east-1:123456789012:cluster:synthetic",
           "region": "us-east-1", "endpoint": "https://example.invalid", "schema_version": 2}
 
 
-def change():
-    return {"request_key": KEY, "action": "create_fact", "record_id": RECORD,
-            "classification": "Sensitive", "data_scope": "synthetic",
-            "fact": {"predicate": "fixture", "value_type": "string", "value": "synthetic fact"},
+def project_creation():
+    return {"request_key": KEY, "record_id": RECORD, "expected_revision": 0,
+            "kind": "entity", "classification": "Sensitive", "data_scope": "owner",
+            "data": {"entity_type": "project", "name": "Fixture project", "aliases": []},
             "source": {"origin": "synthetic fixture", "excerpt": "synthetic evidence"},
             "change_reason": "synthetic test"}
 
@@ -55,8 +55,8 @@ def resolution():
             "approval_source": {"origin": "synthetic owner approval", "excerpt": "Approve exact candidate"}}
 
 
-def event(body=None, path="/v1/records/change"):
-    return {"rawPath": path, "rawQueryString": "", "body": json.dumps(change() if body is None else body),
+def event(body=None, path="/v1/memory/write"):
+    return {"rawPath": path, "rawQueryString": "", "body": json.dumps(project_creation() if body is None else body),
             "headers": {"x-maven-memory-protocol": str(validation.CLIENT_PROTOCOL)},
             "requestContext": {"http": {"method": "POST"},
                                "authorizer": {"iam": {"userArn": ACTOR}}}}
@@ -71,44 +71,21 @@ def control_response(state="ready"):
 
 
 class ValidationTests(unittest.TestCase):
-    def test_typed_values_and_stable_canonical_hash(self):
-        for kind, value in [("string", "é"), ("number", 2.5), ("boolean", False),
-                            ("object", {"a": 1}), ("array", [None]), ("null", None)]:
-            request = change()
-            request["fact"].update(value_type=kind, value=value)
-            self.assertEqual(validation.validate_change(request), request)
-            reverse = dict(reversed(list(request.items())))
-            self.assertEqual(validation.digest(request), validation.digest(reverse))
+    def test_project_metadata_validates_without_changing_content_or_hash(self):
+        request = project_creation()
+        self.assertIs(validation.validate("/v1/memory/write", request), request)
+        self.assertEqual(validation.digest(request), validation.digest(dict(reversed(list(request.items())))))
 
-    def test_owner_facts_are_rejected_for_create_and_correction(self):
-        for action in ("create_fact", "correct_fact"):
-            body = change()
-            body.update(action=action, data_scope="owner")
-            if action == "correct_fact":
-                body["expected_revision"] = 1
-            with self.subTest(action=action), self.assertRaises(validation.MemoryError):
-                validation.validate_change(body)
-
-    def test_rejects_scope_unknown_fields_bad_types_and_revision(self):
-        variants = []
-        for key, value in [("classification", "Secret"), ("data_scope", "personal"),
-                           ("extra", True), ("expected_revision", 1)]:
-            body = change()
-            body[key] = value
-            variants.append(body)
-        for value in [True, 0, -1, 1.5, None]:
-            body = change()
-            body.update(action="correct_fact", expected_revision=value)
-            variants.append(body)
-        for kind, value in [("number", True), ("number", float("nan")),
-                            ("number", float("inf")), ("object", []), ("null", "null"),
-                            ("string", "\x00"), ("string", "x" * 9000)]:
-            body = change()
-            body["fact"].update(value_type=kind, value=value)
-            variants.append(body)
-        for body in variants:
-            with self.subTest(body=repr(body)[:80]), self.assertRaises(validation.MemoryError) as error:
-                validation.validate_change(body)
+    def test_only_reviewed_project_identity_shape_is_accepted_by_metadata_route(self):
+        request = project_creation()
+        for override in ({"classification": "Secret"}, {"data_scope": "synthetic"},
+                         {"data": {**request["data"], "entity_type": "person"}},
+                         {"project_id": EPOCH}, {"extra": True}, {"expected_revision": True},
+                         {"expected_revision": -1}, {"expected_revision": None},
+                         {"kind": "session", "data": {"state": "active", "summary": "Old client"}},
+                         {"kind": "note", "data": {"title": "Old write", "category": "reference", "body_markdown": "Fixture"}}):
+            with self.subTest(override=override), self.assertRaises(validation.MemoryError) as error:
+                validation.validate("/v1/memory/write", {**request, **override})
             self.assertEqual(error.exception.status, "invalid_request")
 
     def test_duplicate_json_keys_and_nonfinite_numbers_rejected(self):
@@ -116,16 +93,13 @@ class ValidationTests(unittest.TestCase):
             with self.assertRaises(validation.MemoryError):
                 validation.decode_json(body)
 
-    def test_legacy_fact_credentials_are_refused_before_transport(self):
-        for target in ("value", "predicate", "source"):
-            body = change()
-            credential = "AKIA" + "X" * 16
-            if target == "source":
-                body["source"]["excerpt"] = credential
-            else:
-                body["fact"][target] = credential
-            with self.subTest(target=target), self.assertRaises(validation.MemoryError) as error:
-                validation.validate_change(body)
+    def test_credentials_in_project_identity_or_evidence_are_refused_before_transport(self):
+        credential = "AKIA" + "X" * 16
+        for field, key in (("data", "name"), ("source", "origin"), ("source", "excerpt")):
+            body = project_creation()
+            body[field][key] = credential
+            with self.subTest(field=field, key=key), self.assertRaises(validation.MemoryError) as error:
+                validation.validate("/v1/memory/write", body)
             self.assertEqual(error.exception.status, "invalid_request")
             self.assertNotIn(credential, str(error.exception.metadata))
 
@@ -297,13 +271,10 @@ class InstructionValidationTests(unittest.TestCase):
             with self.subTest(body=body), self.assertRaises(validation.MemoryError):
                 validation.validate_index(body)
 
-    def test_nonproposal_requests_keep_original_size_limit(self):
-        body = change()
-        body["fact"]["value"] = "a" * validation.MAX_REQUEST_BYTES
-        with self.assertRaises(validation.MemoryError):
-            validation.validate_change(body)
+    def test_request_limits_follow_route(self):
         self.assertEqual(validation.request_limit("/v1/pages/read"), 8192)
         self.assertEqual(validation.request_limit("/v1/proposals/create"), 1048576)
+        self.assertEqual(validation.request_limit("/v1/reconcile/apply"), 1024 * 1024)
 
 
 
@@ -329,12 +300,12 @@ class HandlerTests(unittest.TestCase):
         self.factory.assert_not_called()
 
     def test_invalid_input_does_not_touch_aws(self):
-        body = change()
+        body = project_creation()
         body["data_scope"] = "personal"
         self.assertEqual(service.handler(event(body), None)["statusCode"], 422)
         self.factory.assert_not_called()
 
-    def test_owner_scope_only_reaches_instruction_creation(self):
+    def test_owner_instruction_creation_refuses_secret_classification(self):
         self.factory.return_value.perform.return_value = ({}, 7)
         body = proposal()
         body["data_scope"] = "owner"
@@ -342,9 +313,6 @@ class HandlerTests(unittest.TestCase):
         self.factory.return_value.perform.assert_called_once_with("/v1/proposals/create", body, ACTOR,
                                                                   client_protocol=validation.CLIENT_PROTOCOL)
         self.factory.reset_mock()
-        body = change()
-        body["data_scope"] = "owner"
-        self.assertEqual(service.handler(event(body), None)["statusCode"], 422)
         body = proposal()
         body.update(data_scope="owner", classification="Secret")
         self.assertEqual(service.handler(event(body, "/v1/proposals/create"), None)["statusCode"], 422)
@@ -387,7 +355,7 @@ class HandlerTests(unittest.TestCase):
             request = event({"request_key": KEY}, "/v1/operations/lookup")
             request["requestContext"]["authorizer"]["iam"]["userArn"] = actor
             self.assertEqual(service.handler(request, None)["statusCode"], 200)
-        for path, body in [("/v1/records/change", change()),
+        for path, body in [("/v1/memory/write", project_creation()),
                            ("/v1/records/query", {"record_id": RECORD}),
                            ("/v1/proposals/create", proposal()), ("/v1/pages/index", {}),
                            ("/v1/pages/read", {"slug": "example"})]:
@@ -419,7 +387,7 @@ class HandlerTests(unittest.TestCase):
                                                                  client_protocol=validation.CLIENT_PROTOCOL)
 
     def test_raw_request_size_and_encoding_fail_closed(self):
-        for path, maximum in [("/v1/records/change", 8192),
+        for path, maximum in [("/v1/pages/read", 8192),
                               ("/v1/proposals/create", validation.MAX_PROPOSAL_REQUEST_BYTES)]:
             for encoded in (False, True):
                 request = event(path=path)
@@ -491,15 +459,32 @@ class HandlerTests(unittest.TestCase):
             store.route_result({"status": "project_archived"})
         self.assertEqual((error.exception.status, error.exception.http_status), ("project_archived", 409))
 
-    def test_new_memory_routes_are_client_role_only(self):
-        self.factory.return_value.perform.return_value = ({"revisions": {}}, 3)
-        for path, body in [("/v1/memory/project_context", {"project_id": RECORD, "session_id": KEY}),
-                           ("/v1/memory/revisions", {"record_ids": [RECORD]})]:
+    def test_reconcile_routes_are_client_role_only(self):
+        self.factory.return_value.perform.return_value = ({}, 0)
+        identity = {"instance_id": INSTANCE, "recovery_epoch": EPOCH}
+        project = {**identity, "project_id": RECORD}
+        for path, body in [("/v1/reconcile/status", identity), ("/v1/reconcile/inventory", project),
+                           ("/v1/reconcile/read", {**project, "ids": [KEY], "expected_token": "a" * 64}),
+                           ("/v1/reconcile/apply", {**project, "changes": [], "expected_token": "a" * 64})]:
             with self.subTest(path=path):
                 self.assertEqual(service.handler(event(body, path), None)["statusCode"], 200)
                 request = event(body, path)
                 request["requestContext"]["authorizer"]["iam"]["userArn"] = APPROVAL_ACTOR
                 self.assertEqual(service.handler(request, None)["statusCode"], 403)
+                self.factory.return_value.perform.assert_called_once_with(path, body, ACTOR,
+                                                                         client_protocol=validation.CLIENT_PROTOCOL)
+                self.factory.reset_mock()
+
+    def test_retired_routes_are_refused_before_store_construction(self):
+        for path, body in (("/v1/memory/project_context", {"project_id": RECORD, "session_id": KEY}),
+                           ("/v1/memory/revisions", {"record_ids": [RECORD]}),
+                           ("/v1/memory/claim", {"action": "claim", "session_id": KEY}),
+                           ("/v1/records/change", {"action": "create_fact", "request_key": KEY})):
+            with self.subTest(path=path):
+                response = service.handler(event(body, path), None)
+                self.assertEqual(response["statusCode"], 422)
+                self.assertEqual(json.loads(response["body"])["status"], "invalid_request")
+        self.factory.assert_not_called()
 
     def test_container_reuses_sdk_clients(self):
         import boto3
@@ -537,7 +522,7 @@ class DataAPIContractTests(unittest.TestCase):
         self.storage = store.Store(CONFIG, self.data, self.s3, control_cache=self.cache)
 
     def script_result(self, result):
-        """Legacy /v1/records/* and lookup path: explicit transaction, unchanged statements."""
+        """Exact fact reads still use a protocol-checked explicit transaction."""
         self.data.execute_statement.side_effect = [
             {}, scalar(envelope(None)), {}, {"records": [[{"booleanValue": True}]]}, scalar(result)]
 
@@ -589,7 +574,7 @@ class DataAPIContractTests(unittest.TestCase):
     def test_mutation_is_one_statement_inside_rollbackable_transaction(self):
         self.cache.put(CONFIG, store.control_document(CONFIG, "ready"))
         self.dispatch({"record_id": RECORD, "revision": 1, "request_key": KEY, "replayed": False})
-        result, generation = self.storage.perform("/v1/memory/write", {"request_key": KEY}, ACTOR)
+        result, generation = self.storage.perform("/v1/memory/write", project_creation(), ACTOR)
         self.assertEqual((result["revision"], generation), (1, 5))
         self.assertEqual(self.data.execute_statement.call_count, 1)
         self.assertEqual(self.data.execute_statement.call_args.kwargs["transactionId"], "tx")
@@ -600,7 +585,7 @@ class DataAPIContractTests(unittest.TestCase):
         self.dispatch({"record_id": RECORD, "revision": 1})
         self.s3.get_object.side_effect = [control_response(), control_response("maintenance")]
         with self.assertRaises(validation.MemoryError) as error:
-            self.storage.perform("/v1/memory/write", {"request_key": KEY}, ACTOR)
+            self.storage.perform("/v1/memory/write", project_creation(), ACTOR)
         self.assertEqual(error.exception.status, "context_stale")
         self.assertEqual(self.data.commit_transaction.call_count, 1)
         self.data.rollback_transaction.assert_called_once()
@@ -629,13 +614,13 @@ class DataAPIContractTests(unittest.TestCase):
             self.assertEqual((error.exception.status, error.exception.http_status), (status, http))
         self.dispatch({"status": "revision_conflict", "current_revision": 3})
         with self.assertRaises(validation.MemoryError) as error:
-            self.storage.perform("/v1/memory/write", {"request_key": KEY}, ACTOR)
+            self.storage.perform("/v1/memory/write", project_creation(), ACTOR)
         self.assertEqual(error.exception.metadata, {"current_revision": 3})
         self.data.commit_transaction.assert_not_called()
 
-    def test_legacy_routes_keep_explicit_transaction_and_report_generation(self):
-        self.script_result({"record_id": RECORD, "revision": 1, "request_key": KEY, "replayed": False})
-        result, generation = self.storage.perform("/v1/records/change", change(), ACTOR)
+    def test_exact_historical_read_keeps_explicit_transaction_and_generation(self):
+        self.script_result({"record_id": RECORD, "revision": 1})
+        result, generation = self.storage.perform("/v1/records/query", {"record_id": RECORD, "revision": 1}, ACTOR)
         self.assertEqual((result["revision"], generation), (1, 5))
         self.assertIn("maven.memory_service_state()",
                       self.data.execute_statement.call_args_list[1].kwargs["sql"])
@@ -656,15 +641,6 @@ class DataAPIContractTests(unittest.TestCase):
                 store.parse_control(json.dumps(document), CONFIG, allow_legacy=True)
 
 
-    def test_maintenance_before_commit_rolls_back(self):
-        self.script_result({"record_id": RECORD, "revision": 1, "request_key": KEY, "replayed": False})
-        self.s3.get_object.side_effect = [control_response(), control_response("maintenance")]
-        with self.assertRaises(validation.MemoryError) as error:
-            self.storage.perform("/v1/records/change", change(), ACTOR)
-        self.assertEqual(error.exception.status, "context_stale")
-        self.data.commit_transaction.assert_not_called()
-        self.data.rollback_transaction.assert_called_once()
-
     def test_initial_maintenance_or_epoch_mismatch_never_wakes_database(self):
         for document in [store.control_document(CONFIG, "maintenance"),
                          {**store.control_document(CONFIG, "ready"), "recovery_epoch": RECORD}]:
@@ -676,15 +652,15 @@ class DataAPIContractTests(unittest.TestCase):
 
 
     def test_revision_conflict_and_ambiguous_commit_do_not_retry(self):
-        self.script_result({"status": "revision_conflict", "current_revision": 2})
+        self.dispatch({"status": "revision_conflict", "current_revision": 2})
         with self.assertRaises(validation.MemoryError) as error:
-            self.storage.perform("/v1/records/change", change(), ACTOR)
+            self.storage.perform("/v1/memory/write", project_creation(), ACTOR)
         self.assertEqual(error.exception.metadata, {"current_revision": 2})
         self.data.commit_transaction.assert_not_called()
-        self.script_result({"record_id": RECORD, "revision": 1, "request_key": KEY, "replayed": False})
+        self.dispatch({"record_id": RECORD, "revision": 1, "request_key": KEY, "replayed": False})
         self.data.commit_transaction.side_effect = RuntimeError("lost response")
         with self.assertRaises(RuntimeError):
-            self.storage.perform("/v1/records/change", change(), ACTOR)
+            self.storage.perform("/v1/memory/write", project_creation(), ACTOR)
         self.assertEqual(self.data.commit_transaction.call_count, 1)
 
 

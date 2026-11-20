@@ -24,7 +24,8 @@ MIGRATION_FILES = ("001_foundation.sql", "002_fact_change.sql", "003_current_ver
                    "017_project_archive_visibility.sql", "018_skill_discovery.sql",
                    "019_secret_catalog.sql", "020_secret_adapter_grants.sql",
                    "021_secret_adapter_scope_guard.sql", "022_reviewed_cleanup.sql",
-                   "023_retired_work_visibility.sql", "024_immutable_secret_consumption.sql")
+                   "023_retired_work_visibility.sql", "024_immutable_secret_consumption.sql",
+                   "025_project_reconciliation.sql")
 CLEANUP_LIMIT = 200
 _CLEANUP_REFUSAL = re.compile(r"cleanup_refused:([a-z_]{1,40})")
 
@@ -129,15 +130,18 @@ def _grant_instructions(db, tx):
     db.execute("GRANT EXECUTE ON FUNCTION maven.instruction_visible(uuid), "
                "maven.instruction_write(text,jsonb,text,text,text), "
                "maven.instruction_challenge(uuid,text), maven.instruction_index(jsonb), "
-               "maven.instruction_read(jsonb), maven.change_fact(jsonb,text,text) TO maven_app", transaction=tx)
+               "maven.instruction_read(jsonb) TO maven_app", transaction=tx)
     db.execute("GRANT EXECUTE ON FUNCTION maven.lock_service_state(), maven.memory_protocol_allowed(), "
-               "maven.memory_write(text,jsonb,text,text), maven.memory_read(jsonb), "
+               "maven.memory_read(jsonb), "
                "maven.memory_search(jsonb), maven.memory_context(jsonb), "
                "maven.memory_lookup(uuid) TO maven_app", transaction=tx)
     # Ordinary memory, page and proposal routes are one dispatcher statement with no explicit
     # transaction for reads, so their timeouts are the application role's session defaults.
     db.execute("GRANT EXECUTE ON FUNCTION maven.memory_service_state(), "
-               "maven.memory_request(text,jsonb,text,text,text,integer) TO maven_app", transaction=tx)
+               "maven.memory_request(text,jsonb,text,text,text,integer), "
+               "maven.reconcile_request(text,jsonb) TO maven_app", transaction=tx)
+    db.execute("REVOKE EXECUTE ON FUNCTION maven.memory_request_before_reconcile(text,jsonb,text,text,text,integer), "
+               "maven.memory_write(text,jsonb,text,text), maven.change_fact(jsonb,text,text) FROM maven_app", transaction=tx)
     db.execute("ALTER ROLE maven_app SET statement_timeout = '5s'", transaction=tx)
     db.execute("ALTER ROLE maven_app SET lock_timeout = '1s'", transaction=tx)
 
@@ -217,7 +221,6 @@ def _install(db, config, secrets, control, *, upgrade=False):
         db.execute("GRANT USAGE ON SCHEMA maven TO maven_app", transaction=tx)
         db.execute("GRANT SELECT ON maven.service_state, maven.records, maven.facts, maven.sources, "
                    "maven.record_versions, maven.record_sources, maven.operations TO maven_app", transaction=tx)
-        db.execute("GRANT EXECUTE ON FUNCTION maven.change_fact(jsonb, text, text) TO maven_app", transaction=tx)
         _grant_instructions(db, tx)
         db.execute("INSERT INTO maven.service_state(singleton, instance_id, recovery_epoch, schema_version, "
                    "data_scope, state, app_secret_arn, app_secret_version) "
@@ -239,7 +242,12 @@ def _verify_application(db, config):
                             "AND NOT has_schema_privilege(current_user, 'maven', 'CREATE') "
                             "AND NOT has_schema_privilege(current_user, 'public', 'CREATE') "
                             "AND NOT has_function_privilege(current_user, 'maven.bootstrap_app(text)', 'EXECUTE') "
-                            "AND has_function_privilege(current_user, 'maven.change_fact(jsonb,text,text)', 'EXECUTE') "
+                            "AND has_function_privilege(current_user, 'maven.reconcile_request(text,jsonb)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(current_user, 'maven.change_fact(jsonb,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(current_user, 'maven.memory_write(text,jsonb,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(current_user, 'maven.memory_request_before_reconcile(text,jsonb,text,text,text,integer)', 'EXECUTE') "
+                            "AND NOT has_table_privilege(current_user, 'maven.reconcile_records', 'SELECT,INSERT,UPDATE,DELETE') "
+                            "AND NOT has_table_privilege(current_user, 'maven.reconcile_projects', 'SELECT,INSERT,UPDATE,DELETE') "
                             "AND NOT has_table_privilege(current_user, 'maven.records', 'INSERT,UPDATE,DELETE') "
                             "AND NOT has_table_privilege(current_user, 'maven.record_versions', 'INSERT,UPDATE,DELETE') "
                             "AND NOT has_table_privilege(current_user, 'maven.service_state', 'INSERT,UPDATE,DELETE') "

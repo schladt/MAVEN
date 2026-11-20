@@ -19,12 +19,14 @@ from tools.secret_catalog import SecretCatalog
 
 HOME_ID = '10000000-0000-4000-8000-000000000001'
 INSTANCE_ID = '20000000-0000-4000-8000-000000000002'
+EPOCH = '30000000-0000-4000-8000-000000000003'
 VALUES = {
     'MAVEN_ACCOUNT_ID': '123456789012', 'MAVEN_AWS_REGION': 'us-east-1',
     'MAVEN_SECRETS_PARAMETER_PREFIX': '/synthetic/secrets/',
     'MAVEN_SECRETS_FILE_KEY_PREFIX': '/synthetic/keys/',
     'MAVEN_SECRETS_OBJECT_PREFIX': 'synthetic/files/', 'MAVEN_SECRETS_BUCKET': 'synthetic-private-files',
     'MAVEN_SECRETS_KEY_ID': '0123456789abcdef', 'MAVEN_MEMORY_INSTANCE_ID': INSTANCE_ID,
+    'MAVEN_MEMORY_RECOVERY_EPOCH': EPOCH,
 }
 SOURCE = {'origin': 'offline-owner-request', 'excerpt': 'Store and catalog owner.api.'}
 
@@ -428,7 +430,7 @@ class SecretCatalogTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
-        self.home = Path(self.directory.name)
+        self.home = Path(self.directory.name).resolve()
         self.input = self.home / 'input'
         self.input.write_bytes(b'synthetic credential')
         self.input.chmod(0o600)
@@ -436,7 +438,8 @@ class SecretCatalogTests(unittest.TestCase):
         self.store = SecretStore(VALUES, self.session)
         self.cloud = CatalogCloud()
         environment = patch('tools.secret_catalog.load_environment', return_value=VALUES)
-        home = patch('tools.secret_catalog.load_home', return_value={'project_id': HOME_ID, 'instance_id': INSTANCE_ID})
+        home = patch('tools.secret_catalog.load_home', return_value={
+            'project_id': HOME_ID, 'instance_id': INSTANCE_ID, 'recovery_epoch': EPOCH})
         environment.start()
         home.start()
         self.addCleanup(environment.stop)
@@ -445,6 +448,20 @@ class SecretCatalogTests(unittest.TestCase):
 
     def create(self, **options):
         return self.catalog.store_and_catalog('owner.api', source_path=self.input, source=SOURCE, **options)
+
+    def test_restored_instance_cannot_resume_prior_epoch_secret_write(self):
+        self.cloud.fail_before = 'temporarily_unavailable'
+        pending = self.create()
+        new_epoch = str(uuid.uuid4())
+        binding = {'project_id': HOME_ID, 'instance_id': INSTANCE_ID, 'recovery_epoch': new_epoch}
+        with patch('tools.secret_catalog.load_home', return_value=binding):
+            with self.assertRaisesRegex(StoreError, 'recovery epoch'):
+                SecretCatalog(self.home, client=self.cloud, store=self.store)
+            with patch('tools.secret_catalog.load_environment', return_value={**VALUES, 'MAVEN_MEMORY_RECOVERY_EPOCH': new_epoch}):
+                restored = SecretCatalog(self.home, client=self.cloud, store=self.store)
+                with self.assertRaisesRegex(StoreError, 'different Home, instance or store'):
+                    restored.retry_catalog(pending['operation_id'])
+        self.assertFalse(self.cloud.records)
 
     def test_catalog_failure_retries_only_metadata_and_never_stores_plaintext_locally(self):
         self.cloud.fail_before = 'temporarily_unavailable'

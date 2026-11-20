@@ -17,7 +17,7 @@ class LocalUninstallTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
-        self.base = Path(self.temporary.name)
+        self.base = Path(self.temporary.name).resolve()
         self.home = self.base / 'instance'
         self.home.mkdir(mode=0o700)
         self.environment = patch.dict(os.environ, {'HOME': str(self.base), 'MAVEN_HOME': str(self.home)})
@@ -173,7 +173,16 @@ class LocalUninstallTests(unittest.TestCase):
             self.apply(fragment)
         self.assertTrue(pointer.exists())
 
-    def test_machine_purge_lists_home_files_and_tolerates_later_home_state(self):
+    def test_project_uninstall_refuses_pending_publication_without_changing_it(self):
+        root, _ = self.project()
+        path = root / '.maven/git-publication/receipt.json'
+        review = {'schema': 1, 'root': str(root.resolve()), 'status': 'unverified'}
+        save_private(path, review)
+        with self.assertRaisesRegex(UninstallError, 'Unresolved Git publication'):
+            local.plan_project(root, self.home, offline=True)
+        self.assertEqual(read_private(path), review)
+
+    def test_machine_purge_lists_home_files_and_preserves_changed_home_state(self):
         self.runtime()
         save_private(self.home / 'home.json', {'schema': 1})
         (self.home / 'runtime').mkdir(mode=0o700, exist_ok=True)
@@ -187,8 +196,11 @@ class LocalUninstallTests(unittest.TestCase):
         (self.home / 'runtime/active').mkdir(mode=0o700)
         (self.home / 'runtime/active/session.json').write_text('{}')
         save_private(self.home / 'home.json', {'schema': 1, 'changed': True})
-        self.purge(fragment)
-        self.assertFalse(self.home.exists())
+        with self.assertRaisesRegex(UninstallError, 'changed since review'):
+            self.purge(fragment)
+        self.assertTrue(read_private(self.home / 'home.json')['changed'])
+        self.assertEqual(log.read_text(), '{}\n{}\n')
+        self.assertTrue((self.home / 'runtime/active/session.json').exists())
 
     def test_export_is_private_verified_copy_and_partial_write_resumes(self):
         root, pending = self.project()
@@ -217,6 +229,29 @@ class LocalUninstallTests(unittest.TestCase):
         self.assertFalse((root / '.maven/project.json').exists())
         self.assertEqual(len(list((root / '.maven').glob('detached-project-*.json'))), 1)
 
+    def test_uninstall_bundle_removes_only_unchanged_exclusively_owned_files(self):
+        from tools.harness import skill_plan
+        from tools.update import apply_owned_skills
+        root = self.base / 'custom skills'
+        plan = skill_plan([root], self.home)
+        references = [target for target, _, _ in plan]
+        apply_owned_skills(self.home, self.source, plan, references)
+        shared = root / 'maven/references/secrets.md'
+        modified = root / 'maven/references/project.md'
+        unrelated = root / 'maven/references/my-notes'
+        modified.write_text('owner edits')
+        unrelated.write_text('owner notes')
+        other = self.base / 'second instance'
+        other.mkdir(mode=0o700)
+        local.record_installation(other, self.source, [], [shared])
+        fragment = local.plan_machine(self.home, offline=True)
+        self.assertTrue({str(shared), str(modified)} <= {item['path'] for item in fragment['retained']})
+        self.apply(fragment)
+        self.assertTrue(shared.exists())
+        self.assertEqual(modified.read_text(), 'owner edits')
+        self.assertEqual(unrelated.read_text(), 'owner notes')
+        self.assertFalse(any(path.exists() for path in set(references) - {shared, modified}))
+
     def test_shared_skills_and_active_sessions_are_protected(self):
         skill = self.base / 'skills/maven-connect/SKILL.md'
         skill.parent.mkdir(parents=True)
@@ -234,25 +269,10 @@ class LocalUninstallTests(unittest.TestCase):
         session = {'root': str(self.base / 'project'), 'state': 'paused', 'writers': []}
         save_private(other / 'runtime/sessions.json', {'schema': 1, 'sessions': {identifier: session},
                                                        'reservations': {}})
-        idle = local.plan_machine(other)
-        barrier = next(item for item in idle['actions'] if item['kind'] == 'local_barrier')
-        self.assertTrue(barrier['details']['detach_sessions'])
-        self.assertTrue(any('will be detached' in warning for warning in idle['warnings']))
-        save_private(other / 'runtime/sessions.json', {'schema': 1, 'sessions': {
-            identifier: {**session, 'writers': ['in-flight']}}, 'reservations': {}})
-        with self.assertRaisesRegex(UninstallError, 'in-flight writers'):
-            local.plan_machine(other)
-        # A writer registered after review invalidates the idle detachment.
-        with self.assertRaisesRegex(UninstallError, 'in-flight writers'):
-            local.execute(barrier, {}, lambda: None)
-        save_private(other / 'runtime/sessions.json', {'schema': 1, 'sessions': {identifier: session},
-                                                       'reservations': {}})
-        self.apply_before_purge(idle)
-        self.assertEqual(read_private(other / 'runtime/sessions.json')['sessions'], {})
-        evidence = read_private(next((other / 'runtime').glob('uninstall-sessions-*.json')))
-        self.assertEqual(evidence['sessions'][identifier]['state'], 'detached')
-        self.purge(idle)
-        self.assertFalse(other.exists())
+        for offline in (True, False):
+            with self.subTest(offline=offline), self.assertRaisesRegex(UninstallError, 'legacy writer registration'):
+                local.plan_machine(other, offline=offline)
+        self.assertEqual(read_private(other / 'runtime/sessions.json')['sessions'], {identifier: session})
 
     def test_combined_offline_export_locks_and_multiple_roots_preserve_evidence(self):
         runtime, _ = self.runtime()
@@ -267,14 +287,8 @@ class LocalUninstallTests(unittest.TestCase):
         environment = self.home / '.env'
         environment.write_text('PRIVATE=value\n')
         environment.chmod(0o600)
-        sessions = {}
-        for index, checkout in enumerate((root, second), 1):
-            identifier = f'00000000-0000-4000-8000-{index:012d}'
-            sessions[identifier] = {'root': str(checkout), 'state': 'active',
-                                    'writers': ['exact-in-flight-token'] if index == 1 else [], 'caches': []}
-            save_private(checkout / '.maven/runtime/sessions' / identifier / 'command.lock', {})
-        save_private(self.home / 'runtime/sessions.json',
-                     {'schema': 1, 'sessions': sessions, 'reservations': {}})
+        for checkout in (root, second):
+            save_private(checkout / '.maven/reconcile' / 'records.sqlite3', {'unsynced': 'retained'})
         destination = self.base / 'recovery'
         combined = local.plan_project(root, self.home, offline=True, export=destination)
         combined['actions'].extend(local.plan_project(second, self.home, offline=True,
@@ -282,8 +296,7 @@ class LocalUninstallTests(unittest.TestCase):
         combined['actions'].extend(local.plan_machine(self.home, offline=True,
             selected_homes=[self.home], export=destination)['actions'])
         first = next(item for item in combined['actions'] if item['kind'] == 'local_barrier')
-        identifier = next(iter(sessions))
-        with local._lock(root / '.maven/runtime/sessions' / identifier / 'command.lock'):
+        with local._lock(self.home / 'runtime/registry.lock'):
             with self.assertRaises(UninstallError):
                 local.execute(first, {}, lambda: None)
         self.apply_before_purge(combined)
@@ -291,11 +304,8 @@ class LocalUninstallTests(unittest.TestCase):
         self.assertFalse(environment.exists())
         self.assertFalse(sensitive.exists())
         self.assertTrue(pending.exists())
-        self.assertEqual(read_private(self.home / 'runtime/sessions.json')['sessions'], {})
-        receipts = list((self.home / 'runtime').glob('uninstall-sessions-*.json'))
-        archived = [item for path in receipts for item in read_private(path)['sessions'].values()]
-        self.assertEqual(len(archived), 2)
-        self.assertTrue(all(item['state'] == 'detached' and item['access_revoked'] for item in archived))
+        self.assertTrue((root / '.maven/reconcile/records.sqlite3').is_file())
+        self.assertTrue((second / '.maven/reconcile/records.sqlite3').is_file())
         self.assertTrue(read_private(self.home / 'runtime/uninstall.json')['whole_home'])
         sensitive_export = next(item for item in combined['actions'] if item['target'] == str(sensitive))
         with zipfile.ZipFile(sensitive_export['details']['destination']) as archive:

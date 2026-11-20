@@ -5,7 +5,6 @@ import argparse
 import json
 from pathlib import Path
 import sys
-import uuid
 
 from .client import MemoryClient, MemoryClientError, read_json, selected_session
 from .environment import DEFAULT_ENV, load_environment, memory_config, migration_config
@@ -15,18 +14,6 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument('--env', type=Path, default=DEFAULT_ENV)
     command.add_argument('--format', choices=('json', 'agent'), default='json')
     actions = command.add_subparsers(dest='action', required=True)
-    starter = actions.add_parser('starter', help='Prepare generic new-owner authority offline; never submit or activate')
-    starters = starter.add_subparsers(dest='starter_action', required=True)
-    starter_prepare = starters.add_parser('prepare')
-    starter_prepare.add_argument('--output', type=Path, required=True)
-    starter_prepare.add_argument('--source-origin', required=True)
-    starter_prepare.add_argument('--source-excerpt', required=True)
-    starter_approval = starters.add_parser('approval')
-    starter_approval.add_argument('--draft', type=Path, required=True)
-    starter_approval.add_argument('--challenge', type=Path, required=True)
-    starter_approval.add_argument('--output', type=Path, required=True)
-    starter_approval.add_argument('--approval-origin', required=True)
-    starter_approval.add_argument('--approval-excerpt', required=True)
     build = actions.add_parser('build', help='Generate a deployable template and review manifest offline; never deploy')
     build.add_argument('--output', type=Path, required=True)
     build.add_argument('--notification-email', required=True)
@@ -37,10 +24,6 @@ def parser() -> argparse.ArgumentParser:
     build.add_argument('--instance-id')
     build.add_argument('--recovery-epoch')
     build.add_argument('--availability-zones', nargs=2, metavar=('AZ_A', 'AZ_B'))
-    validate = actions.add_parser('validate', help='Validate a fact change without login or network access')
-    validate.add_argument('input', type=Path)
-    change = actions.add_parser('change', help='Submit an explicitly authorized synthetic fact change')
-    change.add_argument('input', type=Path)
     query = actions.add_parser('query', help='Read one exact fact or historical revision')
     query.add_argument('--record-id', required=True)
     query.add_argument('--revision', type=int)
@@ -85,37 +68,7 @@ def parser() -> argparse.ArgumentParser:
     register_skill = skills.add_parser('register', help='Upload an exact bundle and submit the complete existing draft; never approve')
     register_skill.add_argument('input', type=Path)
     register_skill.add_argument('--bundle', type=Path, required=True)
-    list_skills = skills.add_parser('list', help='List the approved skill catalog')
-    list_skills.add_argument('--refresh', action='store_true', help='Explicitly refresh cached catalog metadata')
-    fetch_skill = skills.add_parser('fetch', help='Retrieve a verified resource ZIP without installing or executing it')
-    fetch_skill.add_argument('--slug', required=True)
-    fetch_skill.add_argument('--refresh', action='store_true', help='Explicitly refresh catalog metadata and re-download')
-    list_skills.add_argument('--root', type=Path)
-    list_skills.add_argument('--session')
-    fetch_skill.add_argument('--root', type=Path, required=True)
-    fetch_skill.add_argument('--session', required=True)
-    context = actions.add_parser('context', help='Load complete applicable cloud authority and exact dependencies')
-    for key in ('project-id', 'workflow', 'operation'):
-        context.add_argument('--' + key)
-    record = actions.add_parser('record', help='Sourced versioned owner memory; notes are never instructions')
-    records = record.add_subparsers(dest='record_action', required=True)
-    put = records.add_parser('put')
-    put.add_argument('input', type=Path)
-    put.add_argument('--root', type=Path, required=True)
-    put.add_argument('--session', required=True)
-    get = records.add_parser('get')
-    get.add_argument('--record-id', required=True)
-    get.add_argument('--revision', type=int)
-    listing = records.add_parser('list')
-    for key in ('kind', 'project-id', 'query', 'tag', 'subject-id', 'state', 'after-id'):
-        listing.add_argument('--' + key)
-    listing.add_argument('--limit', type=int)
-    listing.add_argument('--offset', type=int)
-    listing.add_argument('--scope', choices=('context', 'project', 'universal', 'all'), default='context')
-    claim = actions.add_parser('claim', help='Claim/release/complete a task using an explicit fenced request')
-    claim.add_argument('input', type=Path)
-    claim.add_argument('--root', type=Path, required=True)
-    claim.add_argument('--session', required=True)
+    skills.add_parser('list', help='List reviewed cloud authority bundles, not project memory skills')
     install = actions.add_parser('install', help='Explicit owner-selected build, review, exact deployment and initialization')
     steps = install.add_subparsers(dest='install_action', required=True)
     prepare = steps.add_parser('prepare', help='Build private review artifacts offline')
@@ -147,64 +100,6 @@ def _scope(args):
     return body
 
 
-def _memory_action(args):
-    values, config = _connection(args)
-    client = MemoryClient(config, selected_session(config, environment=values))
-    try:
-        if args.action == 'context':
-            return client.load_context(_scope(args))
-        if args.action == 'record':
-            if args.record_action == 'put':
-                body = read_json(args.input, maximum=196608)
-                route = '/v1/memory/write'
-            elif args.record_action == 'get':
-                body = {'record_id': args.record_id}
-                if args.revision is not None:
-                    body['revision'] = args.revision
-                route = '/v1/memory/read'
-            else:
-                body = {key: getattr(args, key) for key in
-                        ('kind', 'project_id', 'scope', 'query', 'tag', 'subject_id', 'state', 'after_id', 'limit', 'offset')
-                        if getattr(args, key) is not None}
-                route = '/v1/memory/search'
-        elif args.action == 'claim':
-            body = read_json(args.input, maximum=16384)
-            route = '/v1/memory/claim'
-        if route in ('/v1/memory/write', '/v1/memory/claim'):
-            from .validation import validate
-            validate(route, body)
-            root = getattr(args, 'root', None)
-            session_id = getattr(args, 'session', None)
-            if body.get('kind') in ('session', 'checkpoint'):
-                raise MemoryClientError('lifecycle_command_required')
-            if root is None or session_id is None:
-                raise MemoryClientError('explicit_project_and_session_required')
-            from .lifecycle import SessionService
-            from .maintenance import Maintenance
-            service = SessionService(root, session_id, env=args.env, client=client)
-            maintenance = Maintenance(service)
-            project_id = service.project_id
-            if route == '/v1/memory/write' and body.get('project_id') not in (None, project_id):
-                raise MemoryClientError('project_scope_mismatch')
-            if route == '/v1/memory/claim' and body['session_id'] != session_id:
-                raise MemoryClientError('session_scope_mismatch')
-            if body.get('kind') == 'operation' and body['data']['session_id'] != session_id:
-                raise MemoryClientError('session_scope_mismatch')
-            if route == '/v1/memory/claim':
-                fields = {key: body[key] for key in ('record_id', 'action', 'expected_revision', 'source',
-                                                    'request_key', 'lease_seconds', 'fence') if key in body}
-                fields['operation_id'] = str(uuid.uuid5(uuid.UUID(session_id), 'raw-claim:' + body['request_key']))
-                fields['reason'] = body['change_reason']
-                return maintenance.claim_task(**fields)
-            return maintenance.save(
-                body['kind'], body['data'], source=body['source'],
-                record_id=body['record_id'], expected_revision=body['expected_revision'],
-                scope='universal' if body.get('project_id') is None else 'project',
-                tags=body.get('tags', []), reason=body['change_reason'], request_key=body['request_key'],
-                operation_id=str(uuid.uuid5(uuid.UUID(session_id), 'raw-write:' + body['request_key'])))
-        return client.invoke(route, body)
-    finally:
-        client.close()
 
 
 def _install(args):
@@ -257,7 +152,7 @@ def _skill_catalog(client):
 
 
 def _skill_action(args):
-    from .skills import SessionSkills, prepare_bundle, register_bundle
+    from .skills import prepare_bundle, register_bundle
     if args.skill_action == 'prepare':
         return prepare_bundle(args.source, read_json(args.manifest, maximum=1024 * 1024), args.output)
     # Keep the complete original draft; registration owns validation and never
@@ -268,23 +163,7 @@ def _skill_action(args):
     try:
         if args.skill_action == 'register':
             return register_bundle(client, request, args.bundle)
-        from .boundary import BoundaryError, MemoryBoundary
-        from tools.project import load_project
-        if args.skill_action == 'list' and args.root is None and args.session is None:
-            return _skill_catalog(client)
-        if args.root is None or args.session is None:
-            raise MemoryClientError('explicit_project_and_session_required')
-        project = load_project(args.root)
-        root, project_id = Path(project['root']), project['project_id']
-        try:
-            boundary = MemoryBoundary(client, root, project_id, args.session)
-            session = boundary.session()
-        except BoundaryError:
-            raise MemoryClientError('active_session_required') from None
-        skills = SessionSkills(client, root, project_id, session['record_id'])
-        if args.skill_action == 'list':
-            return skills.discover(refresh=args.refresh)
-        return skills.fetch(args.slug, refresh=args.refresh)
+        return _skill_catalog(client)
     finally:
         client.close()
 
@@ -292,16 +171,7 @@ def _skill_action(args):
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     try:
-        if args.action == 'starter':
-            from .onboarding import prepare, approval
-            if args.starter_action == 'prepare':
-                result = prepare(args.output, source_origin=args.source_origin,
-                                 source_excerpt=args.source_excerpt)
-            else:
-                result = approval(args.draft, args.challenge, args.output,
-                                  approval_origin=args.approval_origin,
-                                  approval_excerpt=args.approval_excerpt)
-        elif args.action == 'build':
+        if args.action == 'build':
             from .deployment import build
             result = build(args.output, notification_email=args.notification_email, engine_version=args.engine_version,
                            instance_name=args.instance_name, account_id=args.account_id,
@@ -311,8 +181,6 @@ def main(argv: list[str] | None = None) -> int:
             result = _install(args)
         elif args.action == 'skill':
             result = _skill_action(args)
-        elif args.action in ('record', 'context', 'claim'):
-            result = _memory_action(args)
         elif args.action in ('bootstrap', 'migrate'):
             from .admin import bootstrap, migrate
             values, config = _connection(args, upgrade=args.action == 'migrate')
@@ -321,11 +189,11 @@ def main(argv: list[str] | None = None) -> int:
             operation = bootstrap if args.action == 'bootstrap' else migrate
             result = operation(config, selected_session(config, admin=True, environment=values))
         else:
-            from .validation import (validate_change, validate_query, validate_lookup,
+            from .validation import (validate_query, validate_lookup,
                                      validate_create, validate_challenge, validate_resolve,
                                      validate_index, validate_read)
             approval = args.action == 'lookup' and args.approval
-            offline = args.action == 'validate'
+            offline = False
             full_read = False
             load_instruction = False
             if args.action == 'instruction':
@@ -356,9 +224,6 @@ def main(argv: list[str] | None = None) -> int:
                                           if getattr(args, key) is not None})
                     route = '/v1/pages/read'
                     full_read = True
-            elif args.action in ('validate', 'change'):
-                body = validate_change(read_json(args.input, maximum=65536))
-                route = '/v1/records/change'
             elif args.action == 'query':
                 body = {'record_id': args.record_id}
                 if args.revision is not None:
@@ -370,11 +235,8 @@ def main(argv: list[str] | None = None) -> int:
                 route = '/v1/operations/lookup'
             if offline:
                 result = {'status': 'valid', 'request_key': body['request_key']}
-                if args.action == 'instruction':
-                    from .validation import digest
-                    result.update(proposal_id=body['proposal_id'], candidate_hash=digest(body['candidate']))
-                else:
-                    result['action'] = body['action']
+                from .validation import digest
+                result.update(proposal_id=body['proposal_id'], candidate_hash=digest(body['candidate']))
             else:
                 values, config = _connection(args)
                 client = MemoryClient(config, selected_session(config, approval=approval, environment=values))

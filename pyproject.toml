@@ -22,27 +22,26 @@ mcp = ["mcp>=2.3,<3"]
 
 [project.scripts]
 maven-setup = "tools.setup:main"
-maven-memory = "tools.memory.cli:main"
-maven-workspace = "tools.workspace:main"
 maven-secrets = "tools.aws.secrets:main"
 maven-secret-catalog = "tools.secret_catalog:main"
 maven-project = "tools.project:main"
-maven-start-work = "tools.workflow:start_main"
-maven-checkpoint = "tools.workflow:checkpoint_main"
-maven-stop-work = "tools.workflow:stop_main"
-maven-workflow = "tools.workflow:main"
 maven-uninstall = "tools.uninstall.cli:main"
 maven-mcp = "tools.mcp.server:main"
 maven-git = "tools.git_workflow:main"
 maven-statusline = "tools.statusline:main"
 
 [tool.setuptools]
-script-files = ["maven_resources/maven-session-hook"]
+include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["tools", "tools.*", "maven_resources"]
 
 [tool.setuptools.package-data]
-maven_resources = ["maven-session-hook", "config/*.json", "templates/*.example", "templates/skills/*/SKILL.md", "templates/harness/*.md", "templates/harness/*.js", "templates/authority/*.md", "templates/authority/*.json", "infra/memory/*.json"]
+maven_resources = [
+  "config/*.json", "templates/*.example", "templates/harness/*.md", "infra/memory/*.json",
+  "templates/skills/maven/SKILL.md",
+  "templates/skills/maven/references/project.md", "templates/skills/maven/references/reconcile.md",
+  "templates/skills/maven/references/secrets.md", "templates/skills/maven/references/update.md",
+]
 "tools.memory" = ["migrations/*.sql"]

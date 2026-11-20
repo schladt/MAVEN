@@ -176,7 +176,7 @@ def build_plan(args):
         raise UninstallError('--adopt-legacy requires --machine and review of its exact runtime inventory')
     if reactivate and (args.cloud or args.machine):
         raise UninstallError('reactivation cannot be combined with removal of its runtime or cloud')
-    if (args.optional_resource or args.retained_resource or args.abandon_sessions
+    if (args.optional_resource or args.retained_resource
             or args.cloud_home or args.cloud_mode != 'retire') and not args.cloud:
         raise UninstallError('cloud options require --cloud')
     if args.export and not (project_roots or args.machine):
@@ -217,7 +217,7 @@ def build_plan(args):
         _merge(plan, lifecycle.plan_project(root, project_home, reactivate=True))
     if args.cloud:
         from . import cloud
-        fragment = cloud.plan_cloud(cloud_home, mode=args.cloud_mode, abandon=args.abandon_sessions,
+        fragment = cloud.plan_cloud(cloud_home, mode=args.cloud_mode,
                                     optional=tuple(args.optional_resource),
                                     retained_resources=tuple(args.retained_resource))
         _merge(plan, fragment)
@@ -228,8 +228,6 @@ def build_plan(args):
         instance = next(iter(instances))
         if args.cloud_mode == 'purge':
             plan['confirmations']['purge'] = instance
-        if args.abandon_sessions:
-            plan['confirmations']['abandon'] = instance
     if args.machine:
         for home in homes:
             export_target = str(Path(args.export).expanduser().absolute() / ('machine-' + digest(home)[:16])) if args.export else None
@@ -574,7 +572,6 @@ def _plan_arguments(parser):
     parser.add_argument('--optional-resource', action='append', default=[], metavar='SELECTOR',
                         help='Explicit dedicated s3:BUCKET, ssm:/prefix/, or secret:ARN')
     parser.add_argument('--retained-resource', action='append', default=[], metavar='ARN')
-    parser.add_argument('--abandon-sessions', action='store_true')
     parser.add_argument('--output', metavar='PRIVATE_DIRECTORY')
     parser.add_argument('--adopt-legacy', action='store_true',
                         help='Explicitly inventory a recognized legacy MAVEN runtime without installer ownership receipts')

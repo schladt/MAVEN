@@ -40,7 +40,7 @@ class RemovalRecoveryTests(unittest.TestCase):
         return cli.parser().parse_args(['resume', '--plan', str(planned['plan_path']),
             '--confirm', planned['plan']['plan_digest'], '--writers-quiescent', '--harness-config-risk'])
 
-    def test_detach_failure_preserves_external_evidence_after_home_purge(self):
+    def test_legacy_writer_evidence_blocks_even_offline_machine_purge(self):
         root = self.base / 'project'
         root.mkdir()
         identifier = str(UUID(int=1))
@@ -50,32 +50,10 @@ class RemovalRecoveryTests(unittest.TestCase):
             'schema': 1, 'sessions': {identifier: original}, 'reservations': {}})
         cache = self.home / 'login-cache'
         cache.write_text('DO-NOT-ARCHIVE-LOGIN-BYTES')
-        planned = self.plan('--offline')
-        write = local.save_private
-        failed = False
-
-        def lose_response(path, value):
-            nonlocal failed
-            write(path, value)
-            if Path(path) == self.home / 'runtime/sessions.json' and not failed:
-                failed = True
-                raise OSError('injected interruption after durable registry detach')
-
-        with patch.object(local, 'save_private', side_effect=lose_response):
-            first = cli.apply(self.approval(planned), reexec=False)
-        self.assertEqual(first['status'], 'blocked')
-        second = cli.apply(self.approval(planned), reexec=False)
-        self.assertEqual(second['status'], 'completed')
-        self.assertEqual(second['home_retention'][str(self.home)], 'removed')
-        self.assertFalse(self.home.exists())
-        evidence = list((self.base / 'operation/evidence').glob('uninstall-sessions-*.json'))
-        self.assertEqual(len(evidence), 1)
-        self.assertEqual(read_private(evidence[0])['original_registry']['sessions'][identifier], original)
-        self.assertEqual(evidence[0].stat().st_mode & 0o777, 0o600)
-        self.assertTrue(list((self.base / 'operation/evidence').glob('machine-*.json')))
-        for path in (self.base / 'operation/evidence').iterdir():
-            self.assertNotIn(b'DO-NOT-ARCHIVE-LOGIN-BYTES', path.read_bytes())
-        self.assertEqual(cli.apply(self.approval(planned), reexec=False)['status'], 'completed')
+        with self.assertRaisesRegex(UninstallError, 'legacy writer registration'):
+            self.plan('--offline')
+        self.assertEqual(read_private(self.home / 'runtime/sessions.json')['sessions'][identifier], original)
+        self.assertEqual(cache.read_text(), 'DO-NOT-ARCHIVE-LOGIN-BYTES')
 
     def test_actual_cli_stdlib_only_apply_and_resume_after_runtime_deletion(self):
         planned = self.plan('--offline')
@@ -222,25 +200,16 @@ class RemovalRecoveryTests(unittest.TestCase):
         self.assertTrue(legacy.exists())
 
 
-    def test_failed_external_write_does_not_invalidate_registration(self):
+    def test_writer_registration_appearing_after_review_prevents_purge(self):
         root = self.base / 'project'
         root.mkdir()
         original = {'schema': 1, 'sessions': {str(UUID(int=9)): {
             'root': str(root), 'writers': ['stopped-writer'], 'state': 'active', 'caches': []}},
             'reservations': {}}
-        save_private(self.home / 'runtime/sessions.json', original)
         planned = self.plan('--offline')
-        write = local.save_private
-
-        def fail_evidence(path, value):
-            if 'evidence' in Path(path).parts:
-                raise OSError('injected evidence write failure')
-            write(path, value)
-
-        with patch.object(local, 'save_private', side_effect=fail_evidence):
-            self.assertEqual(cli.apply(self.approval(planned), reexec=False)['status'], 'blocked')
+        save_private(self.home / 'runtime/sessions.json', original)
+        self.assertEqual(cli.apply(self.approval(planned), reexec=False)['status'], 'blocked')
         self.assertEqual(read_private(self.home / 'runtime/sessions.json'), original)
-        self.assertEqual(cli.apply(self.approval(planned), reexec=False)['status'], 'completed')
 
 
     def test_unfinished_installation_intent_survives_purge_without_adoption(self):

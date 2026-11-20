@@ -87,9 +87,13 @@ def validate_accepted_url(value: str) -> str:
 
 
 def _validate(project: dict, root: Path) -> dict:
-    if not isinstance(project, dict) or type(project.get('schema')) is not int or project['schema'] != 1:
+    if not isinstance(project, dict) or type(project.get('schema')) is not int or project['schema'] not in (1, 2):
         raise ProjectError('unsupported project schema')
     allowed = {'schema', 'project_id', 'root', 'remote', 'accepted_url', 'branch', 'checks', 'git_enabled'}
+    if project['schema'] == 2:
+        allowed |= {'instance_id', 'recovery_epoch'}
+        for key in ('instance_id', 'recovery_epoch'):
+            _uuid(project.get(key))
     if set(project) - allowed:
         raise ProjectError('unknown project setting')
     _uuid(project.get('project_id'))
@@ -115,6 +119,12 @@ def _validate(project: dict, root: Path) -> dict:
         raise ProjectError('checks must be a list of nonempty command argument lists')
     return {**project, 'git_enabled': enabled, 'checks': checks,
             **dict(zip(('remote', 'accepted_url', 'branch'), destinations))}
+
+
+def require_binding(project, config):
+    """A project UUID alone is not a selection of an instance or recovery epoch."""
+    if project.get('schema') != 2 or any(project[key] != config.get(key) for key in ('instance_id', 'recovery_epoch')):
+        raise ProjectError('Review a folder switch to bind this project to the selected instance and recovery epoch.')
 
 
 def load_project(root: Path) -> dict:
@@ -147,7 +157,7 @@ def project_values(values: dict, project: dict) -> dict:
 
 
 def _git(root: Path, *args: str) -> str:
-    result = subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True)
+    result = subprocess.run(['git', '-C', str(root), *args], capture_output=True, text=True, stdin=subprocess.DEVNULL)
     if result.returncode:
         raise ProjectError('Git destination validation failed: ' + ' '.join(args))
     return result.stdout.strip()
@@ -198,46 +208,50 @@ def validate_git(root: Path, project: dict) -> None:
         raise ProjectError('--branch must select the current branch')
 
 
-def configure_git(root, *, remote, accepted_url, branch, env=None) -> dict:
+def configure_git(root, *, remote, accepted_url, branch, env=None, expected_project=None) -> dict:
     """Opt into exact Git publication separately from memory project enablement."""
-    from tools.coordination import SessionRegistry
-    from tools.memory.boundary import private_path, read_private, save_private
+    from tools.coordination import project_binding_lock, ensure_available
+    from tools.git_workflow import publication_lock
     root = Path(root).expanduser().resolve(strict=True)
-    registry = SessionRegistry(Path(env if env is not None else default_environment()).expanduser().resolve().parent)
-    with registry.transaction() as state:
-        registry._allow_work(root)
-        if str(root) in state['reservations']:
-            raise ProjectError('resolve the active Git reservation before changing its destination')
-        sessions = private_path(root, '.maven/runtime/sessions')
-        if sessions.exists():
-            for session in sessions.iterdir():
-                approval = private_path(root, str(session.relative_to(root) / 'approval.json'))
-                if approval.exists() and read_private(root, str(approval.relative_to(root))).get('status') not in (
-                        'closed', 'checkpointed', 'cancelled', 'approval_cancelled'):
-                    raise ProjectError('recover or cancel pending Git publication before changing its destination')
-        existing = load_project(root)
-        project = _validate(dict(existing, git_enabled=True, remote=remote,
-                                 accepted_url=accepted_url, branch=branch), root)
-        validate_git(root, project)
-        if project == existing:
-            return {'status': 'unchanged', 'project': project}
-        payload = (json.dumps(project, sort_keys=True, indent=2) + '\n').encode()
-        _record_integration(root, payload, _ensure_ignore(root))
-        save_private(root, '.maven/project.json', project)
-        return {'status': 'configured', 'project': project,
-                'next': 'Use maven-git explicitly for reviewed Git publication; memory remains independent.'}
+    home = Path(env if env is not None else default_environment()).expanduser().resolve().parent
+    with project_binding_lock(home, root):
+        ensure_available(home, root)
+        with publication_lock(root):
+            return configure_git_locked(root, remote=remote, accepted_url=accepted_url, branch=branch,
+                                        expected_project=expected_project)
+
+
+def configure_git_locked(root, *, remote, accepted_url, branch, expected_project=None) -> dict:
+    """Caller holds the binding gate and Git publication lock through verification."""
+    from tools.git_workflow import require_no_pending
+    from tools.memory.boundary import save_private
+    existing = load_project(root)
+    if existing['schema'] != 2:
+        raise ProjectError('Review the project binding before configuring Git publication.')
+    if expected_project is not None and existing != expected_project:
+        raise ProjectError('Project selection changed after Git destination review.')
+    require_no_pending(root)
+    project = _validate(dict(existing, git_enabled=True, remote=remote,
+                             accepted_url=accepted_url, branch=branch), root)
+    validate_git(root, project)
+    if project == existing:
+        return {'status': 'unchanged', 'project': project}
+    payload = (json.dumps(project, sort_keys=True, indent=2) + '\n').encode()
+    _record_integration(root, payload, _ensure_ignore(root))
+    save_private(root, '.maven/project.json', project)
+    return {'status': 'configured', 'project': project}
 
 
 def _initialize(args) -> dict:
     # Serialize binding with uninstall's persistent local removal marker.
-    from tools.coordination import SessionRegistry, private_lock
+    from tools.coordination import ensure_available, project_binding_lock
     home = Path(args.env).expanduser().absolute().parent
-    with private_lock(home, 'runtime/registry.lock', blocking=False):
-        SessionRegistry(home)._allow_work(args.root)
+    with project_binding_lock(home, args.root, shared=False):
+        ensure_available(home, args.root)
         return _initialize_bound(args)
 
 
-def _initialize_bound(args) -> dict:
+def _initialize_bound(args, *, capability_verified=False) -> dict:
     root = args.root.expanduser().resolve(strict=True)
     if not root.is_dir() or root == Path(root.anchor):
         raise ProjectError('project root must be an existing directory, never filesystem /')
@@ -247,8 +261,14 @@ def _initialize_bound(args) -> dict:
             checks.append(json.loads(command))
         except json.JSONDecodeError:
             raise ProjectError('--check requires a JSON argument list') from None
+    from tools.memory.environment import load_environment, memory_config
+    values = getattr(args, 'values', None)
+    if values is None:
+        values = load_environment(args.env)
+    config = memory_config(values)
     project = _validate({
-        'schema': 1, 'project_id': args.project_id, 'root': str(root),
+        'schema': 2, 'instance_id': config['instance_id'], 'recovery_epoch': config['recovery_epoch'],
+        'project_id': args.project_id, 'root': str(root),
         'remote': args.remote, 'accepted_url': args.accepted_url, 'branch': args.branch,
         'git_enabled': any((args.remote, args.accepted_url, args.branch)), 'checks': checks,
     }, root)
@@ -263,6 +283,8 @@ def _initialize_bound(args) -> dict:
             raise ProjectError('project already initialized; existing configuration was preserved')
         _ensure_ignore(root)
         return {'status': 'unchanged', 'project': existing}
+    if (directory / 'reconcile').exists() or (directory / 'reconcile').is_symlink():
+        raise ProjectError('Unbound local records are already present. Preserve them; select a clean folder instead of reusing an unidentified store.')
     if args.create:
         if not all((args.name, args.source_origin, args.source_excerpt, args.request_key)):
             raise ProjectError('--create requires --name, --source-origin, --source-excerpt and --request-key')
@@ -270,8 +292,11 @@ def _initialize_bound(args) -> dict:
     elif any((args.name, args.source_origin, args.source_excerpt, args.request_key)):
         raise ProjectError('project creation arguments require --create')
     from tools.memory.environment import configured_client
-    client = configured_client(args.env, values=getattr(args, 'values', None))
+    client = configured_client(args.env, values=values)
     try:
+        if not capability_verified:
+            from tools.memory.reconcile_cloud import status
+            status(client)
         if args.create:
             client.invoke('/v1/memory/write', {
                 'request_key': args.request_key, 'record_id': project['project_id'],

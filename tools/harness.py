@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import contextmanager
+import errno
 import hashlib
 import json
 import os
@@ -25,7 +26,13 @@ HARNESS_PATHS = {
     'copilot': ('.copilot/mcp-config.json', '.copilot/copilot-instructions.md', '.copilot/skills'),
     'gemini': ('.gemini/settings.json', '.gemini/GEMINI.md', '.gemini/skills'),
 }
-SKILLS = ('maven', 'maven-maintenance', 'maven-update')
+SKILL_FILES = ('maven/SKILL.md', 'maven/references/project.md', 'maven/references/reconcile.md',
+               'maven/references/secrets.md', 'maven/references/update.md')
+RETIRED_SKILLS = ('maven-setup', 'maven-connect', 'maven-skill-use', 'maven-start-work',
+                  'maven-checkpoint', 'maven-stop-work', 'maven-maintenance',
+                  'maven-reconcile', 'maven-secrets', 'maven-update')
+_SKILL_SUFFIXES = tuple(Path(name) for name in SKILL_FILES) + tuple(
+    Path(name, 'SKILL.md') for name in RETIRED_SKILLS)
 CLAUDE_SETTINGS = '.claude/settings.json'
 LIFECYCLE_PATHS = {
     'omp': '.omp/agent/extensions/maven-lifecycle.js',
@@ -40,7 +47,7 @@ LIFECYCLE_PATHS = {
 class Change:
     path: Path
     before: bytes | None
-    after: bytes
+    after: bytes | None
     receipt: dict | None
 
 
@@ -60,80 +67,128 @@ def validate_default_profiles(harnesses) -> None:
                              '--harness-config, --harness-context and --skill-dir, or stage first.')
 
 
-def skill_plan(roots: list[Path], home: Path | None = None, *,
-               conflicts: list[dict] | None = None) -> list[tuple[Path, bytes, dict | None]]:
-    """Plan absent shipped skills, plus upgrades of unmodified installer-owned skills of ``home``.
+def skill_root(target: Path) -> Path | None:
+    """Recognize only shipped bundle leaves and explicit historical entry points."""
+    if target.is_absolute() and '..' not in target.parts:
+        for suffix in _SKILL_SUFFIXES:
+            if target.parts[-len(suffix.parts):] == suffix.parts:
+                return target.parents[len(suffix.parts) - 1]
+    return None
 
-    Each entry is (target, body, expected): expected is None for a new file, otherwise the exact
-    receipt inventory the existing file must still match when it is replaced. User-modified,
-    shared or unowned files are never replaced.
-    """
-    bodies = {name: resource_path(f'templates/skills/{name}/SKILL.md').read_bytes()
-              for name in SKILLS}
-    owned, shared, unknown = {}, set(), False
-    if home is not None:
-        from tools.uninstall.common import read_private
-        from tools.uninstall.local import MANIFEST, _shared_skills
-        receipt = home / MANIFEST
-        prior = read_private(receipt) if receipt.exists() else {}
-        if prior and (prior.get('schema') != 1 or prior.get('home') != str(home)):
-            raise ValueError('Installer ownership receipt does not match this home.')
-        references = set(prior.get('skill_references', []))
-        owned = {path: inventory for path, inventory in prior.get('owned', {}).items() if path in references}
-        if owned:
-            shared, unknown = _shared_skills(home, [])
+
+def skill_bodies(directory: Path | None = None) -> dict[str, bytes]:
+    directory = directory or resource_path('templates/skills')
+    return {name: (directory / name).read_bytes() for name in SKILL_FILES}
+
+
+def _skill_manifest(home):
+    from tools.uninstall.common import read_private
+    from tools.uninstall.local import MANIFEST
+    receipt = home / MANIFEST
+    prior = read_private(receipt) if receipt.exists() else {}
+    if prior and (prior.get('schema') != 1 or prior.get('home') != str(home)):
+        raise ValueError('Installer ownership receipt does not match this home.')
+    return prior if prior.get('active', True) else {}
+
+
+def skill_plan(roots: list[Path], home: Path | None = None, *,
+               conflicts: list[dict] | None = None, bodies: dict[str, bytes] | None = None) -> list[tuple[Path, bytes, dict | None]]:
+    """Plan the complete bundle or leave that root alone, including identical unowned files."""
+    from tools.uninstall.local import _shared_skills, inventory
+    from tools.update import pending_owned_skills
+    bodies = skill_bodies() if bodies is None else bodies
+    prior = _skill_manifest(home) if home is not None else {}
+    references = set(prior.get('skill_references', ()))
+    owned = prior.get('owned', {})
+    pending = {}
+    targets = {str(root / name) for root in roots for name in SKILL_FILES}
+    if home is not None and targets:
+        for saved in pending_owned_skills(home, targets):
+            if not saved.get('disposition'):
+                intent = saved['intent']
+                pending.setdefault(intent['target'], []).append(intent)
+    shared, unknown = _shared_skills(home, []) if home is not None and targets else (set(), False)
     plan = []
     for root in dict.fromkeys(roots):
-        for name, body in bodies.items():
-            target = root / name / 'SKILL.md'
+        candidates, blocked = [], False
+        for name in SKILL_FILES:
+            target, body = root / name, bodies[name]
             try:
+                if skill_root(target) != root or any(p.exists() and not p.is_dir() for p in target.parents):
+                    raise ValueError(f'Invalid skill destination; preserved: {target}')
+                key = str(target)
                 before = _read(target)
+                actual = inventory(target) if before is not None else None
+                expected = owned.get(key)
+                if expected is not None and key not in references:
+                    raise ValueError(f'Ambiguous installer ownership; preserved: {target}')
+                if key in pending:
+                    intents = pending[key]
+                    if len(intents) != 1:
+                        raise ValueError(f'Ambiguous unfinished skill intents; preserved: {target}')
+                    intent = intents[0]
+                    if (actual is not None and actual == intent.get('published')
+                            and expected in (actual, intent['expected'])):
+                        expected = actual
+                    elif actual != expected or (expected != intent['expected'] and before != body):
+                        raise ValueError(f'Interrupted skill or ownership changed; preserved: {target}')
+                if key in shared or unknown:
+                    raise ValueError(f'Shared or uncertain skill ownership; preserved: {target}')
                 if before is not None:
+                    if expected is None or actual != expected:
+                        raise ValueError(f'Existing skill differs from installer ownership; preserved: {target}')
                     if before != body:
-                        expected = owned.get(str(target))
-                        if expected is not None and str(target) not in shared and not unknown:
-                            from tools.uninstall.local import inventory
-                            if inventory(target) == expected:
-                                plan.append((target, body, expected))
-                                continue
-                        raise ValueError(f'Existing skill differs; preserved without changes: {target}. '
-                                         'It was modified after installation, is shared with another installation, '
-                                         'or was not installed by MAVEN. Use --skill-dir with a separate staging '
-                                         'directory for manual review.')
+                        candidates.append((target, body, expected))
+                elif expected is not None:
+                    raise ValueError(f'Previously owned skill is missing; preserved: {target}')
                 else:
-                    if target.parent.exists() and any(target.parent.iterdir()):
-                        raise ValueError(f'Existing nonempty skill directory preserved: {target.parent}')
-                    plan.append((target, body, None))
+                    if name == SKILL_FILES[0] and target.parent.exists() and any(target.parent.iterdir()):
+                        raise ValueError(f'Existing nonempty skill directory; not creating {target}')
+                    candidates.append((target, body, None))
             except (OSError, ValueError) as error:
                 if conflicts is None:
                     raise
+                blocked = True
                 conflicts.append({'target': str(target), 'status': 'conflict', 'reason': str(error)})
+        if not blocked:
+            plan.extend(candidates)
     return plan
 
 
-def write_skill(target: Path, body: bytes, expected: dict | None) -> None:
-    """Create a planned skill, or replace an owned one only while it still matches its receipt."""
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if expected is None:
-        if _read(target) is not None:
-            raise ValueError(f'Skill appeared since review; preserved: {target}')
-        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+def write_skill(target: Path, body: bytes, expected: dict | None, *, publishing=None) -> None:
+    """Publish reviewed bytes, pinning the file identity before replacing an old version."""
+    from tools.uninstall.local import inventory
+
+    def publish(descriptor, path):
         with os.fdopen(descriptor, 'wb') as stream:
+            os.fchmod(descriptor, 0o600)
+            if publishing:
+                # Pin the exclusively created inode, not a later lookalike at this pathname.
+                info = os.fstat(descriptor)
+                pin = inventory(path)
+                if (info.st_dev, info.st_ino) != (pin['']['dev'], pin['']['ino']):
+                    raise ValueError(f'Skill changed during publication; preserved: {path}')
+                pin[''].update(size=len(body), sha256=hashlib.sha256(body).hexdigest())
+                publishing(pin)
             stream.write(body)
             stream.flush()
-            os.fsync(stream.fileno())
+            os.fsync(descriptor)
+
+    before = _read(target)
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if expected is None:
+        if before is not None:
+            raise ValueError(f'Skill appeared since review; preserved: {target}')
+        descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        publish(descriptor, target)
         return
-    from tools.uninstall.local import inventory
-    _read(target)
     if inventory(target) != expected:
         raise ValueError(f'Skill changed since review; preserved: {target}')
     descriptor, temporary = tempfile.mkstemp(prefix='.maven-skill-', dir=target.parent)
     try:
-        with os.fdopen(descriptor, 'wb') as stream:
-            stream.write(body)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.chmod(temporary, 0o600)
+        publish(descriptor, Path(temporary))
+        if _read(target) is None or inventory(target) != expected:
+            raise ValueError(f'Skill changed since review; preserved: {target}')
         os.replace(temporary, target)
     finally:
         if os.path.exists(temporary):
@@ -142,29 +197,24 @@ def write_skill(target: Path, body: bytes, expected: dict | None) -> None:
 
 def retired_skill_plan(home: Path, roots: list[Path], *, conflicts: list[dict] | None = None):
     """Retire only exact installer-owned CLI-ritual skills during cutover."""
-    from tools.uninstall.common import read_private
-    from tools.uninstall.local import MANIFEST, _shared_skills, inventory
-    receipt = home / MANIFEST
-    prior = read_private(receipt) if receipt.exists() else {}
-    if prior and (prior.get('schema') != 1 or prior.get('home') != str(home)):
-        raise ValueError('Installer ownership receipt does not match this home.')
-    retired = ('maven-setup', 'maven-connect', 'maven-skill-use',
-               'maven-start-work', 'maven-checkpoint', 'maven-stop-work')
-    candidates = [root / name / 'SKILL.md' for root in dict.fromkeys(roots) for name in retired]
-    existing = [path for path in candidates if path.exists() or path.is_symlink()]
+    from tools.uninstall.local import _shared_skills, inventory
+    prior = _skill_manifest(home)
+    candidates = [root / name / 'SKILL.md' for root in dict.fromkeys(roots) for name in RETIRED_SKILLS]
+    existing = [path for path in candidates if path.exists() or path.is_symlink()
+                or str(path) in prior.get('owned', {})]
     if not existing:
         return []
     shared, unknown = _shared_skills(home, [])
     result = []
     for path in existing:
         try:
-            _read(path)
+            before = _read(path)
             expected = prior.get('owned', {}).get(str(path))
             if (not expected or str(path) not in prior.get('skill_references', [])
-                    or str(path) in shared or unknown or inventory(path) != expected):
+                    or str(path) in shared or unknown or (before is not None and inventory(path) != expected)):
                 raise ValueError(f'Legacy skill is modified, shared or unowned; preserved: {path}. '
                                  'Review its removal separately or use an inactive staging home.')
-            result.append((path, expected))
+            result.append((path, expected if before is not None else {'absent': expected}))
         except (OSError, ValueError) as error:
             if conflicts is None:
                 raise
@@ -172,14 +222,69 @@ def retired_skill_plan(home: Path, roots: list[Path], *, conflicts: list[dict] |
     return result
 
 
-def retire_skills(plan) -> None:
+def skill_cutover_plan(home, roots, *, conflicts, bodies=None):
+    """Only offer retirements in roots that can receive the entire bundle."""
+    writes = skill_plan(roots, home, conflicts=conflicts, bodies=bodies)
+    retired = retired_skill_plan(home, roots, conflicts=conflicts)
+    blocked = {skill_root(Path(item['target'])) for item in conflicts}
+    ready = [root for root in dict.fromkeys(roots) if root not in blocked]
+    writes = [item for item in writes if skill_root(item[0]) not in blocked]
+    retired = [item for item in retired if skill_root(item[0]) not in blocked]
+    return writes, retired, ready
+
+
+def verify_skill_bundle(home, roots):
+    from tools.uninstall.local import _shared_skills, inventory
+    if not roots:
+        return
+    bodies = skill_bodies()
+    prior = _skill_manifest(home)
+    shared, unknown = _shared_skills(home, [])
+    for root in roots:
+        for name, body in bodies.items():
+            target = root / name
+            key = str(target)
+            if (_read(target) != body or key in shared or unknown or key not in prior.get('skill_references', [])
+                    or inventory(target) != prior.get('owned', {}).get(key)):
+                raise ValueError(f'Replacement bundle is not verified; preserved: {target}')
+
+
+def retire_skills(home, plan) -> None:
     """Remove reviewed legacy files only while their pinned inventory matches."""
-    from tools.uninstall.local import inventory
+    from tools.uninstall.common import read_private, save_private
+    from tools.uninstall.local import MANIFEST, _shared_skills, _sharing_locks, inventory
     for path, expected in plan:
-        _read(path)
-        if inventory(path) != expected:
-            raise ValueError(f'Legacy skill changed since review; preserved: {path}')
-        path.unlink()
+        root = skill_root(path)
+        if root is None or path.parent.name not in RETIRED_SKILLS:
+            raise ValueError(f'Not an explicit retired skill: {path}')
+        with _sharing_locks(home, []):
+            # Check every leaf, including unchanged files that had no write in the review.
+            verify_skill_bundle(home, [root])
+            shared, uncertain = _shared_skills(home, [])
+            before = _read(path)
+            manifest = read_private(home / MANIFEST)
+            actual = inventory(path) if before is not None else None
+            recorded = manifest['owned'].get(str(path))
+            reviewed = expected.get('absent', expected)
+            if (str(path) in shared or uncertain or actual != (None if 'absent' in expected else expected)
+                    or recorded != reviewed or str(path) not in manifest['skill_references']):
+                raise ValueError(f'Legacy skill changed or shared since review; preserved: {path}')
+            manifest['skill_references'].remove(str(path))
+            del manifest['owned'][str(path)]
+            if before is not None:
+                path.unlink()
+            # rmdir cannot remove owner files. Never traverse or purge a legacy directory.
+            directory = path.parent
+            if directory.exists() and not directory.is_symlink():
+                info = directory.stat()
+                if stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o022:
+                    try:
+                        directory.rmdir()
+                    except OSError as error:
+                        if error.errno not in (errno.ENOTEMPTY, errno.EEXIST, errno.ENOENT):
+                            raise
+            save_private(home / MANIFEST, manifest)
+
 
 def _read(path: Path) -> bytes | None:
     for part in (path, *path.parents):
@@ -195,10 +300,8 @@ def _read(path: Path) -> bytes | None:
 
 
 @contextmanager
-def _launcher(home: Path, name='maven-mcp'):
-    if name not in ('maven-mcp', 'maven-session-hook'):
-        raise ValueError('Unsupported harness launcher')
-    path = home / 'venv/bin' / name
+def _launcher(home: Path):
+    path = home / 'venv/bin/maven-mcp'
     for part in (path, *path.parents):
         if part.is_symlink():
             raise ValueError(f'Symlink launcher target preserved: {part}')
@@ -232,9 +335,9 @@ def _launcher_entry(descriptor):
             'size': info.st_size, 'sha256': digest.hexdigest()}
 
 
-def launcher_permission_plan(home: Path, *, recorded=None, name='maven-mcp') -> dict | None:
+def launcher_permission_plan(home: Path, *, recorded=None) -> dict | None:
     """Plan the historical 0775 repair, including its already-repaired receipt."""
-    with _launcher(home, name) as descriptor:
+    with _launcher(home) as descriptor:
         entry = _launcher_entry(descriptor)
     if entry['mode'] == 0o775 or (
             entry['mode'] == 0o755 and recorded == {**entry, 'mode': 0o775}):
@@ -242,11 +345,11 @@ def launcher_permission_plan(home: Path, *, recorded=None, name='maven-mcp') -> 
     return None
 
 
-def repair_launcher_permissions(home: Path, expected: dict, *, name='maven-mcp') -> None:
+def repair_launcher_permissions(home: Path, expected: dict) -> None:
     """Change only the reviewed inode's mode; never follow links or replace bytes."""
     if expected.get('mode') != 0o775:
         raise ValueError('Only an exact 0775 launcher permission repair is supported.')
-    with _launcher(home, name) as descriptor:
+    with _launcher(home) as descriptor:
         if _launcher_entry(descriptor) != expected:
             raise ValueError('Launcher changed since review; preserved.')
         os.fchmod(descriptor, 0o755)
@@ -327,26 +430,24 @@ def installed_targets(home: Path) -> dict:
     if manifest and (manifest.get('schema') != 1 or manifest.get('home') != str(home)):
         raise ValueError('Installer ownership receipt does not match this home.')
     destinations, unresolved = {}, []
-    lifecycle = statusline = False
-    lifecycle_candidates, statusline_candidates = {}, set()
+    statusline_candidates = set()
+    retired = {}
     for item in manifest.get('integrations', []):
         if item.get('conflict'):
             continue
         path = Path(item['path'])
         role, harness = item.get('target'), item.get('harness')
         if item.get('key') == 'maven-lifecycle':
-            lifecycle = True
             if harness not in HARNESS_PATHS:
                 matches = [name for name, suffix in LIFECYCLE_PATHS.items()
                            if path.parts[-len(Path(suffix).parts):] == Path(suffix).parts]
                 harness = matches[0] if len(matches) == 1 else None
             if harness is not None:
-                lifecycle_candidates.setdefault(harness, set()).add(path)
+                retired.setdefault(harness, []).append(item)
             else:
                 unresolved.append(str(path))
             continue
         if item.get('key') == 'statusLine':
-            statusline = True
             statusline_candidates.add(path)
             continue
         if harness not in HARNESS_PATHS or role not in ('config', 'context'):
@@ -372,31 +473,49 @@ def installed_targets(home: Path) -> dict:
             paths[harness] = (slots['config'], slots['context'])
         else:
             unresolved.extend(str(path) for path in slots.values() if path is not None)
-    lifecycle_paths = {}
-    for harness, targets in lifecycle_candidates.items():
-        if len(targets) == 1:
-            lifecycle_paths[harness] = next(iter(targets))
+    retired_hooks = []
+    for harness, receipts in retired.items():
+        if len(receipts) == 1:
+            retired_hooks.append((harness, receipts[0]))
         else:
-            unresolved.extend(map(str, targets))
+            unresolved.extend(item['path'] for item in receipts)
     if len(statusline_candidates) > 1:
         unresolved.extend(map(str, statusline_candidates))
+    roots = set()
+    for recorded in manifest.get('skill_roots', []):
+        root = Path(recorded)
+        if root.is_absolute() and '..' not in root.parts:
+            roots.add(root)
+        else:
+            unresolved.append(recorded)
+    # A first publication can be interrupted before this home's first manifest is durable.
+    from tools.update import pending_owned_skills
+    for saved in pending_owned_skills(home):
+        root = skill_root(Path(saved['intent']['target']))
+        if root is not None and not saved.get('disposition'):
+            roots.add(root)
+    for path in manifest.get('skill_references', []):
+        root = skill_root(Path(path))
+        if root is None:
+            unresolved.append(path)
+        else:
+            roots.add(root)
     return {'paths': paths,
-            'skill_roots': sorted({Path(path).parent.parent for path in manifest.get('skill_references', [])}),
-            'unresolved': sorted(set(unresolved)), 'lifecycle': lifecycle, 'statusline': statusline,
-            'lifecycle_paths': lifecycle_paths,
+            'skill_roots': sorted(roots),
+            'unresolved': sorted(set(unresolved)), 'statusline': bool(statusline_candidates),
+            'retired_hooks': retired_hooks,
             'statusline_path': next(iter(statusline_candidates)) if len(statusline_candidates) == 1 else None}
 
 
 def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
                      ca_bundle: Path | None = None, paths=None, statusline: bool = False,
-                     lifecycle: bool = False) -> list[Change]:
+                     guidance: str | None = None) -> list[Change]:
     """Plan independent harness targets; conflicts never suppress safe optional targets."""
     home = Path(home).expanduser().absolute()
     user_home = (user_home or Path.home()).expanduser().absolute()
     changes = []
     occupied = set()
     recorded = installed_targets(home)
-    owned = _owned_integrations(home)
 
     def conflict(path, error, harness, target):
         return Change(path, None, b'', {'path': str(path), 'format': 'conflict',
@@ -406,30 +525,21 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
     for harness in dict.fromkeys(harnesses):
         config, context, _ = HARNESS_PATHS[harness]
         selected = (paths or {}).get(harness, (user_home / config, user_home / context))
-        custom = tuple(map(Path, selected)) != (user_home / config, user_home / context)
+        explicit_paths = {harness: selected} if paths and harness in paths else None
         try:
             planned = _integration_plan(home, [harness], user_home=user_home, ca_bundle=ca_bundle,
-                                        paths={harness: selected} if custom else None)
+                                        paths=explicit_paths, guidance=guidance)
             if occupied.intersection(change.path for change in planned):
                 raise ValueError('Integration targets overlap; select distinct configuration/context files')
+            for change in planned:
+                if (change.before != change.after and change.before and b'MAVEN BEGIN' in change.before
+                        and change.receipt['format'] == 'text-block'):
+                    _require_unshared(home, change.path)
         except (OSError, ValueError) as error:
             changes.append(conflict(Path(selected[0]), error, harness, 'config'))
             continue
         for index, change in enumerate(planned):
             change.receipt.update(harness=harness, target='config' if index == 0 else 'context')
-        if lifecycle:
-            target = recorded['lifecycle_paths'].get(harness) if custom else user_home / LIFECYCLE_PATHS[harness]
-            try:
-                if target is None:
-                    raise ValueError('Native lifecycle integration supports default or staged profiles, or an exact '
-                                     'recorded custom lifecycle path; no default hook was selected.')
-                earlier = next((item for item in reversed(planned) if item.path == target), None)
-                before = earlier.after if earlier else _read(target)
-                change = _lifecycle_change(home, harness, target, before, owned)
-                change.receipt.update(harness=harness, target='lifecycle')
-                planned.append(change)
-            except (OSError, ValueError) as error:
-                planned.append(conflict(target or Path(selected[0]), error, harness, 'lifecycle'))
         occupied.update(change.path for change in planned if not change.receipt.get('conflict'))
         changes.extend(planned)
     if statusline:
@@ -443,43 +553,67 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
                 if target is None:
                     raise ValueError('Custom Claude profile: select its status line manually; default settings preserved.')
             change = _statusline_change(home, target)
-            # Lifecycle hooks may share settings.json. Plan status after those exact bytes.
-            earlier = next((item for item in reversed(changes)
-                            if item.path == target and not item.receipt.get('conflict')), None)
-            if earlier and not change.receipt.get('conflict'):
-                if change.before == change.after:
-                    change = Change(target, earlier.after, earlier.after, change.receipt)
-                else:
-                    value = _json(earlier.after)
-                    value['statusLine'] = change.receipt['value']
-                    change = Change(target, earlier.after, _encode(value), change.receipt)
             change.receipt.update(harness='claude', target='statusline')
             changes.append(change)
         except (OSError, ValueError) as error:
             changes.append(conflict(target or Path(paths['claude'][0]), error, 'claude', 'statusline'))
+
+    # Only consider receipts for the exact profile being configured. A staged
+    # preview must never retire a hook from the user's live configuration.
+    for harness, receipt in recorded['retired_hooks']:
+        if harness not in harnesses:
+            continue
+        config, context, _ = HARNESS_PATHS[harness]
+        selected = tuple(map(Path, (paths or {}).get(harness, (user_home / config, user_home / context))))
+        target = Path(receipt['path'])
+        if selected != recorded['paths'].get(harness) and not (
+                selected == (user_home / config, user_home / context) and target == user_home / LIFECYCLE_PATHS[harness]):
+            continue
+        try:
+            if not receipt.get('owned', True):
+                raise ValueError(f'Unowned legacy hook preserved: {target}')
+            _require_unshared(home, target)
+            earlier = next((c for c in reversed(changes) if c.path == target and not c.receipt.get('conflict')), None)
+            before = earlier.after if earlier else _read(target)
+            after = _removal_bytes(receipt, before) if before is not None else None
+            if after == b'' and receipt.get('created'):
+                after = None
+            changes.append(Change(target, before, after, {**receipt, 'retired': True}))
+        except (OSError, ValueError) as error:
+            changes.append(conflict(target, error, harness, 'retired-hook'))
     return changes
 
 
-def _lifecycle_change(home, harness, target, before, prior):
-    if harness == 'omp':
-        body = resource_path('templates/harness/maven-lifecycle.js').read_text()
-        body = body.replace('__MAVEN_HOME_JSON__', json.dumps(str(home)))
-        body = body.replace('__MAVEN_HOOK_JSON__', json.dumps(str(home / 'venv/bin/maven-session-hook')))
-        change = _lifecycle_file(target, before, body, prior.get((str(target), 'file', 'maven-lifecycle')))
-    else:
-        change = _lifecycle_hooks(home, harness, target, before,
-                                 prior.get((str(target), 'json-hooks', 'maven-lifecycle')))
-    key = (str(target), change.receipt['format'], 'maven-lifecycle')
-    if key in prior and change.before != change.after:
-        from tools.uninstall.local import _integration_references
-        shared, uncertain = _integration_references(home, [])
-        if uncertain or str(target) in shared:
-            raise ValueError(f'Shared lifecycle integration preserved; review every installation: {target}')
-    return change
+def apply_reviewed_integration(home, source, change):
+    """Journal new ownership before mutation; release old ownership only after retirement."""
+    from tools.uninstall.common import read_private, save_private
+    from tools.uninstall.local import MANIFEST, record_installation
+    receipt = change.receipt
+    if receipt.get('conflict'):
+        return
+    if not receipt.get('retired'):
+        record_installation(home, source, [], [], integrations=[receipt])
+        apply_integration(change)
+        return
+    from tools.uninstall.local import _sharing_locks
+    with _sharing_locks(home, []):
+        _require_unshared(home, change.path)
+        original = {k: v for k, v in receipt.items() if k != 'retired'}
+        manifest = read_private(home / MANIFEST)
+        manifest['integrations'].remove(original)
+        apply_integration(change)
+        save_private(home / MANIFEST, manifest)
+
+
+def _require_unshared(home, path):
+    from tools.uninstall.local import _integration_references
+    shared, uncertain = _integration_references(home, [])
+    if uncertain or str(path) in shared:
+        raise ValueError(f'Shared or uncertain harness configuration preserved: {path}')
 
 
 def _integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
-                      ca_bundle: Path | None = None, paths=None) -> list[Change]:
+                      ca_bundle: Path | None = None, paths=None, guidance=None) -> list[Change]:
     """Plan against an explicit user home (also supports an inactive staging home).
 
     Never copy ambient credentials, PATH, or model runtime settings. MAVEN loads
@@ -488,14 +622,10 @@ def _integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
     """
     home = home.expanduser().absolute()
     user_home = (user_home or Path.home()).expanduser().absolute()
-    environment = {'MAVEN_HOME': str(home), 'HOME': str(Path.home())}
-    if ca_bundle:
-        environment.update({key: str(ca_bundle) for key in (
-            'AWS_CA_BUNDLE', 'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE')})
-    if any('$' in value or '\n' in value or '\r' in value for value in environment.values()):
-        raise ValueError('Integration paths must be literal, without environment interpolation or newlines')
-    guidance = resource_path('templates/harness/startup.md').read_text()
-    receipts = _owned_text_blocks(home)
+    base_env = {'MAVEN_HOME': str(home), 'HOME': str(Path.home())}
+    if guidance is None:
+        guidance = resource_path('templates/harness/startup.md').read_text()
+    receipts = _owned_integrations(home)
     changes = []
     for harness in dict.fromkeys(harnesses):
         config, instructions, _ = HARNESS_PATHS[harness]
@@ -506,6 +636,21 @@ def _integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
             override = context_path.with_name('AGENTS.override.md')
             if _read(override):
                 context_path = override
+        environment = dict(base_env)
+        ca_keys = ('AWS_CA_BUNDLE', 'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE')
+        selected_ca = str(ca_bundle) if ca_bundle else None
+        if selected_ca is None:
+            # Refresh the profile without dropping its installer-owned corporate trust.
+            text = receipts.get((str(path), 'text-block', 'maven'), {})
+            entry = receipts.get((str(path), 'json-entry', 'maven'), {})
+            old_env = (text.get('server') or entry.get('value') or {}).get('env', {})
+            original = old_env.get(ca_keys[0])
+            if isinstance(original, str) and all(old_env.get(key) == original for key in ca_keys):
+                selected_ca = original
+        if selected_ca is not None:
+            environment.update(dict.fromkeys(ca_keys, selected_ca))
+        if any('$' in value or '\n' in value or '\r' in value for value in environment.values()):
+            raise ValueError('Integration paths must be literal, without environment interpolation or newlines')
         server = {'command': str(home / 'venv/bin/maven-mcp'), 'args': [], 'env': environment}
         if harness in ('claude', 'omp'):
             server['type'] = 'stdio'
@@ -515,7 +660,7 @@ def _integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
             body = '[mcp_servers.maven]\ncommand = ' + json.dumps(server['command'])
             body += '\nargs = []\nenv = { ' + ', '.join(
                 json.dumps(key) + ' = ' + json.dumps(value) for key, value in environment.items()) + ' }'
-            changes.append(_text_change(path, body, toml=True, prior=receipts.get(str(path))))
+            changes.append(_text_change(path, body, toml=True, prior=receipts.get((str(path), 'text-block', 'maven'))))
         else:
             before = _read(path)
             value = _json(before)
@@ -538,7 +683,7 @@ def _integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
                            'value': server, 'created': before is None,
                            'created_container': not before or 'mcpServers' not in _json(before)}
                 changes.append(Change(path, before, _encode(value), receipt))
-        changes.append(_text_change(context_path, guidance, prior=receipts.get(str(context_path))))
+        changes.append(_text_change(context_path, guidance, prior=receipts.get((str(context_path), 'text-block', 'maven'))))
     if len({change.path for change in changes}) != len(changes):
         raise ValueError('Integration targets overlap; select distinct configuration/context files')
     return changes
@@ -582,97 +727,11 @@ def _owned_integrations(home: Path) -> dict:
             for item in prior.get('integrations', []) if item.get('owned', True)}
 
 
-def _lifecycle_file(path, before, body, prior):
-    after = body.encode()
-    if before is not None and before != after and (not prior or before != prior['value'].encode()):
-        raise ValueError(f'Modified or unowned lifecycle extension preserved: {path}')
-    receipt = {'path': str(path), 'format': 'file', 'key': 'maven-lifecycle',
-               'value': body, 'created': prior.get('created', False) if prior else before is None}
-    if before == after:
-        receipt['owned'] = False
-    return Change(path, before, after, receipt)
-
-
-def _hook_entries(home, harness):
-    # Provider schemas: code.claude.com/docs/en/hooks, developers.openai.com/codex/hooks,
-    # docs.github.com/en/copilot/reference/hooks-reference, geminicli.com/docs/hooks/reference.
-    result = {}
-    for action, event in (('startup', 'SessionStart'), ('shutdown', 'SessionEnd')):
-        command = shlex.join([str(home / 'venv/bin/maven-session-hook'), action,
-                              '--home', str(home), '--harness', harness])
-        if harness == 'copilot':
-            result[event[0].lower() + event[1:]] = [
-                {'type': 'command', 'bash': command, 'timeoutSec': 5 if action == 'startup' else 1}]
-        else:
-            timeout = (5000 if action == 'startup' else 1000) if harness == 'gemini' else (
-                5 if action == 'startup' else 1)
-            handler = {'type': 'command', 'command': command, 'timeout': timeout}
-            if harness == 'gemini':
-                handler['name'] = 'maven-' + action
-            result[event] = [{'hooks': [handler]}]
-    return result
-
-
 def _hook_map(document, path):
     hooks = document.setdefault('hooks', {})
     if not isinstance(hooks, dict) or any(not isinstance(value, list) for value in hooks.values()):
         raise ValueError(f'Unsupported hooks configuration preserved: {path}')
     return hooks
-
-
-def _lifecycle_hooks(home, harness, path, before, prior):
-    document = _json(before)
-    created_container = 'hooks' not in document
-    if harness == 'copilot':
-        if before is not None and document.get('version') != 1:
-            raise ValueError(f'Unsupported Copilot hook schema preserved: {path}')
-        document['version'] = 1
-    hooks = _hook_map(document, path)
-    desired = _hook_entries(home, harness)
-    if prior:
-        for event, entries in prior['value'].items():
-            current = hooks.get(event, [])
-            for entry in entries:
-                if current.count(entry) != 1:
-                    raise ValueError(f'Modified or duplicated MAVEN lifecycle hook preserved: {path}')
-                current.remove(entry)
-            if not current:
-                hooks.pop(event, None)
-    owned = {}
-    for event, entries in desired.items():
-        current = hooks.setdefault(event, [])
-        if any('maven-session-hook' in json.dumps(existing) for existing in current
-               if existing not in entries):
-            raise ValueError(f'Unowned or conflicting MAVEN lifecycle hook preserved: {path}')
-        for entry in entries:
-            if current.count(entry) > 1:
-                raise ValueError(f'Duplicated MAVEN lifecycle hook preserved: {path}')
-            if entry not in current:
-                current.append(entry)
-                owned.setdefault(event, []).append(entry)
-    receipt = {'path': str(path), 'format': 'json-hooks', 'key': 'maven-lifecycle',
-               'value': owned or desired, 'owned': bool(owned),
-               'created': prior.get('created', False) if prior else before is None,
-               'created_container': prior.get('created_container', False) if prior else created_container}
-    if harness == 'copilot' and before is None:
-        receipt['created_version'] = True
-    elif prior and prior.get('created_version'):
-        receipt['created_version'] = True
-    return Change(path, before, _encode(document) if owned else before, receipt)
-
-
-def _owned_text_blocks(home: Path) -> dict[str, dict]:
-    """Installer receipts for MAVEN text blocks this home wrote (path → receipt)."""
-    from tools.uninstall.common import read_private
-    from tools.uninstall.local import MANIFEST
-    receipt = home / MANIFEST
-    if not receipt.exists():
-        return {}
-    prior = read_private(receipt)
-    if prior.get('schema') != 1 or prior.get('home') != str(home):
-        raise ValueError('Installer ownership receipt does not match this home.')
-    return {item['path']: item for item in prior.get('integrations', [])
-            if item.get('format') == 'text-block' and item.get('owned', True)}
 
 
 def _replace(path: Path, before: bytes | None, after: bytes) -> None:
@@ -702,7 +761,12 @@ def apply_integration(change: Change) -> dict | None:
     if change.receipt.get('conflict'):
         return change.receipt
     if change.before != change.after:
-        _replace(change.path, change.before, change.after)
+        if change.after is None:
+            if _read(change.path) != change.before:
+                raise ValueError(f'Integration changed since review: {change.path}')
+            change.path.unlink()
+        else:
+            _replace(change.path, change.before, change.after)
     elif _read(change.path) != change.before:
         raise ValueError(f'Integration changed since review: {change.path}')
     return change.receipt

@@ -1,8 +1,4 @@
-"""Approved cloud skill registration and session resource retrieval.
-
-Cache catalog metadata and complete ZIPs, never owner instruction bodies.
-Retrieval does not install dependencies or execute a skill.
-"""
+"""Review and verify explicitly selected cloud authority bundles; never execute them."""
 from __future__ import annotations
 
 import copy
@@ -27,7 +23,7 @@ import zlib
 
 from .client import MemoryClientError
 
-from .validation import MAX_SKILL_DESCRIPTION, MemoryError, reject_secrets, text, validate
+from .validation import MemoryError, validate
 
 MAX_BUNDLE = 268435456
 MAX_MANIFEST = 4 * 1024 * 1024
@@ -36,8 +32,6 @@ MAX_DIRECTORY = 16 * 1024 * 1024
 HASH = re.compile(r'[0-9a-f]{64}\Z')
 SLUG = re.compile(r'(?=.{1,80}\Z)[a-z0-9]+(?:-[a-z0-9]+)*\Z')
 VERSION = re.compile(r'[A-Za-z0-9._-]{1,80}\Z')
-METADATA = ('page_id', 'slug', 'page_kind', 'title', 'scope', 'revision',
-            'content_hash', 'data_scope', 'requires', 'bundle', 'description')
 
 
 def _fail(code='skill_bundle_invalid'):
@@ -173,23 +167,6 @@ def _private_dir(path):
         _fail('skill_cache_unsafe')
 
 
-def _atomic_json(path, value):
-    parent = _private_dir(path.parent)
-    if path.is_symlink():
-        _fail('skill_cache_unsafe')
-    temporary = None
-    try:
-        fd, temporary = tempfile.mkstemp(prefix='.metadata-', dir=parent)
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(_json_bytes(value))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except OSError:
-        _fail('skill_cache_unavailable')
-    finally:
-        if temporary and os.path.exists(temporary):
-            os.unlink(temporary)
 
 
 def prepare_bundle(source: Path, manifest: dict, output: Path) -> dict:
@@ -411,190 +388,7 @@ def register_bundle(client, request: dict, bundle_path: Path) -> dict:
     return client.invoke('/v1/proposals/create', request)
 
 
-def _metadata(page):
-    if (not isinstance(page, dict) or not isinstance(page.get('slug'), str)
-            or not SLUG.fullmatch(page['slug']) or page.get('page_kind') not in ('directive', 'skill', 'procedure')
-            or type(page.get('revision')) is not int or page['revision'] < 1
-            or not isinstance(page.get('content_hash'), str) or not HASH.fullmatch(page['content_hash'])
-            or page.get('data_scope') != 'owner' or not isinstance(page.get('scope'), dict)
-            or 'title' in page and (not isinstance(page['title'], str) or not 1 <= len(page['title']) <= 160)
-            or any(key not in ('project', 'workflow', 'operation') or not isinstance(value, str)
-                   or not 1 <= len(value) <= 80
-                   for key, value in page['scope'].items())):
-        _fail('invalid_service_response')
-    if 'page_id' in page:
-        try:
-            if str(uuid.UUID(page['page_id'])) != page['page_id']:
-                _fail('invalid_service_response')
-        except (ValueError, TypeError, AttributeError):
-            _fail('invalid_service_response')
-    requires = page.get('requires', [])
-    if (not isinstance(requires, list) or len(requires) > 32
-            or any(not isinstance(item, str) or not SLUG.fullmatch(item) for item in requires)
-            or len(set(requires)) != len(requires)):
-        _fail('invalid_service_response')
-    if 'description' in page:
-        try:
-            if page['page_kind'] != 'skill':
-                _fail('invalid_service_response')
-            text(page['description'], MAX_SKILL_DESCRIPTION, name='description')
-            reject_secrets(page['description'])
-        except MemoryError:
-            _fail('invalid_service_response')
-    if 'bundle' in page:
-        if page['page_kind'] != 'skill':
-            _fail('invalid_service_response')
-        _bundle(page['bundle'])
-    return copy.deepcopy({key: page[key] for key in METADATA if key in page})
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-class SessionSkills:
-    """Cache approved catalog metadata and complete ZIPs for one work session."""
-
-    def __init__(self, client, root: Path, project_id: str, session_id: str):
-        try:
-            if str(uuid.UUID(project_id)) != project_id or str(uuid.UUID(session_id)) != session_id:
-                _fail('invalid_request')
-        except (ValueError, TypeError, AttributeError):
-            _fail('invalid_request')
-        self.client, self.project_id = client, project_id
-        self.cache = Path(root).resolve() / '.maven' / 'runtime' / 'sessions' / session_id / 'skills'
-        _private_dir(self.cache)
-        self.catalog = None
-        self.generation = None
-        registry = self.cache / 'registry.json'
-        if registry.exists() or registry.is_symlink():
-            data = _json(_file_bytes(registry, MAX_MANIFEST))
-            if (not isinstance(data, dict) or data.get('project_id') != project_id
-                    or data.get('session_id') != session_id or not isinstance(data.get('pages'), list)
-                    or type(data.get('authority_generation')) is not int):
-                _fail('skill_cache_invalid')
-            self.catalog = {}
-            for page in data['pages']:
-                page = _metadata(page)
-                if page['page_kind'] != 'skill' or page['slug'] in self.catalog:
-                    _fail('skill_cache_invalid')
-                self.catalog[page['slug']] = page
-            self.generation = data['authority_generation']
-        self.session_id = session_id
-
-    @staticmethod
-    def catalog_pages(client, project_id=None):
-        """One fresh, generation-consistent catalog; no session or disk cache is required."""
-        catalog, after, generation = {}, None, None
-        while True:
-            request = {'page_kind': 'skill', 'limit': 10,
-                       'scope': 'universal' if project_id is None else 'context'}
-            if project_id is not None:
-                request['project_id'] = project_id
-            if after is not None:
-                request['after_slug'] = after
-            response = client.invoke('/v1/pages/index', request)
-            data = response.get('data', {})
-            if (response.get('status') != 'ready' or not isinstance(data, dict)
-                    or not isinstance(data.get('pages'), list)
-                    or type(data.get('authority_generation')) is not int):
-                _fail('invalid_service_response')
-            if generation is None:
-                generation = data['authority_generation']
-            elif generation != data['authority_generation']:
-                _fail('context_stale')
-            previous = after
-            for page in data['pages']:
-                slug = page.get('slug') if isinstance(page, dict) else None
-                if not isinstance(slug, str) or previous is not None and slug <= previous:
-                    _fail('invalid_service_response')
-                previous = slug
-                if page.get('data_scope') != 'owner':
-                    continue
-                page = _metadata(page)
-                if page['page_kind'] != 'skill':
-                    _fail('invalid_service_response')
-                if 'project' not in page['scope'] or page['scope']['project'] == project_id:
-                    catalog[slug] = page
-            next_after = data.get('next_after_slug')
-            if next_after is None:
-                break
-            if not data['pages'] or next_after != previous or after is not None and next_after <= after:
-                _fail('invalid_service_response')
-            after = next_after
-        return {'pages': list(catalog.values()), 'authority_generation': generation}
-
-    @staticmethod
-    def summaries(catalog, loaded=(), loaded_generation=None):
-        """Only approved generic headers, never bodies, bundle inventories or inferred descriptions."""
-        loaded = {(page['slug'], page['revision']) for page in loaded}
-        generation = catalog['authority_generation']
-        return {'status': 'ready', 'authority_generation': generation, 'pages': [
-            {**{key: page[key] for key in ('slug', 'page_kind', 'title', 'description', 'scope', 'revision')
-                if key in page},
-             'loaded': loaded_generation == generation and (page['slug'], page['revision']) in loaded}
-            for page in catalog['pages']]}
-
-    def discover(self, refresh=False):
-        if self.catalog is None or refresh:
-            data = self.catalog_pages(self.client, self.project_id)
-            _atomic_json(self.cache / 'registry.json', {
-                'project_id': self.project_id, 'session_id': self.session_id, **data})
-            self.catalog = {page['slug']: page for page in data['pages']}
-            self.generation = data['authority_generation']
-        return {'status': 'ready', 'data': {
-            'pages': list(self.catalog.values()), 'authority_generation': self.generation}}
-
-    def fetch(self, slug, refresh=False):
-        self.discover(refresh=refresh)
-        if slug not in self.catalog or 'bundle' not in self.catalog[slug]:
-            _fail('skill_resources_unavailable')
-        page = self.catalog[slug]
-        bundle = page['bundle']
-        destination = self.cache / (slug + '-' + bundle['sha256'] + '.zip')
-        cached = destination.exists() or destination.is_symlink()
-        raw = _file_bytes(destination, MAX_BUNDLE) if cached and not refresh else _download(self.client, bundle)
-        manifest = _verified(raw, bundle, slug)
-        if not cached or refresh:
-            fd, temporary = tempfile.mkstemp(prefix='.download-', dir=self.cache)
-            try:
-                with os.fdopen(fd, 'wb') as stream:
-                    stream.write(raw)
-                if destination.is_symlink():
-                    _fail('skill_cache_unsafe')
-                os.replace(temporary, destination)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-        return {'status': 'cached' if cached and not refresh else 'downloaded', 'data': {
-            'slug': slug, 'revision': page['revision'], 'bundle': copy.deepcopy(bundle),
-            'path': str(destination), 'manifest': manifest}}
-
-    def start(self, *, loaded=(), authority_generation=None):
-        """Discover all skills; preload only the current applicable authority closure."""
-        self.discover(refresh=True)
-        if loaded and self.generation != authority_generation:
-            _fail('context_stale')
-        resources = []
-        for page in loaded:
-            if page.get('bundle', {}).get('load_policy') != 'always':
-                continue
-            current = self.catalog.get(page['slug'])
-            if (current is None or current['revision'] != page['revision']
-                    or current.get('bundle') != page['bundle']):
-                _fail('context_stale')
-            resources.append(self.fetch(page['slug'])['data'])
-        return {'status': 'ready', 'data': {'resources': resources,
-                'available_skills': self.summaries(
-                    self.discover()['data'], loaded, authority_generation)}}
 
 
 

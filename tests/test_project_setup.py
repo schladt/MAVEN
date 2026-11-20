@@ -34,19 +34,22 @@ class ProjectSetupTests(unittest.TestCase):
         stack.enter_context(patch('tools.memory.environment.load_environment', return_value={}))
         stack.enter_context(patch('tools.memory.environment.memory_config', return_value=config))
         stack.enter_context(patch('tools.memory.environment.configured_client', return_value=client))
-        stack.enter_context(patch('tools.project_setup.verify_authority', return_value=7))
+        stack.enter_context(patch('tools.project_setup.verify_connection', return_value={'capability': 'project_reconcile_v1'}))
         return client, config
 
     def test_independent_roots_and_configured_rerun_never_duplicate_records(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             parent = Path(directory).resolve()
-            client, _ = self.cloud(stack)
+            client, config = self.cloud(stack)
             ids = []
             for name in ('one', 'two'):
                 root = parent / name
                 root.mkdir()
                 args = self.args(root, parent / '.env')
                 result = setup_project(args)
+                self.assertEqual(result['project']['schema'], 2)
+                for key in ('instance_id', 'recovery_epoch'):
+                    self.assertEqual(result['project'][key], config[key])
                 ids.append(result['project']['project_id'])
                 before = (root / '.maven' / 'project.json').read_bytes()
                 setup_project(args)
@@ -111,7 +114,7 @@ class ProjectSetupTests(unittest.TestCase):
                 setup_project(git)
             client.invoke.assert_not_called()
 
-    def test_legacy_receipt_is_adopted_exactly_not_replaced(self):
+    def test_legacy_wizard_receipt_is_not_adopted_or_replayed(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             parent = Path(directory).resolve()
             root = parent / 'project'
@@ -126,16 +129,9 @@ class ProjectSetupTests(unittest.TestCase):
             state_path = home / 'runtime' / 'setup' / 'state.json'
             save_json(state_path, {'schema': 1, 'instance_id': config['instance_id'],
                                    'project': legacy, 'submitted_requests': [legacy['request_key']]})
-            with self.assertRaises(SetupPending):
-                setup_project(args)
-            client.invoke.assert_not_called()
-            args.non_interactive = False
-            with patch('tools.project_setup.approve'), patch('tools.project_setup.ask') as ask:
-                setup_project(args)
-            ask.assert_not_called()
-            calls = client.invoke.call_args_list
-            self.assertEqual(calls[0].args, ('/v1/operations/lookup', {'request_key': legacy['request_key']}))
-            self.assertEqual(load_project(root)['project_id'], legacy['project_id'])
+            setup_project(args)
+            self.assertNotEqual(load_project(root)['project_id'], legacy['project_id'])
+            self.assertNotIn(legacy['request_key'], [call.args[1].get('request_key') for call in client.invoke.call_args_list])
             self.assertEqual(read_private(state_path)['project'], legacy)
             second = parent / 'second'
             second.mkdir()
@@ -184,7 +180,8 @@ class ProjectSetupTests(unittest.TestCase):
                 self.assertEqual(configured['project']['project_id'], original['project_id'])
                 self.assertTrue(load_project(root)['git_enabled'])
                 before = (root / '.maven/project.json').read_bytes()
-                save_private(root, f'.maven/runtime/sessions/{uuid4()}/approval.json', {'status': 'unsynchronized'})
+                save_private(root, '.maven/git-publication/receipt.json', {
+                    'schema': 1, 'root': str(root), 'status': 'unverified'})
                 with self.assertRaises(ProjectError):
                     configure_git(root, remote='origin', accepted_url=url, branch='main', env=env)
                 self.assertEqual((root / '.maven/project.json').read_bytes(), before)

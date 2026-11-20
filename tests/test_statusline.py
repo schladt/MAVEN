@@ -11,7 +11,6 @@ import unittest
 from unittest.mock import patch
 
 from tools import statusline
-from tools.home import ACTIVE_DIRECTORY, active, write_active
 
 
 class StatusLineTests(unittest.TestCase):
@@ -22,10 +21,6 @@ class StatusLineTests(unittest.TestCase):
         self.home.mkdir(mode=0o700)
         self.outside = base / 'scratch'
         self.outside.mkdir()
-        self.project = base / 'alpha-repo'
-        (self.project / '.maven').mkdir(parents=True)
-        (self.project / '.maven/project.json').write_text('{}')
-        (self.project / 'src').mkdir()
 
     def tearDown(self):
         self.directory.cleanup()
@@ -41,103 +36,50 @@ class StatusLineTests(unittest.TestCase):
         self.assertEqual(len(lines), 1, output.getvalue())
         return lines[0]
 
-    def test_session_state_wins_and_folder_state_is_only_advisory(self):
-        folder_state = active('read_only')
-        session_state = active('project', label='alpha', project_id='p-1')
-        write_active(self.home, folder_state, folder=self.outside)
-        write_active(self.home, session_state, harness='claude', harness_session='claude-1')
-        self.assertEqual(self.run_line({'session_id': 'claude-1', 'workspace': {'current_dir': str(self.outside)}}),
-                         session_state['line'])
-        for payload in ({'session_id': 'claude-2', 'workspace': {'current_dir': str(self.outside)}},
-                        {'session_id': 'claude-2', 'cwd': str(self.outside)}):
-            self.assertIn('last folder hint (not started here)', self.run_line(payload))
-            self.assertIn(folder_state['line'].removeprefix('MAVEN: '), self.run_line(payload))
+    def test_uses_actual_folder_never_conversation_identity(self):
+        for mode in ('home', 'project'):
+            with self.subTest(mode=mode), patch.object(statusline, 'select_project', return_value={
+                    'mode': mode, 'label': 'Test'}) as select:
+                self.assertEqual(self.run_line({'session_id': 'ignored',
+                                 'workspace': {'current_dir': str(self.outside)}}), f'MAVEN: {mode} Test (local)')
+                select.assert_called_once_with(str(self.outside), self.home)
+        with patch.object(statusline, 'select_project', return_value=None):
+            self.assertEqual(self.run_line({'cwd': str(self.outside)}), statusline.OFF)
+        self.assertEqual(self.run_line({'session_id': 'ignored'}), statusline.OFF)
 
-    def test_state_written_for_session_and_folder_is_found_by_either(self):
-        state = active('home', label='Desk', project_id='p-2')
-        write_active(self.home, state, harness='claude', harness_session='claude-9', folder=self.outside)
-        self.assertEqual(self.run_line({'session_id': 'claude-9'}), state['line'])
-        self.assertIn('last folder hint (not started here)', self.run_line({'session_id': 'unknown', 'cwd': str(self.outside)}))
-        self.assertIn('last folder hint (not started here)', self.run_line({'cwd': str(self.outside) + '/.'}))
-
-    def test_fallbacks_without_state(self):
-        outside = self.run_line({'session_id': 's', 'workspace': {'current_dir': str(self.outside)}})
-        self.assertEqual(outside, statusline.NOT_STARTED)
-        inside = self.run_line({'session_id': 's', 'workspace': {'current_dir': str(self.project / 'src')}})
-        self.assertNotIn(inside, (statusline.NOT_STARTED, statusline.OFF, statusline.UNAVAILABLE))
-        self.assertIn('alpha-repo', inside)
-        self.assertEqual(self.run_line({'session_id': 's'}), statusline.OFF)
-        self.assertEqual(self.run_line({'cwd': str(self.outside / 'missing')}), statusline.OFF)
-
-    def test_unsafe_or_corrupt_state_is_ignored(self):
-        write_active(self.home, active('home', label='Desk'), harness='claude', harness_session='s', folder=self.outside)
-        payload = {'session_id': 's', 'cwd': str(self.outside)}
-        files = sorted((self.home / ACTIVE_DIRECTORY).iterdir())
-        for path in files:
-            path.chmod(0o644)
-        self.assertEqual(self.run_line(payload), statusline.NOT_STARTED)
-        for path in files:
-            path.unlink()
-            path.symlink_to(self.home / 'elsewhere.json')
-        (self.home / 'elsewhere.json').write_text(json.dumps(active('home', label='Forged')))
-        (self.home / 'elsewhere.json').chmod(0o600)
-        self.assertEqual(self.run_line(payload), statusline.NOT_STARTED)
-        for path in files:
-            path.unlink()
-            path.write_text('{not json')
-            path.chmod(0o600)
-        self.assertEqual(self.run_line(payload), statusline.NOT_STARTED)
-
-    def test_state_line_is_one_sanitized_line(self):
-        write_active(self.home, {**active('project', label='x'), 'line': 'MAVEN:\nproject \x1b[31mx'},
-                     harness='claude', harness_session='s')
-        line = self.run_line({'session_id': 's'})
+    def test_scope_line_is_one_sanitized_line(self):
+        with patch.object(statusline, 'select_project', return_value={'mode': 'project', 'label': '\x1b[31mA\nB'}):
+            line = self.run_line({'cwd': str(self.outside)})
         self.assertNotIn('\x1b', line)
         self.assertTrue(line.startswith('MAVEN: project'))
-        write_active(self.home, {'mode': 'read_only'}, harness='claude', harness_session='t')
-        self.assertEqual(self.run_line({'session_id': 't'}), active('read_only')['line'])
 
     def test_bad_input_and_internal_errors_print_a_safe_line(self):
         for raw in (b'', b'not json', b'[1, 2]', b'{"session_id": 5, "workspace": "x", "cwd": []}', b'\xff\xfe'):
             self.assertTrue(self.run_line(None, raw=raw).startswith('MAVEN:'))
         with patch.object(statusline, 'status_line', side_effect=RuntimeError('boom')):
             self.assertEqual(self.run_line({'session_id': 's'}), statusline.UNAVAILABLE)
-        with patch.object(statusline, 'active_name', side_effect=OSError('unreadable')):
-            self.assertEqual(self.run_line({'session_id': 's'}), statusline.UNAVAILABLE)
+        with patch.object(statusline, 'select_project', side_effect=ValueError('legacy selection')):
+            self.assertEqual(self.run_line({'cwd': str(self.outside)}), statusline.UNAVAILABLE)
 
     def test_command_runs_without_cloud_client_imports(self):
-        state = active('project', label='alpha')
-        write_active(self.home, state, harness='claude', harness_session='proc')
         script = ('import sys; from tools.statusline import main; main(); '
                   'sys.stderr.write(" ".join(m for m in ("boto3", "botocore", "requests") if m in sys.modules))')
-        result = subprocess.run([sys.executable, '-c', script], input=json.dumps({'session_id': 'proc'}),
+        result = subprocess.run([sys.executable, '-c', script], input=json.dumps({'cwd': str(self.outside)}),
                                 capture_output=True, text=True, timeout=30,
                                 cwd=Path(__file__).resolve().parents[1],
                                 env={**os.environ, 'MAVEN_HOME': str(self.home)})
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, state['line'] + '\n')
+        self.assertEqual(result.stdout, statusline.OFF + '\n')
         self.assertEqual(result.stderr, '')
 
-    def test_same_native_id_in_another_harness_is_not_current(self):
-        write_active(self.home, active('home', label='Other harness'), harness='omp', harness_session='same')
-        self.assertEqual(self.run_line({'session_id': 'same'}), statusline.OFF)
-        write_active(self.home, active('project', label='Claude'), harness='claude', harness_session='same')
-        self.assertEqual(self.run_line({'session_id': 'same'}), active('project', label='Claude')['line'])
-
-    def test_hardlinked_private_state_is_not_trusted(self):
-        write_active(self.home, active('home', label='Desk'), harness='claude', harness_session='s')
-        path = next((self.home / ACTIVE_DIRECTORY).iterdir())
-        os.link(path, self.home / 'linked-state')
-        self.assertEqual(self.run_line({'session_id': 's'}), statusline.OFF)
 
     def test_generated_status_command_binds_quoted_home_against_ambient_selection(self):
         from tools.harness import _statusline_change
         custom = self.home / "space and 'quote"
         launcher = custom / 'venv/bin/maven-statusline'
         launcher.parent.mkdir(parents=True)
-        launcher.write_text('#!' + sys.executable + '\nfrom tools.statusline import main\nmain()\n')
+        launcher.write_text('#!' + sys.executable + '\nimport os\nprint(os.environ["MAVEN_HOME"])\n')
         launcher.chmod(0o700)
-        write_active(custom, active('project', label='Selected'), harness='claude', harness_session='s')
         command = _statusline_change(custom, self.home / 'settings.json').receipt['value']['command']
         for ambient in (None, str(self.home)):
             environment = {**os.environ, 'PYTHONPATH': str(Path(__file__).resolve().parents[1])}
@@ -147,7 +89,7 @@ class StatusLineTests(unittest.TestCase):
             result = subprocess.run(command, shell=True, env=environment, text=True,
                                     input=json.dumps({'session_id': 's'}), capture_output=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.strip(), active('project', label='Selected')['line'])
+            self.assertEqual(result.stdout.strip(), str(custom))
 
 
 

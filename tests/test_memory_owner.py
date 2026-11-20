@@ -28,42 +28,13 @@ def record(kind="note", data=None):
 
 
 class OwnerValidationTests(unittest.TestCase):
-    def test_every_structured_kind_accepts_sourced_owner_data(self):
-        entity = str(uuid4())
-        session = str(uuid4())
-        cases = {
-            "entity": {"entity_type": "person", "name": "Fixture person", "aliases": ["Fixture"]},
-            "fact": {"subject_id": entity, "predicate": "preference", "value": {"text": "fixture"}},
-            "relationship": {"subject_id": entity, "predicate": "knows", "object_id": str(uuid4())},
-            "task": {"title": "Fixture", "description": "", "state": "open"},
-            "decision": {"title": "Fixture", "body_markdown": "Rationale", "state": "accepted"},
-            "risk": {"title": "Fixture", "body_markdown": "Evidence", "state": "open"},
-            "note": {"title": "Fixture", "body_markdown": "Exact source\n", "category": "reference"},
-            "session": {"state": "active", "summary": "", "workflow": "work"},
-            "operation": {"session_id": session, "name": "refresh", "state": "started", "summary": ""},
-            "setting": {"key": "fixture.region", "value": "region", "scope": "global"},
-            "checkpoint": {"session_id": session, "cutoff": 3,
-                           "memory_refs": [{"record_id": entity, "revision": 1}], "state": "prepared"},
-        }
-        for kind, data in cases.items():
-            with self.subTest(kind=kind):
-                body = record(kind, data)
-                before = copy.deepcopy(body)
-                self.assertIs(validation.validate("/v1/memory/write", body), body)
-                self.assertEqual(body, before)
-
-    def test_note_is_lossless_bounded_and_cannot_become_authority(self):
-        body = record()
-        body["data"]["body_markdown"] = "é" * 65536
-        validation.validate("/v1/memory/write", body)
-        body["data"]["body_markdown"] += "é"
-        with self.assertRaises(validation.MemoryError):
-            validation.validate("/v1/memory/write", body)
-        for extra in ("authority_state", "operative", "requires"):
-            body = record()
-            body["data"][extra] = "active"
-            with self.assertRaises(validation.MemoryError):
-                validation.validate("/v1/memory/write", body)
+    def test_legacy_write_only_accepts_owner_project_identity(self):
+        body = record("entity", {"entity_type": "project", "name": "Fixture", "aliases": []})
+        self.assertEqual(validation.validate("/v1/memory/write", body), body)
+        for change in ({"kind": "session"}, {"kind": "note"}, {"project_id": str(uuid4())},
+                       {"data_scope": "synthetic"}, {"data": {**body["data"], "entity_type": "person"}}):
+            with self.subTest(change=change), self.assertRaises(validation.MemoryError):
+                validation.validate("/v1/memory/write", {**body, **change})
 
     def test_bad_enums_and_types_have_bounded_invalid_request(self):
         for field in ("kind", "data_scope"):
@@ -77,57 +48,6 @@ class OwnerValidationTests(unittest.TestCase):
             body = record("session", {"state": bad, "summary": ""})
             with self.assertRaises(validation.MemoryError):
                 validation.validate("/v1/memory/write", body)
-
-    def test_secret_values_rejected_and_safe_references_allowed(self):
-        body = record("setting", {"key": "fixture.secret-location", "scope": "global", "value": None,
-                                  "secret_ref": {"provider": "ssm", "name": "/fixture/credential"}})
-        validation.validate("/v1/memory/write", body)
-        for forbidden in ({"password": "fixture"}, {"access_token": "fixture"},
-                          "-----BEGIN " + "PRIVATE KEY-----", "AKIA" + "X" * 16,
-                          "Bearer " + "x" * 32):
-            body["data"]["value"] = forbidden
-            with self.assertRaises(validation.MemoryError) as error:
-                validation.validate("/v1/memory/write", body)
-            self.assertEqual(str(error.exception), "invalid_request")
-            self.assertEqual(set(error.exception.metadata), {"detail"})
-            self.assertNotIn(json.dumps(forbidden)[1:12], error.exception.metadata["detail"])
-
-    def test_settings_checkpoint_and_claim_require_exact_scope_and_fence(self):
-        body = record("setting", {"key": "fixture", "value": False, "scope": "project"})
-        with self.assertRaises(validation.MemoryError):
-            validation.validate("/v1/memory/write", body)
-        body["project_id"] = str(uuid4())
-        validation.validate("/v1/memory/write", body)
-        claim = {"request_key": str(uuid4()), "record_id": str(uuid4()), "expected_revision": 1,
-                 "session_id": str(uuid4()), "action": "claim", "lease_seconds": 30,
-                 "source": {"origin": "fixture", "excerpt": ""}, "change_reason": "Claim fixture"}
-        validation.validate("/v1/memory/claim", claim)
-        claim["action"] = "complete"
-        with self.assertRaises(validation.MemoryError):
-            validation.validate("/v1/memory/claim", claim)
-        del claim["lease_seconds"]
-        claim["fence"] = 1
-        validation.validate("/v1/memory/claim", claim)
-        claim["fence"] = True
-        with self.assertRaises(validation.MemoryError):
-            validation.validate("/v1/memory/claim", claim)
-
-
-    def test_memory_checkpoint_needs_no_git_and_has_strict_cutoff_manifest(self):
-        data = {"session_id": str(uuid4()), "cutoff": 0, "memory_refs": [], "state": "prepared"}
-        for state in ("prepared", "saved", "aborted"):
-            validation.validate("/v1/memory/write", record("checkpoint", {**data, "state": state}))
-        for change in ({"cutoff": True}, {"cutoff": -1}, {"cutoff": 1.5}, {"cutoff": 2147483648},
-                       {"state": "committed"}, {"git_base": "a" * 40}, {"final_commit": "b" * 40},
-                       {"candidate_digest": "c" * 64}, {"memory_refs": [{"record_id": str(uuid4()), "revision": 0}]}):
-            with self.subTest(change=change), self.assertRaises(validation.MemoryError):
-                validation.validate("/v1/memory/write", record("checkpoint", {**data, **change}))
-        ref = {"record_id": str(uuid4()), "revision": 1}
-        with self.assertRaises(validation.MemoryError):
-            validation.validate("/v1/memory/write", record("checkpoint", {**data, "memory_refs": [ref, ref]}))
-        git = {"session_id": data["session_id"], "candidate_digest": "a" * 64,
-               "git_base": "b" * 40, "memory_refs": [], "state": "committed", "final_commit": "c" * 40}
-        validation.validate("/v1/memory/write", record("checkpoint", git))
 
     def test_search_requires_unambiguous_explicit_scope(self):
         project = str(uuid4())
@@ -178,7 +98,7 @@ class OwnerValidationTests(unittest.TestCase):
     def test_handler_protocol_is_transport_metadata_not_record_data(self):
         config = {"client_role_arn": "arn:aws:iam::123456789012:role/fixture-client",
                   "approval_role_arn": "arn:aws:iam::123456789012:role/fixture-approval"}
-        body = record()
+        body = record("entity", {"entity_type": "project", "name": "Fixture", "aliases": []})
         event = {"rawPath": "/v1/memory/write", "body": json.dumps(body),
                  "headers": {"x-maven-memory-protocol": str(validation.CLIENT_PROTOCOL)},
                  "requestContext": {"http": {"method": "POST"}, "authorizer": {"iam": {
@@ -195,15 +115,6 @@ class OwnerValidationTests(unittest.TestCase):
             self.assertEqual(storage.perform.call_count, 1)
 
     def test_validation_details_name_fields_and_never_values(self):
-        body = record()
-        body["data"] = {"title": "Fixture", "body": "Hidden value text", "category": "reference"}
-        with self.assertRaises(validation.MemoryError) as error:
-            validation.validate("/v1/memory/write", body)
-        detail = error.exception.metadata["detail"]
-        self.assertIn("requires body_markdown", detail)
-        self.assertIn("does not accept body", detail)
-        self.assertNotIn("Hidden value", detail)
-        self.assertLessEqual(len(detail), validation.MAX_DETAIL)
         for request, expected in [({"limit": 50}, "limit must be an integer from 1 to 20"),
                                   ({"offset": 1}, "offset pages ranked results and requires query"),
                                   ({"query": "x", "offset": 1001}, "offset must be an integer from 0 to 1000"),
@@ -218,27 +129,10 @@ class OwnerValidationTests(unittest.TestCase):
             validation.validate("/v1/memory/search", long_key)
         self.assertNotIn("x" * 50, error.exception.metadata["detail"])
 
-    def test_memory_data_fields_mirror_the_validator_table(self):
-        self.assertEqual(set(validation.MEMORY_DATA_FIELDS), validation.MEMORY_KINDS)
-        self.assertEqual(validation.MEMORY_DATA_FIELDS["note"],
-                         {"required": ["body_markdown", "category", "title"], "optional": []})
-        self.assertEqual(validation.MEMORY_DATA_FIELDS["checkpoint"]["required"],
-                         ["cutoff", "memory_refs", "session_id", "state"])
-
     def test_ranked_search_and_new_route_contracts(self):
         for request in ({"query": "ble firmware", "offset": 20, "limit": 20, "include_archived": True},
                         {"include_archived": False, "after_id": str(uuid4())}):
             self.assertIs(validation.validate("/v1/memory/search", request), request)
-        context = {"project_id": str(uuid4()), "session_id": str(uuid4())}
-        self.assertIs(validation.validate("/v1/memory/project_context", context), context)
-        for bad in ({"project_id": context["project_id"]}, {**context, "extra": 1}, {**context, "session_id": "x"}):
-            with self.subTest(bad=bad), self.assertRaises(validation.MemoryError):
-                validation.validate("/v1/memory/project_context", bad)
-        ids = [str(uuid4()) for _ in range(validation.MAX_REVISION_IDS)]
-        validation.validate("/v1/memory/revisions", {"record_ids": ids})
-        for bad in (ids + [str(uuid4())], ids[:1] * 2, ["not-a-uuid"], "x"):
-            with self.assertRaises(validation.MemoryError):
-                validation.validate("/v1/memory/revisions", {"record_ids": bad})
 
 
 class JsonResultTransportTests(unittest.TestCase):
@@ -947,21 +841,21 @@ BEGIN
  envelope:=maven.memory_request('/v1/memory/revisions',jsonb_build_object('record_ids',jsonb_build_array(a->'record_id')),NULL,NULL,'fixture-reader',4);
  PERFORM pg_temp.assert_equal(envelope->'result'->'revisions'->(a->>'record_id'),'1','dispatched revisions');
  PERFORM pg_temp.assert_equal(maven.memory_request('/v1/unknown','{}',NULL,NULL,'fixture-reader',4)->'result','{"status":"invalid_request"}','unknown route');
- write_request:=pg_temp.request('note','{"title":"Dispatched","body_markdown":"one call","category":"reference"}');
+ write_request:=pg_temp.request('entity','{"entity_type":"project","name":"Dispatched project","aliases":[]}');
  envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
  PERFORM pg_temp.assert_equal(envelope->'result'->'revision','1','dispatched write');
  envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
  PERFORM pg_temp.assert_equal(envelope->'result'->'replayed','true','dispatched write replays');
  PERFORM pg_temp.assert_equal(maven.memory_read(jsonb_build_object('record_id',write_request->'record_id'))->'actor_id','"fixture-owner"','dispatched provenance');
  -- Governed writes assert their authority generation under a share lock; stale writes commit nothing.
- write_request:=pg_temp.request('note','{"title":"Governed","body_markdown":"current authority","category":"reference"}')
+ write_request:=pg_temp.request('entity','{"entity_type":"project","name":"Governed project","aliases":[]}')
    || jsonb_build_object('authority_generation',generation_value);
  envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
  PERFORM pg_temp.assert_equal(envelope->'result'->'revision','1','current generation commits');
  UPDATE maven.instruction_state SET generation=generation+1 WHERE singleton;
  envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
  PERFORM pg_temp.assert_equal(envelope->'result'->'replayed','true','committed request replays after authority moves');
- write_request:=pg_temp.request('note','{"title":"Stale","body_markdown":"superseded authority","category":"reference"}')
+ write_request:=pg_temp.request('entity','{"entity_type":"project","name":"Stale project","aliases":[]}')
    || jsonb_build_object('authority_generation',generation_value);
  envelope:=maven.memory_request('/v1/memory/write',write_request,encode(sha256(convert_to(write_request::text,'UTF8')),'hex'),NULL,'fixture-owner',4);
  PERFORM pg_temp.assert_equal(jsonb_build_object('generation',envelope->'authority_generation','result',envelope->'result'),

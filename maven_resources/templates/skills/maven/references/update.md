@@ -1,11 +1,6 @@
----
-name: maven-update
-description: Update an installed MAVEN to its checkout's version, locally and in the cloud — software, harness skills, database schema, service stack and owner instructions — through one resumable, separately reviewed operation.
----
-
 # Update MAVEN
 
-Use only when the owner asks to update, upgrade or refresh installed MAVEN itself. Editing a source checkout alone does not authorize installation or cloud changes. Every update effect goes through `maven_admin` reviews with the owner's actual answers. Never invent approvals, run AWS sign-in yourself, or search the filesystem for MAVEN source.
+Only an explicit request to update installed MAVEN software starts or resumes this operation. “Update this brief” is a local memory edit. Editing a checkout does not authorize installation or cloud changes. Use `maven_admin` reviews and the owner's actual answers; never invent approvals, run AWS sign-in yourself, or search the filesystem for MAVEN source.
 
 ## 0. Choose the version
 
@@ -22,15 +17,16 @@ The first stage compares the installed software and installer-owned skills with 
 - A form `Update local MAVEN software` shows the differences; relay them and ask whether to update or continue without it.
 - A `local_update` handoff gives the exact installer command. It must run in a separate terminal because it replaces the software this MCP server runs from and rewrites this harness's MAVEN skills and configuration. Give the owner the command; they choose **Update local MAVEN software** and review its changes there. Then the harness must be restarted so it loads the new MAVEN; afterwards continue the same operation ID. If advance says the process is still running old software, the restart has not happened yet.
 - Skills the owner modified, or that another installation shares, are preserved and reported, not overwritten.
+- Older installers may have printed the retired `--no-lifecycle-hooks` option. If the checkout rejects it, omit that option only; this version never installs lifecycle hooks. Keep the same selected home, recorded destinations and operation ID.
 
 ## 3. Sign-in and reviews
 
 - `aws_login` handoffs: give the owner the command to run privately (everyday access first; maintenance access before the service stage), then advance. Identity confirmations are reviews like any other.
-- Reviews: show the owner the complete review (title, description and the decisive content: SQL file names for the schema, every changed resource and its replacement flag for the service, page titles and differences for instructions). Respond only with their real decision: `{approved, review_digest, source: {origin, excerpt}, confirmations}`. Declining pauses the operation; it never skips a stage silently.
-- Stages, in order: **schema** (pending ordered migrations, applied under maintenance mode), **service** (a CloudFormation change set built from the live stack's own deployment inputs; refused before review if it would remove or replace a database, secret, bucket or key), **instructions** (bundled pages that are new or differ from the active ones; the form shows exact differences and warns that an update replaces owner edits). Current stages pass without questions.
+- Reviews: show the complete review, including SQL file names for the schema and every changed resource and replacement flag for the service. Respond only with the owner's real decision: `{approved, review_digest, source: {origin, excerpt}, confirmations}`. Declining pauses the operation; it does not silently skip an effect.
+- After local software, check the **database schema**, then the **service**. Apply approved ordered schema migrations under maintenance mode. The service change set uses the live stack's deployment inputs and refuses changes that remove or replace a database, secret, bucket or key. Current stages pass without changes. This operation is not authorized to import or delete any legacy memory.
 - Error `warming`: the Aurora database is resuming from auto-pause. Use the returned bounded read-only retry path when available. It spaces probes but is not a hard transport deadline. Never retry an uncertain mutation as a readiness probe; reconcile its original receipt.
 - `uncertain` state: an effect may have reached AWS. Advance the same operation to reconcile it; never begin a replacement.
 
 ## 4. Finish
 
-The operation completes after readiness verification. Report each stage's verified outcome from the receipts — local (updated, skipped or current), schema (migrated or current), service (updated with its change set, or current), instructions (activated pages, kept, or current) — plus anything preserved and why. After instruction changes, reload authority with `maven_context`. Remind the owner to restart other harnesses that use MAVEN.
+Report the verified outcomes from the operation receipts: local software and harness integration, schema, service and final readiness. Distinguish skipped or preserved items from changes applied. Remind the owner to restart affected harnesses.

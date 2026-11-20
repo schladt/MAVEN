@@ -1,6 +1,7 @@
 """Mode-gated secret operations. Tool arguments/results never carry credential values."""
 from __future__ import annotations
 
+from functools import wraps
 from typing import Any, Literal
 
 from tools.aws.secret_store import DEFAULT_STREAM_LIMIT, SecretStore
@@ -12,15 +13,24 @@ from tools.secret_catalog import SecretCatalog
 
 
 def register_secret_tools(server, app, guarded):
+    def selected(function):
+        @wraps(function)
+        def invoke(**kwargs):
+            with app.local(kwargs['cwd'], use_home=kwargs.get('use_home', False)):
+                return function(**kwargs)
+        return invoke
+
     @server.tool()
     @guarded
-    def maven_secrets(action: Literal['list', 'lookup', 'store_and_catalog', 'retry_catalog', 'resolve_catalog'],
+    @selected
+    def maven_secrets(cwd: str, action: Literal['list', 'lookup', 'store_and_catalog', 'retry_catalog', 'resolve_catalog'],
                       name: str | None = None, domain: str | None = None, service: str | None = None,
                       cursor: str | None = None, limit: int = 20, source_path: str | None = None,
                       provider: Literal['ssm', 'encrypted-file'] = 'ssm', replace: bool = False,
                       operation_id: str | None = None, source: dict[str, str] | None = None,
-                      max_bytes: int = DEFAULT_STREAM_LIMIT, expected_revision: int | None = None) -> dict[str, Any]:
-        """Use the explicitly configured secret store in Read Only/Home/project; off/unconfigured is refused.
+                      max_bytes: int = DEFAULT_STREAM_LIMIT, expected_revision: int | None = None,
+                      use_home: bool = False) -> dict[str, Any]:
+        """Use the explicitly configured secret store in a selected project or Home.
 
         list returns paged names/metadata for SSM and encrypted files, never values. domain filters a dotted
         namespace, not a substring. lookup returns only the exact Home secret: setting, without a Home session
@@ -33,12 +43,9 @@ def register_secret_tools(server, app, guarded):
         revision conflict returns the current record for review; resolve_catalog requires its expected_revision
         and actual owner source before repointing to the original receipt. Preserve unknown outcomes.
         Low-level maven-secrets CLI commands never write Home. No memory session/capture is started."""
-        app.require_skill_access()
         try:
             if action == 'list':
                 return {'status': 'ready', **SecretStore(load_environment(app.env)).list(domain, cursor, limit)}
-            if action in ('store_and_catalog', 'retry_catalog', 'resolve_catalog'):
-                app.primary()
             if action == 'store_and_catalog':
                 if source is None or not source_path:
                     raise StoreError('explicit storage requires the actual owner request and a private input path')
@@ -58,9 +65,10 @@ def register_secret_tools(server, app, guarded):
 
     @server.tool()
     @guarded
+    @selected
     def maven_secret_adapter(
         action: Literal['policy', 'draft', 'review', 'approve', 'prepare', 'grant_document', 'execute'],
-        parameters: dict[str, Any],
+        parameters: dict[str, Any], cwd: str, use_home: bool = False,
     ) -> dict[str, Any]:
         """Use owner-defined secret consumers; never return raw program output or secret values.
 
@@ -74,15 +82,12 @@ def register_secret_tools(server, app, guarded):
         Publication failed reports a definitive rejection; outcome_unknown is not a confirmed draft.
         Preserve/reconcile the exact original request in either case; never invent new IDs.
         Execution is fail-closed and never replayed after ambiguous consumption.
-        Configured Read Only/Home/project only; no memory session or capture starts.
+        Selected project or explicit Home only; no memory capture starts.
         """
         from ..secret_adapters import SecretAdapters
         from ..memory.adapter_contracts import AdapterError
         from ..memory.environment import configured_client
 
-        app.require_skill_access()
-        if action in ('draft', 'approve', 'execute'):
-            app.primary()
         approval_client = None
         try:
             catalog = SecretCatalog(app.home, client=app.unbound_client())

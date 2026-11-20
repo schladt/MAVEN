@@ -27,14 +27,9 @@ _STAGE_NAMES = {
     'migration_review': 'Review database upgrade', 'migrate': 'Apply approved database upgrade',
     'migration_reconnect': 'Reconnect upgraded instance', 'migration_stack': 'Find upgraded instance',
     'upgrade_choice': 'Choose database upgrade', 'verify': 'Verify instance readiness',
-    'starter_prepare_review': 'Prepare starter instructions', 'starter_prepare': 'Prepare starter instructions',
-    'starter_review': 'Install starter instructions', 'starter_submit': 'Upload approved starter instructions',
-    'starter_challenge': 'Prepare approved activation',
     'update_local': 'Check local software', 'update_local_choice': 'Update local software',
     'update_local_wait': 'Update local software', 'update_schema': 'Check database schema',
     'update_service': 'Check service stack', 'update_service_apply': 'Update service stack',
-    'update_authority': 'Check instructions', 'update_authority_choice': 'Update instructions',
-    'starter_activate': 'Activate approved starter instructions', 'starter_renew': 'Renew activation challenge',
     'done': 'Setup complete',
 }
 
@@ -62,8 +57,7 @@ _CODE_HELP = {
                                  'for this setup. Sign in as the confirmed principal or change the selection.',
     'authentication_required': 'The MAVEN service did not accept the request credentials. Sign in again.',
     'not_authorized': 'AWS or the MAVEN service denied this request for the selected identity or role.',
-    'context_stale': 'The instance changed while this step ran (for example maintenance or a new '
-                     'authority version). Resume re-reads the current state.',
+    'context_stale': 'The instance changed while this step ran. Resume re-reads the current state.',
     'client_incompatible': 'This MAVEN software version does not match the deployed service version.',
     'invalid_configuration': 'The saved connection settings are incomplete or do not belong together. '
                              'Check the instance, roles and endpoint in the saved settings.',
@@ -138,10 +132,6 @@ def _context(result, stage):
                      str(presentation['principal']))
     if presentation.get('target'):
         lines.append('Exact target: ' + str(presentation['target']))
-    progress = result.get('starter_progress')
-    if result.get('step', '').startswith('starter') and progress:
-        lines.append(f'Starter instructions: {progress["completed"]}/{progress["total"]} completed | '
-                     f'Page {progress["position"]}: {progress["title"]}')
     lines.append('Saved: ' + stage + ' | Receipts: ' + str(len(result.get('receipts', []))) +
                  ' | Ctrl+Q pauses')
     return '\n'.join(lines)

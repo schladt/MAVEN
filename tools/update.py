@@ -1,14 +1,12 @@
 """Read-only inspection of what an installed MAVEN home needs to match its checkout.
 
-Covers local software and harness skills, the deployed service stack, the database schema
-and the active owner instructions. Nothing here changes local files or cloud resources;
-the administration controller applies each part only after its own reviewed approval.
+Covers local software and harness skills, the service stack and database schema.
+The administration controller applies cloud changes only after their own reviews.
 """
 from __future__ import annotations
 
 import base64
 import csv
-import difflib
 import hashlib
 import io
 import json
@@ -157,9 +155,7 @@ def _git(checkout: Path) -> dict:
 
 def local_report(home: Path, checkout: Path) -> dict:
     """Compare the installed software and installer-owned harness skills with the checkout."""
-    from tools.harness import installed_targets
-    from tools.uninstall.common import read_private
-    from tools.uninstall.local import MANIFEST
+    from tools.harness import installed_targets, integration_plan, skill_bodies, skill_cutover_plan
     home, checkout = Path(home), Path(checkout)
     if not (checkout / 'install.py').is_file() or not (checkout / 'pyproject.toml').is_file():
         raise ValueError(f'Not a MAVEN checkout (install.py and pyproject.toml required): {checkout}')
@@ -172,29 +168,36 @@ def local_report(home: Path, checkout: Path) -> dict:
                     'changed': sorted(name for name in source if name in installed and installed[name] != source[name]),
                     'added': sorted(name for name in source if name not in installed),
                     'removed': sorted(name for name in installed if name not in source)}
-    manifest = read_private(home / MANIFEST) if (home / MANIFEST).exists() else {}
-    templates = checkout / 'maven_resources/templates/skills'
-    names = sorted(path.parent.name for path in templates.glob('*/SKILL.md'))
-    roots = sorted({str(Path(path).parent.parent) for path in manifest.get('skill_references', [])})
-    stale, missing = [], []
-    for root in roots:
-        for name in names:
-            target = Path(root) / name / 'SKILL.md'
-            if not target.exists():
-                missing.append(str(target))
-            elif target.read_bytes() != (templates / name / 'SKILL.md').read_bytes():
-                stale.append(str(target))
     targets = installed_targets(home)
     harnesses = sorted(targets['paths'])
+    roots = targets['skill_roots']
+    templates = checkout / 'maven_resources/templates'
+    bodies = skill_bodies(templates / 'skills') if roots else {}
+    conflicts = []
+    skills, retired, _ = skill_cutover_plan(home, roots, bodies=bodies, conflicts=conflicts)
+    pending = pending_owned_skills(home)
+    stale = sorted([str(path) for path, _, prior in skills if prior is not None] +
+                   [item['target'] for item in conflicts])
+    missing = sorted(str(path) for path, _, prior in skills if prior is None)
+    integrations = integration_plan(home, harnesses, paths=targets['paths'],
+                                   statusline=targets['statusline'] and 'claude' in harnesses,
+                                   guidance=(templates / 'harness/startup.md').read_text() if harnesses else '')
+    changed_integrations = [str(change.path) for change in integrations if not change.receipt.get('conflict')
+                            and (change.before != change.after or change.receipt.get('retired'))]
+    conflicts.extend({'target': str(change.path), 'reason': change.receipt['conflict']} for change in integrations
+                     if change.receipt.get('conflict'))
     metadata_current = _package_inputs_current(home, checkout)
     integrity_failures = _installed_integrity(home / 'venv')
     current = software['installed'] and metadata_current and not integrity_failures and not (
-        software['changed'] or software['added'] or software['removed'])
+        software['changed'] or software['added'] or software['removed'] or skills or retired or changed_integrations
+        or conflicts or pending or targets['unresolved'])
     return {'checkout': str(checkout), 'home': str(home), 'software': software,
             'package_metadata_current': metadata_current,
             'integrity_failures': integrity_failures,
-            'skills': {'stale': stale, 'missing': missing}, 'harnesses': harnesses,
-            'skills_current': not (stale or missing),
+            'skills': {'stale': stale, 'missing': missing, 'retire': [str(path) for path, _ in retired]},
+            'harnesses': harnesses, 'integration_changes': changed_integrations, 'preserved': conflicts,
+            'skills_current': not (stale or missing or retired or pending),
+            'unfinished_files': [saved['intent']['target'] for saved in pending],
             'unresolved_integration_targets': targets['unresolved'],
             'git': _git(checkout), 'current': current,
             'limitations': ['Installed package bytes and recorded installation inputs are compared; '
@@ -212,16 +215,17 @@ def install_command(home: Path, checkout: Path) -> list[str]:
                         '--harness-context', f'{harness}={context}'])
     for root in targets['skill_roots']:
         command.extend(['--skill-dir', str(root)])
-    if not targets['lifecycle']:
-        command.append('--no-lifecycle-hooks')
     if targets['statusline'] and 'claude' in targets['paths']:
         command.append('--claude-statusline')
     return command
 
 
-def pending_owned_skills(home):
-    """Read exact unfinished file intents for local review without applying them."""
+def pending_owned_skills(home, targets=None):
+    """Return reviewed candidates in scope; obsolete intents can close but never write."""
     from tools.uninstall.common import read_private
+    from tools.harness import SKILL_FILES, skill_root, skill_bodies
+    allowed = None if targets is None else set(map(str, targets))
+    bodies = None
     result = []
     for path in sorted((Path(home) / 'runtime/skill-installations').glob('*.json')):
         intent = read_private(path)
@@ -229,55 +233,107 @@ def pending_owned_skills(home):
             continue
         if intent.get('schema') != 1 or intent.get('home') != str(home):
             raise ValueError('Skill installation intent belongs to another home or schema.')
-        result.append({'path': str(path), 'intent': intent})
+        target = Path(intent['target'])
+        root = skill_root(target)
+        if target == Path(home) / 'activate':
+            obsolete = False
+        else:
+            relative = target.relative_to(root).as_posix() if root is not None else None
+            if relative in SKILL_FILES:
+                if bodies is None:
+                    bodies = skill_bodies()
+                obsolete = base64.b64decode(intent['body'], validate=True) != bodies[relative]
+            else:
+                obsolete = True
+        if obsolete or allowed is None or str(target) in allowed:
+            result.append({'path': str(path), 'intent': intent,
+                           **({'disposition': 'retire obsolete intent without writing its target'} if obsolete else {})})
     return result
 
 
-def apply_owned_skills(home, source, plan, references):
-    """Apply exact journaled skill writes under the caller's installation lock."""
-    from tools.harness import _read, write_skill
+def apply_owned_skills(home, source, plan, references, *, activation=False):
+    """Apply only reviewed leaves; pin publication and check sharing under the installation locks."""
+    from contextlib import nullcontext
+    from tools.harness import _read, _skill_manifest, skill_root, SKILL_FILES, write_skill
     from tools.uninstall.common import save_private
-    from tools.uninstall.local import inventory, record_installation
+    from tools.uninstall.local import _shared_skills, _sharing_locks, inventory, record_installation
     home = Path(home)
-    references = {str(path) for path in references}
-    directory = home / 'runtime' / 'skill-installations'
-    pending = {}
-    for saved in pending_owned_skills(home):
-        path, intent = Path(saved['path']), saved['intent']
-        target = Path(intent['target'])
-        body = base64.b64decode(intent['body'], validate=True)
-        before = _read(target)
-        if before == body:
-            record_installation(home, intent['source'], [target],
-                                [target] if intent.get('skill_reference', str(target) in references) else [])
-            intent['completed'] = True
-            save_private(path, intent)
-        elif ((before is None and intent['expected'] is None) or
-              (before is not None and intent['expected'] is not None and inventory(target) == intent['expected'])):
-            pending[str(target)] = (path, intent)
-        else:
-            raise ValueError(f'Interrupted skill installation changed; original intent retained: {target}')
+    references = set(map(str, references))
+    allowed = references | ({str(home / 'activate')} if activation else set())
     selected = {str(target): (target, body, expected) for target, body, expected in plan}
-    for target, (_, intent) in pending.items():
-        original = base64.b64decode(intent['body'], validate=True)
-        if target in selected and selected[target][1] != original:
-            raise ValueError('Interrupted skill candidate changed; finish the original installation first.')
-        selected[target] = (Path(target), original, intent['expected'])
-    for key, (target, body, expected) in selected.items():
-        if key in pending:
-            path, intent = pending[key]
-        else:
-            path = directory / (str(uuid4()) + '.json')
-            intent = {'schema': 1, 'home': str(home), 'source': str(source), 'target': key,
-                      'body': base64.b64encode(body).decode(), 'expected': expected,
-                      'skill_reference': key in references, 'completed': False}
+    pending = {}
+    directory = home / 'runtime/skill-installations'
+    saved_intents = pending_owned_skills(home, allowed)
+    if not selected and not saved_intents:
+        return
+    lock_shared = bool(references and (selected or any(not item.get('disposition') for item in saved_intents)))
+    with _sharing_locks(home, []) if lock_shared else nullcontext():
+        for saved in saved_intents:
+            intent, journal = saved['intent'], Path(saved['path'])
+            key = intent['target']
+            if saved.get('disposition'):
+                save_private(journal, {**intent, 'completed': True, 'outcome': saved['disposition']})
+                continue
+            if key in pending:
+                raise ValueError(f'Ambiguous unfinished skill intents; preserved: {key}')
+            pending[key] = journal, intent
+            candidate = Path(key), base64.b64decode(intent['body'], validate=True), intent['expected']
+            if key in selected and selected[key] != candidate:
+                raise ValueError(f'Interrupted skill candidate changed; original intent retained: {key}')
+            selected[key] = candidate
+        shared, unknown = _shared_skills(home, []) if lock_shared else (set(), False)
+        for key, (target, body, expected) in selected.items():
+            root = skill_root(target)
+            is_skill = root is not None and target.relative_to(root).as_posix() in SKILL_FILES
+            if key not in allowed or not (is_skill or (activation and target == home / 'activate')):
+                raise ValueError(f'Unreviewed file target; preserved: {target}')
+            if is_skill and (key in shared or unknown):
+                raise ValueError(f'Shared or uncertain skill ownership; preserved: {target}')
+            manifest = _skill_manifest(home)
+            recorded = manifest.get('owned', {}).get(key)
+            if is_skill and recorded is not None and key not in manifest.get('skill_references', []):
+                raise ValueError(f'Ambiguous installer ownership; preserved: {target}')
+            before = _read(target)
+            actual = inventory(target) if before is not None else None
+            if key in pending:
+                path, intent = pending[key]
+                if (before == body and actual is not None and actual in (intent.get('published'), recorded)
+                        and recorded in (expected, actual)):
+                    record_installation(home, intent['source'], [target], [target] if is_skill else [],
+                                        registry_locked=lock_shared, pinned={key: actual})
+                    save_private(path, {**intent, 'completed': True})
+                    continue
+            else:
+                path = directory / (str(uuid4()) + '.json')
+                intent = {'schema': 1, 'home': str(home), 'source': str(source), 'target': key,
+                          'body': base64.b64encode(body).decode(), 'expected': expected,
+                          'skill_reference': is_skill, 'completed': False}
+            if recorded != expected or actual != expected:
+                raise ValueError(f'Skill or ownership changed since review; preserved: {target}')
             save_private(path, intent)
-        write_skill(target, body, expected)
-        record_installation(home, intent['source'], [target],
-                            [target] if intent.get('skill_reference', str(target) in references) else [])
-        intent['completed'] = True
-        save_private(path, intent)
-    record_installation(home, source, [], references)
+
+            def publishing(pin):
+                intent['published'] = pin
+                save_private(path, intent)
+
+            write_skill(target, body, expected, publishing=publishing)
+            record_installation(home, intent['source'], [target], [target] if is_skill else [],
+                                registry_locked=lock_shared, pinned={key: intent['published']})
+            save_private(path, {**intent, 'completed': True})
+
+
+def install_skill_bundle(home, source, roots, writes, retirements):
+    """Recheck the exact cutover review and verify publication before callers change guidance or retire."""
+    from tools.harness import SKILL_FILES, retired_skill_plan, skill_plan, verify_skill_bundle
+    # Roots that were blocked at review are never passed here, even if a conflict goes away.
+    for planned, reviewed in ((skill_plan(roots, home), writes), (retired_skill_plan(home, roots), retirements)):
+        current = {item[0]: item[1:] for item in planned}
+        prior = {item[0]: item[1:] for item in reviewed}
+        if current != prior:
+            changed = next(path for path in sorted(current.keys() | prior.keys()) if current.get(path) != prior.get(path))
+            raise ValueError(f'Skill changed since review; preserved: {changed}')
+    apply_owned_skills(home, source, writes, [root / name for root in roots for name in SKILL_FILES])
+    verify_skill_bundle(home, roots)
 
 
 def schema_status(values: dict) -> dict:
@@ -343,68 +399,3 @@ def stateful_risks(document: dict) -> list[dict]:
     """Changes that would remove or replace a resource holding memory data or credentials."""
     return [row for row in change_summary(document) if row['type'] in _STATEFUL and
             (row['action'] == 'Remove' or row['replacement'] in ('True', 'Conditional'))]
-
-
-def _index(client) -> dict[str, dict]:
-    from tools.memory.client import MemoryClientError
-    pages, after, generation = {}, None, None
-    while True:
-        request = {} if after is None else {'after_slug': after}
-        response = client.invoke('/v1/pages/index', request)
-        data = response.get('data')
-        if (response.get('status') != 'ready' or not isinstance(data, dict)
-                or not isinstance(data.get('pages'), list) or type(data.get('authority_generation')) is not int):
-            raise MemoryClientError('invalid_service_response')
-        if generation is not None and generation != data['authority_generation']:
-            raise MemoryClientError('context_stale')
-        generation = data['authority_generation']
-        for page in data['pages']:
-            pages[page['slug']] = page
-        after = data.get('next_after_slug')
-        if after is None:
-            return pages
-
-
-def authority_changes(client) -> list[dict]:
-    """Bundled instruction pages that are new, or differ from the active cloud version."""
-    from tools.memory.onboarding import catalog
-    from tools.memory.validation import digest
-    candidates, _ = catalog()
-    active = _index(client)
-    changes = []
-    for candidate in candidates:
-        current = active.get(candidate['slug'])
-        if current is None:
-            changes.append({'slug': candidate['slug'], 'title': candidate['title'], 'action': 'add',
-                            'page_id': None, 'revision': 0, 'candidate': candidate, 'diff': ''})
-        elif current.get('content_hash') != digest(candidate):
-            published = client.read_full({'slug': candidate['slug'], 'expected_revision': current['revision']})['data']
-            # Omission is not an instruction to erase an owner's approved discovery description.
-            if candidate['page_kind'] == 'skill' and 'description' not in candidate and 'description' in published:
-                candidate = {**candidate, 'description': published['description']}
-            if digest(candidate) == current['content_hash']:
-                continue
-            diff = ''.join(difflib.unified_diff(published['body_markdown'].splitlines(keepends=True),
-                                                candidate['body_markdown'].splitlines(keepends=True),
-                                                f'active/{candidate["slug"]}.md', f'bundled/{candidate["slug"]}.md'))
-            metadata_keys = ('slug', 'page_kind', 'title', 'scope', 'requires', 'bundle', 'description')
-            before = {key: published[key] for key in metadata_keys if key in published}
-            before['authority_state'] = published['candidate_authority_state']
-            after = {key: value for key, value in candidate.items() if key != 'body_markdown'}
-            diff += ''.join(difflib.unified_diff(
-                (json.dumps(before, indent=2, sort_keys=True, ensure_ascii=False) + '\n').splitlines(keepends=True),
-                (json.dumps(after, indent=2, sort_keys=True, ensure_ascii=False) + '\n').splitlines(keepends=True),
-                f'active/{candidate["slug"]}.metadata.json', f'bundled/{candidate["slug"]}.metadata.json'))
-            changes.append({'slug': candidate['slug'], 'title': candidate['title'], 'action': 'update',
-                            'page_id': current['page_id'], 'revision': current['revision'],
-                            'candidate': candidate, 'diff': diff})
-    return changes
-
-
-def prepare_authority_update(destination: Path, changes: list[dict], evidence: dict) -> dict:
-    from tools.memory.onboarding import catalog, draft, write_drafts
-    _, hashes = catalog()
-    drafts = [draft(change['candidate'], evidence, page_id=change['page_id'], expected_revision=change['revision'],
-                    reason='Update MAVEN instructions to the installed bundled version')
-              for change in changes]
-    return write_drafts(destination, drafts, hashes)

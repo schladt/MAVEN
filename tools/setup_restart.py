@@ -5,7 +5,7 @@ from uuid import uuid4
 
 from tools.administration import AdminOperations, _digest, _source
 from tools.setup_common import SetupPending, atomic_private, private_directory, read_private, save_json, setup_lock
-from tools.uninstall.local import _lock, _quiet
+from tools.uninstall.local import _lock
 
 
 @contextmanager
@@ -16,7 +16,6 @@ def _locked(home):
         directory = controller.home / 'runtime/setup'
         private_directory(directory)
         with setup_lock(directory), _lock(controller.home / 'runtime/registry.lock'):
-            _quiet(controller.home)
             # Local preservation does not authorize using a connection. Read legacy locators
             # for the review without forcing their migration or constructing AWS clients.
             from tools.environment_migrations import inspect

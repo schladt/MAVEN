@@ -676,7 +676,7 @@
                   "Action": "execute-api:Invoke",
                   "Resource": [
                     {
-                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/records/change"
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/status"
                     },
                     {
                       "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/records/query"
@@ -706,10 +706,13 @@
                       "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/context"
                     },
                     {
-                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/claim"
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/apply"
                     },
                     {
-                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/project_context"
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/inventory"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/read"
                     },
                     {
                       "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_lookup"
@@ -722,9 +725,6 @@
                     },
                     {
                       "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_adapter_consume"
-                    },
-                    {
-                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/revisions"
                     }
                   ]
                 },
@@ -1104,17 +1104,17 @@
         "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/context"}
       }
     },
-    "MemoryClaimRoute": {
+    "ReconcileApplyRoute": {
       "Type": "AWS::ApiGatewayV2::Route",
       "Condition": "ApprovedTarget",
       "Properties": {
         "ApiId": {"Ref": "MemoryApi"},
-        "RouteKey": "POST /v1/memory/claim",
+        "RouteKey": "POST /v1/reconcile/apply",
         "AuthorizationType": "AWS_IAM",
         "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
       }
     },
-    "MemoryClaimInvokePermission": {
+    "ReconcileApplyInvokePermission": {
       "Type": "AWS::Lambda::Permission",
       "Condition": "ApprovedTarget",
       "Properties": {
@@ -1122,20 +1122,20 @@
         "FunctionName": {"Ref": "MemoryFunction"},
         "Principal": "apigateway.amazonaws.com",
         "SourceAccount": {"Ref": "AWS::AccountId"},
-        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/claim"}
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/apply"}
       }
     },
-    "MemoryProjectContextRoute": {
+    "ReconcileInventoryRoute": {
       "Type": "AWS::ApiGatewayV2::Route",
       "Condition": "ApprovedTarget",
       "Properties": {
         "ApiId": {"Ref": "MemoryApi"},
-        "RouteKey": "POST /v1/memory/project_context",
+        "RouteKey": "POST /v1/reconcile/inventory",
         "AuthorizationType": "AWS_IAM",
         "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
       }
     },
-    "MemoryProjectContextInvokePermission": {
+    "ReconcileInventoryInvokePermission": {
       "Type": "AWS::Lambda::Permission",
       "Condition": "ApprovedTarget",
       "Properties": {
@@ -1143,7 +1143,28 @@
         "FunctionName": {"Ref": "MemoryFunction"},
         "Principal": "apigateway.amazonaws.com",
         "SourceAccount": {"Ref": "AWS::AccountId"},
-        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/project_context"}
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/inventory"}
+      }
+    },
+    "ReconcileReadRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"},
+        "RouteKey": "POST /v1/reconcile/read",
+        "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "ReconcileReadInvokePermission": {
+      "Type": "AWS::Lambda::Permission",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction",
+        "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com",
+        "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/read"}
       }
     },
     "SecretLookupRoute": {
@@ -1228,27 +1249,6 @@
         "Principal": "apigateway.amazonaws.com",
         "SourceAccount": {"Ref": "AWS::AccountId"},
         "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/secret_adapter_consume"}
-      }
-    },
-    "MemoryRevisionsRoute": {
-      "Type": "AWS::ApiGatewayV2::Route",
-      "Condition": "ApprovedTarget",
-      "Properties": {
-        "ApiId": {"Ref": "MemoryApi"},
-        "RouteKey": "POST /v1/memory/revisions",
-        "AuthorizationType": "AWS_IAM",
-        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
-      }
-    },
-    "MemoryRevisionsInvokePermission": {
-      "Type": "AWS::Lambda::Permission",
-      "Condition": "ApprovedTarget",
-      "Properties": {
-        "Action": "lambda:InvokeFunction",
-        "FunctionName": {"Ref": "MemoryFunction"},
-        "Principal": "apigateway.amazonaws.com",
-        "SourceAccount": {"Ref": "AWS::AccountId"},
-        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/memory/revisions"}
       }
     },
     "MemoryAdminRole": {
@@ -1562,14 +1562,14 @@
         "TimeoutInMillis": 26000
       }
     },
-    "ChangeRoute": {
+    "ReconcileStatusRoute": {
       "Type": "AWS::ApiGatewayV2::Route",
       "Condition": "ApprovedTarget",
       "Properties": {
         "ApiId": {
           "Ref": "MemoryApi"
         },
-        "RouteKey": "POST /v1/records/change",
+        "RouteKey": "POST /v1/reconcile/status",
         "AuthorizationType": "AWS_IAM",
         "Target": {
           "Fn::Join": [
@@ -1584,7 +1584,7 @@
         }
       }
     },
-    "ChangeInvokePermission": {
+    "ReconcileStatusInvokePermission": {
       "Type": "AWS::Lambda::Permission",
       "Condition": "ApprovedTarget",
       "Properties": {
@@ -1597,7 +1597,7 @@
           "Ref": "AWS::AccountId"
         },
         "SourceArn": {
-          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/records/change"
+          "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/status"
         }
       }
     },

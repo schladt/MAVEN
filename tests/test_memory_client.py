@@ -11,9 +11,9 @@ import tempfile
 import unittest
 from unittest.mock import ANY, MagicMock, patch
 
+from tools.memory import cli
 from tools.memory.client import MemoryClient, MemoryClientError, read_json, selected_session, validate_config
 from tools.memory.validation import CLIENT_PROTOCOL
-from tools.memory import cli
 
 
 CONFIG = {
@@ -31,6 +31,18 @@ CONFIG = {
     'skill_bucket': 'synthetic-memory-skills',
 }
 KEY = '00000000-0000-4000-8000-000000000003'
+
+
+def project_creation():
+    return {'request_key': KEY, 'record_id': KEY, 'expected_revision': 0,
+            'kind': 'entity', 'data_scope': 'owner', 'classification': 'Sensitive',
+            'data': {'entity_type': 'project', 'name': 'Example', 'aliases': []},
+            'source': {'origin': 'fixture', 'excerpt': 'Create Example'}, 'change_reason': 'Create project'}
+
+
+def capability(config):
+    return {'instance_id': config['instance_id'], 'recovery_epoch': config['recovery_epoch'],
+            'capability': 'project_reconcile_v1'}
 
 
 class MemoryClientBoundaries(unittest.TestCase):
@@ -80,7 +92,7 @@ class MemoryClientBoundaries(unittest.TestCase):
                                                        (404, {'status': 'operation_unavailable'})]), \
              patch('tools.memory.client.time.sleep'):
             with self.assertRaises(MemoryClientError) as failure:
-                client.invoke('/v1/records/change', {'request_key': KEY})
+                client.invoke('/v1/memory/write', project_creation())
         self.assertEqual(failure.exception.code, 'outcome_unknown')
         self.assertEqual(failure.exception.request_key, KEY)
 
@@ -91,7 +103,7 @@ class MemoryClientBoundaries(unittest.TestCase):
         dispatched = 0
         def provider(route, body, remaining):
             nonlocal committed, dispatched
-            if route == '/v1/records/change':
+            if route == '/v1/memory/write':
                 dispatched += 1
                 if committed:
                     self.fail('uncertain mutation was reissued instead of reconciled')
@@ -100,7 +112,7 @@ class MemoryClientBoundaries(unittest.TestCase):
             self.assertTrue(committed)
             return 200, {'status': 'ready', 'data': {'request_key': KEY, 'revision': 1}}
         with patch.object(client, '_post', side_effect=provider), patch('tools.memory.client.time.sleep'):
-            result = client.invoke('/v1/records/change', {'request_key': KEY})
+            result = client.invoke('/v1/memory/write', project_creation())
         self.assertEqual(result['data']['revision'], 1)
         self.assertEqual(dispatched, 1)
 
@@ -115,11 +127,11 @@ class MemoryClientBoundaries(unittest.TestCase):
     def test_definitive_memory_rejections_preserve_the_request_key_without_retry(self):
         client = MemoryClient(CONFIG, None)
         self.addCleanup(client.close)
-        for status in ('setting_conflict', 'reference_unavailable', 'session_unavailable'):
+        for status in ('revision_conflict', 'reference_unavailable', 'idempotency_conflict'):
             with self.subTest(status=status), \
                     patch.object(client, '_post', return_value=(409, {'status': status})) as post:
                 with self.assertRaises(MemoryClientError) as failure:
-                    client.invoke('/v1/memory/write', {'request_key': KEY})
+                    client.invoke('/v1/memory/write', project_creation())
                 self.assertEqual((failure.exception.code, failure.exception.request_key), (status, KEY))
                 post.assert_called_once()
 
@@ -235,15 +247,15 @@ class AuthenticationAndWarmupBoundaries(unittest.TestCase):
         with patch.object(client, '_post', side_effect=[
                 MemoryClientError('transport_unavailable'), (503, {'status': 'warming'}),
                 (200, receipt)]) as post, patch('tools.memory.client.time.sleep'):
-            self.assertTrue(client.invoke('/v1/records/change', {'request_key': KEY})['reconciled'])
+            self.assertTrue(client.invoke('/v1/memory/write', project_creation())['reconciled'])
             self.assertEqual([call.args[0] for call in post.call_args_list],
-                             ['/v1/records/change', '/v1/operations/lookup', '/v1/operations/lookup'])
+                             ['/v1/memory/write', '/v1/operations/lookup', '/v1/operations/lookup'])
         with patch.object(client, '_post', side_effect=[
                 MemoryClientError('transport_unavailable'),
                 MemoryClientError('selected_login_unavailable_or_expired')]), \
                 patch('tools.memory.client.time.sleep'):
             with self.assertRaises(MemoryClientError) as failure:
-                client.invoke('/v1/records/change', {'request_key': KEY})
+                client.invoke('/v1/memory/write', project_creation())
             self.assertEqual((failure.exception.code, failure.exception.request_key), ('outcome_unknown', KEY))
 
     def test_database_warmup_only_repeats_the_read_only_probe(self):
@@ -261,20 +273,24 @@ class AuthenticationAndWarmupBoundaries(unittest.TestCase):
             self.assertEqual(wait_for_database(values, budget=0), 'warming')
             probe.assert_called_once()
 
-    def test_setup_authority_uses_runtime_scope_without_optional_capabilities(self):
-        from tools.setup_common import SetupPending, verify_authority
-        client = MagicMock()
-        client.load_context.return_value = {'data': {'instructions': [{'page_kind': 'directive'}],
-                                                     'authority_generation': 7}}
+    def test_connection_probe_requires_the_selected_instance_and_recovery_epoch(self):
+        from tools.setup_common import verify_connection
+        client = MagicMock(config=CONFIG)
         with patch('tools.memory.environment.configured_client', return_value=client):
-            self.assertEqual(verify_authority(Path('/synthetic/.env'), values={}), 7)
-            client.load_context.assert_called_once_with({'workflow': 'maven-workflow'})
-            client.close.assert_called_once()
-            client.reset_mock()
-            client.load_context.return_value = {'data': {'instructions': [], 'authority_generation': 7}}
-            with self.assertRaises(SetupPending):
-                verify_authority(Path('/synthetic/.env'), values={})
-            client.close.assert_called_once()
+            for response, expected in ((capability(CONFIG), True),
+                                       ({**capability(CONFIG), 'recovery_epoch': KEY}, False),
+                                       ({'authority_generation': 1}, False)):
+                client.reset_mock()
+                client.invoke.return_value = {'status': 'ready', 'data': response}
+                with self.subTest(response=response):
+                    if expected:
+                        self.assertEqual(verify_connection(Path('/synthetic/.env')), response)
+                    else:
+                        with self.assertRaisesRegex(MemoryClientError, '^context_stale$'):
+                            verify_connection(Path('/synthetic/.env'))
+                    client.invoke.assert_called_once_with('/v1/reconcile/status', {
+                        'instance_id': CONFIG['instance_id'], 'recovery_epoch': CONFIG['recovery_epoch']})
+                    client.close.assert_called_once()
 
 
 class RefreshableSessionBoundaries(unittest.TestCase):
@@ -709,49 +725,6 @@ class InstructionClientBoundaries(unittest.TestCase):
                 with self.assertRaisesRegex(MemoryClientError, 'invalid_service_response'):
                     self.client.load_instruction('example', context={'instructions_only': True})
 
-    def test_catalog_pages_all_results_at_one_generation_and_filters_scope(self):
-        from tools.memory.skills import SessionSkills
-        first = [self.owner_page('skill-' + str(index).zfill(2), 'Complete body',
-                                 description='Generic approved purpose')['data'] for index in range(10)]
-        last = [self.owner_page('skill-10', 'Complete body')['data']]
-        last += [{**self.owner_page('skill-11', 'Private body')['data'], 'scope': {'project': KEY}}]
-        responses = [
-            {'status': 'ready', 'data': {'pages': first, 'authority_generation': 4, 'next_after_slug': 'skill-09'}},
-            {'status': 'ready', 'data': {'pages': last, 'authority_generation': 4, 'next_after_slug': None}},
-        ]
-        with patch.object(self.client, 'invoke', side_effect=responses) as invoke:
-            catalog = SessionSkills.catalog_pages(self.client)
-        self.assertEqual(len(catalog['pages']), 11)
-        self.assertEqual(invoke.call_args_list[0].args, ('/v1/pages/index', {
-            'page_kind': 'skill', 'limit': 10, 'scope': 'universal'}))
-        self.assertEqual(invoke.call_args_list[1].args[1]['after_slug'], 'skill-09')
-        summary = SessionSkills.summaries(catalog, [first[0]], 4)
-        self.assertTrue(summary['pages'][0]['loaded'])
-        self.assertFalse(SessionSkills.summaries(catalog, [first[0]], 3)['pages'][0]['loaded'])
-        self.assertFalse({'body_markdown', 'bundle', 'content_hash', 'provenance'} & summary['pages'][0].keys())
-        self.assertEqual(summary['pages'][0]['description'], 'Generic approved purpose')
-        responses[1]['data']['authority_generation'] = 5
-        with patch.object(self.client, 'invoke', side_effect=responses):
-            with self.assertRaisesRegex(MemoryClientError, 'context_stale'):
-                SessionSkills.catalog_pages(self.client)
-
-    def test_catalog_rejects_repeated_cursor_and_cached_discovery_failure(self):
-        from tools.memory.skills import SessionSkills
-        page = self.owner_page('example', 'Complete body')['data']
-        response = {'status': 'ready', 'data': {'pages': [page], 'authority_generation': 1,
-                                              'next_after_slug': 'example'}}
-        with patch.object(self.client, 'invoke', return_value=response):
-            with self.assertRaisesRegex(MemoryClientError, 'invalid_service_response'):
-                SessionSkills.catalog_pages(self.client)
-        with tempfile.TemporaryDirectory() as directory:
-            skills = SessionSkills(self.client, Path(directory), KEY, CONFIG['instance_id'])
-            response['data']['next_after_slug'] = None
-            with patch.object(self.client, 'invoke', return_value=response):
-                skills.discover()
-            with patch.object(self.client, 'invoke', side_effect=MemoryClientError('selected_login_unavailable_or_expired')):
-                with self.assertRaisesRegex(MemoryClientError, 'selected_login_unavailable_or_expired'):
-                    skills.discover(refresh=True)
-
     def test_inline_context_loads_in_one_request_with_verified_bodies(self):
         dependency = self.owner_page('dependency', 'Dependency body', page_kind='procedure')
         root = self.owner_page('synthetic-skill', 'é root body', requires=['dependency'])
@@ -959,8 +932,8 @@ class InstructionCliBoundaries(unittest.TestCase):
                             patch.object(cli, 'selected_session', return_value=session) as direct_select, \
                             patch.object(bootstrap, 'selected_session', return_value=session) as install_select, \
                             patch.object(bootstrap, 'MemoryClient') as factory:
-                        factory.return_value.load_context.return_value = {
-                            'data': {'authority_generation': 3, 'minimum_client_protocol': 3}}
+                        factory.return_value.config = CONFIG
+                        factory.return_value.invoke.return_value = {'status': 'ready', 'data': capability(CONFIG)}
                         code, result = self.run_cli(
                             ['--env', str(path), *command, '--confirm-instance', CONFIG['instance_id']])
                     self.assertEqual((code, result['status'], result['schema_version']), (0, 'ready', 2))
@@ -1115,35 +1088,6 @@ class EnvironmentAndDisplayBoundaries(unittest.TestCase):
         self.assertEqual(decode(json.loads(rendered)['value']), original)
         self.assertLess(max(map(len, rendered.splitlines())), 1000)
 
-    def test_context_cli_fetches_once_and_closes_client(self):
-        with patch('tools.memory.cli._connection', return_value=({}, CONFIG)), \
-             patch('tools.memory.cli.selected_session'), patch('tools.memory.cli.MemoryClient') as factory:
-            factory.return_value.load_context.return_value = {'status': 'ready', 'data': {'instructions': []}}
-            output = io.StringIO()
-            with redirect_stdout(output):
-                code = cli.main(['--format', 'agent', 'context', '--project-id', KEY, '--workflow', 'work'])
-            self.assertEqual(code, 0)
-            factory.return_value.load_context.assert_called_once_with({'project_id': KEY, 'workflow': 'work'})
-            factory.return_value.close.assert_called_once()
-            self.assertEqual(json.loads(output.getvalue())['format'], 'maven-lossless-tree-v1')
-
-    def test_raw_record_cannot_bypass_managed_session_closure(self):
-        body = {'request_key': KEY, 'record_id': KEY, 'expected_revision': 1,
-                'kind': 'session', 'classification': 'Sensitive', 'data_scope': 'owner',
-                'project_id': KEY, 'data': {'state': 'closed', 'summary': 'Unverified closure'},
-                'source': {'origin': 'Owner conversation', 'excerpt': 'Close the session'},
-                'change_reason': 'Close the session'}
-        with tempfile.TemporaryDirectory() as directory, \
-                patch('tools.memory.cli._connection', return_value=({}, CONFIG)), \
-                patch('tools.memory.cli.selected_session'), patch('tools.memory.cli.MemoryClient') as factory:
-            path = Path(directory) / 'request.json'
-            path.write_text(json.dumps(body))
-            output = io.StringIO()
-            with redirect_stdout(output):
-                code = cli.main(['record', 'put', str(path), '--root', directory, '--session', KEY])
-            self.assertEqual(code, 2)
-            self.assertEqual(json.loads(output.getvalue())['status'], 'lifecycle_command_required')
-            factory.return_value.invoke.assert_not_called()
 
 
 class InstallationBoundaries(unittest.TestCase):
@@ -1293,75 +1237,24 @@ else:
                                     confirm_review=planned['review_sha256'])
             cloud.execute_change_set.assert_not_called()
 
-    def test_initialization_verifies_routine_context_after_admin_operation(self):
+    def test_initialization_checks_reconcile_capability_with_routine_role(self):
         from tools.memory import bootstrap
         with patch('tools.memory.environment.memory_config', return_value=CONFIG), \
              patch('tools.memory.admin.migrate', return_value={'status': 'ready'}) as migrate, \
              patch.object(bootstrap, 'selected_session') as select, \
              patch.object(bootstrap, 'MemoryClient') as factory:
-            factory.return_value.load_context.return_value = {
-                'data': {'authority_generation': 3, 'minimum_client_protocol': 3}}
+            client = factory.return_value
+            client.config = CONFIG
+            client.invoke.return_value = {'status': 'ready', 'data': capability(CONFIG)}
             result = bootstrap.initialize({}, confirm_instance=CONFIG['instance_id'], upgrade=True)
             migrate.assert_called_once()
             self.assertTrue(select.call_args_list[0].kwargs['admin'])
-            factory.return_value.load_context.assert_called_once()
-            factory.return_value.close.assert_called_once()
-            self.assertEqual(result['authority_generation'], 3)
-
-
-class StarterBoundaries(unittest.TestCase):
-    def test_complete_starter_is_offline_and_refuses_overwrite(self):
-        from tools.memory.onboarding import prepare
-        from tools.memory.validation import validate_create
-        from uuid import UUID
-        with tempfile.TemporaryDirectory() as root, patch('tools.memory.cli.selected_session') as login:
-            destination = Path(root) / 'starter'
-            result = prepare(destination, source_origin='fixture owner request',
-                             source_excerpt='Review the generic starter proposal.')
-            manifest = read_json(destination / 'manifest.json')
-            seen = set()
-            ids = set()
-            for entry in manifest['pages']:
-                request = validate_create(read_json(destination / entry['file']))
-                self.assertTrue(set(request['candidate']['requires']) <= seen)
-                seen.add(entry['slug'])
-                for key in ('page_id', 'proposal_id', 'request_key'):
-                    self.assertEqual(UUID(request[key]).version, 4)
-                    self.assertNotIn(request[key], ids)
-                    ids.add(request[key])
-                self.assertEqual((destination / entry['file']).stat().st_mode & 0o777, 0o600)
-            self.assertIn('maven', seen)
-            self.assertFalse(result['authority_activated'])
-            with self.assertRaises(FileExistsError):
-                prepare(destination, source_origin='fixture', source_excerpt='Fixture review')
-            login.assert_not_called()
-
-    def test_approval_binds_exact_real_challenge_and_never_activates(self):
-        from datetime import datetime, timedelta, timezone
-        from tools.memory.onboarding import prepare, approval
-        from tools.memory.validation import digest, validate_resolve
-        with tempfile.TemporaryDirectory() as root:
-            directory = Path(root)
-            prepare(directory / 'starter', source_origin='fixture', source_excerpt='Fixture request')
-            draft_path = directory / 'starter' / 'maven.json'
-            draft = read_json(draft_path)
-            challenge = {'status': 'ready', 'data': {
-                'proposal_id': draft['proposal_id'], 'page_id': draft['page_id'], 'challenge_id': KEY,
-                'candidate_hash': digest(draft['candidate']), 'expected_revision': 0,
-                'expires_at': (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()}}
-            challenge_path = directory / 'challenge.json'
-            challenge_path.write_text(json.dumps(challenge))
-            result = approval(draft_path, challenge_path, directory / 'approval.json',
-                              approval_origin='fixture review', approval_excerpt='Approve exact fixture')
-            request = validate_resolve(read_json(directory / 'approval.json'))
-            self.assertEqual(request['candidate_hash'], challenge['data']['candidate_hash'])
-            self.assertFalse(result['authority_activated'])
-            challenge['data']['candidate_hash'] = '0' * 64
-            challenge_path.write_text(json.dumps(challenge))
-            with self.assertRaisesRegex(MemoryClientError, 'candidate_confirmation_mismatch'):
-                approval(draft_path, challenge_path, directory / 'rejected.json',
-                         approval_origin='fixture', approval_excerpt='Fixture approval')
-            self.assertFalse((directory / 'rejected.json').exists())
+            self.assertFalse(select.call_args_list[-1].kwargs.get('admin'))
+            client.invoke.assert_called_once_with('/v1/reconcile/status', {
+                'instance_id': CONFIG['instance_id'], 'recovery_epoch': CONFIG['recovery_epoch']})
+            client.close.assert_called_once()
+            self.assertTrue(result['service_verified'])
+            self.assertEqual(result['capability'], 'project_reconcile_v1')
 
 
 if __name__ == '__main__':

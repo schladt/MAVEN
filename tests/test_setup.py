@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from tools.memory.client import MemoryClientError
-from tools.interaction import OperationPaused, using
+from tools.interaction import using
 from tools.setup import SetupPending, Wizard, read_private, save_json
 
 
@@ -23,7 +23,7 @@ class GuidedSetupTests(unittest.TestCase):
             wizard.settings({'MAVEN_MEMORY_INSTANCE_ID': str(uuid4())})
             output = io.StringIO()
             with patch.object(wizard, 'existing'), patch.object(wizard, 'fresh') as fresh, \
-                    patch.object(wizard, 'verify_authority', side_effect=MemoryClientError('not_authorized')), \
+                    patch.object(wizard, 'verify_connection', side_effect=MemoryClientError('not_authorized')), \
                     patch('tools.project_setup.setup_project') as project, redirect_stdout(output):
                 with self.assertRaises(MemoryClientError):
                     wizard.run()
@@ -122,11 +122,11 @@ class GuidedSetupTests(unittest.TestCase):
             wizard.state['project'] = saved
             wizard.save()
             with patch.object(wizard, 'existing'), \
-                    patch.object(wizard, 'verify_authority', return_value=7) as authority, \
+                    patch.object(wizard, 'verify_connection', return_value={'capability': 'project_reconcile_v1'}) as probe, \
                     patch('tools.project_setup.setup_project') as project, \
                     patch('tools.setup.confirm') as confirm, redirect_stdout(io.StringIO()):
                 self.assertEqual(wizard.run(), 0)
-            authority.assert_called_once_with()
+            probe.assert_called_once_with()
             project.assert_not_called()
             confirm.assert_not_called()
             state = read_private(wizard.state_path)
@@ -138,70 +138,12 @@ class GuidedSetupTests(unittest.TestCase):
             wizard = self.wizard(directory)
             wizard.settings({'MAVEN_MEMORY_INSTANCE_ID': str(uuid4())})
             with patch.object(wizard, 'existing'), \
-                    patch.object(wizard, 'verify_authority', return_value=7), \
+                    patch.object(wizard, 'verify_connection', return_value={'capability': 'project_reconcile_v1'}), \
                     patch('tools.administration.AdminOperations.begin', side_effect=AssertionError('optional secrets')), \
                     redirect_stdout(io.StringIO()):
                 self.assertEqual(wizard.run(), 0)
             self.assertTrue(read_private(wizard.state_path)['instance_ready'])
             self.assertNotIn('secrets_operation', wizard.state)
-
-    def test_stale_unsubmitted_starter_review_is_retained_and_refreshed_in_same_setup(self):
-        from tools.memory.validation import digest
-        with tempfile.TemporaryDirectory() as directory:
-            wizard = self.wizard(directory)
-            starter = wizard.directory / 'starter'
-            starter.mkdir(mode=0o700)
-            (starter / 'manifest.json').write_text('{}')
-            old = {'review_digest': 'old', 'source': {'origin': 'original owner', 'excerpt': 'original approval'}}
-            wizard.state['starter_collection_approval'] = old
-            wizard.save()
-            candidate = {'pages': [{'candidate': {'slug': 'fixture', 'title': 'Fixture'},
-                                    'request_key': str(uuid4()), 'proposal_id': str(uuid4())}]}
-            ui = Mock(review=Mock(return_value=False))
-            with patch.object(wizard, 'preflight'), patch('tools.setup_starter.collection', return_value=candidate), \
-                    patch('tools.setup_starter.summary', return_value='Exact replacement review'), using(ui):
-                with self.assertRaisesRegex(SetupPending, 'declined'):
-                    wizard.starter()
-            ui.review.assert_called_once()
-            self.assertEqual(ui.review.call_args.kwargs['identity'], digest(candidate))
-            self.assertEqual(wizard.state['starter_approval_history'], [old])
-            self.assertNotIn('starter_collection_approval', wizard.state)
-            self.assertNotIn('starter_submitted', wizard.state)
-
-    def test_submitted_starter_review_cannot_be_replaced(self):
-        with tempfile.TemporaryDirectory() as directory:
-            wizard = self.wizard(directory)
-            starter = wizard.directory / 'starter'
-            starter.mkdir(mode=0o700)
-            (starter / 'manifest.json').write_text('{}')
-            original = {'review_digest': 'original', 'source': {'origin': 'owner', 'excerpt': 'original'}}
-            wizard.state.update(starter_collection_approval=original, starter_submitted=True,
-                                submitted_requests=[str(uuid4())])
-            wizard.save()
-            before = wizard.state_path.read_bytes()
-            ui = Mock()
-            with patch.object(wizard, 'preflight'), patch('tools.setup_starter.collection', return_value={
-                    'pages': [{'candidate': {'slug': 'fixture'}}]}), using(ui):
-                with self.assertRaisesRegex(SetupPending, 'Submitted starter'):
-                    wizard.starter()
-            ui.review.assert_not_called()
-            self.assertEqual(wizard.state_path.read_bytes(), before)
-
-    def test_pause_before_request_keeps_original_submitted_keys(self):
-        with tempfile.TemporaryDirectory() as directory:
-            wizard = self.wizard(directory)
-            key = str(uuid4())
-            wizard.state['submitted_requests'] = [key]
-            wizard.save()
-            ui = Mock()
-            ui.checkpoint.side_effect = OperationPaused('pause')
-            client = Mock()
-            with using(ui), self.assertRaises(OperationPaused):
-                wizard.before_request(client, key)
-            client.invoke.assert_not_called()
-            self.assertEqual(read_private(wizard.state_path)['submitted_requests'], [key])
-
-
 
 if __name__ == '__main__':
     unittest.main()

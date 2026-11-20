@@ -8,171 +8,23 @@ so client PATH differences cannot select another installation. Do not put creden
 in MCP configuration. Preserve unrelated entries and use the selected profile/custom
 destination. No public endpoint, listening port or mandatory OMP plugin is needed.
 
-The matrix records **documented support**. Runtime verification is limited to the
-specific local proof below; it is not a claim of interoperability with every client,
-version, enterprise policy, or optional feature.
+The installer has configuration paths for the following clients. These are configuration formats, not a claim that each version or enterprise policy has been exercised with a live instance:
 
-| Client | Documented stdio configuration and environment | Startup, decisions and trust | Semantic maintenance baseline |
-| --- | --- | --- | --- |
-| [OMP](https://omp.sh/docs/mcp) | `.omp/mcp.json`, `~/.omp/agent/mcp.json`, or named-profile MCP config; `command`, `args`, `env`, optional `cwd`; review precedence | `AGENTS.md` fallback; optional native extension supplies exact session identity and startup context. OMP 18.20.0+ supports the cancellable ordinary-exit prompt described below | Use available native background tasks only when exposed and responsive; otherwise foreground |
-| [Claude Code](https://code.claude.com/docs/en/mcp) | `mcpServers` in selected local/user configuration or project `.mcp.json`; stdio command/args/env | `CLAUDE.md` fallback; optional [SessionStart/SessionEnd hooks](https://code.claude.com/docs/en/hooks). End is advisory, not an exit veto. Workspace trust can block loading | [Native subagents](https://code.claude.com/docs/en/sub-agents) documented, including background configuration; confirm worker tool access/permissions, else foreground |
-| [Codex](https://developers.openai.com/codex/mcp) | `[mcp_servers.<name>]` in selected `config.toml`; command/args/env and supported environment controls | `AGENTS.md` fallback; optional [SessionStart/SessionEnd hooks](https://developers.openai.com/codex/hooks) in supported versions. End is advisory; trust/tool approval remains separate from MAVEN exact reviews | Foreground is portable baseline; use native agents only if the installed version exposes verified background execution |
-| [GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers) | `~/.copilot/mcp-config.json`, `mcpServers`, local/stdio command/args/env; PATH inherited, other needed variables explicitly configured | `copilot-instructions.md` fallback; optional [sessionStart/sessionEnd hooks](https://docs.github.com/en/copilot/reference/hooks-reference). End output cannot veto exit. Use user configuration for non-Git projects | Foreground fallback; do not infer nonblocking background execution from tool discovery or custom-agent support |
-| [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/) | `settings.json` `mcpServers`: command/args/env/cwd; sensitive inherited variables may be filtered | `GEMINI.md` fallback; optional [SessionStart/SessionEnd hooks](https://geminicli.com/docs/hooks/reference/). End is best-effort. Keep confirmations enabled; `trust: true` bypasses them | Foreground fallback unless installed native background capabilities are actually available and verified |
-
-Gemini's official documentation currently notes its transition to Antigravity CLI
-for some account tiers. A legacy skill destination is not proof of Antigravity MCP
-compatibility; confirm the actual product/version before choosing an integration.
-
-### Recorded local verification
-
-Recorded runtime exercises are limited to OMP 18.18.2 and 18.20.0 with disposable
-profiles and simulated storage. They covered stdio startup, native background-worker
-delivery, and exit-prompt behavior—not live AWS or end-to-end model-driven cloud wrap-up.
-
-Claude Code, Codex, Copilot CLI and Gemini CLI have documented configuration paths
-and offline adapter checks, not verified live-runtime interoperability. Offline
-fixtures do not establish deployed SQL behavior, live IAM permissions, cloud rollout,
-or active-instruction correctness.
-
-### Optional capabilities and honest fallbacks
-
-| Capability | Required portable behavior | Optional enhancement / limitation |
+| Client | MCP configuration | Standing guidance |
 | --- | --- | --- |
-| Startup | Native guidance invokes the shared inspection/initialization workflow; print checking, then initializing and ready/blocked based on actual results | Optional hooks inject exact-conversation startup context; they do not load cloud authority or create a session themselves. Missing/disabled hooks retain first-turn fallback |
-| Session identity | Preserve returned MAVEN binding in accessible session context/private evidence | Associate a native harness ID only when reliably exposed; never infer from PID, cwd or newest receipt |
-| Background reasoning | Foreground agent reads, reasons and reconciles bounded assignments | Native subagent may work while another user turn proceeds; must receive scoped context and access to MAVEN tools. MCP cannot launch it |
-| Catch-up | Resume from accessible paused discussion and disclose missing portions | Harness transcript APIs are optional, not a standard MCP facility; resume fresh avoids backfill |
-| Progress / notifications | Visible chat for initialization, explicit saves/checkpoints, mode changes and meaningful blockers | Native progress/status delivery where supported; routine successful updates stay quiet |
-| Owner decisions | Present full persisted review and bind the actual response to its identity/revision | Native dialogs/elicitation are optional; never forge consent or treat tool permission as exact target approval |
-| Shutdown | Journal effects before mutation; preserve uncertain outcomes and finish explicitly | OMP's optional ordinary-exit guard can cancel before wrap-up. Other clients' end hooks are advisory. Forced exit/EOF/signals guarantee neither grace nor background completion |
+| [OMP](https://omp.sh/docs/mcp) | `~/.omp/agent/mcp.json` | `AGENTS.md` |
+| [Claude Code](https://code.claude.com/docs/en/mcp) | `mcpServers` in `~/.claude.json` | `CLAUDE.md` |
+| [Codex](https://developers.openai.com/codex/mcp) | `[mcp_servers.<name>]` in `~/.codex/config.toml` | `AGENTS.override.md` or `AGENTS.md` |
+| [Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers) | `mcpServers` in `~/.copilot/mcp-config.json` | `copilot-instructions.md` |
+| [Gemini CLI](https://geminicli.com/docs/tools/mcp-server/) | `mcpServers` in `~/.gemini/settings.json` | `GEMINI.md` or selected custom context |
 
-The [MCP transport specification](https://modelcontextprotocol.io/specification/latest/basic/transports)
-defines client-launched stdio and transport-independent protocol semantics, not
-subagents, startup policy, a permanent model runtime or uniform approval APIs.
-Instructions and current context still come from the selected AWS instance.
+The harness supplies workspace context; the installed [reconcile procedure](../maven_resources/templates/skills/maven/references/reconcile.md) orients from the local brief. No native startup or shutdown integration is needed. If skills or MCP tools are not available, inspect the selected local configuration; do not claim a successful local save or cloud check from tool discovery. Respect workspace trust and client consent settings.
 
-Native standing-context references:
-[OMP context files](https://omp.sh/docs/context-files),
-[Claude memory files](https://code.claude.com/docs/en/memory),
-[Codex AGENTS.md](https://developers.openai.com/codex/guides/agents-md),
-[Copilot custom instructions](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-custom-instructions),
-and [Gemini GEMINI.md](https://geminicli.com/docs/cli/gemini-md/).
-MAVEN always installs first-eligible-turn guidance; optional lifecycle adapters add
-native events. Neither guarantees that authority is initialized before the first
-user input; readiness still requires the real MCP result and complete context.
-
-Status commands pin the selected `MAVEN_HOME`, including paths with spaces. Active
-status keys include both harness and native conversation ID; a folder fallback is
-explicitly a **last folder hint (not started here)**, not proof of this chat's binding.
-The optional terminal UI supports Textual `>=2.1,<3`.
-
-### Native lifecycle adapters
-
-The shared local helper stores only exact native-conversation bindings and observed
-end-event hints. It does not log in, contact AWS, copy transcripts or spawn agents.
-The main assistant uses `maven_startup` for cloud peer inspection and authorized
-initialization, or `maven_diagnose` for repair choices. An end event does not close a
-cloud session, prove writer death or mark unsaved work saved.
-
-OMP uses `session_start`/agent context and `session_before_shutdown` in a native
-extension. Startup delivery is deferred through a managed callback, so the startup
-event never waits for a model turn to finish within its 30-second handler budget.
-Callbacks recheck the live session-manager cwd and conversation identity after awaits,
-and fence queued work after workspace changes or shutdown. Delivery failures remain
-visible. For an open exact MAVEN binding, the prompt offers wrap up and exit,
-exit without wrapping up, or stay. Wrap-up cancels immediate shutdown, lets the
-agent reconcile accepted work, then checks the exact finish receipt before exiting.
-Failure leaves the harness open. OMP 18.20.0+ documents this cancellable event; older
-versions retain first-turn guidance and explicit wrap-up.
-Forced exits, signals, restart and programmatic `ctx.shutdown()` bypass the guard;
-a second quit can bypass a pending prompt. It is a convenience, not crash recovery.
-
-Claude Code and Codex use `SessionStart` additional context with genuine `session_id`;
-Copilot uses `sessionStart` and `sessionId`; Gemini uses its own `SessionStart` output
-shape. Their end events are advisory/best-effort, never modeled as an OMP-equivalent
-veto. Hook timeout, policy or unsupported versions can suppress delivery. Startup
-still checks retained evidence and offers recovery when an end event was missed.
-Resume only the exact recorded conversation; stale peers are not interchangeable.
-
-An MCP process that never successfully initialized may recover through an explicit
-`maven_startup(action="new")` in the same enabled root, project, instance and harness.
-This also permits attaching the real native conversation ID after an earlier attempt
-had none. `inspect` can diagnose that failed process binding under the supplied native
-identity without adopting it; `continue` still requires the original identity.
-Replacement requires a verified existing cloud project and an exact existence check
-including archived state proving the old session unavailable—not absence from a
-bounded search page. Authentication,
-transport and uncertain read failures remain blockers. An unavailable project is
-reported as a local folder association with `project_check.cloud_verified=false`;
-this does not establish deletion or archival and never creates or rebinds a project.
-Verified cloud project names, including renames, label startup's active project
-without renaming its folder; an unverified folder-name fallback is explicitly marked.
-
-Previously initialized/resumed sessions, cloud sessions, pending requests, receipts,
-checkpoints, closure, assignments, writers or uncertain registrations prevent this
-replacement. Peers are never closed, adopted or marked stopped. The failed binding
-is fenced with `superseded_by`; `failed-start-recovery.json` preserves its original
-binding, registration and native-conversation reservation. Only its exact successor
-may replace that reservation. Existing runtime evidence and definitive rejected
-initial-write request identities remain intact; no old request is replayed.
-After a process restart, select the exact failed attempt with
-`maven_startup(action="new", failed_start_session_id=…)`. Its durable journal resumes
-interrupted cutover at the original boundary; it does not adopt a discovered peer.
-Folder switching recognizes that exact fenced failed-start receipt as a terminal
-local attempt, not a closed cloud session. Its replacement must either have verified
-closure or independently satisfy the reviewed never-initialized proof below.
-Pending work or incomplete retirement still prevents switching.
-
-The official reviewed folder switch can also preserve a never-initialized attempt
-when its old cloud project is unavailable. It requires the exact original MCP
-binding with `initialized:false` and `resume_required:false`, no retained work or
-uncertain effects, and either no registration yet or only its exact memory-only
-`starting` registration without writers or reservations. An exact session read
-with `include_archived:true` must return `record_unavailable`; search absence,
-timeouts, authentication failures and other outages never establish this proof.
-Initialized, abandoned, unknown and session-receipt-only runtimes cannot use this
-never-initialized exception.
-
-The owner's review pins each original binding, registry and native-conversation
-record, retained-file fingerprints and cloud absence proof. Applying that review
-revalidates the originals under the exclusive project gate and native-pointer locks.
-The durable switch journal and sibling preservation archive retain the original
-IDs, request evidence and owner source across interruption. Only after successful
-runtime cutover are the reviewed starting registrations and their exact native
-conversation pointers removed; unrelated registrations and conversations are never
-cleared. The switch barrier remains until cleanup is durable. Resume uses the same
-journal, not a new operation or inferred closure. Fresh native startup then selects
-the new project; an old direct session service remains fenced by its original
-root/project binding. No cloud session is closed or peer automatically declared stopped.
-Before preserving private evidence beside a root, every enclosing Git worktree must
-already exclude the destination. Otherwise the switch refuses before moving data;
-it does not edit parent repositories' ignore rules.
-
-A separate, explicit owner-stopped historical path is available on project/Home
-switch administration operations through `parameters.stopped_session_ids`: an exact,
-duplicate-free list of canonical session UUIDs, not a root-wide bypass. It applies
-only to unregistered historical runtimes with matching `session.json` pointers,
-no pending requests, no unfinished maintenance/checkpoints or closure, no active
-publication, and only definitive rejected requests. Rejection receipts must verify
-either the current request-internal digest or the legacy outer `pending_digest`
-against the exact canonical request; missing, changed or mixed hashes are refused.
-Unknown evidence and MCP-bound runtimes cannot use this path. The full review pins every retained file fingerprint,
-pointer and original registration absence. The owner must separately confirm the
-exact IDs, that those sessions **and their workers** have stopped, and preservation
-without cloud closure, with a truthful source. Generic approval alone is insufficient.
-Apply rechecks the same guards and fingerprints, including after interruption.
-The archive and journal retain originals unchanged and label them `stopped-by-owner`,
-not verified closed or cloud-absent. No cloud request is replayed and no registered
-session or unrelated native pointer is removed by this historical path.
-
+The optional Claude status line identifies the **local** selected project, not a live cloud connection. During a reviewed integration update, retire only exact, unmodified installer-owned legacy hooks and skills; preserve edited, shared or unowned files for owner review.
 
 ### Installation and update boundaries
 
-The normal local installation includes the official Python SDK (`mcp>=2.3,<3`) on
-Python 3.11+; CLI/TUI recovery remains independent. Installer-owned MCP entries,
-the `maven` and `maven-maintenance` skills,
-and delimited native guidance are tracked for safe removal. Stage/review conflicts
+The normal local installation includes the official Python MCP SDK on Python 3.11+. The installer tracks its MCP entries, guidance blocks and all five files in the `maven` skill bundle for safe removal. Stage/review conflicts
 instead of replacing unrelated configuration. Approve exact writes and acknowledge
 running-harness configuration risk separately from any required writer quiescence.
 
@@ -182,16 +34,6 @@ configuration. Custom profiles use paired `--harness-config NAME=ABSOLUTE_FILE` 
 the exact local-change review. Supported native targets are OMP, Claude Code,
 Codex, Copilot CLI and Gemini CLI, not every client accepting a similar skill format.
 
-Native adapters are enabled by default with `--lifecycle-hooks`; disable them with
-`--no-lifecycle-hooks` or the TUI's **Install native MAVEN startup and shutdown
-integration** checkbox. They require the installed `maven-session-hook` executable.
-Review includes the extension/hook configuration and ownership receipts. Hooks,
-status-line and MCP entries sharing one configuration file are removed together
-under a single pinned-file review, preserving unrelated keys and refusing owner edits.
-Updates reuse exact recorded custom hook/configuration destinations. Ambiguous legacy
-targets are refused rather than guessed or replaced with default-profile paths.
-Conflicts preserve the affected target without blocking independent safe writes.
-
 Codex integration uses an existing nonempty `AGENTS.override.md` when present,
 otherwise `AGENTS.md`. If Gemini's custom `context.fileName` excludes `GEMINI.md`,
 select the context path explicitly. Identical preexisting integration entries are
@@ -200,9 +42,7 @@ content. Legacy CLI skills are retired only when their bytes match the prior
 installer inventory and ownership is unshared; modified, unowned or shared copies
 block cutover and require separate review rather than deletion.
 
-First-time project enablement is explicit. Startup guidance does not authorize
-unrelated capture and is not active cloud authority. Follow [getting started](getting-started.md)
-for existing-instance schema rollout and separately approved policy activation.
+First-time project enablement is explicit. Installing guidance does not authorize capture, cloud changes or private-data disclosure. See [Getting started](getting-started.md) for binding, rollout and independent approvals.
 
 ## Configured AWS and workspace services
 
@@ -267,24 +107,16 @@ spooling. Receipts contain metadata, not values. `list` pages both providers usi
 `--cursor`; `--domain` matches a dotted namespace, not a substring. These low-level
 commands never update Home.
 
-### Approved skills and the Home secret catalog
+### Home secret catalog
 
-In configured **Read Only**, **Home**, or **project** mode, `maven_instructions`
-discovers approved skills; `maven_context(skill_slug="maven-secrets")` loads the full
-approved skill and governing dependencies. Read Only uses universal authority;
-bound Home/project loads use their actual scope. Discovery does not load authority.
-Off and unconfigured modes provide no skill access. Named loading creates no session
-and captures no discussion.
+The installed [secrets procedure](../maven_resources/templates/skills/maven/references/secrets.md) describes explicit credential requests. It does not grant access. The secret catalog is separate from ordinary Home or project memory and is not copied by reconcile.
 
 `maven_secrets` provides `list`, `lookup`, `store_and_catalog`, `retry_catalog` and `resolve_catalog`.
 `list` returns paged names/metadata only. `lookup(name=...)` uses the narrow exact
 Home secret-setting route, not general memory search. Explicit `store_and_catalog`
 reads an owner-private `source_path` and genuine request `source`; never supply a
 plaintext value in tool arguments. Choose `provider="ssm"` or `"encrypted-file"`.
-It may write exactly that one Home catalog setting from Read Only or another
-project, without rebinding, opening a Home session, general search or capture.
-
-The standalone equivalent needs no memory session:
+It may write exactly that one Home catalog setting without changing the selected memory project, searching other Home records or capturing discussion. For a private terminal handoff:
 
 ```sh
 maven-secret-catalog store-and-catalog example.service.token --input "$PRIVATE_SOURCE" --domain example.service
@@ -322,9 +154,7 @@ within their reviewed constraints; single-use grants pin invocation/digest and e
 and are consumed atomically across hosts. Missing/stale policy fails closed.
 Never rerun after uncertain consumption or execution.
 
-Reusing consumed authorization returns `invocation_consumed`, with guidance to
-prepare a new invocation and obtain any required fresh approval—not inspect session
-status or replay the old attempt. Other explicit authorization denials return
+Reusing consumed authorization returns `invocation_consumed`: prepare a new invocation and obtain any required fresh approval; do not replay the old attempt. Other explicit authorization denials return
 `adapter_not_authorized`. The service does not distinguish grant expiry from binding
 mismatches in that response, so the client does not invent a `grant_expired` diagnosis.
 Both refusals stop before secret retrieval or program execution.
@@ -338,70 +168,12 @@ requires correcting the database/service implementation or its access rules; it 
 not automatically retried as a transient outage. A failed lookup after a lost write
 response still leaves the original write outcome unknown.
 
-Migration `021_secret_adapter_scope_guard.sql` repairs the adapter/grant proposal
-scope guard without rewriting deployed migration 020. Roll it out through installer
-**Update MAVEN**, including the matching service/client changes and a fresh MCP
-session; then retry the original adapter request unchanged.
-
 Raw stdout/stderr is withheld from the agent and transcript; only defined nonsecret
 results are returned. This is not a sandbox against misuse by a trusted executable.
 Approve the actual executable, inputs, destination and effects, not merely its name.
 Executable-path approval is not binary attestation or a guarantee of plaintext
 zeroization. The bounded consumer input limit is separate from streaming file restore.
 
-
-## Workspace originals and metadata
-
-The selected project needs an active MAVEN session. All output is JSON:
-
-```sh
-maven-workspace --root "$PROJECT_ROOT" --session "$SESSION_ID" intake-pending
-maven-workspace --root "$PROJECT_ROOT" --session "$SESSION_ID" intake --request "$PRIVATE_REQUEST"
-```
-
-`--env PATH` explicitly selects a different private environment. A mutation request
-must be an owner-owned private regular JSON file. For intake, use fields such as:
-
-```json
-{
-  "path": ".maven/incoming/source.txt",
-  "kind": "reference",
-  "origin": "Owner-selected source",
-  "sensitivity": "Sensitive",
-  "authorization": "Owner approved this classification and local preservation",
-  "disposition": "retain"
-}
-```
-
-Replace the provenance and authorization with actual owner decisions. Supported kinds
-are `reference`, `operational` and `artifact`. `archive` or `delete` needs `confirm:
-true`; `delete` also needs `reviewed: true`. Both remove the incoming source **after
-preserving a private verified original**; neither is secure erasure. Raw content is
-not uploaded by intake. The cloud receives metadata and operation receipts.
-
-Other actions accept these request fields:
-
-- `archive-plan`: `record_id`, `revision`, `confirm`, `completed`; optional
-  `source_path` and `source_disposition` (`retain` or `archive`). The exact current
-  cloud note must be a completed plan. Its stable ID, category and prior revisions remain; `archived` is the standard tag.
-- `override`: `identifier`, `slug`, `revision`, `content_hash`, `operation` (`record`
-  or `revoke`) and `confirm`. This records metadata about an already-approved
-  directive; it cannot grant authority.
-- `status`: `record_id`, `revision`, optional `output: "team-status.md"`, optional
-  `check: true`. The cloud `project-status` setting must explicitly enable external
-  status and provide all publishable sections: Progress, Milestones, Blockers, Next
-  Steps and Client Actions. Internal fields never substitute for publishable data.
-
-Review status readership manually; identifier warnings and secret-pattern scans are
-not proof that content is safe to publish. Mutations serialize the selected session's
-pending cloud journal and retain registered-writer safeguards where applicable.
-Optional Git publication reservations must not be confused with memory-checkpoint cutoffs.
-Intake, archive and status publication journal whole operations. Retry with the same
-`operation_id`; the local `receipt` command inspects evidence without a cloud client.
-The kernel-held `cloud-workspace-v2.lock` is never unlinked to take over. Legacy lock
-recovery requires `recover-lock --writers-quiescent` and preserves original evidence.
-First output publication refuses overwrite; replacement of an existing reviewed
-output and source removal rely on cooperating writers, not a filesystem sandbox.
 
 ## Google removal and independent integrations
 

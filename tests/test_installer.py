@@ -21,6 +21,12 @@ from tools.harness import (
 )
 
 
+def setUpModule():
+    # macOS spells its default temp path via /var -> /private/var. Real integration
+    # targets must have no symlink ancestors, even in a throwaway user profile.
+    unittest.enterModuleContext(patch.object(tempfile, 'tempdir', str(Path(tempfile.gettempdir()).resolve())))
+
+
 class InstallerTests(unittest.TestCase):
     def test_installed_handoff_ignores_checkout_cwd_and_pythonpath(self):
         import venv
@@ -379,10 +385,9 @@ with using(object()):
                 (dist / 'RECORD').write_text('')
                 (dist / 'METADATA').write_text('Name: maven-cloud-memory\nVersion: 0.1.0\n')
                 (dist / 'entry_points.txt').write_text('[console_scripts]\n')
-                for name in ('maven-mcp', 'maven-session-hook'):
-                    launcher = home / 'venv/bin' / name
-                    launcher.write_text('#!/test-only/python\n')
-                    launcher.chmod(0o775)
+                launcher = home / 'venv/bin/maven-mcp'
+                launcher.write_text('#!/test-only/python\n')
+                launcher.chmod(0o775)
             mask = os.umask(0o002)
             try:
                 with patch.object(Path, 'home', return_value=user), patch.dict(os.environ, {}, clear=True), \
@@ -399,16 +404,17 @@ with using(object()):
             launcher = home / 'venv/bin/maven-mcp'
             self.assertEqual(launcher.stat().st_mode & 0o7777, 0o755)
             self.assertIsNotNone(_read(launcher))
-            hook_launcher = home / 'venv/bin/maven-session-hook'
-            self.assertEqual(hook_launcher.stat().st_mode & 0o7777, 0o755)
-            self.assertIsNotNone(_read(hook_launcher))
+            self.assertFalse((home / 'venv/bin/maven-session-hook').exists())
             receipt = read_private(home / MANIFEST)
             self.assertEqual(receipt['owned'][str(home / 'venv')], inventory(home / 'venv'))
             self.assertFalse((user / '.omp').exists())
             config = staged / HARNESS_PATHS['omp'][0]
             self.assertEqual(json.loads(_read(config))['mcpServers']['maven']['command'], str(launcher))
-            for name in ('maven', 'maven-maintenance'):
-                skill = staged / HARNESS_PATHS['omp'][2] / name / 'SKILL.md'
+            root = staged / HARNESS_PATHS['omp'][2]
+            self.assertEqual(list(root.rglob('SKILL.md')), [root / 'maven/SKILL.md'])
+            for relative in ('SKILL.md', 'references/project.md', 'references/reconcile.md',
+                             'references/secrets.md', 'references/update.md'):
+                skill = root / 'maven' / relative
                 self.assertEqual(skill.stat().st_mode & 0o777, 0o600)
                 self.assertIsNotNone(_read(skill))
                 self.assertEqual(receipt['owned'][str(skill)], inventory(skill))
@@ -767,9 +773,10 @@ class HarnessFinishTests(unittest.TestCase):
                 launcher_permission_plan(self.home)
         for mode in (0o777, 0o6755, 0o644):
             self.launcher.chmod(mode)
+            installed_mode = self.launcher.stat().st_mode & 0o7777  # Some filesystems clear setgid on chmod.
             with self.assertRaises(ValueError):
                 launcher_permission_plan(self.home)
-            self.assertEqual(self.launcher.stat().st_mode & 0o7777, mode)
+            self.assertEqual(self.launcher.stat().st_mode & 0o7777, installed_mode)
         self.assertEqual(self.launcher.read_bytes(), original)
 
     def test_changed_launcher_refuses_repair_and_unowned_launcher_is_not_adopted(self):

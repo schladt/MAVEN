@@ -21,6 +21,8 @@ _TEMPLATE = resource_path("infra/memory/template.json")
 _RUNTIME_FILES = {
     "tools": "tools/__init__.py",
     "tools.memory": "tools/memory/__init__.py",
+    "tools.reconcile_records": "tools/reconcile_records.py",
+    "tools.memory.reconcile_transport": "tools/memory/reconcile_transport.py",
     "tools.memory.validation": "tools/memory/validation.py",
     "tools.memory.secrets_contract": "tools/memory/secrets_contract.py",
     "tools.memory.adapter_contracts": "tools/memory/adapter_contracts.py",
@@ -30,6 +32,7 @@ _RUNTIME_FILES = {
 _LOCAL_REVIEW_FILES = (
     "tools/memory/admin.py",
     "tools/memory/client.py",
+    "tools/memory/reconcile_cloud.py",
     "tools/memory/cli.py",
     "tools/memory/skills.py",
     "tools/aws/settings.py",
@@ -41,7 +44,6 @@ _LOCAL_REVIEW_FILES = (
     "tools/memory/deployment.py",
     "tools/memory/environment.py",
     "tools/memory/bootstrap.py",
-    "tools/memory/onboarding.py",
     "tools/memory/display.py",
     "tools/memory/boundary.py",
     "tools/setup.py",
@@ -53,7 +55,8 @@ _LOCAL_REVIEW_FILES = (
     "tools/project_setup.py",
     "tools/project.py",
     "tools/coordination.py",
-    "tools/workflow.py",
+    "tools/reconcile.py",
+    "tools/reconcile_local.py",
     "tools/workspace.py",
 )
 
@@ -272,7 +275,7 @@ def build(
             "After separate owner deployment approval, capture the reviewed stack's Outputs array without fetching secret values.",
             "Map exactly output_to_config, convert schema_version to integer 2, and write a fresh private client/admin/approval configuration from reviewed outputs; never silently update an existing runtime configuration.",
             "Explicitly select the human credential profile; assume ClientRoleArn for ordinary calls, ApprovalRoleArn only for owner challenge/activation or activation lookup, and AdminRoleArn only for approved bootstrap/migration.",
-            "Bootstrap or migrate the complete bundled SQL set through the separately approved administrative consumer, then deploy its matching runtime. The package manifest binds the exact migration names and hashes; schema version 2 and client protocol 4 are required. Resolve pending older-format publication recovery through its original supported implementation before cutover.",
+            "Bootstrap or migrate the complete bundled SQL set through the separately approved administrative consumer, then deploy its matching runtime. Verify project_reconcile_v1 through signed status with the exact instance and recovery epoch. Schema changes do not import or delete legacy records or approve any external operation.",
         ],
     }
     artifacts = {

@@ -140,7 +140,7 @@ class VerificationConnection(Connection):
 
 @unittest.skipUnless(ENABLED, 'requires an explicitly disposable PostgreSQL cluster and psql')
 class ApplicationVerificationTests(unittest.TestCase):
-    def test_post_migration_cleanup_privileges(self):
+    def test_post_migration_application_privileges(self):
         dsn = os.environ['MAVEN_MEMORY_TEST_DSN']
         if run_sql(dsn, 'SELECT current_database();') != 'maven':
             self.skipTest('verifier checks privileges on database maven by name')
@@ -159,10 +159,19 @@ class ApplicationVerificationTests(unittest.TestCase):
             GRANT CONNECT ON DATABASE maven TO maven_app;
             GRANT USAGE ON SCHEMA maven TO maven_app;
             GRANT SELECT ON maven.service_state, maven.record_versions TO maven_app;
-            GRANT EXECUTE ON FUNCTION maven.change_fact(jsonb,text,text), maven.instruction_read(jsonb) TO maven_app;
+            GRANT EXECUTE ON FUNCTION maven.reconcile_request(text,jsonb), maven.instruction_read(jsonb) TO maven_app;
         """)
         admin._verify_application(db, config)
-        for privilege in ('EXECUTE ON FUNCTION maven.forget_records(uuid[],boolean,uuid,jsonb,text,text,text)',
+        db.query('SAVEPOINT missing_grant; REVOKE EXECUTE ON FUNCTION maven.reconcile_request(text,jsonb) FROM maven_app;')
+        with self.assertRaises(admin.MemoryError) as denied:
+            admin._verify_application(db, config)
+        self.assertEqual(denied.exception.status, 'bootstrap_refused')
+        db.query('ROLLBACK TO missing_grant; RELEASE missing_grant;')
+        for privilege in ('EXECUTE ON FUNCTION maven.change_fact(jsonb,text,text)',
+                          'EXECUTE ON FUNCTION maven.memory_write(text,jsonb,text,text)',
+                          'EXECUTE ON FUNCTION maven.memory_request_before_reconcile(text,jsonb,text,text,text,integer)',
+                          'SELECT ON maven.reconcile_records', 'UPDATE ON maven.reconcile_projects',
+                          'EXECUTE ON FUNCTION maven.forget_records(uuid[],boolean,uuid,jsonb,text,text,text)',
                           'EXECUTE ON FUNCTION maven.erase_records(uuid[],uuid,jsonb,text,text,text)',
                           'EXECUTE ON FUNCTION maven.cleanup_mutate(text,uuid[],uuid,jsonb,text,text,text)',
                           'SELECT ON maven.cleanup_operations'):
@@ -272,31 +281,20 @@ class ConcurrentPostgreSQLTests(unittest.TestCase):
         self.assertEqual(recovered.json("pg_temp.try_sql('" + escaped + "')"), {'error': 'immutable history'})
         recovered.query('ROLLBACK;')
 
-    def test_retired_tasks_hide_consistently_but_keep_reads_and_receipt_replay(self):
-        project = self.create('entity', {'entity_type': 'project', 'name': 'Retirement fixture', 'aliases': []})['record_id']
-        session = self.create('session', {'state': 'active', 'summary': 'Fixture session'}, project_id=project)['record_id']
-        archived = self.create('task', {'title': 'Archived task fixture', 'description': 'Retired', 'state': 'open'},
-                               project_id=project, tags=['archived'])
-        task = self.create('task', {'title': 'Superseded task fixture', 'description': 'Retired', 'state': 'open'}, project_id=project)
-        claim = {'request_key': str(uuid4()), 'record_id': task['record_id'], 'expected_revision': 1,
-                 'session_id': session, 'action': 'claim', 'lease_seconds': 60,
-                 'source': task['source'], 'change_reason': 'Fixture claim'}
-        claimed = self.observer.json(write_expression(claim, 'claim'))
-        release = {**claim, 'request_key': str(uuid4()), 'expected_revision': 2, 'action': 'release', 'fence': claimed['fence']}
-        self.assertEqual(self.observer.json(write_expression(release, 'claim'))['revision'], 3)
-        retired = {**task, 'request_key': str(uuid4()), 'expected_revision': 3, 'tags': ['fixture', 'maven-scope-superseded']}
-        self.assertEqual(self.observer.json(write_expression(retired))['revision'], 4)
-        for body, revision in ((task, 4), (archived, 1)):
-            request = {**claim, 'record_id': body['record_id'], 'expected_revision': revision, 'request_key': str(uuid4())}
-            self.assertEqual(self.observer.json(write_expression(request, 'claim'))['status'], 'claim_conflict')
-            self.assertNotIn('status', self.observer.json(f"maven.memory_read({literal({'record_id': body['record_id'], 'revision': 1})})"))
-        self.assertEqual(self.observer.json(write_expression(claim, 'claim')), {**claimed, 'replayed': True})
-        request = literal({'project_id': project, 'session_id': session})
-        for expression in (f'maven.memory_context({request})', f'maven.memory_project_context({request})'):
-            ids = {entry['record_id'] for entry in self.observer.json(expression)['tasks']}
-            self.assertTrue(ids.isdisjoint({task['record_id'], archived['record_id']}))
-        search = self.observer.json(f"maven.memory_search({literal({'scope': 'project', 'project_id': project, 'kind': 'task'})})")
-        self.assertEqual(search['records'], [])
+    def test_old_service_dispatcher_cannot_repopulate_retired_work(self):
+        project = self.create('entity', {'entity_type': 'project', 'name': 'Guard fixture', 'aliases': []})['record_id']
+        body = {**record('session', {'state': 'active', 'summary': 'Old client'}), 'project_id': project}
+        task = str(uuid4())
+        claim = {'request_key': str(uuid4()), 'record_id': task, 'expected_revision': 1,
+                 'session_id': body['record_id'], 'action': 'claim', 'lease_seconds': 60,
+                 'source': body['source'], 'change_reason': 'Old client'}
+        for route, request in (('/v1/memory/write', body), ('/v1/memory/claim', claim)):
+            with self.subTest(route=route):
+                response = self.observer.json(
+                    f"maven.memory_request('{route}',{literal(request)},repeat('a',64),NULL,'fixture-owner',4)")
+                self.assertEqual(response['result'], {'status': 'client_incompatible'})
+        self.assertFalse(self.observer.json(
+            f"to_jsonb(EXISTS(SELECT 1 FROM maven.records WHERE id='{body['record_id']}'))"))
 
     def test_uuid_scope_case_matches_without_rewriting_reviewed_content(self):
         project = self.create('entity', {'entity_type': 'project', 'name': 'Scope fixture', 'aliases': []},
