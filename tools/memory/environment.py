@@ -1,6 +1,7 @@
 """Private, literal configuration shared by cloud clients; never shell-source .env."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 import os
@@ -12,7 +13,8 @@ import stat
 
 import boto3
 from botocore.config import Config
-from botocore.credentials import CredentialResolver, LoginProvider
+from botocore.credentials import CredentialResolver, LoginProvider, RefreshableCredentials
+from botocore.session import Session as BotocoreSession
 from botocore.utils import JSONFileCache
 from botocore.exceptions import BotoCoreError, ClientError
 
@@ -24,6 +26,7 @@ DEFAULT_ENV = default_environment()
 EXTRA_KEYS = {
     'MAVEN_AWS_PROFILE', 'MAVEN_AWS_EXPECTED_PRINCIPAL', 'MAVEN_AWS_LOGIN_CACHE',
     'MAVEN_DEPLOY_PROFILE', 'MAVEN_DEPLOY_EXPECTED_PRINCIPAL', 'MAVEN_DEPLOY_LOGIN_CACHE',
+    'MAVEN_DEPLOY_MODE', 'MAVEN_DEPLOY_ROLE_ARN',
     'MAVEN_AWS_REGION',
     'MAVEN_SECRETS_BUCKET', 'MAVEN_SECRETS_KEY_ID',
     'MAVEN_SECRETS_PARAMETER_PREFIX', 'MAVEN_SECRETS_FILE_KEY_PREFIX', 'MAVEN_SECRETS_OBJECT_PREFIX',
@@ -114,16 +117,46 @@ def migration_config(values: dict[str, str]) -> dict:
     return memory_config(values)
 
 
+def deployment_mode(values):
+    mode = values.get('MAVEN_DEPLOY_MODE', 'profile')
+    if mode not in ('role', 'profile', 'deferred'):
+        raise MemoryClientError('invalid_deployment_mode')
+    return mode
+
+
+def _role_binding(values):
+    role = values.get('MAVEN_DEPLOY_ROLE_ARN')
+    source = values.get('MAVEN_AWS_EXPECTED_PRINCIPAL')
+    match = isinstance(role, str) and re.fullmatch(
+        r'arn:aws:iam::([0-9]{12}):role/(?:[!-~]+/)?([\w+=,.@-]{1,64})', role, re.ASCII)
+    if (not match or not isinstance(source, str)
+            or not re.fullmatch(r'arn:aws:(?:iam|sts)::[0-9]{12}:[A-Za-z0-9+=,.@_/-]+', source)):
+        raise MemoryClientError('selected_login_configuration_unavailable')
+    account, name = match.groups()
+    if (source.endswith(':root') or source.split(':')[4] != account
+            or values.get('MAVEN_ACCOUNT_ID', account) != account):
+        raise MemoryClientError('unexpected_login_identity')
+    return role, account, name
+
+
 def sign_in(values: dict[str, str], *, deploy: bool = False) -> dict:
     """Exact owner sign-in for a selected profile into MAVEN's own private login cache.
 
     A plain `aws login` writes the AWS default cache, which MAVEN never reads; only this
     command (with AWS_LOGIN_CACHE_DIRECTORY) renews the sign-in MAVEN uses.
     """
+    purpose = 'Maintenance access' if deploy else 'Daily-use access'
+    mode = deployment_mode(values) if deploy else 'profile'
+    if mode == 'deferred':
+        raise MemoryClientError('deployment_access_deferred')
+    if mode == 'role':
+        role, _, _ = _role_binding(values)
+        purpose = 'Fresh MFA for deployment role ' + role
+        deploy = False
     profile, cache, region = _login_selection(values, deploy=deploy)
     cache = str(cache)
     argv = ['aws', 'login', '--profile', profile, '--region', region]
-    return {'purpose': 'Maintenance access' if deploy else 'Daily-use access', 'profile': profile,
+    return {'purpose': purpose, 'profile': profile,
             'argv': argv, 'environment': {'AWS_LOGIN_CACHE_DIRECTORY': cache},
             'command': 'AWS_LOGIN_CACHE_DIRECTORY=' + shlex.quote(cache) + ' ' + shlex.join(argv)}
 
@@ -131,20 +164,28 @@ def sign_in(values: dict[str, str], *, deploy: bool = False) -> dict:
 def authentication_handoff(error, values, *, deploy=False):
     """Return executable, selected-cache login advice only for typed auth failures."""
     normalized = aws_error(error)
-    if normalized.code not in AUTHENTICATION_CODES:
-        return None
     try:
+        role_handoff = (deploy and deployment_mode(values) == 'role' and normalized.code in
+                        ('deployment_elevation_denied', 'deployment_session_expired'))
+        if not role_handoff and normalized.code not in AUTHENTICATION_CODES:
+            return None
         exact = sign_in(values, deploy=deploy)
     except MemoryClientError:
         return None
+    reconnect = ('After owner sign-in, retry the same read-only inspection or resume the exact '
+                 'retained operation. Do not replace an unresolved request or initialize another session.')
+    if normalized.code == 'deployment_elevation_denied':
+        reconnect += (' AWS denied AssumeRole; stale MFA is one possible cause. If a fresh MFA challenge '
+                      'does not resolve it, stop and check the role trust and permissions.')
     return {'type': 'aws_login', 'command': exact['argv'], 'environment': exact['environment'],
             'reason': normalized.code, 'purpose': exact['purpose'], 'profile': exact['profile'],
-            'reconnect': 'After owner sign-in, retry the same read-only inspection or resume the exact '
-                         'retained operation. Do not replace an unresolved request or initialize another session.'}
+            'reconnect': reconnect}
 
 
 def _login_selection(values, *, deploy=False, region=None):
     prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
+    if deploy and deployment_mode(values) != 'profile':
+        raise MemoryClientError('selected_login_configuration_unavailable')
     try:
         profile = values[prefix + 'PROFILE']
         raw_cache = values[prefix + 'LOGIN_CACHE']
@@ -198,28 +239,106 @@ def login_session(values, *, deploy=False, region=None):
         raise MemoryClientError('login_cache_unavailable') from None
 
 
-def selected_aws_session(values: dict[str, str], *, deploy: bool = False, region: str | None = None):
-    """Use only a named existing login and verify its principal; never elevate or login."""
+def _sts(session):
+    return session.client('sts', verify=transport_ca_bundle(),
+                          config=Config(connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
+
+
+def _identity(session):
+    client = _sts(session)
+    try:
+        result = client.get_caller_identity()
+        return {key: result[key] for key in ('Account', 'Arn', 'UserId') if key in result}
+    finally:
+        client.close()
+
+
+def _profile_session(values, *, deploy=False, region=None, allow_unbound=False):
     prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
     try:
-        expected = values[prefix + 'EXPECTED_PRINCIPAL']
-        if (not isinstance(expected, str)
-                or not re.fullmatch(r'arn:aws:(?:iam|sts)::[0-9]{12}:[A-Za-z0-9+=,.@_/-]+', expected)):
-            raise MemoryClientError('selected_login_configuration_unavailable')
+        expected = values.get(prefix + 'EXPECTED_PRINCIPAL')
+        if expected is not None or not allow_unbound:
+            if (not isinstance(expected, str)
+                    or not re.fullmatch(r'arn:aws:(?:iam|sts)::[0-9]{12}:[A-Za-z0-9+=,.@_/-]+', expected)):
+                raise MemoryClientError('selected_login_configuration_unavailable')
         session = login_session(values, deploy=deploy, region=region)
-        client = session.client('sts', verify=transport_ca_bundle(),
-                                config=Config(connect_timeout=3, read_timeout=10,
-                                              retries={'total_max_attempts': 1}))
-        try:
-            if client.get_caller_identity().get('Arn') != expected:
-                raise MemoryClientError('unexpected_login_identity')
-        finally:
-            client.close()
-        return session
+        identity = _identity(session)
+        if expected is not None and identity.get('Arn') != expected:
+            raise MemoryClientError('unexpected_login_identity')
+        return session, identity
     except (BotoCoreError, ClientError) as error:
         raise aws_error(error) from None
     except (KeyError, ValueError, TypeError):
         raise MemoryClientError('selected_login_configuration_unavailable') from None
+
+
+def _deployment_time():
+    return datetime.now(timezone.utc)
+
+
+def _expired_deployment():
+    # Never renew an elevated session behind the owner's back or replay its operation.
+    raise MemoryClientError('deployment_session_expired')
+
+
+def deployment_session(values, *, region=None, allow_unbound=False):
+    """Resolve exactly the reviewed deployment path; return its session and stable identity."""
+    mode = deployment_mode(values)
+    region = region or values.get('MAVEN_AWS_REGION', 'us-east-1')
+    if mode == 'profile':
+        return _profile_session(values, deploy=True, region=region, allow_unbound=allow_unbound)
+    if mode == 'deferred':
+        raise MemoryClientError('deployment_access_deferred')
+    role, account, name = _role_binding(values)
+    source, identity = _profile_session(values, region=region)
+    if identity.get('Account') != account:
+        raise MemoryClientError('unexpected_login_identity')
+    try:
+        sts = _sts(source)
+        try:
+            try:
+                result = sts.assume_role(RoleArn=role, RoleSessionName='maven-deployment', DurationSeconds=900)
+            except ClientError as error:
+                if aws_error(error).code == 'not_authorized':
+                    raise MemoryClientError('deployment_elevation_denied') from None
+                raise
+        finally:
+            sts.close()
+        temporary = result['Credentials']
+        expiration = temporary['Expiration']
+        now = _deployment_time()
+        if not isinstance(expiration, datetime) or expiration.tzinfo is None:
+            raise ValueError('expiration')
+        if expiration <= now:
+            raise MemoryClientError('deployment_session_expired')
+        keys = [temporary[key] for key in ('AccessKeyId', 'SecretAccessKey', 'SessionToken')]
+        if not all(isinstance(key, str) and key for key in keys):
+            raise ValueError('credentials')
+        sdk = BotocoreSession()
+        sdk._credentials = RefreshableCredentials(
+            *keys, expiry_time=min(expiration, now + timedelta(seconds=900)), refresh_using=_expired_deployment,
+            method='assume-role', time_fetcher=_deployment_time, advisory_timeout=0, mandatory_timeout=0)
+        elevated = boto3.Session(botocore_session=sdk, region_name=region)
+        actual = _identity(elevated)
+        # STS omits the role's path, but IAM role names are unique within an account.
+        assumed = rf'arn:aws:sts::{account}:assumed-role/{re.escape(name)}/[\w+=,.@-]{{2,64}}'
+        if actual.get('Account') != account or not re.fullmatch(assumed, actual.get('Arn', ''), re.ASCII):
+            raise MemoryClientError('unexpected_login_identity')
+        actual['Arn'] = role
+        if 'UserId' in actual:
+            actual['UserId'] = actual['UserId'].partition(':')[0]
+        return elevated, actual
+    except (BotoCoreError, ClientError) as error:
+        raise aws_error(error) from None
+    except (KeyError, TypeError, ValueError):
+        raise MemoryClientError('invalid_role_credentials') from None
+
+
+def selected_aws_session(values: dict[str, str], *, deploy: bool = False, region: str | None = None):
+    """Return only the verified session for the selected purpose; never log in."""
+    if deploy:
+        return deployment_session(values, region=region)[0]
+    return _profile_session(values, region=region)[0]
 
 
 def configured_client(path: Path = DEFAULT_ENV, *, admin: bool = False,

@@ -867,6 +867,15 @@ class HarnessFinishTests(unittest.TestCase):
                                      previous.get('starter_binding') or previous['outcome']['binding'])
                     self.assertEqual(receipt_path.read_bytes(), before)
 
+    def test_changing_deployment_access_keeps_daily_memory_readiness(self):
+        from tools.tui.harness import completed_setup_outcome
+        previous = self.completed()
+        values = {key: value for key, value in previous['outcome']['binding'].items()
+                  if not key.startswith('MAVEN_DEPLOY_')}
+        values.update(MAVEN_DEPLOY_MODE='role', MAVEN_DEPLOY_ROLE_ARN='arn:aws:iam::123456789012:role/Admin')
+        (self.home / '.env').write_text(''.join(k + '=' + json.dumps(v) + '\n' for k, v in values.items()))
+        self.assertEqual(completed_setup_outcome(self.home, previous), previous['outcome'])
+
     def test_changed_targets_or_missing_binding_cannot_reuse_completed_readiness(self):
         from tools.setup import _present
         from tools.setup_common import SetupPending
@@ -924,6 +933,20 @@ class HarnessFinishTests(unittest.TestCase):
         self.assertIn('--repair-secrets', command)
         self.assertNotIn('--mode', command)
         ui.form.assert_not_called()
+
+    def test_installer_opens_deployment_access_without_restarting_setup(self):
+        self.completed()
+        args, ui = argparse.Namespace(home=self.home), Mock()
+        ui.choose.return_value = 'deployment-access'
+        with using(ui):
+            install._options(args)
+        self.assertIn('deployment-access', [value for _, value in ui.choose.call_args.args[1]])
+        self.assertTrue(args.deployment_access)
+        self.assertTrue(args.check_existing)
+        self.assertFalse(args.setup_fresh)
+        ui.form.assert_not_called()
+        command = install._handoff_command({'home': self.home, 'deployment_access': True})
+        self.assertEqual(command[-4:], ['tools.setup', '--home', str(self.home), '--deployment-access'])
 
     def test_memory_only_readiness_reuses_its_receipt_without_optional_secrets_stage(self):
         from tools.setup import _present

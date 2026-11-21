@@ -251,13 +251,15 @@ def build_plan(args):
         plan['cloud_recovery'] = {
             'manifest_sha256': file_digest(directory / 'cloud-runtime/manifest.json'),
             'configuration': 'private lifecycle environments and reviewed deployment identity; no login caches copied',
-            'authentication': 'fresh deployment-profile login may be required after local cache deletion',
+            'authentication': 'the selected deployment source may need a fresh private login after local cache deletion',
             'external_environment': external_dependencies,
         }
         for action in plan['actions']:
             if action['handler'] == 'cloud':
                 action['details']['portable_recovery'] = True
-                cache = action['details']['identity'].get('MAVEN_DEPLOY_LOGIN_CACHE')
+                identity = action['details']['identity']
+                cache = identity.get('MAVEN_AWS_LOGIN_CACHE' if identity.get('MAVEN_DEPLOY_MODE') == 'role'
+                                     else 'MAVEN_DEPLOY_LOGIN_CACHE')
                 if cache and any(_inside(Path(cache).expanduser().absolute(), Path(home))
                                  for home in plan['machine_homes']):
                     action['details']['recovery_login_cache'] = str(directory / 'authentication/deploy')

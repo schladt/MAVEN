@@ -14,4 +14,6 @@ Use the route that matches the owner's intent. These phrases are conversational 
 
 For explicit setup or removal, use `maven_admin`; show the full review and bind the owner's actual response to that operation, interaction and revision. Keep sign-in and sensitive input in the designated private handoff. For requested workspace artifacts use `maven_workspace`: review metadata, pin record ID and digest for archival or team status, review disposition or audience, and use `check=true` for a dry run where supported. Never send original file bytes. Git publication requires separate intent and exact-candidate review through `maven_git`.
 
+To **change deployment access** on an existing installation, use `maven_admin(action="begin", kind="deployment_access", parameters={})`. Choose an existing IAM role via the daily identity, a separate named login profile or configure later. Relay the exact identity and binding review. This changes the local deployment selection only, not IAM, memory roles, or the project binding.
+
 A project's `skill` records describe project procedures; they are not installed harness skills. No record or link grants permission to execute, publish, deploy or erase.

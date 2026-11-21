@@ -144,7 +144,20 @@ def _identity(values):
             'MAVEN_MEMORY_JOURNAL_BUCKET', 'MAVEN_MEMORY_SKILL_BUCKET',
             'MAVEN_SECRETS_BUCKET', 'MAVEN_SECRETS_FILE_KEY_PREFIX',
             'MAVEN_SECRETS_KEY_ID')
+    # Legacy plans must keep their exact old identity shape. Role recovery also
+    # needs the verified source binding, never credentials or a copied cache.
+    if 'MAVEN_DEPLOY_MODE' in values:
+        keys += ('MAVEN_DEPLOY_MODE',)
+    if values.get('MAVEN_DEPLOY_MODE') == 'role':
+        keys += ('MAVEN_DEPLOY_ROLE_ARN', 'MAVEN_AWS_PROFILE',
+                 'MAVEN_AWS_EXPECTED_PRINCIPAL', 'MAVEN_AWS_LOGIN_CACHE', 'MAVEN_ACCOUNT_ID')
     return {key: values.get(key) for key in keys}
+
+
+def _deployment_principal(values):
+    key = ('MAVEN_DEPLOY_ROLE_ARN' if values.get('MAVEN_DEPLOY_MODE') == 'role'
+           else 'MAVEN_DEPLOY_EXPECTED_PRINCIPAL')
+    return values[key]
 
 
 def _tags(items):
@@ -347,7 +360,7 @@ def _plan(cloud, values, home, mode, optional, retained_resources):
     region, account = parts[3:5]
     if region != values.get('MAVEN_AWS_REGION', 'us-east-1') or not re.fullmatch(r'\d{12}', account):
         raise UninstallError('Stack account/region mismatch.')
-    principal = values['MAVEN_DEPLOY_EXPECTED_PRINCIPAL']
+    principal = _deployment_principal(values)
     if principal.split(':')[4] != account:
         raise UninstallError('Deployment principal must belong to the stack account.')
     outputs = {item['OutputKey']: item['OutputValue'] for item in stack.get('Outputs', [])}
@@ -579,7 +592,7 @@ def _plan_retained(cloud, values, home, mode, optional, retained_resources):
         raise UninstallError('Stack no longer exists; select purge and individual retained-resource ARNs/optional selectors.')
     instance = values['MAVEN_MEMORY_INSTANCE_ID']
     region = values.get('MAVEN_AWS_REGION', 'us-east-1')
-    account = values['MAVEN_DEPLOY_EXPECTED_PRINCIPAL'].split(':')[4]
+    account = _deployment_principal(values).split(':')[4]
     cluster_arn = values['MAVEN_MEMORY_CLUSTER_ARN']
     if not cluster_arn.startswith(f'arn:aws:rds:{region}:{account}:cluster:'):
         raise UninstallError('Retained-resource account/region does not match the configured cluster.')
@@ -1041,8 +1054,10 @@ def execute(action, progress, save):
     if _identity(values) != details['identity']:
         raise UninstallError('Cloud configuration changed since approval.')
     recovery_cache = details.get('recovery_login_cache')
-    if recovery_cache and not Path(values['MAVEN_DEPLOY_LOGIN_CACHE']).expanduser().exists():
-        values['MAVEN_DEPLOY_LOGIN_CACHE'] = recovery_cache
+    cache_key = ('MAVEN_AWS_LOGIN_CACHE' if values.get('MAVEN_DEPLOY_MODE') == 'role'
+                 else 'MAVEN_DEPLOY_LOGIN_CACHE')
+    if recovery_cache and not Path(values[cache_key]).expanduser().exists():
+        values[cache_key] = recovery_cache
     try:
         cloud = _Cloud(values)
     except Exception as error:
@@ -1057,7 +1072,11 @@ def execute(action, progress, save):
     except UninstallError:
         raise
     except Exception as error:
-        progress['pending'] = 'AWS operation did not finish: ' + (_code(error) or type(error).__name__)
+        from tools.memory.environment import authentication_handoff, sign_in
+        if authentication_handoff(error, values, deploy=True):
+            progress['pending'] = 'Deployment authentication interrupted this action. Run ' + sign_in(values, deploy=True)['command']
+        else:
+            progress['pending'] = 'AWS operation did not finish: ' + (_code(error) or type(error).__name__)
         save()
         raise UninstallError(progress['pending'] + '. Resume this exact plan; no success is assumed.') from None
     finally:

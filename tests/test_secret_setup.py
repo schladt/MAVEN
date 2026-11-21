@@ -108,6 +108,7 @@ class SecretSetupTests(unittest.TestCase):
     def test_import_merges_only_integration_locators_not_host_login_or_memory(self):
         path = Path(self.temporary.name) / 'source.env'
         imported = {**VALUES, 'MAVEN_AWS_PROFILE': 'other-host', 'MAVEN_AWS_LOGIN_CACHE': '/other/private/cache',
+                    'MAVEN_DEPLOY_MODE': 'role', 'MAVEN_DEPLOY_ROLE_ARN': 'arn:aws:iam::123456789012:role/Other',
                     'MAVEN_MEMORY_ENDPOINT': 'https://other.example', 'MAVEN_SECRETS_OBJECT_PREFIX': 'changed/'}
         path.write_text(''.join(key + '=' + json.dumps(value) + '\n' for key, value in imported.items()))
         path.chmod(0o600)
@@ -232,11 +233,11 @@ class SecretSetupTests(unittest.TestCase):
     def test_selected_identities_must_match_account_without_fallback(self):
         wrong = {**ACTUAL['maintenance'], 'Account': '999999999999',
                  'Arn': 'arn:aws:iam::999999999999:user/maintenance'}
-        with patch('tools.secret_setup.inspect_login_identity', side_effect=[ACTUAL['daily'], wrong]), \
-                patch('tools.memory.environment.selected_aws_session') as selected:
+        with patch('tools.secret_setup.inspect_login_identity', return_value=ACTUAL['daily']), \
+                patch('tools.memory.environment.deployment_session', return_value=(Mock(), wrong)), \
+                patch('tools.memory.environment.selected_aws_session'):
             with self.assertRaises(SetupPending):
                 secrets.identities(VALUES)
-        selected.assert_called_once_with(VALUES, deploy=False, region=REGION)
 
     def test_read_only_failure_allows_revising_choices_without_discarding_approval(self):
         with self.identity_patches():

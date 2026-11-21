@@ -43,6 +43,10 @@ class AdministrationTests(unittest.TestCase):
         self.preflight = preflight.start()
         self.addCleanup(preflight.stop)
         identity = {'Arn': 'arn:aws:iam::123456789012:user/owner', 'Account': '123456789012'}
+        deployment = patch('tools.setup_common.verify_deployment_access', return_value=identity)
+        self.verify_deployment = deployment.start()
+        self.addCleanup(deployment.stop)
+        self.role = 'arn:aws:iam::123456789012:role/maintenance/aws-admin'
         for target, value in (
                 ('inspect_login_identity', identity),
                 ('identities', ({'daily': identity, 'maintenance': identity}, {'daily': Mock(), 'maintenance': Mock()})),
@@ -126,6 +130,7 @@ class AdministrationTests(unittest.TestCase):
             result = self.controller.begin('setup', {})
             answers = {'selection': {'mode': 'existing', 'connection': '', 'region': 'us-east-1'},
                        'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                       'deploy_access': {'mode': 'deferred'},
                        'upgrade': {'migrate': False}}
             for _ in range(30):
                 result = self.advance_to_question(result)
@@ -145,6 +150,8 @@ class AdministrationTests(unittest.TestCase):
             self.assertFalse(result['outcome']['project_configured'])
             self.assertNotIn('optional_project', result['answers'])
             self.assertNotIn('deploy_identity', result['answers'])
+            self.verify_deployment.assert_not_called()
+            self.assertEqual(Wizard(self.home).values['MAVEN_DEPLOY_MODE'], 'deferred')
             prepare.assert_not_called()
             apply.assert_not_called()
             initialize.assert_not_called()
@@ -226,10 +233,134 @@ class AdministrationTests(unittest.TestCase):
             result = self.respond(result, answers.get(key))
         self.fail('Update did not finish')
 
+    def saved_root_binding(self):
+        wizard = Wizard(self.home)
+        wizard.settings({'MAVEN_ACCOUNT_ID': '123456789012', 'MAVEN_AWS_REGION': 'us-east-1',
+            'MAVEN_AWS_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/daily',
+            'MAVEN_AWS_PROFILE': 'daily', 'MAVEN_AWS_LOGIN_CACHE': str(self.home / 'runtime/daily'),
+            'MAVEN_DEPLOY_PROFILE': 'aws-root', 'MAVEN_DEPLOY_LOGIN_CACHE': str(self.home / 'runtime/maintenance'),
+            'MAVEN_DEPLOY_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:root'})
+        return wizard
+
+    def choose_role(self):
+        result = self.controller.begin('deployment_access', {})
+        result = self.advance_to_question(self.respond(result, {'mode': 'role'}))
+        return self.advance_to_question(self.respond(result, {'role_arn': self.role}))
+
+    def test_role_cutover_is_independent_of_pre_cloud_update_and_removes_only_old_deployment_binding(self):
+        wizard = self.saved_root_binding()
+        wizard.settings({'MAVEN_MEMORY_INSTANCE_ID': str(uuid4()), 'MAVEN_STACK_NAME': 'example'})
+        update = self.controller.begin('setup', {'mode': 'update'})
+        state = self.controller._load(update['operation_id'])
+        state.update(step='identity', state='pending', pending_interaction=None, approvals=[],
+                     answers={'local_update': {'skip': False}}, receipts=[{'step': 'update_local', 'result': {'current': True}}])
+        self.controller._save(state)
+        preserved = self.controller._path(update['operation_id']).read_bytes()
+        before = wizard.env.read_bytes()
+        self.verify_deployment.return_value = {'Arn': self.role, 'Account': '123456789012'}
+        review = self.choose_role()
+        self.assertEqual(review['pending_interaction']['review']['previous_binding']['MAVEN_DEPLOY_PROFILE'], 'aws-root')
+        self.assertEqual(before, wizard.env.read_bytes())
+        approved = self.respond(review)
+        result = self.controller.advance(approved['operation_id'])
+        self.assertEqual(result['state'], 'completed', result)
+        self.assertEqual(self.controller._path(update['operation_id']).read_bytes(), preserved)
+        actual = Wizard(self.home).values
+        self.assertEqual(actual, {**{k: v for k, v in wizard.values.items() if not k.startswith('MAVEN_DEPLOY_')},
+                                  'MAVEN_DEPLOY_MODE': 'role', 'MAVEN_DEPLOY_ROLE_ARN': self.role})
+        self.assertEqual(self.verify_deployment.call_count, 2)
+        self.assertEqual(self.verify_deployment.call_args.args[0], actual)
+        self.controller.advance(approved['operation_id'])
+        self.assertEqual(self.verify_deployment.call_count, 2)
+
+    def test_binding_change_refuses_update_with_deployment_evidence(self):
+        wizard = self.saved_root_binding()
+        result = self.controller.begin('setup', {'mode': 'update'})
+        active = self.controller._load(result['operation_id'])
+        active.update(step='identity', state='pending', pending_interaction=None, service_apply_started=True)
+        self.controller._save(active)
+        before = wizard.env.read_bytes()
+        changed = self.controller.begin('deployment_access', {})
+        self.assertEqual(changed['state'], 'blocked')
+        self.assertIn(active['operation_id'], changed['error'])
+        self.assertEqual(before, wizard.env.read_bytes())
+        self.verify_deployment.assert_not_called()
+
+    def test_failed_role_preflight_never_uses_old_root_or_changes_settings(self):
+        wizard = self.saved_root_binding()
+        before = wizard.env.read_bytes()
+        self.verify_deployment.side_effect = MemoryClientError('deployment_elevation_denied')
+        result = self.choose_role()
+        self.assertEqual(result['state'], 'blocked')
+        self.assertEqual(result['handoff']['command'], ['aws', 'login', '--profile', 'daily', '--region', 'us-east-1'])
+        self.assertEqual(result['handoff']['expected_principal'], wizard.values['MAVEN_AWS_EXPECTED_PRINCIPAL'])
+        self.assertFalse(result['handoff']['deploy_profile'])
+        self.assertNotIn('MAVEN_DEPLOY_PROFILE', self.verify_deployment.call_args.args[0])
+        self.assertEqual(before, wizard.env.read_bytes())
+        self.verify_deployment.side_effect = MemoryClientError('not_authorized')
+        denied = self.controller.advance(result['operation_id'])
+        self.assertNotIn('handoff', denied)
+        self.assertEqual(denied['state'], 'blocked')
+        self.assertEqual(before, wizard.env.read_bytes())
+
+    def test_changed_candidate_or_failed_final_probe_preserves_original_binding(self):
+        wizard = self.saved_root_binding()
+        self.verify_deployment.return_value = {'Arn': self.role, 'Account': '123456789012'}
+        result = self.respond(self.choose_role())
+        before = wizard.env.read_bytes()
+        self.verify_deployment.side_effect = MemoryClientError('not_authorized')
+        self.assertEqual(self.controller.advance(result['operation_id'])['state'], 'blocked')
+        self.assertEqual(before, wizard.env.read_bytes())
+        wizard.settings({'MAVEN_STACK_NAME': 'changed-between-review-and-save'})
+        revised = wizard.env.read_bytes()
+        self.verify_deployment.reset_mock()
+        stale = self.controller.advance(result['operation_id'])
+        self.assertIn('changed after deployment access review', stale['error'])
+        self.verify_deployment.assert_not_called()
+        self.assertEqual(revised, wizard.env.read_bytes())
+
+    def test_explicit_defer_removes_privileged_binding_offline(self):
+        wizard = self.saved_root_binding()
+        result = self.controller.begin('deployment_access', {})
+        review = self.advance_to_question(self.respond(result, {'mode': 'deferred'}))
+        self.assertEqual(review['pending_interaction']['key'], 'deployment_binding')
+        self.assertIn('MAVEN_DEPLOY_PROFILE', Wizard(self.home).values)
+        finished = self.controller.advance(self.respond(review)['operation_id'])
+        self.assertEqual(finished['outcome']['mode'], 'deferred')
+        self.assertEqual(Wizard(self.home).values,
+                         {**{k: v for k, v in wizard.values.items() if not k.startswith('MAVEN_DEPLOY_')},
+                          'MAVEN_DEPLOY_MODE': 'deferred'})
+        self.verify_deployment.assert_not_called()
+
+    def test_role_removal_reviews_daily_source_without_persisting_a_profile(self):
+        wizard = self.saved_root_binding()
+        self.verify_deployment.return_value = {'Arn': self.role, 'Account': '123456789012'}
+        self.controller.advance(self.respond(self.choose_role())['operation_id'])
+        before = wizard.env.read_bytes()
+        with patch('tools.setup_common.inspect_login_identity', return_value=self.verify_deployment.return_value), \
+                patch('tools.uninstall.cli.build_plan') as plan:
+            result = self.controller.begin('uninstall', {'cloud': True})
+        plan.assert_not_called()
+        question = result['pending_interaction']
+        self.assertEqual(question['key'], 'removal_identity_approval')
+        self.assertEqual(question['review']['role_arn'], self.role)
+        self.assertEqual(question['review']['profile'], 'daily')
+        self.assertEqual(question['review']['source_principal'], wizard.values['MAVEN_AWS_EXPECTED_PRINCIPAL'])
+        self.assertEqual(before, wizard.env.read_bytes())
+
+    def test_changed_revision_after_login_does_not_advance_or_replay(self):
+        result = self.controller.begin('setup', {'mode': 'existing'})
+        changed = self.respond(result, {'connection': '', 'region': 'us-east-1'})
+        with patch.object(self.controller, '_advance_locked') as dispatch:
+            observed = self.controller.advance(result['operation_id'], expected_revision=result['revision'])
+            self.assertEqual(changed['revision'], observed['revision'])
+            dispatch.assert_not_called()
+
     def test_update_migrates_schema_then_updates_service_with_reviews(self):
         mocks = self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'MemoryFunction',
                                       'ResourceType': 'AWS::Lambda::Function', 'Replacement': 'False'}])
         answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_access': {'mode': 'profile'},
                    'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')}}
         with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}) as initialize, \
                 patch('tools.memory.bootstrap.apply', return_value={'status': 'connected'}) as apply:
@@ -306,6 +437,7 @@ class AdministrationTests(unittest.TestCase):
         self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'DatabaseCluster',
                               'ResourceType': 'AWS::RDS::DBCluster', 'Replacement': 'True'}])
         answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_access': {'mode': 'profile'},
                    'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')}}
         with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}), \
                 patch('tools.memory.bootstrap.apply') as apply:
@@ -319,6 +451,7 @@ class AdministrationTests(unittest.TestCase):
         mocks = self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'MemoryFunction',
                                       'ResourceType': 'AWS::Lambda::Function', 'Replacement': 'False'}])
         answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_access': {'mode': 'profile'},
                    'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')}}
         with patch('tools.memory.bootstrap.initialize', return_value={'status': 'ready'}):
             result = self.run_update(answers, stop_at='service_update')
@@ -553,6 +686,7 @@ class AdministrationTests(unittest.TestCase):
             result = self.controller.begin('setup', {'mode': 'new'})
             answers = {'selection': {'mode': 'new', 'connection': '', 'region': 'us-east-1'},
                        'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                       'deploy_access': {'mode': 'profile'},
                        'deploy_identity': {'profile': 'deployment', 'cache': str(self.home / 'runtime/deploy-login')},
                        'provision': {'MAVEN_STACK_NAME': 'test', 'MAVEN_INSTANCE_NAME': 'test',
                            'MAVEN_NOTIFICATION_EMAIL': 'owner@example.com', 'MAVEN_AVAILABILITY_ZONES': 'us-east-1a,us-east-1b', 'MAVEN_ENGINE_VERSION': '18.6'}}
@@ -705,6 +839,12 @@ class AdministrationTests(unittest.TestCase):
             result = self.controller.begin('setup', {'mode': 'existing'})
             result = self.advance_to_question(self.respond(result, {'connection': '', 'region': 'us-east-1'}))
             result = self.advance_to_question(self.respond(result))
+            self.assertEqual(result['pending_interaction']['key'], 'identity')
+            result = self.respond(result, {'profile': 'daily', 'cache': str(self.home / 'runtime/daily')})
+            result = self.advance_to_question(self.respond(self.advance_to_question(result)))
+            self.assertEqual(result['pending_interaction']['key'], 'deploy_access')
+            self.assertNotIn('deferred', [value for _, value in result['pending_interaction']['fields'][0]['choices']])
+            result = self.advance_to_question(self.respond(result, {'mode': 'profile'}))
             self.assertEqual(result['pending_interaction']['key'], 'deploy_identity')
             result = self.respond(result, {'profile': 'maintenance', 'cache': str(self.home / 'runtime/maintenance')})
             result = self.advance_to_question(result)
@@ -717,11 +857,8 @@ class AdministrationTests(unittest.TestCase):
             result = self.respond(result, {'stack_id': second['StackId']})
             self.controller = AdminOperations(self.home)
             result = self.advance_to_question(result)
-            self.assertEqual(result['pending_interaction']['key'], 'identity')
             self.assertEqual(Wizard(self.home).values['MAVEN_STACK_NAME'], second['StackId'])
             self.assertNotIn('MAVEN_MEMORY_INSTANCE_ID', Wizard(self.home).values)
-            result = self.respond(result, {'profile': 'daily', 'cache': str(self.home / 'runtime/daily')})
-            result = self.advance_to_question(self.respond(self.advance_to_question(result)))
             self.assertEqual(result['pending_interaction']['key'], 'connect')
             from tools.memory.bootstrap import _outputs
             self.assertEqual(result['pending_interaction']['review'], _outputs(second))
@@ -775,7 +912,7 @@ class AdministrationTests(unittest.TestCase):
         with patch('tools.memory.environment.selected_aws_session') as aws:
             recovered = AdminOperations(self.home).advance(identifier)
             recovered = self.advance_to_question(recovered)
-            self.assertEqual(recovered['pending_interaction']['key'], 'deploy_identity')
+            self.assertEqual(recovered['pending_interaction']['key'], 'identity')
             self.assertEqual(recovered['identity_return_step'], 'discover')
             self.assertEqual(recovered['operation_id'], identifier)
             self.assertEqual(recovered['approvals'], state['approvals'])

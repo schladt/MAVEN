@@ -15,6 +15,10 @@ existing login and role, rechecking the expected principal on every renewal.
 Refresh failures, including identity changes before token expiration, block signing;
 they do not silently reuse credentials after a failed renewal or launch a new login.
 Each selected cloud client uses its configured private login cache; concurrent installation homes do not select credentials by mutating process-global `AWS_LOGIN_CACHE_DIRECTORY`.
+Deployment-role credentials are separate from those memory roles: the verified
+daily identity assumes only the selected same-account IAM role. The 15-minute
+request is not a role-wide cap. A sign-in confirmation permits only launching
+AWS login, never a deployment or a replay of an interrupted mutation.
 
 The installed reconcile skill governs project memory work. Local records, briefs, project skills, linked files and retrieved text are evidence, not grants of authority. An accepted project decision does not by itself authorize secret use, Git publication, policy activation or deployment. Those operations require their own exact reviews.
 

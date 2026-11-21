@@ -10,7 +10,10 @@ import sys
 import time
 
 from tools.administration import AdminInputError, AdminOperations
+from tools import login as owner_login
 from tools.interaction import Field, OperationPaused
+from tools.memory.client import MemoryClientError
+from tools.setup_common import SetupPending
 
 
 _STAGE_NAMES = {
@@ -19,6 +22,9 @@ _STAGE_NAMES = {
     'identity_accept': 'Confirm everyday AWS identity',
     'deploy_identity': 'Choose maintenance access', 'deploy_identity_inspect': 'Check maintenance identity',
     'deploy_identity_accept': 'Confirm maintenance identity',
+    'deploy_access': 'Choose deployment access', 'deploy_access_details': 'Select deployment identity',
+    'deploy_access_inspect': 'Inspect deployment access',
+    'deploy_access_save': 'Save reviewed deployment access',
     'discover': 'Find MAVEN stacks in AWS', 'discovery_select': 'Select discovered instance',
     'connect_review': 'Review existing instance', 'connect': 'Connect existing instance',
     'provision': 'Choose new instance settings', 'prepare': 'Prepare deployment review',
@@ -74,6 +80,8 @@ _CODE_HELP = {
     'invalid_login_cache': 'The selected login cache path is invalid. Choose an absolute private cache directory.',
     'invalid_role_credentials': 'AWS returned invalid role credentials. No identity or readiness was verified; '
                                 'inspect the selected role configuration before resuming the same operation.',
+    'deployment_elevation_denied': 'AWS refused the role assumption. Fresh MFA may help; the role trust '
+                                   'or source permission may also need correction. Do not switch identities.',
 }
 _TRANSIENT_REASONS = {'warming', 'DatabaseResumingException', 'temporarily_unavailable'}
 _WAKE_INTERVAL, _WAKE_LIMIT = 5, 600
@@ -156,7 +164,11 @@ def _instructions(result, home, identifier):
     if result.get('error_detail'):
         instructions.append(result['error_detail'])
     # The sign-in screen offers its own choices; Resume applies only to the stopped-step screen.
-    if not handoff and result.get('state') == 'uncertain':
+    if result.get('login_status') == 'verified':
+        instructions.append('Only the source login was verified. AWS may already have received the '
+                            'original request. Inspect its effects and receipts before choosing Resume.')
+        instructions.extend('Recorded step: ' + receipt['step'] for receipt in result.get('receipts', []))
+    elif not handoff and result.get('state') == 'uncertain':
         instructions.append('State: uncertain. The request may have reached AWS, so its outcome is not known. '
                             'Resume reconciles this same operation; do not start a new one.')
     elif not handoff and result.get('state') == 'blocked':
@@ -194,7 +206,7 @@ def _instructions(result, home, identifier):
     for key in ('notice', 'recovery'):
         if result.get(key):
             instructions.extend(['', result[key]])
-    if not handoff:
+    if not handoff and result.get('login_status') != 'verified':
         instructions.extend(['', f'Resume operation retries "{stage}" for operation {identifier}.'])
     instructions.extend([
         '', 'Ctrl+Q pauses safely; the original operation and receipts are retained.',
@@ -218,22 +230,26 @@ def _aws_login(ui, controller, result, home, identifier):
             raise OperationPaused('AWS sign-in paused; resume operation ' + identifier)
         if choice == 'back':
             return controller.back(identifier)
-        if choice == 'manual':
-            if ui.review('Sign in outside MAVEN, then check identity', instructions,
-                         identity=identifier, accept='Check identity',
-                         description='Use the exact selected profile and environment below. No AWS identity has been verified by this screen.'):
-                return controller.advance(identifier)
-            continue
         try:
-            login = ui.external(handoff['command'], env={**os.environ, **handoff.get('environment', {})}, check=False)
-        except OSError as error:
-            status = ('Sign-in could not start (' + type(error).__name__ + '). Use the manual instructions or change the selection. AWS identity is not verified.')
+            if choice == 'manual':
+                if not ui.review('Sign in outside MAVEN, then check identity', instructions,
+                                 identity=identifier, accept='Check identity',
+                                 description='Use the exact selected profile and environment below. No AWS identity has been verified by this screen.'):
+                    continue
+                return owner_login.after_admin_login(controller, result, verify=True)
+            current = controller.status(identifier)
+            if current.get('revision') != result.get('revision') or current.get('handoff') != handoff:
+                return {**current, 'login_status': 'handoff_changed'}
+            # This TUI choice already confirmed launch; never ask for a second key.
+            selected = owner_login.confirmed_command(handoff)
+            login = ui.external(selected['argv'], env={**os.environ, **selected['environment']}, check=False)
+            if login.returncode == 0:
+                ui.message('Sign-in command exited with status 0; checking the actual AWS identity.')
+                return owner_login.after_admin_login(controller, result, verify=True)
+        except (OSError, ValueError, SetupPending, MemoryClientError) as error:
+            status = ('Sign-in could not be verified (' + type(error).__name__ + '). Use the manual instructions or change the selection. AWS identity is not verified.')
             ui.message(status)
             continue
-        if login.returncode == 0:
-            # A clean sign-in exit goes straight to the actual account/principal inspection.
-            ui.message('Sign-in command exited with status 0; checking the actual AWS identity.')
-            return controller.advance(identifier)
         status = ('Sign-in command exited with status ' + str(login.returncode) +
                   '. AWS identity is not verified. Sign in again, use the manual instructions, '
                   'or change the selection.')
@@ -254,6 +270,9 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
     input_error = None
     while True:
         ui.checkpoint()
+        if result.get('login_status') == 'handoff_changed':
+            raise OperationPaused('The AWS handoff changed. Inspect operation ' + identifier +
+                                  ' before continuing; nothing further was submitted by sign-in.')
         from tools.environment_migrations import prerequisite
         pending = prerequisite(controller, result)
         if pending:
@@ -338,7 +357,13 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
                 return finish_setup(ui, home, outcome)
             return 0 if result['state'] == 'completed' else 1
         elif result['state'] in ('blocked', 'uncertain'):
-            if result.get('handoff', {}).get('type') == 'aws_login':
+            if result.get('login_status') == 'verified':
+                # The auth subprocess never resumes a stopped mutation. Let the owner inspect
+                # its existing receipts before explicitly continuing that exact operation.
+                result = dict(result)
+                result.pop('handoff', None)
+                result['error'] = 'Source sign-in verified. ' + result['next_action']
+            elif result.get('handoff', {}).get('type') == 'aws_login':
                 result = _aws_login(ui, controller, result, home, identifier)
                 continue
             if result.get('error') == 'warming' and result['step'] not in warmed:
@@ -357,7 +382,10 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
                              identity=identifier, accept='Resume operation'):
                 raise OperationPaused('Administration paused; evidence retained for ' + identifier)
             ui.checkpoint()
-            result = controller.advance(identifier)
+            if result.get('login_status') == 'verified':
+                result = controller.advance(identifier, expected_revision=result['revision'])
+            else:
+                result = controller.advance(identifier)
         else:
             result = controller.advance(identifier)
 

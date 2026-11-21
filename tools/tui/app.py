@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import signal
 import subprocess
@@ -339,7 +340,7 @@ class Interaction:
     def external(self, command, **kwargs):
         self.checkpoint()
         # Authentication owns the terminal temporarily; its output is never retained.
-        if any(key in kwargs for key in ("stdout", "stderr", "capture_output", "input")):
+        if any(key in kwargs for key in ("stdin", "stdout", "stderr", "capture_output", "input")):
             raise ValueError("External authentication must use the terminal directly")
         self.app.call_from_thread(self.app.show_activity, "input", "External authentication")
         try:
@@ -503,8 +504,12 @@ class WorkflowApp(App):
 
     def external(self, command, kwargs):
         try:
-            with self.suspend():
-                return subprocess.run(command, **kwargs)
+            # Textual may wrap stderr, or the caller may have redirected it. Give
+            # AWS all three descriptors of the owner's foreground terminal only.
+            with self.suspend(), open('/dev/tty', 'r+b', buffering=0) as terminal:
+                if os.tcgetpgrp(terminal.fileno()) != os.getpgrp():
+                    raise OSError('AWS sign-in requires a foreground terminal')
+                return subprocess.run(command, stdin=terminal, stdout=terminal, stderr=terminal, **kwargs)
         except KeyboardInterrupt:
             self.interaction.pause_requested.set()
             raise OperationPaused("External authentication interrupted; resume after completing your normal login.") from None

@@ -246,8 +246,9 @@ def main(argv=None) -> int:
                     handoff.update(home=home, uninstall=True)
                     ui.close_when_finished()
                     return 0
-                if args.home_action:
-                    handoff.update(home=home, home_action=args.home_action)
+                if args.home_action or getattr(args, 'deployment_access', False):
+                    handoff.update(home=home, home_action=args.home_action,
+                                   deployment_access=getattr(args, 'deployment_access', False))
                     ui.close_when_finished()
                     return 0
                 if args.restart_operation:
@@ -362,6 +363,8 @@ def _handoff_command(handoff):
                 '--home', str(home), '--restart-operation', handoff['restart_operation']]
     if handoff.get('repair_secrets'):
         return [*prefix, 'tools.setup', '--home', str(home), '--repair-secrets']
+    if handoff.get('deployment_access'):
+        return [*prefix, 'tools.setup', '--home', str(home), '--deployment-access']
     if handoff.get('migrate_environment'):
         return [*prefix, 'tools.setup', '--home', str(home), '--migrate-environment']
     command = [*prefix, 'tools.setup', '--home', str(home), '--mode', handoff['mode']]
@@ -388,6 +391,7 @@ def _saved_installation(home):
                 'MAVEN_INSTANCE_NAME', 'MAVEN_MEMORY_INSTANCE_ID', 'MAVEN_STACK_NAME',
                 'MAVEN_ACCOUNT_ID', 'MAVEN_MEMORY_CLIENT_ROLE_ARN', 'MAVEN_MEMORY_REGION',
                 'MAVEN_AWS_REGION', 'MAVEN_AWS_PROFILE', 'MAVEN_DEPLOY_PROFILE',
+                'MAVEN_DEPLOY_MODE', 'MAVEN_DEPLOY_ROLE_ARN',
             }
             for line in raw.decode('utf-8').splitlines():
                 key, separator, value = line.strip().partition('=')
@@ -418,7 +422,10 @@ def _saved_installation(home):
         f'AWS account: {account}',
         'Region: ' + (values.get('MAVEN_MEMORY_REGION') or values.get('MAVEN_AWS_REGION') or 'Not selected'),
         'Daily-use profile: ' + (values.get('MAVEN_AWS_PROFILE') or 'Not selected'),
-        'Maintenance profile: ' + (values.get('MAVEN_DEPLOY_PROFILE') or 'Not selected; requested only when needed'),
+        'Deployment access: ' + (values.get('MAVEN_DEPLOY_ROLE_ARN', 'Missing role ARN')
+            if values.get('MAVEN_DEPLOY_MODE') == 'role' else 'Configure later'
+            if values.get('MAVEN_DEPLOY_MODE') == 'deferred' else
+            values.get('MAVEN_DEPLOY_PROFILE', 'Not selected')),
     ]) + notice
     state_path = home / 'runtime/setup/state.json'
     if state_path.exists():
@@ -484,6 +491,7 @@ def _options(args):
     args.restart_operation = None
     args.home_action = None
     args.repair_secrets = False
+    args.deployment_access = False
     while True:
         stage('Choose a task')
         home = (args.home or Path(os.environ.get('MAVEN_HOME', '~/.maven'))).expanduser().absolute()
@@ -499,6 +507,8 @@ def _options(args):
                  'Check or repair this connection — verify the saved instance; no automatic redeployment', 'existing'),
                 *([('Repair secrets / integrations — import or verify exact portable locators; read-only checks', 'repair-secrets')]
                   if not pending else []),
+                *([('Change deployment access — use an existing IAM role, a separate sign-in profile, or configure later',
+                    'deployment-access')] if (home / '.env').is_file() else []),
                 *([('Abandon unfinished setup and start over — preserve receipts and cloud resources', 'restart')]
                   if pending else []),
                 *([('Update MAVEN — local software and harness skills, then database schema '
@@ -519,10 +529,11 @@ def _options(args):
             ], description='Choose your goal. The wizard explains each step before asking you to decide.\n'
                            'Maintenance access manages infrastructure; daily-use access operates memory.\n'
                            'They may be separate identities in the same AWS account. Neither is assumed yet.')
-        if task == 'repair-secrets':
+        if task in ('repair-secrets', 'deployment-access'):
             args.home, args.local_only, args.check_existing = home, False, True
             args.setup_mode, args.setup_operation, args.setup_fresh = 'existing', None, False
-            args.repair_secrets = True
+            args.repair_secrets = task == 'repair-secrets'
+            args.deployment_access = task == 'deployment-access'
             return
         if task == 'harness':
             args.home, args.local_only, args.check_existing = home, False, True

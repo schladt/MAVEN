@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict
 
 from tools.administration import AdminInputError, AdminOperations
 from tools.coordination import ensure_available, project_binding_lock
+from tools import login
 from tools.memory.boundary import BoundaryError
 from tools.memory.client import AUTHENTICATION_CODES, MemoryClientError
 from tools.project import ProjectError, instance_home
@@ -71,6 +72,7 @@ class MavenApplication:
     def close(self):
         if self._unbound_client is not None:
             self._unbound_client.close()
+            self._unbound_client = None
 
 
 class MavenMCPServer(MCPServer):
@@ -160,37 +162,77 @@ def create_server(application=None):
     def maven_reconcile(cwd: str, project_id: str, action: Literal['inspect', 'read', 'apply', 'verify'],
                         local_token: str | None = None, cloud_token: str | None = None,
                         ids: list[str] | None = None, choices: list[Choice] | None = None,
-                        after_id: str | None = None, limit: int = 100, use_home: bool = False) -> dict[str, Any]:
-        """Inspect project inventories; read both sides selectively; apply reviewed choices against both observed tokens; verify actual convergence. A page continuation requires both original tokens. Not a session."""
+                        after_id: str | None = None, limit: int = 100, use_home: bool = False,
+                        interactive_login: bool = False) -> dict[str, Any]:
+        """Inspect, read, apply reviewed choices, or verify. Supply both original tokens for paging. For an explicit reconcile, interactive_login offers one owner-terminal sign-in and resumes only a fresh inspection."""
         from tools.memory.reconcile_cloud import CloudStore
-        with app.local(cwd, project_id=project_id, use_home=use_home) as store:
-            from tools.project import load_project, require_binding
-            client = app.unbound_client()
-            require_binding(load_project(store.root), client.config)
-            cloud = CloudStore(client, project_id)
-            if action in ('inspect', 'verify'):
-                return inspect_views(store, cloud, verify=action == 'verify', after_id=after_id,
-                                     limit=limit, local_token=local_token, cloud_token=cloud_token)
-            if not local_token or not cloud_token:
-                raise ValueError('both tokens required')
-            if action == 'read':
-                return read_details(store, cloud, ids or [], local_token, cloud_token)
-            return apply_review(store, cloud, [c.model_dump(exclude_none=True) for c in choices or []], local_token, cloud_token)
+        from tools.project import load_project, require_binding
+
+        original_binding = None
+
+        def run(*, fresh=False):
+            nonlocal original_binding
+            with app.local(cwd, project_id=project_id, use_home=use_home) as store:
+                binding = (store.root, load_project(store.root))
+                if fresh and binding != original_binding:
+                    raise StaleView('project changed during sign-in')
+                original_binding = binding
+                client = app.unbound_client()
+                require_binding(binding[1], client.config)
+                cloud = CloudStore(client, project_id)
+                if fresh:
+                    return inspect_views(store, cloud, limit=limit)
+                if action in ('inspect', 'verify'):
+                    return inspect_views(store, cloud, verify=action == 'verify', after_id=after_id,
+                                         limit=limit, local_token=local_token, cloud_token=cloud_token)
+                if not local_token or not cloud_token:
+                    raise ValueError('both tokens required')
+                if action == 'read':
+                    return read_details(store, cloud, ids or [], local_token, cloud_token)
+                return apply_review(store, cloud, [c.model_dump(exclude_none=True) for c in choices or []], local_token, cloud_token)
+
+        try:
+            return run()
+        except MemoryClientError as error:
+            if error.code not in AUTHENTICATION_CODES or original_binding is None:
+                raise
+            handoff = login.daily_handoff(app.env)
+            attempt = login.offer(handoff, ['--env', str(app.env)], interactive=interactive_login)
+            app.close()  # Reload both the verified source and role; never hold a project lock during login.
+            if attempt['login_status'] != 'verified':
+                return {'status': 'blocked', 'error': error.code, **attempt,
+                        'next_action': 'Keep local work. Only the owner may sign in in their own terminal. Then inspect this project afresh; never replay an apply.'}
+        if login.daily_handoff(app.env) != handoff:
+            raise StaleView('login selection changed')
+        return {**run(fresh=True), 'login_status': 'verified', 'resumed_action': 'inspect'}
 
     @server.tool()
     @guarded
-    def maven_admin(action: Literal['begin', 'respond', 'advance', 'back', 'status'], kind: str | None = None,
+    def maven_admin(action: Literal['begin', 'respond', 'advance', 'back', 'status', 'login'], kind: str | None = None,
                     parameters: dict[str, Any] | None = None, operation_id: str | None = None,
                     interaction_id: str | None = None, revision: int | None = None,
-                    response: dict[str, Any] | None = None, detail: bool = False) -> dict[str, Any]:
-        """Separate reviewed setup, project/Home binding, installation, secrets administration and removal. Present full exact review, then respond with genuine owner evidence. Never part of reconcile."""
+                    response: dict[str, Any] | None = None, detail: bool = False,
+                    interactive_login: bool = False) -> dict[str, Any]:
+        """Reviewed administration. Bind genuine owner evidence to each review. interactive_login offers a private owner terminal for a typed AWS handoff. login requires the blocked operation ID and revision; never replays a mutation."""
         admin = AdminOperations(app.home)
         if action == 'begin':
             result = admin.begin(kind, parameters or {})
         elif action == 'respond':
             result = admin.respond(operation_id, interaction_id, revision, response)
+        elif action == 'login':
+            result = admin.status(operation_id)
+            login.current_admin_handoff(result, revision)
         else:
             result = getattr(admin, action)(operation_id)
+        if (result.get('handoff', {}).get('type') == 'aws_login' and result['state'] == 'blocked'
+                and not result.get('pending_interaction') and action not in ('status', 'back')):
+            attempt = login.offer(result['handoff'], ['--home', str(app.home), '--operation',
+                result['operation_id'], '--revision', str(result['revision'])],
+                interactive=(action == 'login' or interactive_login))
+            if attempt['login_status'] == 'verified':
+                result = login.after_admin_login(admin, result)
+            else:
+                result = {**result, **attempt}
         return result if detail else {k: v for k, v in result.items() if k not in ('choice_checkpoints', 'responses', 'navigation', 'retired_interactions')}
 
     from .publication import register_git_tools

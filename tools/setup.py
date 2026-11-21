@@ -39,13 +39,15 @@ class Wizard:
         save_json(self.state_path, self.state)
 
 
-    def settings(self, updates):
+    def settings(self, updates, *, remove=()):
         from tools.memory.environment import load_environment, ENV_KEYS
-        if set(updates) - ENV_KEYS:
+        if (set(updates) | set(remove)) - ENV_KEYS:
             raise SetupPending('Unsupported private setting; nothing was written.')
-        if self.env.exists() and load_environment(self.env) != self.values:
+        current = load_environment(self.env) if self.env.exists() or self.env.is_symlink() else {}
+        if current != self.values:
             raise SetupPending('Private settings changed during setup; rerun without discarding pending artifacts.')
-        values = {**self.values, **updates}
+        values = {key: value for key, value in self.values.items() if key not in remove}
+        values.update(updates)
         if any(not isinstance(v, str) or not v or any(ord(c) < 32 for c in v) for v in values.values()):
             raise SetupPending('Settings must be nonempty literal text, never credentials.')
         atomic_private(self.env, ''.join(k + '=' + json.dumps(v) + '\n' for k, v in sorted(values.items())))
@@ -55,8 +57,24 @@ class Wizard:
         import boto3
         from tools.memory.client import MemoryClientError
         from tools.memory.environment import selected_aws_session, authentication_handoff
-        prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
-        purpose = 'maintenance (CloudFormation or necessary metadata discovery)' if deploy else 'daily-use memory'
+        if deploy:
+            # Only legacy interrupted setup uses this presenter. Rebinding must
+            # remain separate from resuming an existing cloud effect.
+            from tools.memory.environment import deployment_mode, deployment_session
+            from tools.setup_common import verify_cloudformation_access
+            mode = deployment_mode(self.values)
+            if mode == 'deferred' or (mode == 'profile' and not self.values.get('MAVEN_DEPLOY_EXPECTED_PRINCIPAL')):
+                raise SetupPending('Select deployment access first: ' + shlex.join(
+                    ['maven-setup', '--home', str(self.home), '--deployment-access']) +
+                    '. Then resume the original setup.')
+            session, identity = deployment_session(self.values)
+            check_login_identity(self.values, identity, deploy=True)
+            verify_cloudformation_access(session)
+            approve('Confirm this verified deployment identity for the original operation.', identity['Arn'],
+                    body=json.dumps(identity, indent=2))
+            return session, identity
+        prefix = 'MAVEN_AWS_'
+        purpose = 'daily-use memory'
         stage('AWS identities')
         message('Purpose: ' + purpose + '\nExpected account: ' + expected_account(self.values) +
                 '\nExpected principal: ' + self.values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown — confirm actual identity after sign-in'))
@@ -67,7 +85,7 @@ class Wizard:
         if profile is None or cache_setting is None:
             profiles = ([p for p in boto3.Session().available_profiles if re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', p)]
                         if profile is None else [profile])
-            default_cache = self.home / 'runtime' / ('aws-deploy-login-cache' if deploy else 'aws-login-cache')
+            default_cache = self.home / 'runtime' / 'aws-login-cache'
             fields = []
             if profile is None:
                 fields.append(Field('profile', f'Named AWS {purpose} profile',
@@ -87,7 +105,7 @@ class Wizard:
         cache = Path(cache_setting).expanduser()
         if not cache.is_absolute():
             raise SetupPending('The selected login cache must be an absolute private directory.')
-        other = self.values.get(('MAVEN_AWS_' if deploy else 'MAVEN_DEPLOY_') + 'LOGIN_CACHE')
+        other = self.values.get('MAVEN_DEPLOY_LOGIN_CACHE')
         if other and cache == Path(other).expanduser():
             raise SetupPending('Routine and metadata/deployment login caches must be separate.')
         private_directory(cache)
@@ -95,10 +113,10 @@ class Wizard:
         region = self.values['MAVEN_AWS_REGION']
         for attempt in range(2):
             try:
-                identity = inspect_login_identity(self.values, deploy=deploy)
+                identity = inspect_login_identity(self.values)
                 break
             except MemoryClientError as error:
-                if authentication_handoff(error, self.values, deploy=deploy) is None:
+                if authentication_handoff(error, self.values) is None:
                     raise
                 message(f'Login unavailable for selected profile {profile}. Configure it with your owner-approved AWS login flow.')
                 message('If a VPN/proxy requires a CA, source your installation activate file or set AWS_CA_BUNDLE to your trusted PEM bundle; TLS stays enabled.')
@@ -116,15 +134,15 @@ class Wizard:
                 if result.returncode:
                     raise SetupPending('Login did not succeed. Complete your normal AWS login and resume.')
         arn = identity.get('Arn', '')
-        if not deploy and arn.endswith(':root'):
+        if arn.endswith(':root'):
             raise SetupPending('Root cannot be used for routine access. Select a named non-root profile in the private settings and resume.')
-        check_login_identity(self.values, identity, deploy=deploy)
+        check_login_identity(self.values, identity)
         message(f'Actual {purpose} principal: {arn}\nAccount: {identity.get("Account", "unknown")}\nRegion: {region}')
         approve(f'Confirm this explicitly selected {purpose} identity.', arn,
                 body=f'Principal: {arn}\nAccount: {identity.get("Account", "unknown")}\nRegion: {region}\nProfile: {profile}\nLogin cache: {cache}')
         self.settings({prefix + 'EXPECTED_PRINCIPAL': arn})
         require().set_context(f'{purpose}\nAccount: {identity["Account"]}\nPrincipal: {arn}\nProfile: {profile}\nRegion: {region}\nHome: {self.home}')
-        return selected_aws_session(self.values, deploy=deploy, region=region), identity
+        return selected_aws_session(self.values, region=region), identity
 
     def preflight(self, task):
         report = permission_preflight(self.values, task)
@@ -157,10 +175,8 @@ class Wizard:
                     raise SetupPending('Select an absolute path to the existing private settings.')
                 from tools.environment_migrations import present as migrate, load_import
                 migrate(require(), self.home, source)
-                imported = load_import(self.home, source)
-                # Connection locators are portable; another machine's cache paths are not.
-                imported.pop('MAVEN_AWS_LOGIN_CACHE', None)
-                imported.pop('MAVEN_DEPLOY_LOGIN_CACHE', None)
+                imported = {key: value for key, value in load_import(self.home, source).items()
+                            if not key.startswith('MAVEN_DEPLOY_') and key != 'MAVEN_AWS_LOGIN_CACHE'}
                 config = memory_config(imported)
                 approve(f'Bind imported instance {config["instance_id"]} in {config["region"]}? No deployment or initialization will run.', config['instance_id'])
                 conflicts = [key for key in self.values if key in imported and self.values[key] != imported[key]]
@@ -378,6 +394,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, default=Path(os.environ.get('MAVEN_HOME', str(Path.home() / '.maven'))))
     parser.add_argument('--operation', help='Resume the exact persisted administration operation UUID')
+    parser.add_argument('--deployment-access', action='store_true',
+                        help='Review and change only the deployment login or role; no deployment or project changes')
     parser.add_argument('--migrate-environment', action='store_true',
                         help='Review only the one-time local environment migration; no cloud operations')
     parser.add_argument('--repair-secrets', action='store_true',
@@ -388,6 +406,9 @@ def main(argv=None):
     parser.add_argument('--fresh-operation', action='store_true', help='Review a new administration operation after verified completion; unresolved operations are never discarded')
     parser.add_argument('--restart-operation', help='Review abandonment of this unfinished setup UUID and start over without deleting cloud resources')
     args = parser.parse_args(argv)
+    if args.deployment_access and (args.mode or args.fresh_operation or args.restart_operation
+                                   or args.repair_secrets or args.migrate_environment):
+        parser.error('--deployment-access is separate; use --operation only to resume its exact UUID')
     if args.migrate_environment and (args.operation or args.mode or args.repair_secrets or args.fresh_operation or args.restart_operation):
         parser.error('--migrate-environment reviews local migration only; resume its UUID through administration')
     if args.repair_secrets and (args.mode or args.fresh_operation or args.restart_operation):
@@ -414,6 +435,10 @@ def _present(ui, args, home):
         return migration_result
     if getattr(args, 'migrate_environment', False):
         return 0
+    if getattr(args, 'deployment_access', False):
+        if args.operation and AdminOperations(home).status(args.operation)['kind'] != 'deployment_access':
+            raise SetupPending('Select the exact deployment access operation.')
+        return present(ui, home, operation_id=args.operation, kind='deployment_access')
     if getattr(args, 'repair_secrets', False):
         identifier = args.operation
         if not identifier:

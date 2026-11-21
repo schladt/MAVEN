@@ -28,6 +28,7 @@ SECRETS_KEYS = frozenset({
 HOST_KEYS = frozenset({
     'MAVEN_AWS_PROFILE', 'MAVEN_AWS_EXPECTED_PRINCIPAL', 'MAVEN_AWS_LOGIN_CACHE',
     'MAVEN_DEPLOY_PROFILE', 'MAVEN_DEPLOY_EXPECTED_PRINCIPAL', 'MAVEN_DEPLOY_LOGIN_CACHE',
+    'MAVEN_DEPLOY_MODE', 'MAVEN_DEPLOY_ROLE_ARN',
     'MAVEN_AWS_REGION', 'MAVEN_STACK_NAME', 'MAVEN_NOTIFICATION_EMAIL', 'MAVEN_ENGINE_VERSION',
     'MAVEN_INSTANCE_NAME', 'MAVEN_ACCOUNT_ID', 'MAVEN_CALLER_PRINCIPAL_ARN',
     'MAVEN_AVAILABILITY_ZONES', 'MAVEN_INSTANCE_ID', 'MAVEN_RECOVERY_EPOCH',
@@ -90,18 +91,21 @@ def _code(error):
 
 def identities(values):
     """Revalidate both explicitly selected identities and one exact account/region."""
-    from tools.memory.environment import selected_aws_session
+    from tools.memory.environment import deployment_session, selected_aws_session
     account, region = expected_account(values), values.get('MAVEN_AWS_REGION')
     if not re.fullmatch(r'[0-9]{12}', account) or not region or region != values.get('MAVEN_MEMORY_REGION', region):
         raise SetupPending('Select the exact store account and the same region as this installation before reviewing access.')
     result, sessions = {}, {}
     for name, deploy in (('daily', False), ('maintenance', True)):
-        actual = inspect_login_identity(values, deploy=deploy)
+        if deploy:
+            sessions[name], actual = deployment_session(values, region=region)
+        else:
+            actual = inspect_login_identity(values)
+            sessions[name] = selected_aws_session(values, region=region)
         check_login_identity(values, actual, deploy=deploy)
         if actual['Account'] != account:
             raise SetupPending('Both selected identities must belong to the exact reviewed store account.')
         result[name] = actual
-        sessions[name] = selected_aws_session(values, deploy=deploy, region=region)
     return result, sessions
 
 
@@ -537,13 +541,20 @@ def advance(controller, state, wizard):
             fields = [Field(key, key, defaults.get(key, ''), help='Nonsecret locator only. Prefixes are namespaces, not AWS resources.') for key in sorted(SECRETS_KEYS)]
         controller._question(state, 'secrets_details', 'Select exact secrets-store locators', fields, 'secrets_identity')
     elif step == 'secrets_identity':
+        deploy_mode = wizard.values.get('MAVEN_DEPLOY_MODE', 'profile')
+        if deploy_mode == 'deferred':
+            raise SetupPending('Configure deployment access before secrets-store administration. No store was changed.')
         fields = [Field('account', 'Exact AWS account', expected_account(wizard.values)),
                   Field('region', 'Exact AWS region', wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'))]
-        for label, prefix, folder in (('daily', 'MAVEN_AWS_', 'aws-login-cache'), ('maintenance', 'MAVEN_DEPLOY_', 'aws-deploy-login-cache')):
-            fields.extend([Field(label + '_profile', label.capitalize() + ' named login-only profile', wizard.values.get(prefix + 'PROFILE', '')),
-                           Field(label + '_cache', label.capitalize() + ' private login cache', wizard.values.get(prefix + 'LOGIN_CACHE', str(wizard.home / 'runtime' / folder)))])
+        if deploy_mode == 'profile':
+            for label, prefix, folder in (('daily', 'MAVEN_AWS_', 'aws-login-cache'), ('maintenance', 'MAVEN_DEPLOY_', 'aws-deploy-login-cache')):
+                fields.extend([Field(label + '_profile', label.capitalize() + ' named login-only profile', wizard.values.get(prefix + 'PROFILE', '')),
+                               Field(label + '_cache', label.capitalize() + ' private login cache', wizard.values.get(prefix + 'LOGIN_CACHE', str(wizard.home / 'runtime' / folder)))])
         controller._question(state, 'secrets_identity', 'Select daily and maintenance AWS access', fields, 'secrets_prepare',
-            description='Both identities must be explicitly selected in the same account and region. No IAM policy is attached automatically; the exact required access and read-only permission checks are reviewed next.')
+            description=('Maintenance uses the selected role: ' + wizard.values['MAVEN_DEPLOY_ROLE_ARN']
+                         + ' via daily profile ' + wizard.values['MAVEN_AWS_PROFILE']
+                         if deploy_mode == 'role' else 'Select both named login profiles in the same account and region.')
+                        + ' No IAM policy is attached automatically.')
     elif step == 'secrets_prepare':
         answer = state['answers']['secrets_identity']
         if not re.fullmatch(r'[0-9]{12}', answer['account']) or not re.fullmatch(r'[a-z]{2}(?:-[a-z]+)+-[0-9]', answer['region']):
@@ -553,20 +564,26 @@ def advance(controller, state, wizard):
             raise SetupPending('Repair cannot change this installation account.')
         updates = {'MAVEN_ACCOUNT_ID': answer['account'], 'MAVEN_AWS_REGION': answer['region']}
         caches = []
-        for label, prefix in (('daily', 'MAVEN_AWS_'), ('maintenance', 'MAVEN_DEPLOY_')):
-            cache = Path(answer[label + '_cache']).expanduser()
-            if not cache.is_absolute() or not re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', answer[label + '_profile']):
-                raise SetupPending('Select named profiles and absolute owner-private login caches.')
-            private_directory(cache)
-            caches.append(cache)
-            updates.update({prefix + 'PROFILE': answer[label + '_profile'], prefix + 'LOGIN_CACHE': str(cache)})
-        if caches[0] == caches[1]:
+        if wizard.values.get('MAVEN_DEPLOY_MODE') == 'role':
+            if answer['region'] != wizard.values.get('MAVEN_AWS_REGION'):
+                raise SetupPending('Use the region of the verified daily identity for the selected deployment role.')
+        else:
+            for label, prefix in (('daily', 'MAVEN_AWS_'), ('maintenance', 'MAVEN_DEPLOY_')):
+                cache = Path(answer[label + '_cache']).expanduser()
+                if not cache.is_absolute() or not re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', answer[label + '_profile']):
+                    raise SetupPending('Select named profiles and absolute owner-private login caches.')
+                private_directory(cache)
+                caches.append(cache)
+                updates.update({prefix + 'PROFILE': answer[label + '_profile'], prefix + 'LOGIN_CACHE': str(cache)})
+        if len(caches) != len(set(caches)):
             raise SetupPending('Daily and maintenance login caches must remain separate.')
         wizard.settings(updates)
         actual = {}
         for label, deploy in (('daily', False), ('maintenance', True)):
             actual[label] = inspect_login_identity(wizard.values, deploy=deploy)
-        proposed_identity = {('MAVEN_DEPLOY_' if label == 'maintenance' else 'MAVEN_AWS_') + 'EXPECTED_PRINCIPAL': actual[label]['Arn'] for label in actual}
+        proposed_identity = {'MAVEN_AWS_EXPECTED_PRINCIPAL': actual['daily']['Arn']}
+        if wizard.values.get('MAVEN_DEPLOY_MODE') != 'role':
+            proposed_identity['MAVEN_DEPLOY_EXPECTED_PRINCIPAL'] = actual['maintenance']['Arn']
         settings, provenance = _selection(wizard, state)
         validate_settings(settings)
         values = {**wizard.values, **proposed_identity, **settings}
@@ -582,7 +599,7 @@ def advance(controller, state, wizard):
             return
         state['presentation'] = {'title': 'Required secrets store / Repair', 'purpose': 'Explicit independent secrets-store binding',
                                  'account': answer['account'], 'region': answer['region'],
-                                 'principal': checked['daily']['Arn'], 'profile': answer['daily_profile'],
+                                 'principal': checked['daily']['Arn'], 'profile': values['MAVEN_AWS_PROFILE'],
                                  'verified': True, 'target': settings['MAVEN_SECRETS_BUCKET']}
         review = {'settings': settings, 'previous_settings': integration_settings(wizard.values), 'provenance': provenance,
                   'account': answer['account'], 'region': answer['region'], 'identities': checked,

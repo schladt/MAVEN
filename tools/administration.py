@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 from uuid import UUID, uuid4, uuid5
@@ -26,6 +27,8 @@ HOME_TAG = 'maven-home'
 CLEANUP_ACTIONS = ('review', 'forget', 'restore', 'erase')
 CLEANUP_LIMIT = 200
 _LIFECYCLE_KINDS = ('session', 'checkpoint', 'operation')
+_DEPLOY_KEYS = frozenset('MAVEN_DEPLOY_' + key for key in (
+    'MODE', 'ROLE_ARN', 'PROFILE', 'LOGIN_CACHE', 'EXPECTED_PRINCIPAL'))
 # What the SQL keeps of a memory receipt result after erase; the same keys survive locally.
 _RECEIPT_KEYS = ('record_id', 'revision', 'request_key', 'replayed')
 ERASE_CAVEATS = (
@@ -338,6 +341,7 @@ class AdminOperations:
     def begin(self, kind, parameters):
         allowed = {
             'setup': {'mode', 'source', 'checkout'},
+            'deployment_access': set(),
             'secrets_setup': set(),
             'environment_migration': {'path'},
             'repair': set(),
@@ -577,7 +581,8 @@ class AdminOperations:
         previous = state['answers'].get(key, {})
         serialized = [asdict(field) for field in fields]
         for field in serialized:
-            if field['name'] in previous:
+            if (field['name'] in previous and (not field['choices'] or
+                    any(value == previous[field['name']] for _, value in field['choices']))):
                 field['default'] = previous[field['name']]
         question = {
             'interaction_id': str(uuid4()), 'revision': state['revision'] + 1,
@@ -593,6 +598,8 @@ class AdminOperations:
     def _review(self, state, key, title, review, next_step, confirmations=None):
         context = state.get('presentation', {})
         summary = {
+            'deployment_binding': 'Change only this installation’s deployment credentials selection. '
+                                  'No IAM permissions, cloud resources, memory roles or projects change.',
             'connection': 'Save the selected local connection only; existing mode never deploys or initializes.',
             'connect': 'Bind this existing memory instance locally; preserve its data and authority.',
             'plan': 'Create a reviewable CloudFormation change set, not the resources. The candidate describes Aurora database, networking, IAM, API, storage, notifications and logging. Execution is separately approved; Aurora capacity, retained data/snapshots, network traffic, API requests and logs can incur ongoing charges. Interruption must reconcile this same change set; no automatic execution or rollback.',
@@ -620,6 +627,7 @@ class AdminOperations:
             targets = {name: review[name] for name in
                        ('instance_id', 'identity', 'selection', 'instance', 'targets',
                         'machine_homes', 'scopes', 'region', 'mode', 'connection',
+                        'previous_binding', 'deployment_binding', 'daily_source', 'check',
                         'home_file', 'remove', 'consent', 'replaces', 'switch', 'rename', 'create_cloud')
                        if name in review}
             if targets:
@@ -651,7 +659,7 @@ class AdminOperations:
     def _expired_login_handoff(self, state, error, *, values=None, deploy=None):
         from tools.memory.environment import authentication_handoff, load_environment
         from tools.memory.client import AUTHENTICATION_CODES, MemoryClientError, aws_error
-        if aws_error(error).code not in AUTHENTICATION_CODES:
+        if aws_error(error).code not in AUTHENTICATION_CODES | {'deployment_elevation_denied', 'deployment_session_expired'}:
             return False
         from tools.setup_common import expected_account
         if values is None:
@@ -665,15 +673,19 @@ class AdminOperations:
                                             'migration_stack', 'discover', 'deploy_identity'))
         handoff = authentication_handoff(error, values, deploy=deploy)
         if handoff:
-            prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
+            separate = deploy and values.get('MAVEN_DEPLOY_MODE', 'profile') == 'profile'
+            prefix = 'MAVEN_DEPLOY_' if separate else 'MAVEN_AWS_'
             state['handoff'] = {**handoff, 'completion_claimed': False, 'account': expected_account(values),
+                                'deploy_profile': bool(separate),
                                 'expected_principal': values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown')}
         return handoff is not None
 
-    def advance(self, operation_id):
+    def advance(self, operation_id, *, expected_revision=None):
         self._prepare()
         from tools.environment_migrations import prerequisite
         original = self._load(operation_id)
+        if expected_revision is not None and original['revision'] != expected_revision:
+            return {**self.status(operation_id), 'login_status': 'handoff_changed'}
         if original['state'] in ('completed', 'cancelled', 'abandoned', 'failed'):
             return self.status(operation_id)
         prerequisite_target = original
@@ -693,8 +705,11 @@ class AdminOperations:
                     'prerequisite': pending, 'next_actions': ['advance_prerequisite'],
                     'notice': 'Complete the separate persisted migration review, then advance this original operation. Its interactions and approvals are unchanged.'}
         with setup_lock(self.directory):
-            self._advance_locked(self._load(operation_id))
-        return self.status(operation_id)
+            state = self._load(operation_id)
+            if expected_revision is not None and state['revision'] != expected_revision:
+                return {**self.status(operation_id), 'login_status': 'handoff_changed'}
+            self._advance_locked(state)
+            return self.status(operation_id)
 
     def _advance_locked(self, state):
         """Execute one phase while the caller holds the administration lock."""
@@ -753,7 +768,10 @@ class AdminOperations:
                 state['error_detail'] = error.metadata.get('detail', '')
             state['recovery'] = 'Inspect status, correct the prerequisite, then advance this same operation. Original request artifacts are retained.'
             try:
-                self._expired_login_handoff(state, error)
+                # An unsaved candidate can differ from the installed binding (even root).
+                # Only the code holding that candidate may supply its login handoff.
+                if state['step'] not in ('deploy_access_inspect', 'deploy_access_save'):
+                    self._expired_login_handoff(state, error)
                 if state.get('handoff', {}).get('type') == 'aws_login':
                     state['state'] = 'blocked'
             except (OSError, ValueError, KeyError):
@@ -819,6 +837,142 @@ class AdminOperations:
         from tools.secret_setup import standalone
         standalone(self, state)
 
+    def _deployment_access(self, state):
+        from tools.setup import Wizard
+        directory = self.home / 'runtime' / 'setup'
+        private_directory(directory)
+        with setup_lock(directory):
+            wizard = Wizard(self.home)
+            if not wizard.env.is_file():
+                raise SetupPending('Connect this installation first; no deployment setting was changed.')
+            owner = wizard.state.get('administration_operation')
+            if owner:
+                active = self._load(owner)
+                # A software-only update handoff may be parked before the daily identity
+                # prompt. It has not selected deployment access or submitted cloud work.
+                pre_cloud_update = (active['kind'] == 'setup' and active['parameters'].get('mode') == 'update'
+                    and active['step'] == 'identity' and active['state'] == 'pending'
+                    and not active['pending_interaction'] and not active['approvals']
+                    and set(active['answers']) <= {'local_update'}
+                    and all(r['step'] in ('update_local', 'update_local_choice') for r in active['receipts'])
+                    and not any(active.get(key) for key in ('effect_started', 'effect_sequence', 'service_apply_started',
+                        'service_candidate_directory', 'deploy_identity_actual', 'identity_return_step')))
+                if active['state'] != 'completed' and not pre_cloud_update:
+                    raise SetupPending('Resume the unfinished setup operation ' + owner +
+                                       ' before changing its deployment binding.')
+            elif not wizard.state.get('instance_ready') and (
+                    set(wizard.state) - {'schema', 'mode', 'existing_source', 'secrets_operation'}
+                    or any(p.name not in ('lock', 'state.json') for p in directory.iterdir())):
+                raise SetupPending('Unresolved legacy setup artifacts may bind deployment access. Preserve and reconcile them first.')
+            self._deploy_access_phase(state, wizard)
+
+    def _deploy_access_phase(self, state, wizard):
+        """Review a replacement in memory; the sole settings write is after approval and preflight."""
+        from tools.setup_common import expected_account, verify_deployment_access
+        step, answers, values = state['step'], state['answers'], wizard.values
+        previous = {key: values[key] for key in _DEPLOY_KEYS if key in values}
+        account = expected_account(values)
+        region = values.get('MAVEN_AWS_REGION', 'us-east-1')
+        state['presentation'] = {'title': 'Deployment access', 'purpose': 'Maintenance access — CloudFormation',
+            'region': region, 'account': account, 'target': str(self.home)}
+        if step in ('start', 'deploy_identity'):
+            choices = [('Assume an existing IAM role from daily sign-in (recommended)', 'role'),
+                       ('Use a separate sign-in profile', 'profile')]
+            if state['kind'] == 'deployment_access' or (state.get('identity_return_step') == 'connect_review'
+                                                        and values.get('MAVEN_MEMORY_INSTANCE_ID')):
+                choices.append(('Configure later — do not use deployment credentials', 'deferred'))
+            default = previous.get('MAVEN_DEPLOY_MODE', 'profile' if previous else 'role')
+            self._question(state, 'deploy_access', 'How should MAVEN access AWS for deployment?', [
+                Field('mode', 'Deployment access', default if any(mode == default for _, mode in choices) else 'role',
+                      kind='select', choices=tuple(choices),
+                      help='Role mode verifies the daily login and assumes one exact role for 15 minutes.')],
+                'deploy_access_details', description='Expected account: ' + account + '. Uses existing IAM access only. '
+                'No roles, grants or cloud resources are created. No root or other credential fallback.')
+            return
+        mode = answers['deploy_access']['mode']
+        if step == 'deploy_access_details':
+            if mode == 'role':
+                self._question(state, 'deploy_role', 'Select the existing deployment role', [
+                    Field('role_arn', 'Exact same-account IAM role ARN', values.get('MAVEN_DEPLOY_ROLE_ARN', ''),
+                          pattern=r'arn:aws:iam::[0-9]{12}:role/[\w+=,.@/-]+',
+                          help='Use an IAM role ARN, not a CLI profile or an STS session ARN.')],
+                    'deploy_access_inspect', description='Source: ' + values.get('MAVEN_AWS_EXPECTED_PRINCIPAL', 'Not configured')
+                    + '. MAVEN verifies this source and the assumed role, then reads CloudFormation account limits.')
+            elif mode == 'profile':
+                self._question(state, 'deploy_identity', 'Select the separate deployment sign-in', [
+                    Field('profile', 'Named AWS login-only profile', values.get('MAVEN_DEPLOY_PROFILE', ''),
+                          help='Use a separate deployment login. No access keys, tokens, or passwords.'),
+                    Field('cache', 'Private deployment login-cache directory', values.get('MAVEN_DEPLOY_LOGIN_CACHE',
+                          str(self.home / 'runtime/aws-deploy-login-cache')), help='Separate from the daily login cache.')],
+                    'deploy_access_inspect', description='Expected account: ' + account +
+                    '. MAVEN checks STS identity and reads CloudFormation account limits before saving.')
+            else:
+                state['step'] = 'deploy_access_inspect'
+            return
+        if step not in ('deploy_access_inspect', 'deploy_access_save'):
+            raise SetupPending('Unknown deployment access phase; preserve this operation.')
+        base = {key: value for key, value in values.items() if key not in _DEPLOY_KEYS}
+        binding = {'MAVEN_DEPLOY_MODE': mode}
+        if mode == 'role':
+            binding['MAVEN_DEPLOY_ROLE_ARN'] = answers['deploy_role']['role_arn']
+        elif mode == 'profile':
+            profile, cache = answers['deploy_identity']['profile'], Path(answers['deploy_identity']['cache']).expanduser()
+            if not cache.is_absolute() or str(cache) == values.get('MAVEN_AWS_LOGIN_CACHE'):
+                raise SetupPending('Select a separate absolute private deployment login cache.')
+            if profile == values.get('MAVEN_AWS_PROFILE'):
+                raise SetupPending('Select a separate named login profile, not the daily profile.')
+            binding.update(MAVEN_DEPLOY_PROFILE=profile, MAVEN_DEPLOY_LOGIN_CACHE=str(cache))
+        approved = state['approvals'][-1]['review'] if step == 'deploy_access_save' else None
+        if approved:
+            self._approved(state, 'deployment_binding', approved)
+            if (_digest(base) != approved['environment_digest'] or
+                    previous not in (approved['previous_binding'], approved['deployment_binding'])):
+                raise SetupPending('Settings changed after deployment access review. Review the current binding before replacing it.')
+        identity = None
+        if mode != 'deferred':
+            if mode == 'profile':
+                private_directory(cache)
+            candidate = {**base, **binding}
+            if account.isdigit():
+                candidate.setdefault('MAVEN_ACCOUNT_ID', account)
+            if mode == 'profile' and approved:
+                candidate['MAVEN_DEPLOY_EXPECTED_PRINCIPAL'] = approved['identity']['Arn']
+            elif mode == 'profile' and previous.get('MAVEN_DEPLOY_PROFILE') == profile and previous.get('MAVEN_DEPLOY_EXPECTED_PRINCIPAL'):
+                candidate['MAVEN_DEPLOY_EXPECTED_PRINCIPAL'] = previous['MAVEN_DEPLOY_EXPECTED_PRINCIPAL']
+            try:
+                actual = verify_deployment_access(candidate)
+            except Exception as error:
+                if not self._expired_login_handoff(state, error, values=candidate, deploy=True):
+                    raise
+                state.update(state='blocked', error=_error_code(error))
+                return
+            if account.isdigit() and actual['Account'] != account:
+                raise SetupPending('The deployment account differs from this installation; no settings were changed.')
+            identity = {key: actual[key] for key in ('Account', 'Arn', 'UserId') if key in actual}
+            if mode == 'profile':
+                binding['MAVEN_DEPLOY_EXPECTED_PRINCIPAL'] = identity['Arn']
+        review = {'previous_binding': approved['previous_binding'] if approved else previous,
+                  'deployment_binding': binding, 'mode': mode, 'identity': identity,
+                  'daily_source': {key: base.get('MAVEN_AWS_' + key) for key in ('PROFILE', 'EXPECTED_PRINCIPAL', 'LOGIN_CACHE')},
+                  'environment_digest': _digest(base), 'region': region, 'home': str(self.home),
+                  'check': 'No AWS check requested; deployment disabled.' if mode == 'deferred' else
+                           'STS identity and cloudformation:DescribeAccountLimits passed. Write permissions not tested.'}
+        state['live_state_checked'] = identity is not None
+        if not approved:
+            self._review(state, 'deployment_binding', 'Review deployment access — replace local binding only',
+                         review, 'deploy_access_save')
+            return
+        self._approved(state, 'deployment_binding', review)
+        if previous != binding:
+            wizard.settings(binding, remove=_DEPLOY_KEYS)
+        state['effect_sequence'] = state.get('effect_sequence', 0) + 1
+        self._receipt(state, 'deployment_binding', review)
+        if state['kind'] == 'deployment_access':
+            state.update(state='completed', outcome={'mode': mode, 'identity': identity, 'check': review['check']})
+        else:
+            state['deploy_identity_actual'] = identity
+            state['step'] = state.pop('identity_return_step', 'provision')
+
     def _preflight(self, state, values, task):
         from tools.setup_common import permission_preflight
         report = permission_preflight(values, task)
@@ -856,19 +1010,23 @@ class AdminOperations:
                 advance(self, state, wizard)
                 return
             step, answers = state['step'], state['answers']
+            if step.startswith('deploy_access_') or step == 'deploy_identity':
+                self._deploy_access_phase(state, wizard)
+                return
             from tools.setup_common import expected_account
             deploy = (step.startswith('deploy_identity') or
                       step in ('discover', 'discovery_select', 'provision', 'prepare', 'plan', 'apply_review', 'apply',
                                'migration_stack', 'update_service', 'update_service_apply') or
                       (step == 'connect_review' and not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID')))
             prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
-            actual = state.get(('deploy_identity' if deploy else 'identity') + '_actual', {})
+            actual = state.get(('deploy_identity' if deploy else 'identity') + '_actual') or {}
             state['presentation'] = {'title': 'Update MAVEN' if state['parameters'].get('mode') == 'update' else 'MAVEN instance setup',
                 'purpose': ('Maintenance access — CloudFormation create/update or necessary metadata discovery'
                             if deploy else 'Daily-use access — connect to memory; SQL/authority require separate approvals'),
                 'account': actual.get('Account') or expected_account(wizard.values),
-                'profile': wizard.values.get(prefix + 'PROFILE', 'Not selected'),
-                'principal': actual.get('Arn') or wizard.values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown'),
+                'profile': wizard.values.get('MAVEN_AWS_PROFILE' if deploy and wizard.values.get('MAVEN_DEPLOY_MODE') == 'role'
+                                             else prefix + 'PROFILE', 'Not selected'),
+                'principal': actual.get('Arn') or wizard.values.get(prefix + 'ROLE_ARN') or wizard.values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown'),
                 'verified': bool(actual), 'region': wizard.values.get('MAVEN_AWS_REGION', 'us-east-1'),
                 'target': (wizard.values.get('MAVEN_STACK_NAME', '') + '; instance ' +
                            (wizard.values.get('MAVEN_MEMORY_INSTANCE_ID') or state.get('new_instance_id', 'Not selected'))),
@@ -882,7 +1040,8 @@ class AdminOperations:
             if step == 'connect_review' and not has_target:
                 # Resume old blank-target failures through confirmed discovery,
                 # never by guessing a stack or discarding prior receipts.
-                state.update(step='deploy_identity', identity_return_step='discover')
+                state.update(step='deploy_identity' if state.get('identity_actual') else 'identity',
+                             identity_return_step='discover')
                 return
             if state['parameters'].get('mode') == 'update' and step.startswith('update_'):
                 self._update(state, wizard, step, answers)
@@ -924,9 +1083,8 @@ class AdminOperations:
                 connection = selection['connection']
                 if selection['mode'] == 'existing' and connection.startswith('/'):
                     from tools.environment_migrations import load_import
-                    imported = load_import(self.home, Path(connection))
-                    imported.pop('MAVEN_AWS_LOGIN_CACHE', None)
-                    imported.pop('MAVEN_DEPLOY_LOGIN_CACHE', None)
+                    imported = {key: value for key, value in load_import(self.home, Path(connection)).items()
+                                if key not in _DEPLOY_KEYS and key != 'MAVEN_AWS_LOGIN_CACHE'}
                     _connection_config(imported)
                     review['imported_settings'] = imported
                     review['target_settings'] = dict(wizard.values)
@@ -939,9 +1097,8 @@ class AdminOperations:
                 updates = {'MAVEN_AWS_REGION': answers['selection']['region']}
                 if 'imported_settings' in review:
                     from tools.environment_migrations import load_import
-                    imported = load_import(self.home, Path(review['connection']))
-                    imported.pop('MAVEN_AWS_LOGIN_CACHE', None)
-                    imported.pop('MAVEN_DEPLOY_LOGIN_CACHE', None)
+                    imported = {key: value for key, value in load_import(self.home, Path(review['connection'])).items()
+                                if key not in _DEPLOY_KEYS and key != 'MAVEN_AWS_LOGIN_CACHE'}
                     if imported != review['imported_settings']:
                         raise SetupPending('Imported private settings changed after review.')
                     conflicts = [key for key in imported if key in wizard.values and imported[key] != wizard.values[key]]
@@ -954,36 +1111,34 @@ class AdminOperations:
                 if target is not None and wizard.values not in (target, {**target, **updates}):
                     raise SetupPending('Local settings changed after import review; preserve this operation and review the new exact target.')
                 wizard.settings(updates)
-                if answers['selection']['mode'] == 'existing' and not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'):
-                    state.update(step='deploy_identity', identity_return_step=(
-                        'identity' if wizard.values.get('MAVEN_STACK_NAME') else 'discover'))
-                else:
-                    state['step'] = 'identity'
-            elif step in ('identity', 'deploy_identity'):
-                deploy = step == 'deploy_identity'
-                prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
+                state['step'] = 'identity'
+            elif step == 'identity':
+                prefix = 'MAVEN_AWS_'
                 state['presentation'].update(verified=False, account=expected_account(wizard.values),
                     principal=wizard.values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown'))
-                self._question(state, step, 'Select ' + ('maintenance access' if deploy else 'daily-use access'), [
+                self._question(state, step, 'Select daily-use access', [
                     Field('profile', 'Named AWS login-only profile', wizard.values.get(prefix + 'PROFILE', ''),
                           help='A local AWS CLI profile name selects who signs in, not a permission grant. Daily-use accesses memory; maintenance manages infrastructure or reads required stack metadata. Never enter access keys.'),
                     Field('cache', 'Private sign-in cache directory', wizard.values.get(prefix + 'LOGIN_CACHE',
-                          str(self.home / 'runtime' / ('aws-deploy-login-cache' if deploy else 'aws-login-cache'))),
+                          str(self.home / 'runtime' / 'aws-login-cache')),
                           help='An absolute owner-private local folder for AWS login tokens. Use separate folders for daily-use and maintenance so sign-ins cannot replace each other.')], step + '_inspect',
                     description=state['presentation']['purpose'] + '\nExpected account: ' + expected_account(wizard.values) +
                                 '\nExpected principal: ' + wizard.values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown — confirm actual STS identity after sign-in'))
-            elif step in ('identity_inspect', 'deploy_identity_inspect'):
+            elif step == 'deploy_identity_inspect':
+                # An unfinished older form selected a profile, not a role. Preserve the
+                # answer and require the new verified binding review before continuing.
+                answers['deploy_access'] = {'mode': 'profile'}
+                state['step'] = 'deploy_access_inspect'
+            elif step == 'identity_inspect':
                 from tools.setup_common import inspect_login_identity
-                deploy = step.startswith('deploy')
-                key = 'deploy_identity' if deploy else 'identity'
-                prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
+                key, prefix = 'identity', 'MAVEN_AWS_'
                 selected = answers[key]
                 if not re.fullmatch(r'[A-Za-z0-9_.@+-]{1,128}', selected['profile']):
                     raise SetupPending('Select a valid named AWS profile, not credentials.')
                 cache = Path(selected['cache']).expanduser()
                 if not cache.is_absolute():
                     raise SetupPending('Login cache must be an absolute private directory.')
-                other = wizard.values.get(('MAVEN_AWS_' if deploy else 'MAVEN_DEPLOY_') + 'LOGIN_CACHE')
+                other = wizard.values.get('MAVEN_DEPLOY_LOGIN_CACHE')
                 if other and cache == Path(other).expanduser():
                     raise SetupPending('Routine and deployment caches must be separate.')
                 private_directory(cache)
@@ -993,9 +1148,9 @@ class AdminOperations:
                     account=expected_account(wizard.values),
                     principal=wizard.values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown'))
                 try:
-                    identity = inspect_login_identity(wizard.values, deploy=deploy)
+                    identity = inspect_login_identity(wizard.values)
                     from tools.setup_common import check_login_identity
-                    check_login_identity(wizard.values, identity, deploy=deploy)
+                    check_login_identity(wizard.values, identity)
                 except SetupPending as error:
                     self._question(state, key, 'Correct the selected login identity: ' + str(error), [
                         Field('profile', 'Named AWS login-only profile', selected['profile'],
@@ -1005,7 +1160,7 @@ class AdminOperations:
                         description=str(error) + '\nExpected account: ' + expected_account(wizard.values))
                     return
                 except Exception as error:
-                    if not self._expired_login_handoff(state, error, values=wizard.values, deploy=deploy):
+                    if not self._expired_login_handoff(state, error, values=wizard.values, deploy=False):
                         raise
                     state['state'] = 'blocked'
                     return
@@ -1016,10 +1171,10 @@ class AdminOperations:
                 self._review(state, key + '_approval', 'Confirm actual selected AWS principal',
                              {'identity': identity, 'profile': selected['profile'], 'cache': str(cache), 'region': wizard.values['MAVEN_AWS_REGION']}, key + '_accept')
             elif step in ('identity_accept', 'deploy_identity_accept'):
-                from tools.setup_common import inspect_login_identity
+                from tools.setup_common import inspect_login_identity, verify_deployment_access
                 deploy = step.startswith('deploy')
                 key = 'deploy_identity' if deploy else 'identity'
-                identity = inspect_login_identity(wizard.values, deploy=deploy)
+                identity = verify_deployment_access(wizard.values) if deploy else inspect_login_identity(wizard.values)
                 from tools.setup_common import check_login_identity
                 check_login_identity(wizard.values, identity, deploy=deploy)
                 review = {'identity': identity, **answers[key], 'region': wizard.values['MAVEN_AWS_REGION']}
@@ -1032,12 +1187,17 @@ class AdminOperations:
                         state['connection_maintenance_confirmed'] = True
                 elif not deploy and state['parameters'].get('mode') == 'update':
                     state['step'] = 'update_schema'
-                elif not deploy and (answers['selection']['mode'] == 'new' or
-                        (not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID') and
-                         not state.get('connection_maintenance_confirmed'))):
-                    state['step'] = 'deploy_identity'
-                else:
+                elif deploy:
                     state['step'] = 'provision' if answers['selection']['mode'] == 'new' else 'connect_review'
+                elif answers['selection']['mode'] == 'new':
+                    state.update(step='deploy_identity', identity_return_step='provision')
+                elif not wizard.values.get('MAVEN_MEMORY_INSTANCE_ID') and not state.get('connection_maintenance_confirmed'):
+                    state.update(step='deploy_identity', identity_return_step=(
+                        'connect_review' if wizard.values.get('MAVEN_STACK_NAME') else 'discover'))
+                elif not any(key in wizard.values for key in _DEPLOY_KEYS):
+                    state.update(step='deploy_identity', identity_return_step='connect_review')
+                else:
+                    state['step'] = 'connect_review'
             elif step == 'discover':
                 candidates = _discover_stacks(wizard.values)
                 state['discovered_stacks'] = candidates
@@ -1050,7 +1210,7 @@ class AdminOperations:
                     'discovery_select',
                     description=f'Account: {expected_account(wizard.values)} | Region: {wizard.values["MAVEN_AWS_REGION"]}. '
                                 'Read-only discovery is complete. Continue saves the selected stack locator locally, '
-                                'then asks for daily-use access. Complete connection details require review before binding memory. '
+                                'then shows the complete connection details for review before binding memory. '
                                 'No deployment, database initialization or authority replacement is authorized.',
                     details=json.dumps(candidates, indent=2))
             elif step == 'discovery_select':
@@ -1061,7 +1221,7 @@ class AdminOperations:
                 wizard.settings({'MAVEN_STACK_NAME': selected['stack_id']})
                 state['effect_sequence'] = state.get('effect_sequence', 0) + 1
                 self._receipt(state, step, selected)
-                state['step'] = 'identity'
+                state['step'] = 'connect_review' if state.get('identity_actual') else 'identity'
             elif step == 'connect_review':
                 if wizard.values.get('MAVEN_MEMORY_INSTANCE_ID'):
                     config = _connection_config(wizard.values)
@@ -1178,8 +1338,7 @@ class AdminOperations:
             elif step == 'migration_stack':
                 if 'upgraded_stack' in answers:
                     wizard.settings({'MAVEN_STACK_NAME': answers['upgraded_stack']['stack']})
-                if not state.get('deploy_identity_actual') or not all(
-                        wizard.values.get('MAVEN_DEPLOY_' + key) for key in ('PROFILE', 'EXPECTED_PRINCIPAL', 'LOGIN_CACHE')):
+                if not state.get('deploy_identity_actual'):
                     state['identity_return_step'] = 'migration_stack'
                     state['step'] = 'deploy_identity'
                     return
@@ -1298,8 +1457,7 @@ class AdminOperations:
             else:
                 state['step'] = 'update_service'
         elif step == 'update_service':
-            if not state.get('deploy_identity_actual') or not all(
-                    wizard.values.get('MAVEN_DEPLOY_' + key) for key in ('PROFILE', 'EXPECTED_PRINCIPAL', 'LOGIN_CACHE')):
+            if not state.get('deploy_identity_actual'):
                 state.update(identity_return_step='update_service', step='deploy_identity')
                 return
             self._preflight(state, wizard.values, 'metadata')
@@ -2032,31 +2190,31 @@ class AdminOperations:
         state['outcome']['local_sweep']['administration_files_touched'] = touched
 
     def _removal_access(self, state, home):
-        from tools.memory.environment import load_environment
-        from tools.setup_common import inspect_login_identity, expected_account, atomic_private
+        from tools.memory.environment import load_environment, deployment_mode
+        from tools.setup_common import inspect_login_identity, verify_deployment_access, expected_account, atomic_private
         path = Path(home) / '.env'
         values = load_environment(path)
+        before = dict(values)
+        mode = deployment_mode(values)
+        prefix = 'MAVEN_AWS_' if mode == 'role' else 'MAVEN_DEPLOY_'
         selected = state['answers'].get('removal_identity', {})
-        if selected:
+        if selected and mode == 'profile':
             cache = Path(selected['cache']).expanduser()
             if not cache.is_absolute() or str(cache) == values.get('MAVEN_AWS_LOGIN_CACHE'):
                 raise SetupPending('Maintenance cache must be absolute and separate from daily-use login.')
             private_directory(cache)
             values.update(MAVEN_DEPLOY_PROFILE=selected['profile'], MAVEN_DEPLOY_LOGIN_CACHE=str(cache))
         state['presentation'] = {'title': 'Cloud removal', 'purpose': 'Maintenance access — inspect and remove only reviewed cloud resources',
-            'account': expected_account(values), 'profile': values.get('MAVEN_DEPLOY_PROFILE', 'Not selected'),
-            'principal': values.get('MAVEN_DEPLOY_EXPECTED_PRINCIPAL', 'Unknown'), 'verified': False,
+            'account': expected_account(values), 'profile': values.get(prefix + 'PROFILE', 'Not selected'),
+            'principal': values.get('MAVEN_DEPLOY_ROLE_ARN' if mode == 'role' else
+                                    'MAVEN_DEPLOY_EXPECTED_PRINCIPAL', 'Unknown'), 'verified': False,
             'region': values.get('MAVEN_AWS_REGION', 'us-east-1'),
             'target': values.get('MAVEN_STACK_NAME', '') + '; instance ' + values.get('MAVEN_MEMORY_INSTANCE_ID', ''),
             'description': 'Home: ' + str(home) + '. No resources are removed until the exact removal plan is approved.', 'details': ''}
-        if not all(values.get('MAVEN_DEPLOY_' + key) for key in ('PROFILE', 'LOGIN_CACHE')):
-            self._question(state, 'removal_identity', 'Select maintenance access for cloud removal', [
-                Field('profile', 'AWS login-only maintenance profile', values.get('MAVEN_DEPLOY_PROFILE', ''),
-                      help='A named local profile selects your maintenance identity; it does not grant permissions. Never enter credentials.'),
-                Field('cache', 'Private maintenance sign-in cache', values.get('MAVEN_DEPLOY_LOGIN_CACHE', str(Path(home) / 'runtime/aws-deploy-login-cache')),
-                      help='Absolute owner-private folder for login tokens, separate from daily-use memory access.')],
-                state['step'], description='Expected account: ' + expected_account(values) + '. Sign-in checks identity only; permissions and removal need separate review.')
-            return False
+        if mode == 'deferred' or (mode == 'profile' and not all(values.get(prefix + key) for key in ('PROFILE', 'LOGIN_CACHE'))):
+            raise SetupPending('Configure deployment access first: ' + shlex.join(
+                ['maven-setup', '--home', str(home), '--deployment-access']) +
+                '. Then resume this exact removal operation; no removal was dispatched.')
         try:
             identity = inspect_login_identity(values, deploy=True)
         except SetupPending:
@@ -2067,16 +2225,21 @@ class AdminOperations:
             state['state'] = 'blocked'
             return False
         state['presentation'].update(account=identity['Account'], principal=identity['Arn'], verified=True)
-        review = {'identity': identity, 'home': str(home), 'profile': values['MAVEN_DEPLOY_PROFILE'],
-                  'cache': values['MAVEN_DEPLOY_LOGIN_CACHE'], 'purpose': state['presentation']['purpose']}
+        review = {'identity': identity, 'home': str(home), 'profile': values[prefix + 'PROFILE'],
+                  'cache': values[prefix + 'LOGIN_CACHE'], 'purpose': state['presentation']['purpose']}
+        if mode == 'role':
+            review.update(role_arn=values['MAVEN_DEPLOY_ROLE_ARN'], source_principal=values['MAVEN_AWS_EXPECTED_PRINCIPAL'])
         if 'removal_identity_approval' not in state['answers']:
             self._review(state, 'removal_identity_approval', 'Confirm actual maintenance identity before removal planning', review, state['step'])
             return False
         self._approved(state, 'removal_identity_approval', review)
-        values['MAVEN_DEPLOY_EXPECTED_PRINCIPAL'] = identity['Arn']
-        if load_environment(path) != values:
-            atomic_private(path, ''.join(key + '=' + json.dumps(value) + '\n' for key, value in sorted(values.items())))
+        if mode == 'profile':
+            values['MAVEN_DEPLOY_EXPECTED_PRINCIPAL'] = identity['Arn']
         self._preflight(state, values, 'removal')
+        if before != values:
+            if verify_deployment_access(values) != identity or load_environment(path) != before:
+                raise SetupPending('Deployment identity or settings changed; nothing was saved.')
+            atomic_private(path, ''.join(key + '=' + json.dumps(value) + '\n' for key, value in sorted(values.items())))
         return True
 
     def _project_lifecycle(self, state):

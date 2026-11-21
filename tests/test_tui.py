@@ -139,11 +139,17 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app._main_screen.query_one('#busy').display)
             return result
 
-        with patch.object(app, 'suspend') as suspend, patch('tools.tui.app.subprocess.run', side_effect=authenticate) as run:
+        terminal = Mock()
+        with patch.object(app, 'suspend') as suspend, patch('tools.tui.app.open', create=True) as opened, \
+                patch('tools.tui.app.os.tcgetpgrp', return_value=os.getpgrp()), \
+                patch('tools.tui.app.subprocess.run', side_effect=authenticate) as run:
+            opened.return_value.__enter__.return_value = terminal
             async with app.run_test(size=(80, 24)) as pilot:
                 await pilot.pause()
                 suspend.assert_called_once_with()
-                run.assert_called_once_with(['local-auth-placeholder'], check=False)
+                opened.assert_called_once_with('/dev/tty', 'r+b', buffering=0)
+                run.assert_called_once_with(['local-auth-placeholder'], stdin=terminal, stdout=terminal,
+                                            stderr=terminal, check=False)
                 self.assertEqual(answers, [result])
                 self.assertEqual(app.activity_state, 'complete')
                 self.assertFalse(app.screen.query_one('#busy').display)
@@ -264,9 +270,9 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             identifier = str(uuid4())
             command = ['aws', 'login', '--profile', 'selected-owner', '--region', 'us-east-1']
-            environment = {'AWS_LOGIN_CACHE_DIRECTORY': str(Path(directory) / 'private cache')}
+            environment = {'AWS_LOGIN_CACHE_DIRECTORY': str(Path(directory).resolve() / 'private cache')}
             blocked = {
-                'operation_id': identifier, 'state': 'blocked', 'step': 'identity_inspect',
+                'operation_id': identifier, 'state': 'blocked', 'step': 'identity_inspect', 'revision': 7,
                 'pending_interaction': None, 'next_actions': ['advance', 'back'],
                 'presentation': {'title': 'Check everyday AWS identity', 'purpose': 'Everyday memory access',
                                  'account': '123456789012', 'profile': 'selected-owner', 'verified': False},
@@ -294,7 +300,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                         await pilot.pause()
                         external.assert_called_once_with(command, {'env': {**os.environ, **environment}, 'check': False})
                         # Status 0 inspects the actual identity without an intermediate screen.
-                        controller.advance.assert_called_once_with(identifier)
+                        controller.advance.assert_called_once_with(identifier, expected_revision=7)
                         self.assertIn('actual-owner', str(app.screen.query_one('#context', Static).render()))
                         controller.respond.assert_not_called()
                         await pilot.press('ctrl+q')
@@ -402,7 +408,8 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     'operation_id': identifier, 'state': 'blocked', 'step': 'identity_inspect',
                     'pending_interaction': None, 'next_actions': ['advance', 'back'],
                     'handoff': {'type': 'aws_login', 'reason': 'Authenticate selected access.',
-                                'command': ['aws', 'login', '--profile', 'owner'], 'environment': {}},
+                                'command': ['aws', 'login', '--profile', 'owner', '--region', 'us-east-1'],
+                                'environment': {'AWS_LOGIN_CACHE_DIRECTORY': str(Path(directory).resolve() / 'cache')}},
                 }
                 controller = Mock(home=Path(directory))
                 controller.status.return_value = state

@@ -76,13 +76,13 @@ PATH; it is **not** the private `.env`. Never source `.env`.
 **Existing instance:** leave the connection override blank for the guided path.
 If this private home already has a connection, setup reuses it. Otherwise:
 
-1. Select maintenance access, sign in if needed, and confirm the actual AWS account
-   and principal.
+1. Verify the daily-use login, then select deployment access for discovery.
+   Confirm the source and the actual same-account deployment identity.
 2. MAVEN searches CloudFormation in the selected region, reading all result pages.
    Choose the intended stack explicitly, even if only one was found. The list shows
    stack names, instance IDs and status; only ready stacks with valid MAVEN outputs
    from the selected account are offered.
-3. Select daily-use access, then review the complete connection before binding memory.
+3. Review the complete connection before binding memory.
 
 Discovery is read-only and requires `cloudformation:DescribeStacks` permission to
 enumerate stacks in the selected account/region. Missing access or no eligible stacks
@@ -121,10 +121,13 @@ small terminals. A bottom status bar distinguishes **Waiting…**, **Awaiting in
 pause requested, paused, failed and complete. Declining an approval preserves
 the operation rather than claiming completion or rollback.
 
-**Daily-use access** operates memory. **Maintenance access** manages CloudFormation
-or reads required stack metadata; it is requested only when needed. These purposes
-can use identities in the same AWS account. A configured existing connection does
-not require maintenance access just to verify memory.
+**Daily-use access** operates memory. **Deployment access** manages infrastructure
+or reads stack metadata. Choose an existing, same-account IAM role assumed from
+the verified daily login, a separate login profile, or configure deployment access
+later when the selected work does not need it. Existing installations retain
+their separate profile until an explicit change. Changing deployment access
+does not create IAM roles, change policies, switch projects or alter the three
+MAVEN memory roles.
 
 Use a named `aws login` profile, not root or static access keys. A profile is a local
 label, not an access grant. Saved/imported account and principal details are labelled
@@ -134,10 +137,13 @@ An identity differing from saved bindings is blocked, not silently substituted.
 Choose **Sign in**, manual instructions, Back or pause; login is never launched
 without that choice. A failed login offers manual recovery, not a readiness claim.
 
-MAVEN keeps its own private AWS sign-in caches inside the installation home
-(`runtime/aws-login-cache` for daily use, `runtime/aws-deploy-login-cache` for
-maintenance). A plain `aws login --profile …` writes the AWS default cache, which MAVEN
-does not read. When sign-in expires, run the exact command returned for the selected cache, profile and region in your own terminal, for example:
+MAVEN keeps the daily AWS login in its selected private cache. A separate deployment
+profile has its own private cache; role mode instead assumes the exact deployment
+role from the daily identity, requesting 900-second credentials held in process.
+The IAM trust policy, not MAVEN, determines whether fresh MFA is required.
+A plain `aws login --profile …` writes to the AWS default cache, not this installation's.
+If a user-controlled login terminal is unavailable, run the exact manual command
+returned for the selected profile, cache and region; for example:
 
 ```sh
 AWS_LOGIN_CACHE_DIRECTORY=~/.maven/runtime/aws-login-cache aws login --profile maven-interactive --region us-east-1
@@ -154,7 +160,11 @@ condition, organization control, quota or dependency; role assumption and reads
 cannot prove write permissions. No test resources are created by these probes.
 
 Importing `.env` does not copy credentials or reuse another machine's cache paths.
-Choose owner-private local login caches, separate for daily-use and maintenance.
+For a separate deployment profile choose a different owner-private cache. To change
+an existing installation, select **Change deployment access** or run
+`maven-setup --home "$HOME/.maven" --deployment-access` for the same reviewed flow.
+The live preflight verifies the identity and reads CloudFormation; it does not
+create test resources or prove write permissions.
 See [AWS command-line sign-in](https://docs.aws.amazon.com/signin/latest/userguide/command-line-sign-in.html)
 for account/identity prerequisites and login permissions.
 
@@ -326,10 +336,12 @@ Configure these owner-selected groups:
 
 - Routine login: `MAVEN_AWS_PROFILE`, `MAVEN_AWS_EXPECTED_PRINCIPAL`,
   `MAVEN_AWS_LOGIN_CACHE`, `MAVEN_AWS_REGION`.
-- Separate setup login: `MAVEN_DEPLOY_PROFILE`, `MAVEN_DEPLOY_EXPECTED_PRINCIPAL`,
-  `MAVEN_DEPLOY_LOGIN_CACHE`. Keep login-cache directories private (`0700`) and
-  separate. Authenticate these profiles explicitly using your approved AWS login
-  method before manual cloud commands; there is no silent login or default-profile fallback.
+- Deployment authentication: `MAVEN_DEPLOY_MODE` is `profile`, `role` or `deferred`.
+  An absent mode retains existing profile behavior. Separate-profile mode uses
+  `MAVEN_DEPLOY_PROFILE`, `MAVEN_DEPLOY_EXPECTED_PRINCIPAL`, and `MAVEN_DEPLOY_LOGIN_CACHE`.
+  Role mode uses `MAVEN_DEPLOY_ROLE_ARN` and the verified daily source login;
+  it does not try the old deployment profile if elevation is denied. Keep login
+  caches owner-private (`0700`). Configure deployment access through reviewed setup.
 - Deployment: `MAVEN_STACK_NAME`, `MAVEN_INSTANCE_NAME`, `MAVEN_ACCOUNT_ID`,
   `MAVEN_CALLER_PRINCIPAL_ARN`, `MAVEN_NOTIFICATION_EMAIL`,
   `MAVEN_AVAILABILITY_ZONES` (two comma-separated selected zones), and optionally

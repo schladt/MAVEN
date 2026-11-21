@@ -146,7 +146,7 @@ def expected_account(values):
     accounts = set()
     if values.get('MAVEN_ACCOUNT_ID'):
         accounts.add(values['MAVEN_ACCOUNT_ID'])
-    for key in ('MAVEN_AWS_EXPECTED_PRINCIPAL', 'MAVEN_DEPLOY_EXPECTED_PRINCIPAL',
+    for key in ('MAVEN_AWS_EXPECTED_PRINCIPAL', 'MAVEN_DEPLOY_EXPECTED_PRINCIPAL', 'MAVEN_DEPLOY_ROLE_ARN',
                 'MAVEN_CALLER_PRINCIPAL_ARN', 'MAVEN_MEMORY_CLUSTER_ARN',
                 'MAVEN_MEMORY_CLIENT_ROLE_ARN', 'MAVEN_MEMORY_ADMIN_ROLE_ARN'):
         value = values.get(key, '')
@@ -158,8 +158,10 @@ def expected_account(values):
 
 
 def check_login_identity(values, identity, *, deploy=False):
-    prefix = 'MAVEN_DEPLOY_' if deploy else 'MAVEN_AWS_'
-    expected = values.get(prefix + 'EXPECTED_PRINCIPAL')
+    from tools.memory.environment import deployment_mode
+    key = ('MAVEN_DEPLOY_ROLE_ARN' if deploy and deployment_mode(values) == 'role' else
+           'MAVEN_DEPLOY_EXPECTED_PRINCIPAL' if deploy else 'MAVEN_AWS_EXPECTED_PRINCIPAL')
+    expected = values.get(key)
     account = expected_account(values)
     if (expected and identity['Arn'] != expected) or (
             account.isdigit() and identity['Account'] != account):
@@ -218,10 +220,36 @@ def wait_for_database(values, *, budget=60.0, interval=2.0, checkpoint=None, on_
         return 'warming'
 
 
+def verify_cloudformation_access(session):
+    """Check deployment reads with the actual verified session, never ambient credentials."""
+    from botocore.config import Config
+    from botocore.exceptions import BotoCoreError, ClientError
+    from tools.memory.client import aws_error
+    from tools.memory.environment import transport_ca_bundle
+    try:
+        client = session.client('cloudformation', verify=transport_ca_bundle(), config=Config(
+            connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
+        try:
+            client.describe_account_limits()
+        finally:
+            client.close()
+    except (BotoCoreError, ClientError) as error:
+        raise aws_error(error) from None
+
+
+def verify_deployment_access(values):
+    """Setup may inspect an unbound profile, but never an unbound role source."""
+    from tools.memory.environment import deployment_session
+    session, identity = deployment_session(values, allow_unbound=True)
+    check_login_identity(values, identity, deploy=True)
+    verify_cloudformation_access(session)
+    return identity
+
+
 def permission_preflight(values, task):
     """Read/assume/simulate only. Results describe probes, not blanket permission."""
     from botocore.config import Config
-    from tools.memory.environment import selected_aws_session, transport_ca_bundle, migration_config
+    from tools.memory.environment import deployment_mode, selected_aws_session, transport_ca_bundle, migration_config
     checks = []
     limits = ['STS identity alone is not proof of permissions. No resource is created or deleted by these checks.']
     options = {'verify': transport_ca_bundle(), 'config': Config(
@@ -247,17 +275,16 @@ def permission_preflight(values, task):
 
     if task in ('infrastructure', 'removal', 'metadata'):
         try:
-            session = selected_aws_session(values, deploy=True, region=values['MAVEN_AWS_REGION'])
+            session = selected_aws_session(values, deploy=True, region=values.get('MAVEN_AWS_REGION', 'us-east-1'))
         except Exception as error:
-            checks.append({'check': 'Selected maintenance login', 'status': 'Could not verify',
+            checks.append({'check': 'Resolve selected deployment access', 'status': 'Could not verify',
                            'reason': getattr(error, 'code', type(error).__name__)})
         else:
             if task in ('metadata', 'removal'):
                 probe('Read the selected CloudFormation stack', lambda: call(session, 'cloudformation',
                       'describe_stacks', StackName=values['MAVEN_STACK_NAME']))
             else:
-                probe('Read CloudFormation account limits', lambda: call(session, 'cloudformation',
-                      'describe_account_limits'))
+                probe('Read CloudFormation account limits', lambda: verify_cloudformation_access(session))
             if task != 'metadata':
                 actions = (['cloudformation:CreateChangeSet', 'cloudformation:DescribeChangeSet',
                             'cloudformation:ExecuteChangeSet', 'cloudformation:DescribeStacks',
@@ -270,8 +297,9 @@ def permission_preflight(values, task):
                            ['cloudformation:DeleteStack', 'cloudformation:DescribeStacks',
                             'rds:DeleteDBCluster', 'rds:DeleteDBInstance', 's3:DeleteBucket',
                             'iam:DeleteRole', 'lambda:DeleteFunction'])
-                principal = values['MAVEN_DEPLOY_EXPECTED_PRINCIPAL']
-                if principal.startswith('arn:aws:iam:') and ':user/' in principal:
+                role_mode = deployment_mode(values) == 'role'
+                principal = values['MAVEN_DEPLOY_ROLE_ARN' if role_mode else 'MAVEN_DEPLOY_EXPECTED_PRINCIPAL']
+                if role_mode or (principal.startswith('arn:aws:iam:') and ':user/' in principal):
                     def simulate():
                         result = call(session, 'iam', 'simulate_principal_policy',
                                       PolicySourceArn=principal, ActionNames=actions, ResourceArns=['*'])
@@ -321,7 +349,11 @@ def inspect_login_identity(values, *, deploy=False):
     from botocore.config import Config
     from botocore.exceptions import BotoCoreError, ClientError
     from tools.memory.client import aws_error
-    from tools.memory.environment import login_session, transport_ca_bundle
+    from tools.memory.environment import deployment_session, login_session, transport_ca_bundle
+    if deploy:
+        _, identity = deployment_session(values, allow_unbound=True)
+        check_login_identity(values, identity, deploy=True)
+        return identity
     session = login_session(values, deploy=deploy, region=values.get('MAVEN_AWS_REGION', 'us-east-1'))
     try:
         client = session.client('sts', verify=transport_ca_bundle(), config=Config(

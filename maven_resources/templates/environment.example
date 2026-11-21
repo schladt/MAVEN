@@ -30,7 +30,13 @@
 # MAVEN_MEMORY_ENDPOINT=
 # MAVEN_MEMORY_SCHEMA_VERSION=2
 
-# Separately selected deploy identity; never a fallback for routine failures:
+# Deployment access is never a fallback for routine failures. An absent mode retains
+# the original separate login profile. Set deferred to leave deployment unavailable.
+# MAVEN_DEPLOY_MODE=role
+# Role mode: exact existing IAM role, same account as the pinned daily login.
+# Only a 900-second in-memory session is requested; no deployment login cache.
+# MAVEN_DEPLOY_ROLE_ARN=
+# Profile mode: explicitly selected separate deployment login and private cache.
 # MAVEN_DEPLOY_PROFILE=
 # MAVEN_DEPLOY_EXPECTED_PRINCIPAL=
 # MAVEN_DEPLOY_LOGIN_CACHE=

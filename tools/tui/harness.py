@@ -50,7 +50,11 @@ def _verified(home, outcome):
     from tools.setup_common import expected_account, SetupPending
     try:
         values = load_environment(home / '.env')
-        return (values == outcome['binding']
+        # Deployment credentials do not attest the daily memory connection.
+        def memory_binding(settings):
+            return {key: value for key, value in settings.items() if not key.startswith('MAVEN_DEPLOY_')}
+
+        return (memory_binding(values) == memory_binding(outcome['binding'])
                 and outcome['account'] == expected_account(values)
                 and outcome['instance_id'] == values.get('MAVEN_MEMORY_INSTANCE_ID')
                 and outcome['region'] == values.get('MAVEN_AWS_REGION', 'us-east-1')

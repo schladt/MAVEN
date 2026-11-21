@@ -150,6 +150,17 @@ class ScheduledSecret:
 
 
 class CloudUninstallTests(unittest.TestCase):
+    def test_role_teardown_rejects_source_change_before_contacting_aws(self):
+        values = {'MAVEN_DEPLOY_MODE': 'role', 'MAVEN_DEPLOY_ROLE_ARN': 'arn:aws:iam::123456789012:role/Admin',
+                  'MAVEN_AWS_PROFILE': 'daily', 'MAVEN_AWS_LOGIN_CACHE': '/private/one',
+                  'MAVEN_AWS_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/operator'}
+        details = {'identity': cloud._identity(values), 'home': '/installation'}
+        with patch.object(cloud, '_load', return_value={**values, 'MAVEN_AWS_LOGIN_CACHE': '/private/two'}), \
+                patch.object(cloud, '_Cloud') as aws:
+            with self.assertRaisesRegex(UninstallError, 'changed since approval'):
+                cloud.execute({'kind': 'cloud-teardown', 'details': details}, {}, Mock())
+            aws.assert_not_called()
+
     def test_snapshot_pending_resumes_without_duplicate_and_rejects_foreign_snapshot(self):
         rds = SnapshotRds()
         provider = Clients(rds=rds)

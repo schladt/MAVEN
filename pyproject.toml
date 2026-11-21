@@ -27,6 +27,7 @@ maven-secret-catalog = "tools.secret_catalog:main"
 maven-project = "tools.project:main"
 maven-uninstall = "tools.uninstall.cli:main"
 maven-mcp = "tools.mcp.server:main"
+maven-login = "tools.login:main"
 maven-git = "tools.git_workflow:main"
 maven-statusline = "tools.statusline:main"
 
