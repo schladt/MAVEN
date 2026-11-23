@@ -1247,7 +1247,18 @@ class AdminOperations:
                 if _connection_config(wizard.values) != review:
                     raise SetupPending('Selected connection changed after review.')
                 self._receipt(state, step, {'instance_id': review['instance_id'], 'connected': True})
-                self._question(state, 'upgrade', 'Existing instance schema', [Field('migrate', 'Review and explicitly apply schema migration?', False, kind='bool')], 'upgrade_choice')
+                from tools.memory.validation import SCHEMA_VERSION
+                self._question(state, 'upgrade', 'Optional database schema upgrade', [Field(
+                    'migrate', 'Review a database schema upgrade (SQL changes) before finishing setup', False, kind='bool',
+                    help='Leave unchecked to finish setup without changing the database.')], 'upgrade_choice',
+                    description=f'Instance {review["instance_id"]} records schema version {review["schema_version"]}; '
+                                f'this MAVEN release uses schema version {SCHEMA_VERSION}.\n\n'
+                                'Unchecked: skip the upgrade and verify the connection with a read-only status '
+                                'request. No database or cloud changes.\n\n'
+                                'Checked: run a read-only SQL permission check, then show the exact migration SQL '
+                                'for review. That SQL changes the database schema, but only after you approve '
+                                'that separate review; you can still decline there.\n\n'
+                                'Continue on this screen only records your choice.')
             elif step == 'upgrade_choice':
                 state['step'] = 'migration_review' if answers['upgrade']['migrate'] else 'verify'
             elif step == 'provision':
