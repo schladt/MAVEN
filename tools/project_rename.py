@@ -3,10 +3,11 @@ from copy import deepcopy
 from pathlib import Path
 from uuid import UUID, uuid5
 
+from tools.coordination import project_binding_lock
 from tools.memory.client import MemoryClientError
 from tools.memory.environment import configured_client
 from tools.memory.validation import validate
-from tools.project import load_project, require_binding
+from tools.project import load_project, require_binding, save_project_name
 from tools.setup_common import SetupPending, expected_account, verify_connection
 
 
@@ -109,6 +110,11 @@ def apply_rename(home, candidate, binding, source, progress, persist):
         current = _record(client, request['record_id'])
         if current['revision'] != result['revision'] or _fields(current) != _fields(request):
             raise SetupPending('The rename committed, but the project changed again; inspect the retained receipt and current record.')
+        root = Path(candidate['root'])
+        with project_binding_lock(home, root, shared=False):
+            if load_project(root) != candidate['local_project']:
+                raise SetupPending('Rename committed but the local binding changed; display name not updated.')
+            save_project_name(root, candidate['local_project'], current['data']['name'])
         progress['verified'] = True
         persist()
         return {'status': 'renamed', 'project_id': request['record_id'], 'record_id': request['record_id'],

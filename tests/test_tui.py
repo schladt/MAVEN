@@ -102,7 +102,8 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_terminal_status_distinguishes_failure_pause_and_completion(self):
         for result, state in ((0, 'complete'), (2, 'failed'), (3, 'paused'), (130, 'paused'),
-                              ('exception', 'failed'), ({'status': 'conflict'}, 'failed')):
+                              ('exception', 'failed'), ({'status': 'conflict'}, 'failed'),
+                              ({'state': 'partial', 'recovery': 'Restore the original directory.'}, 'failed')):
             with self.subTest(result=result):
                 def operation(ui):
                     if result == 'exception':
@@ -117,6 +118,10 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                     status = app.screen.query_one('#status', Static)
                     self.assertTrue(str(status.render()).startswith(state.capitalize()))
                     self.assertNotIn('private exception material', str(status.render()))
+                    if isinstance(result, dict) and 'recovery' in result:
+                        self.assertIn(result['recovery'], str(status.render()))
+                    elif state == 'failed':
+                        self.assertIn('without making changes', str(status.render()))
                     self.assertTrue(status.is_on_screen)
                     self.assertFalse(app.screen.query_one('#busy').display)
                     await pilot.pause()

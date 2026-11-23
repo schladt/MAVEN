@@ -111,7 +111,7 @@ for name in files:
             client = Mock()
             client.invoke.return_value = {'status': 'ready', 'data': {
                 'record_id': args.project_id, 'kind': 'entity', 'data_scope': 'owner',
-                'project_id': None, 'data': {'entity_type': 'project'}}}
+                'project_id': None, 'data': {'entity_type': 'project', 'name': args.name}}}
             config = {'instance_id': str(uuid4()), 'recovery_epoch': str(uuid4())}
             with patch('tools.memory.environment.load_environment', return_value={}), \
                     patch('tools.memory.environment.memory_config', return_value=config), \
@@ -132,6 +132,8 @@ for name in files:
                     _initialize(args)
                 self.assertEqual((root / '.maven/project.json').read_bytes(), before)
             project = load_project(root)
+            from tools.reconcile import select_project
+            self.assertEqual(select_project(root, root)['label'], 'Example project')
             self.assertEqual(project['root'], str(root))
             self.assertEqual((root / '.maven/project.json').stat().st_mode & 0o777, 0o600)
 

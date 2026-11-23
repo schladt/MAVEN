@@ -338,7 +338,12 @@ class SecretStoreTests(unittest.TestCase):
                     patch.object(self.session.files, 'get_object', return_value=response), \
                     redirect_stderr(diagnostic):
                 self.assertEqual(cli.main(['file', 'get', 'owner.restore', str(destination)]), 2)
-            self.assertEqual(diagnostic.getvalue().strip(), 'file encryption or authentication failed')
+            message = diagnostic.getvalue()
+            self.assertIn('file encryption or authentication failed', message)
+            self.assertIn('verify the selected store and encryption key', message)
+            self.assertNotIn('plaintext', message)
+            self.assertNotIn(receipt['object_key'], message)
+            self.assertNotIn(str(destination), message)
             self.assertTrue(response['Body'].closed)
             self.assertFalse(destination.exists())
             self.assertFalse(list(Path(directory).glob('.maven-restore-*')))

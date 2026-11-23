@@ -14,6 +14,7 @@ from tools.home import load_home, save_home
 from tools.memory.boundary import save_private
 from tools.memory.client import MemoryClientError
 from tools.project import load_project
+from tools.statusline import status_line
 from tools import project_switch as switching
 from tools.setup_common import SetupPending, read_private, save_json
 
@@ -112,6 +113,7 @@ class ProjectSwitchTests(unittest.TestCase):
 
     def test_switch_preserves_cloud_git_files_and_isolates_entire_old_runtime(self):
         record_path = self.local_records()
+        self.entities[self.new_id]['data']['name'] = 'Destination project'
         self.old.update(git_enabled=True, remote='origin', accepted_url='git@example.org:owner/repo.git',
                         branch='main', checks=[['true']])
         save_private(self.root, '.maven/project.json', self.old)
@@ -127,7 +129,7 @@ class ProjectSwitchTests(unittest.TestCase):
         archive = Path(result['preservation_path'])
         self.assertEqual(read_private(archive / record_path), {'unsynced': 'private work'})
         self.assertFalse((self.root / record_path).exists())
-        self.assertEqual(list((self.root / '.maven').iterdir()), [self.root / '.maven/project.json'])
+        self.assertEqual(status_line(self.home, {'cwd': str(self.root)}), 'MAVEN: project Destination project (local)')
         self.assertEqual(load_project(self.root), {**self.old, 'project_id': self.new_id})
         self.assertEqual(self.entities, before)
         self.assertFalse(self.writes)

@@ -12,6 +12,7 @@ import subprocess
 import sys
 from uuid import UUID
 from urllib.parse import urlsplit
+from tools.recovery import DEFAULT_NEXT_ACTION
 
 
 class ProjectError(ValueError):
@@ -144,6 +145,30 @@ def load_project(root: Path) -> dict:
         return _validate(json.loads(raw), root)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ProjectError('project configuration unavailable or invalid') from exc
+
+
+def project_label(root, binding):
+    """Display metadata only: a name never participates in project selection."""
+    from tools.memory.boundary import BoundaryError, read_private
+    path = '.maven/project-name.json'
+    if (root / path).is_file():
+        try:
+            cached = read_private(root, path)
+        except BoundaryError:
+            return binding['project_id']
+        if all(cached.get(k) == binding[k] for k in ('project_id', 'instance_id', 'recovery_epoch')):
+            name = cached.get('name')
+            if isinstance(name, str) and name.strip() and name.isprintable():
+                return name
+    return binding['project_id']
+
+
+def save_project_name(root, binding, name):
+    from tools.memory.boundary import save_private
+    cached = {k: binding[k] for k in ('project_id', 'instance_id', 'recovery_epoch')}
+    label = ''.join(c if c.isprintable() else ' ' for c in name).strip() if isinstance(name, str) else ''
+    if label and project_label(root, binding) != label:
+        save_private(root, '.maven/project-name.json', {**cached, 'name': label})
 
 
 def project_values(values: dict, project: dict) -> dict:
@@ -325,10 +350,21 @@ def _initialize_bound(args, *, capability_verified=False) -> dict:
         stream.flush()
         os.fsync(stream.fileno())
     _record_integration(root, payload, ignore)
+    save_project_name(root, project, record['data'].get('name'))
     return {'status': 'initialized', 'project': project}
 
 
 def main(argv=None) -> int:
+    try:
+        return _run_cli(argv)
+    except ProjectError as exc:
+        print(f'{exc}. {DEFAULT_NEXT_ACTION}', file=sys.stderr)
+    except Exception as exc:
+        print(f'Project command stopped: {type(exc).__name__}. {DEFAULT_NEXT_ACTION}', file=sys.stderr)
+    return 1
+
+
+def _run_cli(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     initialize = commands.add_parser('init', help='Validate a cloud project and create private local selection')
@@ -394,6 +430,12 @@ def main(argv=None) -> int:
         return 1
     except (ProjectError, SetupPending, OSError, json.JSONDecodeError) as exc:
         print(str(exc), file=sys.stderr)
+        if args.command == 'show':
+            print('Check that --root names the enabled project folder. If its .maven directory was moved, '
+                  'restore the original directory there. For a new folder, use maven-project setup --root '
+                  'with the intended folder instead.', file=sys.stderr)
+        else:
+            print(DEFAULT_NEXT_ACTION, file=sys.stderr)
         return 1
     except Exception as exc:
         from tools.memory.client import MemoryClientError
@@ -404,6 +446,8 @@ def main(argv=None) -> int:
             print('Preserved request key: ' + exc.request_key, file=sys.stderr)
         if args.command == 'setup':
             print('Preserve the private .maven/runtime/project-setup receipt and rerun setup with the same --root. Never replace IDs or choose another root to retry an unknown outcome.', file=sys.stderr)
+        else:
+            print(DEFAULT_NEXT_ACTION, file=sys.stderr)
         return 1
 
 

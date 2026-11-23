@@ -101,6 +101,8 @@ class ProjectRenameTests(unittest.TestCase):
         result = self.apply(candidate)
         self.assertEqual(result['status'], 'renamed')
         self.assertEqual(result['project_id'], self.project_id)
+        from tools.project import project_label
+        self.assertEqual(project_label(self.root, self.local), 'maven-code')
         self.assertEqual(self.record, {**self.original, 'revision': 5,
                                       'data': {**self.original['data'], 'name': 'maven-code'}})
         self.assertEqual(self.writes[0]['source'], self.source)

@@ -443,6 +443,18 @@ def _private_locator():
 
 def main(argv=None):
     """Begin a reviewed Home or redaction operation, or resume its exact administration UUID."""
+    from tools.recovery import DEFAULT_NEXT_ACTION
+    try:
+        return _run_cli(argv)
+    except (EOFError, KeyboardInterrupt):
+        print('Administration interrupted. Inspect the saved operation in the same home before resuming.', file=sys.stderr)
+        return 130
+    except Exception as error:
+        print(f'Administration stopped: {type(error).__name__}. {DEFAULT_NEXT_ACTION}', file=sys.stderr)
+        return 1
+
+
+def _run_cli(argv):
     parser = argparse.ArgumentParser(description=main.__doc__)
     parser.add_argument('--home', type=Path, default=Path(os.environ.get('MAVEN_HOME', str(Path.home() / '.maven'))))
     from tools.administration import _REDACTION_ACTIONS

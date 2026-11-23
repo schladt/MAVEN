@@ -57,6 +57,7 @@ work using system Python without importing Textual or AWS packages.
 
 ## Change requirements
 
+- No dead ends: every user-visible failure must include a concrete next action in the same result. Supply the specific remedy when you know it; use `tools.recovery` at the presentation boundary when you don't. Never turn an uncertain write into an automatic retry. Test what the user sees, not just the exception.
 - Preserve offline orientation and durable local capture. Do not add a work-session lifecycle, implicit project selection or cloud dependency on harness open/exit.
 - Keep semantic reasoning in the installed `maven` skill’s reconcile procedure. Compare whole-project views, fetch details selectively, guard writes on both sides, and verify convergence. Preserve competing evidence and never resurrect erased content.
 - Keep record ownership clear: a project skill carries steps **or** a repository link; a link does not authorize reading secrets, uploading the file, running code or publishing.

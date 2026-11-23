@@ -11,6 +11,7 @@ import sys
 from uuid import uuid4
 
 from tools.interaction import Field, OperationPaused, checkpoint, message, require, stage
+from tools.recovery import DEFAULT_NEXT_ACTION
 
 
 from tools.setup_common import (
@@ -417,13 +418,20 @@ def main(argv=None):
         parser.error('--operation resumes exact evidence and cannot be combined with --fresh-operation')
     if args.restart_operation and (args.operation or args.fresh_operation or args.mode):
         parser.error('--restart-operation starts with fresh choices; it cannot be combined with --operation, --fresh-operation or --mode')
-    home = args.home.expanduser().absolute()
-    os.environ['MAVEN_HOME'] = str(home)
-    from tools.tui import run_workflow
-    return run_workflow('MAVEN instance setup', [
-        'Instance selection', 'AWS identities', 'Deployment review', 'Initialize',
-        'Verify readiness',
-    ], lambda ui: _present(ui, args, home))
+    try:
+        home = args.home.expanduser().absolute()
+        os.environ['MAVEN_HOME'] = str(home)
+        from tools.tui import run_workflow
+        return run_workflow('MAVEN instance setup', [
+            'Instance selection', 'AWS identities', 'Deployment review', 'Initialize',
+            'Verify readiness',
+        ], lambda ui: _present(ui, args, home))
+    except (EOFError, KeyboardInterrupt, OperationPaused):
+        print('Setup paused. Reopen setup in the same home to inspect the saved operation.', file=sys.stderr)
+        return 130
+    except Exception as error:
+        print(f'Setup stopped: {type(error).__name__}. {DEFAULT_NEXT_ACTION}', file=sys.stderr)
+        return 1
 
 
 def _present(ui, args, home):

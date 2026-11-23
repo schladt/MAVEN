@@ -23,6 +23,7 @@ from botocore.exceptions import BotoCoreError, ClientError, ProfileNotFound
 
 from tools.aws.settings import load_settings, prefix, required
 from tools.memory.environment import MemoryClientError, selected_aws_session
+from tools.recovery import DEFAULT_NEXT_ACTION
 
 MAX_BYTES = 4096
 NAME = re.compile(r"[a-z0-9][a-z0-9_.-]{0,63}\Z")
@@ -182,7 +183,8 @@ def file_action(args) -> None:
         else:
             restore_file(args, selected)
     except (AWSEncryptionSDKClientError, InvalidSignature):
-        raise StoreError("file encryption or authentication failed") from None
+        raise StoreError("file encryption or authentication failed; verify the selected store and encryption key "
+                         "before retrying") from None
 
 
 def main(argv=None) -> int:
@@ -265,30 +267,28 @@ def main(argv=None) -> int:
         if code == "ParameterAlreadyExists":
             message = "name already exists; use replace for an intentional update"
         elif code == "ParameterNotFound":
-            message = "name not found"
+            message = "name not found; use maven-secrets list to check names in the selected store"
         elif code in ("PreconditionFailed", "ConditionalRequestConflict"):
             message = "object already exists or changed during upload; choose a new name"
         elif code in ("NoSuchKey", "404"):
-            message = "object not found"
+            message = "object not found; use maven-secrets list to check names in the selected store"
         elif code in ("AccessDeniedException", "AccessDenied"):
-            message = "AWS denied this operation for the MAVEN profile"
+            message = "AWS denied this operation; check the selected profile and its permissions for this store"
         else:
-            message = "AWS request failed (details withheld to protect secret data)"
-        print(message, file=sys.stderr)
-        return 2
+            message = "AWS request failed (details withheld to protect secret data). " + DEFAULT_NEXT_ACTION
     except (BotoCoreError, ProfileNotFound):
-        print("AWS credentials or connection unavailable; log in to the explicitly configured profile", file=sys.stderr)
-        return 2
+        message = "AWS credentials or connection unavailable; log in to the explicitly configured profile"
     except StoreError as exc:
-        print(str(exc), file=sys.stderr)
-        return 2
+        message = str(exc) + "\nNext action: " + DEFAULT_NEXT_ACTION
     except MemoryClientError as exc:
-        print("Secret store unavailable: " + exc.code, file=sys.stderr)
-        return 2
+        message = "Secret store unavailable: " + exc.code + "\nNext action: " + DEFAULT_NEXT_ACTION
     except OSError:
-        print("Local file access failed; check the path and permissions.", file=sys.stderr)
-        return 2
+        message = "Local file access failed; check the path and permissions."
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
+        print("Interrupted. " + DEFAULT_NEXT_ACTION, file=sys.stderr)
         return 130
+    except Exception:
+        message = "Secret operation could not finish (details withheld to protect secret data). " + DEFAULT_NEXT_ACTION
+    print(message, file=sys.stderr)
+    return 2
 

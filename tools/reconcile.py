@@ -6,7 +6,7 @@ from pathlib import Path
 import stat
 from uuid import UUID, uuid4
 
-from tools.project import ProjectError, load_project
+from tools.project import ProjectError, load_project, project_label
 from tools.reconcile_records import brief_id, combine_history, digest, make_change, tombstone
 from tools.reconcile_local import StaleView
 
@@ -60,7 +60,7 @@ def select_project(cwd: str | Path, home: Path, *, use_home=False) -> dict | Non
     if use_home and not is_home:
         raise ProjectError('configured Home binding changed')
     return {'root': str(root), 'project_id': project['project_id'], 'mode': 'home' if is_home else 'project',
-            'label': selected['label'] if is_home else root.name}
+            'label': selected['label'] if is_home else project_label(root, project)}
 
 
 def _by_id(inventory):

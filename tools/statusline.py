@@ -8,7 +8,7 @@ import sys
 
 from tools.reconcile import select_project
 
-UNAVAILABLE = 'MAVEN: status unavailable'
+UNAVAILABLE = 'MAVEN: status unavailable; ask MAVEN to inspect the local project selection without changing it'
 OFF = 'MAVEN: off'
 INPUT_LIMIT = 1024 * 1024
 LINE_LIMIT = 120

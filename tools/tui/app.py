@@ -18,6 +18,7 @@ from textual.widgets import Button, Checkbox, Collapsible, Footer, Header, Input
 from textual.widgets.option_list import Option
 
 from tools.interaction import OperationPaused, confirmation_prefix, using
+from tools.recovery import DEFAULT_NEXT_ACTION, recovery_action
 
 
 class StateCheckbox(Checkbox):
@@ -518,14 +519,18 @@ class WorkflowApp(App):
         code, message = 0, "Completed. Review the results; Ctrl+Q closes this screen."
         with using(self.interaction):
             try:
+                action = None
                 result = self.operation(self.interaction)
                 if isinstance(result, int):
                     code = result
                 elif isinstance(result, dict):
                     self.interaction.message(json.dumps(result, indent=2, ensure_ascii=False))
-                    code = 130 if result.get("status") == "paused" else (2 if result.get("status") in ("blocked", "conflict") else 0)
-                if code:
-                    message = "Paused; preserve the receipts and resume." if code in (3, 130) else "Not complete. Review the diagnostics and preserved recovery state."
+                    action = recovery_action(result)
+                    code = 130 if result.get("status") == "paused" else (2 if action else 0)
+                if code in (3, 130):
+                    message = action or "Paused; keep the receipt and resume the same operation."
+                elif code:
+                    message = "Not complete. Next step: " + (action or DEFAULT_NEXT_ACTION)
             except OperationPaused as error:
                 code, message = 130, str(error)
             except subprocess.CalledProcessError as error:
@@ -537,7 +542,7 @@ class WorkflowApp(App):
                     "This is not proof of an authentication failure or rollback.")
             except Exception as error:
                 # Raw SDK/subprocess exceptions can contain private request material.
-                code, message = 2, f"Stopped ({type(error).__name__}). Preserve existing receipts; no success or rollback is implied."
+                code, message = 2, f"Stopped ({type(error).__name__}). Next step: {DEFAULT_NEXT_ACTION}"
             self.app_finish(code, message)
 
     def app_finish(self, code, message):

@@ -23,6 +23,15 @@ from tools.setup_common import SetupPending, expected_account, inspect_login_ide
 _OUTCOMES = {b'V': 'verified', b'C': 'cancelled', b'F': 'login_failed',
              b'I': 'identity_not_verified', b'U': 'terminal_unavailable', b'S': 'handoff_changed'}
 _INSPECTIONS = {'identity_inspect', 'deploy_identity_inspect', 'deploy_access_inspect'}
+_NEXT_ACTION = {
+    'manual': 'Run the offered terminal command in your own foreground terminal.',
+    'cancelled': 'Leave sign-in paused. When ready, request a fresh sign-in handoff from MAVEN.',
+    'login_failed': 'Check the AWS login diagnostic in your private terminal and the selected profile before signing in again.',
+    'identity_not_verified': 'Compare the AWS identity with the account and principal in the handoff before continuing.',
+    'terminal_unavailable': 'Request the current terminal command from MAVEN and run it in your own foreground terminal.',
+    'handoff_changed': 'Ask MAVEN for the current sign-in handoff; do not reuse the old command.',
+    'login_timed_out': 'Check the open sign-in terminal and ask MAVEN to verify the selected identity before starting another login.',
+}
 
 
 def daily_handoff(env):
@@ -161,8 +170,11 @@ def offer(handoff, args, *, interactive):
             status = 'terminal_unavailable'
     executable = Path(sys.executable).with_name('maven-login')
     helper = [str(executable)] if executable.is_file() else [sys.executable, '-I', '-m', 'tools.login']
-    return {'login_status': status, 'terminal_command': shlex.join([*helper, *args]),
-            'sign_in_command': exact['command']}
+    result = {'login_status': status, 'terminal_command': shlex.join([*helper, *args]),
+              'sign_in_command': exact['command']}
+    if status != 'verified':
+        result['next_action'] = _NEXT_ACTION[status]
+    return result
 
 
 def current_admin_handoff(result, revision):
@@ -177,7 +189,7 @@ def after_admin_login(controller, result, *, verify=False):
     identifier = result['operation_id']
     current = controller.status(identifier)
     if current.get('revision') != result.get('revision') or current.get('handoff') != result.get('handoff'):
-        return {**current, 'login_status': 'handoff_changed'}
+        return {**current, 'login_status': 'handoff_changed', 'next_action': _NEXT_ACTION['handoff_changed']}
     if current['step'] in _INSPECTIONS:
         return controller.advance(identifier, expected_revision=current['revision'])
     if verify:
@@ -207,7 +219,10 @@ def main(argv=None):
             from tools.administration import AdminOperations
             handoff = current_admin_handoff(AdminOperations(args.home).status(args.operation), args.revision)
         outcome = (b'S' if args.binding and _digest(handoff) != args.binding else _foreground(handoff))
-    except (KeyError, ValueError, OSError, SetupPending, MemoryClientError):
+    except KeyboardInterrupt:
+        outcome = b'C'
+    except Exception:
+        # The private terminal protocol only reports a bounded outcome, never provider details.
         outcome = b'S'
     finally:
         if channel is not None:
@@ -217,6 +232,8 @@ def main(argv=None):
                 pass
             channel.close()
     print('MAVEN sign-in: ' + _OUTCOMES[outcome] + '. No administration or reconciliation change was submitted.')
+    if outcome != b'V':
+        print('Next action: ' + _NEXT_ACTION[_OUTCOMES[outcome]], file=sys.stderr)
     return 0 if outcome == b'V' else 130 if outcome == b'C' else 1
 
 

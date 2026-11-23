@@ -96,6 +96,7 @@ def _setup_project_locked(args):
     from tools.memory.environment import configured_client, load_environment, memory_config
     from tools.project import (
         ProjectError, _ensure_ignore, _initialize_bound, _uuid, _validate, load_project, require_binding, validate_git,
+        save_project_name,
     )
     if not args.non_interactive:
         stage('Project selection')
@@ -196,6 +197,8 @@ def _setup_project_locked(args):
         if project['project_id'] != selected['project_id'] or (existing and project != existing):
             raise SetupPending('Project configuration changed during setup; preserve the receipt.')
         verified = verify_connection(args.env, project['project_id'], values=values)
+        if 'project_name' in verified:
+            save_project_name(root, project, verified['project_name'])
         state['complete'] = True
         save_json(state_path, state)
         checkpoint()

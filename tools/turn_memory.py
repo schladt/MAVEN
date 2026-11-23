@@ -107,7 +107,13 @@ def consult(app, cwd):
     except Exception:
         # A damaged binding, guard, or unreadable store never enables a fallback. Do not
         # reflect file names or exception text across the workspace context boundary.
-        return {**result, 'status': 'partial' if result['active'] is not None else 'unavailable', 'error': error}
+        action = ('Check the selected Nexus Home in MAVEN setup, then load context again. '
+                  'You can continue with any project context already returned.'
+                  if error == 'nexus_unavailable' else
+                  'Open the intended project folder and ask MAVEN to inspect its local binding. '
+                  'Do not switch projects or recreate the binding to recover missing context.')
+        return {**result, 'status': 'partial' if result['active'] is not None else 'unavailable',
+                'error': error, 'next_action': action}
 
 
 def capture(app, cwd, *, project_id, use_home, expected_token, reason, kind=None, data=None, record_id=None, erase=False):

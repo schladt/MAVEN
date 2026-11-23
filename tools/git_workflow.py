@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from tools.project import ProjectError, instance_home, load_project, require_binding
+from tools.recovery import DEFAULT_NEXT_ACTION
 from tools.uninstall.common import UninstallError, private_directory, read_private, save_private
 
 SCHEMA = 1
@@ -570,6 +571,8 @@ def inspect_publication(root, policy, message):
     if issues:
         report['status'] = 'blocked'
         report['issues'] = sorted(set(issues))
+        report['next_action'] = ('Review the listed issues without discarding local work or staging. '
+                                 'Resolve them before requesting a fresh Git inspection.')
         return report
     if not paths:
         return {**report, 'status': 'unchanged'}
@@ -855,7 +858,10 @@ def bound_publication(root, action, *, writers_quiescent=False, message=None, ap
         if stored and stored.get('project_id') != project['project_id']:
             raise WorkflowFailure('publication receipt belongs to a different project')
         if action == 'status' or action == 'recover' and approval is None:
-            return {'status': 'observed', 'publication': stored}
+            result = {'status': 'observed', 'publication': stored}
+            if stored and stored['status'] in ('installing', 'unverified'):
+                result['next_action'] = 'Compare the retained commit with the local and remote branch before recovering this exact approval.'
+            return result
         code = (approval or {}).get('candidate') if action != 'cancel' else candidate
         proposal = review_candidate(stored, code)
         if action == 'cancel':
@@ -880,10 +886,11 @@ def bound_publication(root, action, *, writers_quiescent=False, message=None, ap
                 stored['approval'] = approval
                 install_commit(root, policy, stored, proposal)
             return publish_commit(root, policy, stored, proposal)
-        except (WorkflowFailure, OSError, UninstallError) as error:
+        except Exception as error:
             if stored['status'] not in ('installing', 'unverified'):
                 raise
-            return {'status': 'uncertain', 'candidate': code, 'issue': str(error),
+            issue = str(error) if isinstance(error, (WorkflowFailure, UninstallError)) else 'Git publication could not be verified.'
+            return {'status': 'uncertain', 'candidate': code, 'issue': issue,
                     'next_action': 'Inspect the retained publication; recover only this exact approval.'}
 
 
@@ -913,11 +920,15 @@ def main(argv=None):
         result = publication(args.root, args.action, writers_quiescent=getattr(args, 'writers_quiescent', False),
                              candidate=candidate if args.action == 'cancel' else None,
                              message=getattr(args, 'message', None), approval=approval)
-    except (ValueError, OSError, BoundaryError) as error:
-        result = {'status': 'blocked', 'issue': str(error)}
+    except (ProjectError, UninstallError, BoundaryError) as error:
+        result = {'status': 'blocked', 'issue': str(error), 'next_action': DEFAULT_NEXT_ACTION}
+    except KeyboardInterrupt:
+        result = {'status': 'interrupted', 'issue': 'Git workflow interrupted.', 'next_action': DEFAULT_NEXT_ACTION}
+    except Exception:
+        result = {'status': 'blocked', 'issue': 'Git workflow could not finish.', 'next_action': DEFAULT_NEXT_ACTION}
     print(json.dumps(result, indent=2, sort_keys=True))
     return {'blocked': EXIT_BLOCKED, 'approval_required': EXIT_APPROVAL_REQUIRED,
-            'uncertain': EXIT_UNCERTAIN}.get(result['status'], EXIT_OK)
+            'uncertain': EXIT_UNCERTAIN, 'interrupted': 130}.get(result['status'], EXIT_OK)
 
 
 if __name__ == '__main__':

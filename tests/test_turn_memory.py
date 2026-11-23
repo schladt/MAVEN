@@ -60,6 +60,17 @@ class TurnMemoryTests(unittest.TestCase):
                        'use_home': view['use_home'], 'expected_token': view['token'], **options}),
                        kind=kind, data={'summary': 'Changed project files'} if data is None else data, reason='Observed')
 
+    def test_footer_label_is_bound_to_project_and_epoch_not_checkout_name(self):
+        from tools.project import save_project_name
+        binding = {**self.ident, 'project_id': self.project.project_id}
+        for identity, expected in ((binding, 'maven-code'),
+                                   ({**binding, 'recovery_epoch': uid()}, self.project.project_id),
+                                   ({**binding, 'project_id': uid()}, self.project.project_id)):
+            save_project_name(self.project.root, identity, 'maven-code')
+            context = consult(self.app, self.project.root)
+            self.assertEqual(context['active']['label'], expected)
+            self.assertEqual(context['nexus']['label'], 'Nexus')
+
     def test_clipboard_only_fresh_project_consults_manual_commit_preference_without_git_or_copy(self):
         key = self.seed(self.nexus, 'setting', preference('nexus', 'I commit manually. Provide the message only.'))
         nested = self.project.root / 'src'

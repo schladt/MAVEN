@@ -2,6 +2,8 @@
 
 MAVEN gives coding assistants project memory they can read and update offline. In an enabled folder the assistant opens a local orientation brief, records useful knowledge as work happens, and uses **maven reconcile** to bring that project's local and AWS copies into agreement. Close the harness whenever you like: no work session to finish and no network call required on exit. A local save does not mean another machine has received it.
 
+**No dead ends.** If MAVEN can’t finish, it must tell you what to do next. When the fix is known, it gives you that fix. When the outcome is unknown, it shows you how to check what happened before repeating anything.
+
 ## Before you start
 
 - macOS, Linux, or Windows through WSL (run the installer inside WSL).

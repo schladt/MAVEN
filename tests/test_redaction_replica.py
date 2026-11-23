@@ -93,9 +93,12 @@ class ReplicaTests(unittest.TestCase):
 
     def test_retired_project_blocks_future_offline_access_preserves_unselected_work(self):
         store = self.machine('barred')
+        from tools.project import save_project_name
+        save_project_name(store.root, {**self.identity, 'project_id': self.project}, SENSITIVE)
         targets = [{'kind': 'project', 'id': self.project}, self.target]
         with self.assertRaisesRegex(SetupPending, 'permanently retired'):
             self.deliver(store, targets, denied='project_unavailable')
+        self.assertFalse((store.root / '.maven/project-name.json').exists())
         self.assertNotIn(SENSITIVE.encode(), store.path.read_bytes())
         with closing(sqlite3.connect(store.path)) as db:
             self.assertEqual(json.loads(db.execute('SELECT record FROM records WHERE id=?', (self.other['record']['id'],)).fetchone()[0]), self.other['record'])
@@ -166,7 +169,7 @@ class ReplicaTests(unittest.TestCase):
         self.assertNotIn(SENSITIVE, json.dumps(actual_admin))
         self.assertEqual(json.loads((home / f'runtime/administration/{keep_op}.json').read_text()), other_admin)
 
-    def test_preserved_directory_is_pinned_by_switch_journal_not_neighbor_scan(self):
+    def test_preserved_archive_on_renumbered_device_is_swept_without_touching_neighbor(self):
         store = self.machine('switched')
         ident = uid()
         archive = self.base / ('.maven-preserved-' + ident)
@@ -176,7 +179,7 @@ class ReplicaTests(unittest.TestCase):
         info = (archive / '.maven').stat()
         candidate = {'old_project': dict(self.identity, project_id=self.project, root=str(store.root)),
                      'root': str(store.root), 'operation_id': ident, 'instance_id': self.identity['instance_id'],
-                     'old_directory': {'device': info.st_dev, 'inode': info.st_ino}, 'preservation_path': str(archive)}
+                     'old_directory': {'device': info.st_dev + 1, 'inode': info.st_ino}, 'preservation_path': str(archive)}
         save_private(store.replica.home, f'runtime/project-switches/{ident}.json', {'phase': 'completed', 'intent': {'candidate': candidate}})
         neighbor = self.machine('not-a-managed-preservation')
         current = uid()

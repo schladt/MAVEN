@@ -1,7 +1,7 @@
 """Explicit one-secret Home catalog writes, independent of memory session capture."""
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 import json
 from pathlib import Path
 import sys
@@ -14,9 +14,18 @@ from tools.home import load_home
 from tools.memory.boundary import private_path, read_private, save_private
 from tools.memory.client import MemoryClientError
 from tools.memory.environment import configured_client, load_environment
-from tools.memory.validation import digest, source as validate_source, validate
+from tools.memory.validation import MemoryError as ValidationError, digest, source as validate_source, validate
+from tools.recovery import DEFAULT_NEXT_ACTION
 
 _MANAGED_METADATA = {'store_id', 'provider', 'storage_operation', 'storage_name', 'version', 'domain', 'service'}
+
+
+def _error_code(error, fallback):
+    if isinstance(error, MemoryClientError):
+        return error.code
+    if isinstance(error, ValidationError):
+        return error.status
+    return fallback
 
 
 class SecretCatalog:
@@ -94,7 +103,7 @@ class SecretCatalog:
             result['conflict'] = state['conflict']
         if state['state'] != 'completed':
             result['next_action'] = (
-                'Inspect the failed storage operation; no catalog was written.'
+                'Check the selected store, name, input and permissions. Correct the rejected request before starting a new operation.'
                 if state['state'] == 'storage_failed' else
                 'Review conflict.current and storage_receipt. To deliberately repoint the catalog, use resolve_catalog '
                 'with this operation_id, the reviewed expected_revision, and the actual owner source; no secret is re-uploaded.'
@@ -290,7 +299,7 @@ class SecretCatalog:
                     or record.get('data') != request['data'] or record.get('tags') != request['tags']):
                 raise StoreError('catalog receipt could not be verified at its exact revision')
         except Exception as error:
-            code = getattr(error, 'code', None) or getattr(error, 'status', None) or 'catalog_unavailable'
+            code = _error_code(error, 'catalog_unavailable')
             state.update(state='catalog_pending', error=code)
             if code == 'revision_conflict' and 'catalog_request' in state:
                 try:
@@ -319,7 +328,7 @@ def main(argv=None):
     import argparse
     from tools.project import instance_home
     parser = argparse.ArgumentParser(description='Explicit store-and-catalog; no memory session is created')
-    parser.add_argument('--home', type=Path, default=instance_home())
+    parser.add_argument('--home', type=Path)
     commands = parser.add_subparsers(dest='action', required=True)
     store = commands.add_parser('store-and-catalog')
     store.add_argument('name')
@@ -342,28 +351,29 @@ def main(argv=None):
     lookup = commands.add_parser('lookup')
     lookup.add_argument('name')
     args = parser.parse_args(argv)
-    controller = None
     try:
-        controller = SecretCatalog(args.home)
-        if args.action == 'lookup':
-            result = {'record': controller.lookup(args.name), 'home_id': controller.home_id}
-        elif args.action == 'retry-catalog':
-            result = controller.retry_catalog(args.operation_id)
-        elif args.action == 'resolve-catalog':
-            result = controller.resolve_catalog(args.operation_id, expected_revision=args.expected_revision,
-                source={'origin': args.source_origin, 'excerpt': args.source_excerpt})
-        else:
-            options = vars(args).copy()
-            options.pop('action')
-            options.pop('home')
-            result = controller.store_and_catalog(**options, source={
-                'origin': 'maven-secret-catalog', 'excerpt': 'Explicit store-and-catalog command for ' + args.name})
+        with closing(SecretCatalog(args.home or instance_home())) as controller:
+            if args.action == 'lookup':
+                result = {'record': controller.lookup(args.name), 'home_id': controller.home_id}
+            elif args.action == 'retry-catalog':
+                result = controller.retry_catalog(args.operation_id)
+            elif args.action == 'resolve-catalog':
+                result = controller.resolve_catalog(args.operation_id, expected_revision=args.expected_revision,
+                    source={'origin': args.source_origin, 'excerpt': args.source_excerpt})
+            else:
+                options = vars(args).copy()
+                options.pop('action')
+                options.pop('home')
+                result = controller.store_and_catalog(**options, source={
+                    'origin': 'maven-secret-catalog', 'excerpt': 'Explicit store-and-catalog command for ' + args.name})
         print(json.dumps(result))
         return 0 if result.get('state', 'completed') == 'completed' else 2
+    except KeyboardInterrupt:
+        print(json.dumps({'error': 'interrupted', 'next_action': DEFAULT_NEXT_ACTION}), file=sys.stderr)
+        return 130
     except Exception as error:
-        code = getattr(error, 'code', None) or getattr(error, 'status', None) or 'secret_catalog_unavailable'
-        print(json.dumps({'error': code}), file=sys.stderr)
+        failure = {'error': _error_code(error, 'secret_catalog_unavailable'), 'next_action': DEFAULT_NEXT_ACTION}
+        if isinstance(error, StoreError):
+            failure['issue'] = str(error)
+        print(json.dumps(failure), file=sys.stderr)
         return 2
-    finally:
-        if controller is not None:
-            controller.close()

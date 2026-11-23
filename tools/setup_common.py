@@ -136,6 +136,7 @@ def verify_connection(env, project_id=None, *, values=None):
                     or record.get('data', {}).get('entity_type') != 'project'
                     or 'archived' in record.get('tags', []) or record.get('data', {}).get('state') == 'archived'):
                 raise SetupPending('The selected cloud record is not an active owner project entity.')
+            verified = {**verified, 'project_name': record['data'].get('name')}
         return verified
     finally:
         client.close()

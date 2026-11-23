@@ -19,6 +19,7 @@ import sys
 import tempfile
 
 from uuid import UUID, uuid4
+from tools.recovery import DEFAULT_NEXT_ACTION
 from tools.interaction import Field, OperationPaused, checkpoint, current, message, require, stage
 from tools.harness import (
     HARNESS_PATHS as INTEGRATIONS, SKILL_FILES, apply_reviewed_integration, integration_plan,
@@ -320,10 +321,14 @@ def main(argv=None) -> int:
                     'Resume that exact operation in this home after addressing the child diagnostic.', file=sys.stderr)
         return result
     except (EOFError, KeyboardInterrupt, OperationPaused):
-        _notify('Installation paused; existing private configuration is preserved.', file=sys.stderr)
+        _notify('Installation paused. Reopen the installer with the same home to review where to continue.', file=sys.stderr)
         return 130
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         _notify(f'Installation stopped: {exc}', file=sys.stderr)
+        _notify(DEFAULT_NEXT_ACTION, file=sys.stderr)
+        return 1
+    except Exception as exc:
+        _notify(f'Installation stopped: {type(exc).__name__}. {DEFAULT_NEXT_ACTION}', file=sys.stderr)
         return 1
 
 
@@ -349,7 +354,7 @@ if not valid:
     raise SystemExit('Installed MAVEN package origin is unavailable or mismatched; repair this exact runtime.')
 selected = importlib.util.find_spec(module)
 if selected is None or not selected.origin or not Path(selected.origin).resolve().is_relative_to(expected):
-    raise SystemExit('Installed task module origin is unavailable or mismatched; no checkout fallback was used.')
+    raise SystemExit('Installed task module origin is unavailable or mismatched; repair the selected runtime before resuming. No checkout fallback was used.')
 sys.argv[0] = module
 runpy.run_module(module, run_name='__main__', alter_sys=True)
 """
@@ -955,8 +960,9 @@ def _install(args, handoff=None):
         return 130
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         _notify(f'Installation stopped: {exc}', file=sys.stderr)
-        _notify('If TLS verification failed on a corporate VPN, use --ca-bundle with an IT-approved PEM bundle. '
-              'TLS verification must remain enabled.', file=sys.stderr)
+        if isinstance(exc, subprocess.CalledProcessError) or 'tls' in str(exc).lower() or 'certificate' in str(exc).lower():
+            _notify('If TLS verification failed, use --ca-bundle with an IT-approved PEM bundle; leave TLS verification enabled.', file=sys.stderr)
+        _notify(DEFAULT_NEXT_ACTION, file=sys.stderr)
         return 1
     finally:
         installation_locks.close()

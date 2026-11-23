@@ -19,6 +19,15 @@ _UUID = r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
 _ZIP = re.compile(r'([a-z0-9]+(?:-[a-z0-9]+)*)-([0-9a-f]{64})\.zip\Z')
 
 
+class PreservedArchiveUnavailable(SetupPending):
+    next_action = (
+        'Put the original preserved directory back at the recorded location beside the project folder, '
+        'then start a fresh reconcile inspection. If it is gone, keep any unsynced local work here '
+        'and use another installation bound to the same cloud project to access the cloud copy. '
+        'That does not recover local-only records.'
+    )
+
+
 def _unsafe():
     raise SetupPending('Local redaction evidence is ambiguous or unsafe. No original request was replayed; inspect the selected installation privately.')
 
@@ -131,6 +140,8 @@ class Replica:
         private_ids = {t['id'] for t in targets if t.get('project_id') == store.project_id}
         retired = {'kind': 'project', 'id': store.project_id} in targets
         store.install_redactions(private_ids, retired=retired)
+        if retired:
+            _forget_project_name(store.root / '.maven', store.project_id)
         _sweep_workspace(store.root, store.project_id, private_ids)
         if retired and not delivering:
             raise SetupPending('Project identity is permanently retired. Unreviewed local work is not uploaded.')
@@ -430,6 +441,16 @@ def _sweep_workspace(root, project, private_ids):
     return count
 
 
+def _forget_project_name(private, project):
+    path = private / 'project-name.json'
+    if not _exists(path):
+        return 0
+    if _json(path).get('project_id') != project:
+        _unsafe()
+    path.unlink()
+    return 1
+
+
 def _sweep_root(root, project, targets, bundle_check):
     private = root / '.maven'
     _owned_dir(private)
@@ -437,7 +458,7 @@ def _sweep_root(root, project, targets, bundle_check):
     # Project identity redaction does NOT retire every unrelated unsynced legacy
     # request. Only its exact record/dependency closure is authorized.
     setup = private / 'runtime' / 'project-setup'
-    touched = 0
+    touched = _forget_project_name(private, project) if project in ids['project'] else 0
     if project in ids['project'] and _exists(setup / 'state.json'):
         _owned_dir(setup)
         with setup_lock(setup):
@@ -520,12 +541,14 @@ def _sweep_preserved(home, instance_id, targets, bundle_check, receive_project=N
         if (not root.is_absolute() or root != root.resolve() or candidate['operation_id'] != match[1]
                 or old['root'] != str(root) or candidate['preservation_path'] != str(archive)):
             _unsafe()
+        if not _exists(archive) or not _exists(archive / '.maven'):
+            raise PreservedArchiveUnavailable(f'Preserved archive {archive.name} is missing or incomplete.')
         _owned_dir(archive)
         private = archive / '.maven'
         _owned_dir(private)
-        info = private.stat()
-        if candidate['old_directory'] != {'device': info.st_dev, 'inode': info.st_ino}:
-            _unsafe()
+        # A remount can assign a different device number to the same directory.
+        if candidate['old_directory'].get('inode') != private.stat().st_ino:
+            raise PreservedArchiveUnavailable(f'Preserved archive {archive.name} is not the recorded directory.')
         binding = _json(private / 'project.json')
         if binding.get('project_id') != project or binding.get('root') != str(root):
             _unsafe()

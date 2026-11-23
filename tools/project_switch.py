@@ -10,7 +10,7 @@ import subprocess
 
 from tools.coordination import ensure_available, project_binding_lock
 from tools.home import load_home, validate_root
-from tools.project import _uuid, _validate, load_project
+from tools.project import _uuid, _validate, load_project, save_project_name
 from tools.setup_common import SetupPending, private_directory, read_private, save_json
 
 
@@ -251,6 +251,7 @@ def apply_switch(home, candidate, binding, source):
             _rename(staged, active)
         if _directory(active) != journal['new_directory'] or load_project(root) != candidate['new_project']:
             raise SetupPending('Active replacement differs from the pinned switch receipt.')
+        save_project_name(root, candidate['new_project'], destination['data'].get('name'))
         if new_home is not None:
             save_json(home / 'home.json', new_home)
         result = {'status': 'ready', 'project': candidate['new_project'], 'preservation_path': str(archive),

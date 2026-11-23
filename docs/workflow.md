@@ -6,6 +6,8 @@ For ordinary work, follow **Every turn** in the [installed MAVEN skill](../maven
 
 Enable the intended root through the reviewed project setup. Selection follows the nearest enabled project, not the repository name, the last conversation, or another machine's choice. A schema-2 binding records the reviewed signed cloud identity. A schema-1 binding needs an explicit, reviewed switch, not an automatic upgrade or a hand edit. To share a project across machines, select the same instance and cloud project ID on each; local paths can differ.
 
+The footer uses the last verified project name, not the checkout folder name. Setup, switching projects and a verified rename refresh the name locally; ordinary replies never look it up in the cloud. If an older checkout has no verified name, the footer uses its project UUID. Run project setup for the existing binding to refresh the name without renaming or rebinding it. Nexus Home keeps its configured label.
+
 Outside an enabled project, use configured **Nexus Home**. On first load, consult the active brief and preferences plus Nexus preferences; reuse them until the workspace changes, context is lost or a refresh is needed. Never redirect a broken project to Home. “Turn off MAVEN for this session” disables automatic memory for this conversation only.
 
 ## What to save
@@ -23,6 +25,8 @@ A project skill describes **when to use a procedure** and either carries steps a
 **Saved locally** means the local write completed. **Synced** means both stores were verified to match at the reported point; it does not settle an open question or guarantee no later edits. If either view changes before a write, reread and reconsider the affected conclusions. If a reply is lost, inspect actual state on the next reconcile rather than submitting a duplicate. An outage does not undo confirmed local writes.
 
 An absent record is not a deletion. Cancel or supersede it explicitly. A bad merge can be corrected from history as a new write without rolling back the project. Explicit, owner-requested erasure removes the selected record's managed content and history; its content-free marker defeats stale offline edits at reconciliation. See [privacy and retention](security.md#data-and-external-models).
+
+A changed disk number does not invalidate a preserved archive. A missing archive is different: the failure names the archive and offers recovery. Put the original directory back if available. Otherwise, another installation bound to the same project can access the cloud copy; it cannot recover work saved only on this machine. For any failure, report the next recovery action rather than silently retrying a write.
 
 ## Optional Git publication
 

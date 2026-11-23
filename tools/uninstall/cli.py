@@ -397,7 +397,13 @@ def _status(plan, journal):
                       if item['kind'] == 'local_home_purge' and item['target'] == home), None)
         homes[home] = ('removed' if purge and journal['actions'].get(purge['id'], {}).get('state') == 'completed'
                        else 'removal_pending' if purge else 'retained')
+    guidance = {
+        'blocked': 'Inspect last_error and its action receipt. Resolve the blocker before resuming the original reviewed plan.',
+        'paused': 'Inspect the pending actions. When ready, use the original plan’s resume_command.',
+        'pending-provider': 'Inspect the pending provider action receipts for the next verification time before resuming the original plan.',
+    }.get(journal['state'])
     return {'status': journal['state'], 'operation_id': plan['operation_id'],
+            **({'guidance': guidance} if guidance else {}),
             'plan_digest': plan['plan_digest'], 'scopes': plan['scopes'],
             'scope_status': scope_status, 'targets': plan['targets'], 'actions': actions,
             'retained': plan['retained'], 'warnings': plan['warnings'], 'home_retention': homes,
@@ -698,18 +704,15 @@ def main(argv=None):
             result = apply(args)
         print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))
         return _exit_status(result)
-    except (UninstallError, OSError, ValueError, ImportError) as error:
-        message = str(error) if isinstance(error, UninstallError) else type(error).__name__
-        print(json.dumps({'status': 'blocked', 'error': message,
-                          'guidance': 'Preserve the operation directory. No success is implied; inspect status before retrying.'}),
-              file=sys.stderr)
-        return 2
     except (EOFError, KeyboardInterrupt):
         print(json.dumps({'status': 'interrupted', 'guidance': 'Preserve the plan and use status/resume.'}), file=sys.stderr)
         return 130
     except Exception as error:
-        print(json.dumps({'status': 'blocked', 'error': type(error).__name__,
-                          'guidance': 'Preserve the operation directory and reconcile before retrying.'}),
+        message = str(error) if isinstance(error, UninstallError) else type(error).__name__
+        guidance = ('Use the original plan’s recovery_command to inspect local receipts before resuming.'
+                    if getattr(args, 'plan', None) else
+                    'Inspect the selected paths and plan options with plan --help before starting another review.')
+        print(json.dumps({'status': 'blocked', 'error': message, 'guidance': guidance}),
               file=sys.stderr)
         return 2
 

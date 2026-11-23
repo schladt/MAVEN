@@ -27,6 +27,50 @@ class OfflineStdioTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ProjectError, 'switch in progress'):
                 select_project(nested, home)
 
+    async def test_unexpected_tool_failure_returns_a_private_read_only_way_forward(self):
+        from unittest.mock import patch
+        from tools.mcp.server import create_server
+        with patch('tools.mcp.server.consult', side_effect=RuntimeError('private argument')):
+            result = await create_server().call_tool('maven_context', {'cwd': '/'})
+        self.assertTrue(result.is_error)
+        visible = json.loads(result.content[0].text)
+        self.assertNotIn('private argument', result.content[0].text)
+        self.assertIn('without making changes', visible['next_action'])
+        self.assertEqual(visible, result.structured_content)
+
+    async def test_missing_preserved_archive_offers_recovery_without_submitting_a_write(self):
+        from unittest.mock import Mock
+        from tools.mcp.server import MavenApplication, create_server
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory).resolve()
+            home, root = base / 'installation', base / 'enabled'
+            for folder in (home, root):
+                folder.mkdir(mode=0o700)
+            identity = {'instance_id': str(uuid4()), 'recovery_epoch': str(uuid4())}
+            project, operation = str(uuid4()), str(uuid4())
+            binding = {**identity, 'root': str(root), 'project_id': project, 'schema': 2}
+            save_private(root, '.maven/project.json', binding)
+            archive = base / ('.maven-preserved-' + operation)
+            candidate = {'instance_id': identity['instance_id'], 'old_project': binding, 'root': str(root),
+                         'operation_id': operation, 'preservation_path': str(archive)}
+            save_private(home, f'runtime/project-switches/{operation}.json',
+                         {'phase': 'completed', 'intent': {'candidate': candidate}})
+            app = MavenApplication(home=home)
+            client = Mock(config=identity)
+            client.invoke.return_value = {'status': 'ready', 'data': {
+                'total': 0, 'token': 'a'*64, 'targets': [], 'more': False}}
+            app._unbound_client = client
+            result = await create_server(app).call_tool('maven_reconcile', {
+                'cwd': str(root), 'project_id': project, 'action': 'inspect'})
+            self.assertTrue(result.is_error)
+            self.assertIn(archive.name, result.structured_content['error'])
+            recovery = result.structured_content['next_action']
+            self.assertIn('original preserved directory', recovery)
+            self.assertIn('another installation', recovery)
+            self.assertEqual(json.loads(result.content[0].text)['next_action'], recovery)
+            self.assertEqual([c.args[0] for c in client.invoke.call_args_list], ['/v1/reconcile/markers'])
+            self.assertFalse(archive.exists())
+
     async def test_independent_harnesses_see_durable_local_knowledge_without_login_or_exit_steps(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory).resolve()
@@ -55,6 +99,10 @@ class OfflineStdioTests(unittest.IsolatedAsyncioTestCase):
                 context = await call(client, 'maven_context', {'cwd': str(child)})
                 self.assertEqual(context['status'], 'partial')  # No configured Nexus.
                 self.assertIsNone(context['nexus'])
+                self.assertIn('Nexus Home', context['next_action'])
+                invalid = await call(client, 'maven_reconcile', {'action': 'PRIVATE-INVALID-VALUE'}, ok=False)
+                self.assertIn('argument', invalid['next_action'])
+                self.assertNotIn('PRIVATE-INVALID-VALUE', json.dumps(invalid))
                 self.assertNotIn('turn_key', context)
                 state = context['active']
                 write = await call(client, 'maven_local_write', {**selected, 'expected_token': state['token'],
