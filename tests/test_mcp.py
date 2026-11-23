@@ -69,4 +69,13 @@ class OfflineStdioTests(unittest.IsolatedAsyncioTestCase):
                            'reason': 'Wrong selected project'}, ok=False)
                 await call(client, 'maven_reconcile', {**selected, 'action': 'verify'}, ok=False)
                 again = await call(client, 'maven_orient', {'cwd': str(root)})
+                receipt = await call(client, 'maven_turn', {'cwd': str(child), 'action': 'begin'})
+                self.assertEqual(receipt['status'], 'partial')  # Valid project, no configured Nexus.
+                turn = {'cwd': str(child), 'turn_key': receipt['turn_key']}
+                change = await call(client, 'maven_turn', {**turn, 'action': 'capture', 'project_id': project,
+                    'kind': 'action', 'data': {'summary': 'Adjusted fixture files'}, 'reason': 'Verified', 'covers_files': True})
+                self.assertTrue(change['changed'])
+                status = await call(client, 'maven_turn', {**turn, 'action': 'finish'})
+                self.assertIn('updated locally', status['footer'])
+                self.assertIn('Nexus preferences unavailable', status['footer'])
                 self.assertEqual(again['brief'], state['brief'])

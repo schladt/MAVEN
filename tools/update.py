@@ -155,7 +155,7 @@ def _git(checkout: Path) -> dict:
 
 def local_report(home: Path, checkout: Path) -> dict:
     """Compare the installed software and installer-owned harness skills with the checkout."""
-    from tools.harness import installed_targets, integration_plan, skill_bodies, skill_cutover_plan
+    from tools.harness import TURN_LIMITS, installed_targets, integration_plan, skill_bodies, skill_cutover_plan
     home, checkout = Path(home), Path(checkout)
     if not (checkout / 'install.py').is_file() or not (checkout / 'pyproject.toml').is_file():
         raise ValueError(f'Not a MAVEN checkout (install.py and pyproject.toml required): {checkout}')
@@ -169,7 +169,7 @@ def local_report(home: Path, checkout: Path) -> dict:
                     'added': sorted(name for name in source if name not in installed),
                     'removed': sorted(name for name in installed if name not in source)}
     targets = installed_targets(home)
-    harnesses = sorted(targets['paths'])
+    harnesses = sorted({name for name, _, _ in targets['profiles']})
     roots = targets['skill_roots']
     templates = checkout / 'maven_resources/templates'
     bodies = skill_bodies(templates / 'skills') if roots else {}
@@ -179,12 +179,24 @@ def local_report(home: Path, checkout: Path) -> dict:
     stale = sorted([str(path) for path, _, prior in skills if prior is not None] +
                    [item['target'] for item in conflicts])
     missing = sorted(str(path) for path, _, prior in skills if prior is None)
-    integrations = integration_plan(home, harnesses, paths=targets['paths'],
-                                   statusline=targets['statusline'] and 'claude' in harnesses,
-                                   guidance=(templates / 'harness/startup.md').read_text() if harnesses else '')
+    if harnesses and not roots:
+        missing.extend(f'{name}: no recorded skill root' for name in harnesses)
+        conflicts.extend({'target': name, 'component': 'skill', 'status': 'conflict',
+                          'reason': 'No canonical skill root recorded for this profile; select --skill-dir.'}
+                         for name in harnesses)
+    integrations = []
+    guidance = (templates / 'harness/startup.md').read_text() if harnesses else ''
+    for name, config, context in targets['profiles']:
+        adapter = targets['adapters'].get((name, config, context))
+        statusline = name == 'claude' and (adapter in targets['statusline_paths'] or
+                                           adapter is None and targets['paths'].get(name) == (config, context)
+                                           and targets['statusline'])
+        integrations.extend(integration_plan(home, [name], paths={name: (config, context)}, statusline=statusline,
+                                            adapter_template=templates / 'harness/maven-turn.js', guidance=guidance))
     changed_integrations = [str(change.path) for change in integrations if not change.receipt.get('conflict')
                             and (change.before != change.after or change.receipt.get('retired'))]
-    conflicts.extend({'target': str(change.path), 'reason': change.receipt['conflict']} for change in integrations
+    conflicts.extend({'target': str(change.path), 'component': change.receipt.get('target'),
+                      'harness': change.receipt.get('harness'), 'reason': change.receipt['conflict']} for change in integrations
                      if change.receipt.get('conflict'))
     metadata_current = _package_inputs_current(home, checkout)
     integrity_failures = _installed_integrity(home / 'venv')
@@ -196,13 +208,19 @@ def local_report(home: Path, checkout: Path) -> dict:
             'integrity_failures': integrity_failures,
             'skills': {'stale': stale, 'missing': missing, 'retire': [str(path) for path, _ in retired]},
             'harnesses': harnesses, 'integration_changes': changed_integrations, 'preserved': conflicts,
+            'integration_inventory': [
+                {'harness': c.receipt.get('harness'), 'component': c.receipt.get('target'), 'target': str(c.path),
+                 'status': ('conflict' if c.receipt.get('conflict') else 'retire' if c.receipt.get('retired') else
+                            'update' if c.before != c.after else 'current')}
+                for c in integrations],
             'skills_current': not (stale or missing or retired or pending),
             'unfinished_files': [saved['intent']['target'] for saved in pending],
             'unresolved_integration_targets': targets['unresolved'],
             'git': _git(checkout), 'current': current,
             'limitations': ['Installed package bytes and recorded installation inputs are compared; '
                             'dependency environment health is not verified.',
-                            'Git ahead/behind uses the last fetch; nothing was fetched.']}
+                            'Git ahead/behind uses the last fetch; nothing was fetched.',
+                            *(f'{name}: {TURN_LIMITS[name]}' for name in harnesses)]}
 
 
 def install_command(home: Path, checkout: Path) -> list[str]:
@@ -213,6 +231,9 @@ def install_command(home: Path, checkout: Path) -> list[str]:
     for harness, (config, context) in targets['paths'].items():
         command.extend(['--harness', harness, '--harness-config', f'{harness}={config}',
                         '--harness-context', f'{harness}={context}'])
+        adapter = targets['adapters'].get((harness, config, context))
+        if adapter is not None:
+            command.extend(['--harness-adapter', f'{harness}={adapter}'])
     for root in targets['skill_roots']:
         command.extend(['--skill-dir', str(root)])
     if targets['statusline'] and 'claude' in targets['paths']:
@@ -254,7 +275,7 @@ def pending_owned_skills(home, targets=None):
 def apply_owned_skills(home, source, plan, references, *, activation=False):
     """Apply only reviewed leaves; pin publication and check sharing under the installation locks."""
     from contextlib import nullcontext
-    from tools.harness import _read, _skill_manifest, skill_root, SKILL_FILES, write_skill
+    from tools.harness import _read, _active_manifest, skill_root, SKILL_FILES, write_skill
     from tools.uninstall.common import save_private
     from tools.uninstall.local import _shared_skills, _sharing_locks, inventory, record_installation
     home = Path(home)
@@ -289,7 +310,7 @@ def apply_owned_skills(home, source, plan, references, *, activation=False):
                 raise ValueError(f'Unreviewed file target; preserved: {target}')
             if is_skill and (key in shared or unknown):
                 raise ValueError(f'Shared or uncertain skill ownership; preserved: {target}')
-            manifest = _skill_manifest(home)
+            manifest = _active_manifest(home)
             recorded = manifest.get('owned', {}).get(key)
             if is_skill and recorded is not None and key not in manifest.get('skill_references', []):
                 raise ValueError(f'Ambiguous installer ownership; preserved: {target}')

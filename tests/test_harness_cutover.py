@@ -1,13 +1,14 @@
 """Local-only harness bootstrap and selective retirement of previously installed lifecycle hooks."""
 import json
 import os
+import shlex
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 from tools.harness import (
-    HARNESS_PATHS, LIFECYCLE_PATHS, apply_integration, apply_reviewed_integration, integration_plan,
+    HARNESS_PATHS, LIFECYCLE_PATHS, TURN_PATHS, apply_integration, apply_reviewed_integration, integration_plan,
     validate_default_profiles,
 )
 from tools.uninstall.common import read_private
@@ -19,8 +20,9 @@ class HarnessIntegrationTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.user = Path(self.directory.name).resolve()
-        self.home = self.user / 'instance with spaces'
+        self.home = self.user / "instance with spaces ' and ; characters"
         self.home.mkdir(mode=0o700)
+        self.enterContext(patch.dict(os.environ, {'MAVEN_HOME': str(self.home)}))
         self.source = Path(__file__).resolve().parents[1]
         self.home_patch = patch.object(Path, 'home', return_value=self.user)
         self.home_patch.start()
@@ -55,22 +57,130 @@ class HarnessIntegrationTests(unittest.TestCase):
             'target': 'lifecycle', 'value': value, 'created': harness == 'omp'}])
         return path
 
-    def test_all_harnesses_use_local_orientation_without_hooks(self):
-        changes = self.apply(HARNESS_PATHS)
-        self.assertFalse(any(change.receipt.get('conflict') for change in changes))
+    def test_staged_native_rollout_and_machine_removal_for_all_five_clients(self):
+        from tools.uninstall import local
+        from tools.turn_native import NATIVE_EVENTS, POST_MATCHERS
+        stage = self.user / 'inactive'
+        changes = integration_plan(self.home, HARNESS_PATHS, user_home=stage)
+        self.assertFalse(stage.exists(), 'planning may not create files or directories')
+        for change in changes:
+            self.assertNotIn('conflict', change.receipt)
+            apply_reviewed_integration(self.home, self.source, change)
         for name, (_, context, _) in HARNESS_PATHS.items():
             with self.subTest(harness=name):
-                text = (self.user / context).read_text()
-                self.assertIn('maven_orient', text)
-                self.assertIn('maven_local_write', text)
-                self.assertIn('references/reconcile.md', text)
-                self.assertNotIn('maven-reconcile', text)
-                self.assertNotIn('maven_startup', text)
-                target = self.user / LIFECYCLE_PATHS[name]
-                if name == 'gemini':
-                    self.assertNotIn('hooks', json.loads(target.read_text()))
-                else:
-                    self.assertFalse(target.exists())
+                self.assertIn('Every turn', (stage / context).read_text())
+                target = stage / TURN_PATHS[name]
+                if name == 'omp':
+                    self.assertIn(json.dumps(str(self.home)), target.read_text())
+                    self.assertNotIn('__MAVEN_HOME_JSON__', target.read_text())
+                    continue
+                hooks = json.loads(target.read_text())['hooks']
+                events = dict(zip(NATIVE_EVENTS[name], ('begin', 'observe', 'end')))
+                if name == 'copilot':
+                    events['preToolUse'] = 'guard'
+                self.assertEqual(set(hooks), set(events))
+                for event, phase in events.items():
+                    entry, = hooks[event]
+                    if phase == 'observe':
+                        self.assertEqual(entry['matcher'], POST_MATCHERS[name])
+                    else:
+                        self.assertNotIn('matcher', entry)
+                    command = entry['bash'] if name == 'copilot' else entry['hooks'][0]['command']
+                    self.assertEqual(shlex.split(command), [str(self.home / 'venv/bin/python'), '-I', '-m',
+                                     'tools.turn_hook', name, phase, '--home', str(self.home)])
+        again = integration_plan(self.home, HARNESS_PATHS, user_home=stage)
+        self.assertTrue(all(c.before == c.after and not c.receipt.get('conflict') for c in again))
+        plan = local.plan_machine(self.home, offline=True)
+        for action in plan['actions']:
+            if action['kind'] in ('local_barrier', 'local_integration'):
+                local.execute(action, {}, lambda: None)
+        for c in changes:
+            self.assertFalse(c.path.exists(), c.path)
+        self.assertFalse(any((self.user / path[0]).exists() for path in HARNESS_PATHS.values()))
+
+    def test_modified_subscriptions_are_preserved_and_restoring_exact_bytes_reenables_updates(self):
+        from tools.harness import remove_integrations
+        path = self.user / TURN_PATHS['claude']
+        path.parent.mkdir()
+        original = {'theme': 'owner', 'hooks': {'UserPromptSubmit': [], 'Stop': [
+            {'hooks': [{'type': 'command', 'command': 'my-check'}]}]}}
+        path.write_text(json.dumps(original))
+        self.apply(['claude'])
+        correct = path.read_bytes()
+        document = json.loads(correct)
+        document['hooks']['Stop'][-1]['hooks'][0]['command'] = 'owner-edit'
+        changed = json.dumps(document).encode()
+        path.write_bytes(changed)
+        attempt = self.apply(['claude'])
+        self.assertEqual([c.path for c in attempt if c.receipt.get('conflict')], [path])
+        self.assertEqual(path.read_bytes(), changed)
+        path.write_bytes(correct)
+        revised = {'claude': '^Write$'}
+        with patch('tools.turn_native.POST_MATCHERS', revised):
+            upgrade = self.apply(['claude'])
+            owned = next(c for c in upgrade if c.receipt['key'] == 'maven-turn')
+            self.assertNotEqual(owned.before, owned.after)
+            self.assertEqual(json.loads(owned.after)['hooks']['PostToolUse'][0]['matcher'], '^Write$')
+        receipts = [r for r in read_private(self.home / MANIFEST)['integrations'] if r['path'] == str(path)]
+        remove_integrations(receipts)
+        self.assertEqual(json.loads(path.read_text()), original)
+
+    def test_native_drift_inventory_is_independent_of_pointer_and_skill_drift(self):
+        from tools.harness import SKILL_FILES, skill_plan
+        from tools.update import apply_owned_skills, local_report
+        custom = self.user / 'inactive custom profile'
+        config, pointer = custom / 'mcp.json', custom / 'AGENTS.md'
+        extension, skills = custom / 'extensions/maven-turn.js', custom / 'skills'
+        plan = skill_plan([skills], self.home)
+        apply_owned_skills(self.home, self.source, plan, [p for p, _, _ in plan])
+        self.apply(['omp'], paths={'omp': (config, pointer)}, adapter_paths={'omp': extension})
+        self.apply(['claude'], guidance='old guidance')
+        drift = {extension: 'owner extension', pointer: 'owner pointer', skills / SKILL_FILES[0]: 'owner skill'}
+        for path, value in drift.items():
+            path.write_text(value)
+        with patch('tools.update._git', return_value={}):
+            report = local_report(self.home, self.source)
+        self.assertEqual(set(item['target'] for item in report['preserved']), {str(p) for p in drift})
+        self.assertIn(str(self.user / HARNESS_PATHS['claude'][1]), report['integration_changes'])
+        self.assertEqual({(i['component'], i['status']) for i in report['integration_inventory']
+                          if i['harness'] == 'omp'}, {('adapter', 'conflict'), ('config', 'current'),
+                                                      ('context', 'conflict')})
+        self.assertEqual({p: p.read_text() for p in drift}, drift)
+        self.assertFalse((self.user / '.omp').exists())
+
+    def test_disabled_foreign_and_duplicate_hooks_never_activate(self):
+        codex = self.user / HARNESS_PATHS['codex'][0]
+        codex.parent.mkdir()
+        codex.write_text('[features]\nhooks = false\n')
+        for name in ('claude', 'gemini', 'copilot'):
+            path = self.user / TURN_PATHS[name]
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({'claude': {'disableAllHooks': True}, 'gemini': {
+                'hooksConfig': {'enabled': False}}, 'copilot': {'version': 1, 'hooks': {}}}[name]))
+        other = self.user / '.omp/agent/extensions/copied.js'
+        other.parent.mkdir(parents=True)
+        other.write_text('run("tools.turn_hook")')
+        changes = self.apply(HARNESS_PATHS)
+        self.assertEqual({c.receipt['harness'] for c in changes if c.receipt.get('conflict')}, set(HARNESS_PATHS))
+        self.assertFalse((self.user / TURN_PATHS['omp']).exists())
+        self.assertFalse((self.user / TURN_PATHS['codex']).exists())
+        self.assertTrue(json.loads((self.user / TURN_PATHS['claude']).read_text())['disableAllHooks'])
+        self.assertNotIn('hooks', json.loads((self.user / TURN_PATHS['gemini']).read_text()))
+
+    def test_uninstall_removes_intact_mcp_but_preserves_modified_native_group(self):
+        from tools.uninstall import local
+        self.apply(['gemini'])
+        path = self.user / TURN_PATHS['gemini']
+        document = json.loads(path.read_text())
+        document['hooks']['AfterAgent'][0]['hooks'][0]['command'] = 'owner-custom'
+        path.write_text(json.dumps(document))
+        plan = local.plan_machine(self.home, offline=True)
+        self.assertTrue(any(item['path'] == str(path) and 'maven-turn' in item['reason']
+                            for item in plan['retained']))
+        local.execute(next(a for a in plan['actions'] if a['kind'] == 'local_barrier'), {}, lambda: None)
+        action = next(a for a in plan['actions'] if a['kind'] == 'local_integration' and a['target'] == str(path))
+        local.execute(action, {}, lambda: None)
+        self.assertEqual(json.loads(path.read_text()), {'hooks': document['hooks']})
 
     def test_cutover_removes_exact_owned_hooks_and_keeps_owner_entries(self):
         for name in HARNESS_PATHS:
@@ -85,7 +195,8 @@ class HarnessIntegrationTests(unittest.TestCase):
                 continue
             document = json.loads(path.read_text())
             start = 'sessionStart' if name == 'copilot' else 'SessionStart'
-            self.assertEqual(document['hooks'], {start: [{'command': 'keep'}]})
+            self.assertEqual(document['hooks'][start], [{'command': 'keep'}])
+            self.assertNotIn('sessionEnd' if name == 'copilot' else 'SessionEnd', document['hooks'])
             self.assertEqual(document['theme'], 'owner')
             if name == 'claude':
                 self.assertIn('statusLine', document)
@@ -116,6 +227,14 @@ class HarnessIntegrationTests(unittest.TestCase):
         path = self.legacy('omp')
         changes = integration_plan(self.home, ['omp'], user_home=self.user / 'inactive')
         self.assertFalse(any(c.path == path for c in changes))
+        for change in changes:
+            apply_reviewed_integration(self.home, self.source, change)
+        # The live hook receipt still belongs to the old live profile, including
+        # on a later update which recovered the staged destinations from receipts.
+        from tools.harness import installed_targets
+        recorded = installed_targets(self.home)
+        changes = integration_plan(self.home, ['omp'], paths=recorded['paths'])
+        self.assertFalse(any(c.path == path for c in changes))
         self.assertTrue(path.exists())
 
     def test_no_owner_memory_or_session_lifecycle_entrypoints(self):
@@ -136,7 +255,7 @@ class HarnessIntegrationTests(unittest.TestCase):
         self.apply(['claude'])
         self.assertEqual((self.user / HARNESS_PATHS['claude'][0]).read_bytes(), config)
         self.assertTrue(context.read_text().startswith('Owner context\n'))
-        self.assertIn('maven_orient', context.read_text())
+        self.assertIn('Every turn', context.read_text())
         self.assertNotIn('Previous startup', context.read_text())
         root = self.user / HARNESS_PATHS['claude'][2]
         old = root / 'maven-maintenance/SKILL.md'

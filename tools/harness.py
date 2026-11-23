@@ -1,7 +1,7 @@
 """Stdlib-only, reviewable harness configuration with selective ownership.
 
-Only documented stdio and standing-instruction surfaces are used. Loading
-instructions is not an execution hook or a verified project initialization.
+The installer manages documented stdio, standing-instruction and native
+turn-hook surfaces. Configuration on disk is not proof a client ran a hook.
 """
 from __future__ import annotations
 
@@ -40,6 +40,20 @@ LIFECYCLE_PATHS = {
     'codex': '.codex/hooks.json',
     'copilot': '.copilot/hooks/maven-lifecycle.json',
     'gemini': '.gemini/settings.json',
+}
+TURN_PATHS = {
+    'omp': '.omp/agent/extensions/maven-turn.js',
+    'claude': CLAUDE_SETTINGS,
+    'codex': '.codex/hooks.json',
+    'copilot': '.copilot/hooks/maven-turn.json',
+    'gemini': '.gemini/settings.json',
+}
+TURN_LIMITS = {
+    'omp': 'Restart OMP with extensions enabled; extension loading is not verified here.',
+    'claude': 'Restart Claude Code; enterprise settings and hook permission decisions still apply.',
+    'codex': 'Review and trust the exact definitions in /hooks; untrusted hooks do not execute.',
+    'copilot': 'Prompt-hook output is not model context: first-load preferences require the skill/MCP fallback.',
+    'gemini': 'Use a hook-capable Gemini CLI; disabled hooks, custom agents and policy can limit coverage.',
 }
 
 
@@ -81,7 +95,7 @@ def skill_bodies(directory: Path | None = None) -> dict[str, bytes]:
     return {name: (directory / name).read_bytes() for name in SKILL_FILES}
 
 
-def _skill_manifest(home):
+def _active_manifest(home):
     from tools.uninstall.common import read_private
     from tools.uninstall.local import MANIFEST
     receipt = home / MANIFEST
@@ -97,7 +111,7 @@ def skill_plan(roots: list[Path], home: Path | None = None, *,
     from tools.uninstall.local import _shared_skills, inventory
     from tools.update import pending_owned_skills
     bodies = skill_bodies() if bodies is None else bodies
-    prior = _skill_manifest(home) if home is not None else {}
+    prior = _active_manifest(home) if home is not None else {}
     references = set(prior.get('skill_references', ()))
     owned = prior.get('owned', {})
     pending = {}
@@ -198,7 +212,7 @@ def write_skill(target: Path, body: bytes, expected: dict | None, *, publishing=
 def retired_skill_plan(home: Path, roots: list[Path], *, conflicts: list[dict] | None = None):
     """Retire only exact installer-owned CLI-ritual skills during cutover."""
     from tools.uninstall.local import _shared_skills, inventory
-    prior = _skill_manifest(home)
+    prior = _active_manifest(home)
     candidates = [root / name / 'SKILL.md' for root in dict.fromkeys(roots) for name in RETIRED_SKILLS]
     existing = [path for path in candidates if path.exists() or path.is_symlink()
                 or str(path) in prior.get('owned', {})]
@@ -238,7 +252,7 @@ def verify_skill_bundle(home, roots):
     if not roots:
         return
     bodies = skill_bodies()
-    prior = _skill_manifest(home)
+    prior = _active_manifest(home)
     shared, unknown = _shared_skills(home, [])
     for root in roots:
         for name, body in bodies.items():
@@ -385,6 +399,8 @@ def _text_change(path: Path, body: str, *, toml=False, prior: dict | None = None
     before = _read(path)
     text = (before or b'').decode()
     block = _block(body, toml=toml)
+    if prior and text.count(prior['value']) != 1:
+        raise ValueError(f'Installer-owned MAVEN block differs or is missing; preserved: {path}')
     if 'MAVEN BEGIN' in text or 'MAVEN END' in text:
         if text.count('MAVEN BEGIN') != 1 or text.count('MAVEN END') != 1:
             raise ValueError(f'Existing MAVEN guidance differs; preserved: {path}')
@@ -423,20 +439,36 @@ def _text_change(path: Path, body: str, *, toml=False, prior: dict | None = None
 
 def installed_targets(home: Path) -> dict:
     """Recover recorded destinations, never substitute defaults for unknown custom paths."""
-    from tools.uninstall.common import read_private
-    from tools.uninstall.local import MANIFEST
     home = Path(home).expanduser().absolute()
-    manifest = read_private(home / MANIFEST) if (home / MANIFEST).exists() else {}
-    if manifest and (manifest.get('schema') != 1 or manifest.get('home') != str(home)):
-        raise ValueError('Installer ownership receipt does not match this home.')
+    manifest = _active_manifest(home)
     destinations, unresolved = {}, []
     statusline_candidates = set()
     retired = {}
+    adapter_sites = {}
+    known_profiles = set()
     for item in manifest.get('integrations', []):
         if item.get('conflict'):
             continue
         path = Path(item['path'])
         role, harness = item.get('target'), item.get('harness')
+        profile = item.get('profile', [])
+        valid_profile = (harness in HARNESS_PATHS and isinstance(profile, list) and len(profile) == 2
+                         and all(isinstance(p, str) and Path(p).is_absolute() and '..' not in Path(p).parts
+                                 for p in profile))
+        if valid_profile and (role == 'adapter' or role == 'config' and str(path) == profile[0]
+                              or role == 'context' and str(path) == profile[1]):
+            config, context = map(Path, profile)
+            known_profiles.add((harness, config, context))
+            slots = destinations.setdefault(harness, {'config': set(), 'context': set()})
+            slots['config'].add(config)
+            slots['context'].add(context)
+            target = path if role == 'adapter' else Path(item['adapter_path']) if item.get('adapter_path') else None
+            if target is not None:
+                adapter_sites.setdefault((harness, config, context), set()).add(target)
+        if item.get('key') == 'maven-turn':
+            if not valid_profile or role != 'adapter':
+                unresolved.append(str(path))
+            continue
         if item.get('key') == 'maven-lifecycle':
             if harness not in HARNESS_PATHS:
                 matches = [name for name, suffix in LIFECYCLE_PATHS.items()
@@ -461,18 +493,20 @@ def installed_targets(home: Path) -> dict:
                 unresolved.append(str(path))
                 continue
             harness, role = matches[0]
-        slots = destinations.setdefault(harness, {})
-        if role in slots and slots[role] != path:
-            unresolved.extend((str(slots[role]), str(path)))
-            slots[role] = None
-        else:
-            slots[role] = path
+        slots = destinations.setdefault(harness, {'config': set(), 'context': set()})
+        slots[role].add(path)
     paths = {}
     for harness, slots in destinations.items():
-        if slots.get('config') and slots.get('context'):
-            paths[harness] = (slots['config'], slots['context'])
+        if len(slots['config']) == len(slots['context']) == 1:
+            paths[harness] = (next(iter(slots['config'])), next(iter(slots['context'])))
+            known_profiles.add((harness, *paths[harness]))
         else:
-            unresolved.extend(str(path) for path in slots.values() if path is not None)
+            unresolved.extend(str(path) for group in slots.values() for path in group)
+    adapters = {}
+    for key, sites in adapter_sites.items():
+        adapters[key] = next(iter(sites)) if len(sites) == 1 else None
+        if len(sites) != 1:
+            unresolved.extend(map(str, sites))
     retired_hooks = []
     for harness, receipts in retired.items():
         if len(receipts) == 1:
@@ -501,20 +535,26 @@ def installed_targets(home: Path) -> dict:
         else:
             roots.add(root)
     return {'paths': paths,
+            'profiles': sorted(known_profiles), 'statusline_paths': statusline_candidates,
+            'adapters': adapters,
             'skill_roots': sorted(roots),
             'unresolved': sorted(set(unresolved)), 'statusline': bool(statusline_candidates),
-            'retired_hooks': retired_hooks,
-            'statusline_path': next(iter(statusline_candidates)) if len(statusline_candidates) == 1 else None}
+            'retired_hooks': retired_hooks}
 
 
 def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
                      ca_bundle: Path | None = None, paths=None, statusline: bool = False,
-                     guidance: str | None = None) -> list[Change]:
+                     guidance: str | None = None, adapter_paths=None, adapter_template=None) -> list[Change]:
     """Plan independent harness targets; conflicts never suppress safe optional targets."""
     home = Path(home).expanduser().absolute()
     user_home = (user_home or Path.home()).expanduser().absolute()
     changes = []
-    occupied = set()
+    profiles = {}
+    baselines = {}
+    harnesses = list(dict.fromkeys(harnesses))
+    receipts = _owned_integrations(home)
+    if guidance is None:
+        guidance = resource_path('templates/harness/startup.md').read_text()
     recorded = installed_targets(home)
 
     def conflict(path, error, harness, target):
@@ -522,52 +562,89 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
                       'key': 'maven', 'value': None, 'owned': False, 'conflict': str(error),
                       'harness': harness, 'target': target})
 
-    for harness in dict.fromkeys(harnesses):
+    for harness in harnesses:
         config, context, _ = HARNESS_PATHS[harness]
-        selected = (paths or {}).get(harness, (user_home / config, user_home / context))
-        explicit_paths = {harness: selected} if paths and harness in paths else None
-        try:
-            planned = _integration_plan(home, [harness], user_home=user_home, ca_bundle=ca_bundle,
-                                        paths=explicit_paths, guidance=guidance)
-            if occupied.intersection(change.path for change in planned):
-                raise ValueError('Integration targets overlap; select distinct configuration/context files')
-            for change in planned:
-                if (change.before != change.after and change.before and b'MAVEN BEGIN' in change.before
-                        and change.receipt['format'] == 'text-block'):
-                    _require_unshared(home, change.path)
-        except (OSError, ValueError) as error:
-            changes.append(conflict(Path(selected[0]), error, harness, 'config'))
-            continue
-        for index, change in enumerate(planned):
-            change.receipt.update(harness=harness, target='config' if index == 0 else 'context')
-        occupied.update(change.path for change in planned if not change.receipt.get('conflict'))
-        changes.extend(planned)
+        default = (user_home / config, user_home / context)
+        pair = tuple(map(Path, (paths or {}).get(harness, default)))
+        if len(pair) != 2 or not all(p.is_absolute() and '..' not in p.parts for p in pair):
+            raise ValueError('Integration targets must be two explicit absolute paths.')
+        if harness == 'codex' and harness not in (paths or {}):
+            override = pair[1].with_name('AGENTS.override.md')
+            if override.is_symlink() or override.exists() and override.stat().st_size:
+                pair = (pair[0], override)
+        profiles[harness] = pair
+        # An older inactive staging receipt did not name its hook file. Recover
+        # the documented layout only if config, context AND skill root agree.
+        candidates = [user_home]
+        if (harness, *pair) in recorded['profiles']:
+            skill_parts = Path(HARNESS_PATHS[harness][2]).parts
+            candidates.extend(root.parents[len(skill_parts) - 1] for root in recorded['skill_roots']
+                              if root.parts[-len(skill_parts):] == skill_parts)
+        baselines[harness] = next((base for base in candidates if pair[0] == base / config
+                                   and (pair[1] == base / context or harness == 'codex'
+                                        and pair[1] == (base / context).with_name('AGENTS.override.md'))), None)
+    destinations = [path for pair in profiles.values() for path in pair]
+    for harness, (config, context) in profiles.items():
+        for role, path in (('config', config), ('context', context)):
+            try:
+                if destinations.count(path) != 1:
+                    raise ValueError('Integration targets overlap; select distinct configuration/context files.')
+                if role == 'config':
+                    change = _mcp_change(home, harness, path, ca_bundle, receipts)
+                else:
+                    if harness == 'gemini' and harness not in (paths or {}):
+                        filenames = _json(_read(config)).get('context', {})
+                        filenames = filenames.get('fileName', 'GEMINI.md') if isinstance(filenames, dict) else None
+                        if not (filenames == 'GEMINI.md' or isinstance(filenames, list) and 'GEMINI.md' in filenames):
+                            raise ValueError('Gemini uses custom context filenames; select --harness-context explicitly.')
+                    change = _text_change(path, guidance, prior=receipts.get((str(path), 'text-block', 'maven')))
+                if change.before != change.after:
+                    _require_unshared(home, path)
+                change.receipt.update(harness=harness, target=role)
+                changes.append(change)
+            except (OSError, ValueError) as error:
+                changes.append(conflict(path, error, harness, role))
+    adapter_targets = {}
+    for harness, pair in profiles.items():
+        pin = (harness, *pair)
+        recorded_target = recorded['adapters'].get(pin)
+        requested = (adapter_paths or {}).get(harness)
+        target = (Path(requested) if requested is not None else recorded_target
+                  or (baselines[harness] / TURN_PATHS[harness] if baselines[harness] else None))
+        if (pin in recorded['adapters'] and (recorded_target is None or target != recorded_target)):
+            changes.append(conflict(target or pair[0], 'Ambiguous or different recorded adapter; '
+                                    'remove the old registration through a reviewed operation first.', harness, 'adapter'))
+        elif target is None:
+            changes.append(conflict(pair[0], 'Guidance only: custom profile has no selected native adapter. '
+                                    'Select its exact --harness-adapter NAME=ABSOLUTE_PATH.', harness, 'adapter'))
+        else:
+            adapter_targets[harness] = target
     if statusline:
         if 'claude' not in harnesses:
             raise ValueError('The MAVEN status line is a Claude Code option; select the claude harness.')
-        target = user_home / CLAUDE_SETTINGS
+        target = adapter_targets.get('claude')
         try:
-            if paths and 'claude' in paths and tuple(map(Path, paths['claude'])) != (
-                    user_home / HARNESS_PATHS['claude'][0], user_home / HARNESS_PATHS['claude'][1]):
-                target = recorded['statusline_path']
-                if target is None:
-                    raise ValueError('Custom Claude profile: select its status line manually; default settings preserved.')
+            if target is None or not target.is_absolute() or '..' in target.parts or target.name != 'settings.json':
+                raise ValueError('Custom Claude profile: select its exact settings.json; default settings preserved.')
             change = _statusline_change(home, target)
+            if target in destinations:
+                raise ValueError('Status line target overlaps a configuration or context file.')
+            if change.before != change.after:
+                _require_unshared(home, target)
             change.receipt.update(harness='claude', target='statusline')
             changes.append(change)
         except (OSError, ValueError) as error:
-            changes.append(conflict(target or Path(paths['claude'][0]), error, 'claude', 'statusline'))
+            changes.append(conflict(target or profiles['claude'][0], error, 'claude', 'statusline'))
 
     # Only consider receipts for the exact profile being configured. A staged
     # preview must never retire a hook from the user's live configuration.
     for harness, receipt in recorded['retired_hooks']:
         if harness not in harnesses:
             continue
-        config, context, _ = HARNESS_PATHS[harness]
-        selected = tuple(map(Path, (paths or {}).get(harness, (user_home / config, user_home / context))))
         target = Path(receipt['path'])
-        if selected != recorded['paths'].get(harness) and not (
-                selected == (user_home / config, user_home / context) and target == user_home / LIFECYCLE_PATHS[harness]):
+        adapter = adapter_targets.get(harness)
+        if (adapter is None or adapter.name != Path(TURN_PATHS[harness]).name
+                or target != adapter.with_name(Path(LIFECYCLE_PATHS[harness]).name)):
             continue
         try:
             if not receipt.get('owned', True):
@@ -581,6 +658,40 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
             changes.append(Change(target, before, after, {**receipt, 'retired': True}))
         except (OSError, ValueError) as error:
             changes.append(conflict(target, error, harness, 'retired-hook'))
+    for harness, target in adapter_targets.items():
+        config, context = profiles[harness]
+        try:
+            if (not target.is_absolute() or '..' in target.parts
+                    or target.name != Path(TURN_PATHS[harness]).name
+                    or (harness == 'gemini' and target != config)
+                    or (target in destinations and (harness != 'gemini' or destinations.count(target) != 1))
+                    or list(adapter_targets.values()).count(target) != 1):
+                raise ValueError(f'Unsupported or overlapping native adapter destination; guidance only: {target}')
+            if any(c.receipt.get('target') == 'statusline' and c.path == target and harness != 'claude'
+                   for c in changes):
+                raise ValueError(f'Adapter overlaps another profile setting; preserved: {target}')
+            if any(c.receipt.get('harness') == harness and c.receipt.get('target') == 'config'
+                   and c.receipt.get('conflict') for c in changes):
+                raise ValueError('Native adapter not activated: this profile has a conflicting MAVEN MCP target.')
+            earlier = next((c for c in reversed(changes) if c.path == target and not c.receipt.get('conflict')), None)
+            before = earlier.after if earlier else _read(target)
+            fmt = 'file' if harness == 'omp' else 'json-hooks'
+            prior = receipts.get((str(target), fmt, 'maven-turn'))
+            if prior and prior.get('profile') != [str(config), str(context)]:
+                raise ValueError('Native adapter belongs to a different recorded profile.')
+            _require_unshared(home, target)
+            change = _turn_change(home, harness, config, target, before, prior, adapter_template)
+            change.receipt.update(harness=harness, target='adapter', profile=[str(config), str(context)])
+            changes.append(change)
+        except (OSError, ValueError) as error:
+            changes.append(conflict(target, error, harness, 'adapter'))
+    for change in changes:
+        item = change.receipt
+        if not item.get('conflict') and item.get('target') in ('config', 'context'):
+            name = item['harness']
+            item['profile'] = list(map(str, profiles[name]))
+            if name in adapter_targets:
+                item['adapter_path'] = str(adapter_targets[name])
     return changes
 
 
@@ -591,13 +702,16 @@ def apply_reviewed_integration(home, source, change):
     receipt = change.receipt
     if receipt.get('conflict'):
         return
-    if not receipt.get('retired'):
-        record_installation(home, source, [], [], integrations=[receipt])
-        apply_integration(change)
-        return
     from tools.uninstall.local import _sharing_locks
     with _sharing_locks(home, []):
-        _require_unshared(home, change.path)
+        if _read(change.path) != change.before:
+            raise ValueError(f'Integration changed since review; preserved: {change.path}')
+        if change.before != change.after or receipt.get('retired'):
+            _require_unshared(home, change.path)
+        if not receipt.get('retired'):
+            record_installation(home, source, [], [], integrations=[receipt], registry_locked=True)
+            apply_integration(change)
+            return
         original = {k: v for k, v in receipt.items() if k != 'retired'}
         manifest = read_private(home / MANIFEST)
         manifest['integrations'].remove(original)
@@ -612,81 +726,45 @@ def _require_unshared(home, path):
         raise ValueError(f'Shared or uncertain harness configuration preserved: {path}')
 
 
-def _integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
-                      ca_bundle: Path | None = None, paths=None, guidance=None) -> list[Change]:
-    """Plan against an explicit user home (also supports an inactive staging home).
-
-    Never copy ambient credentials, PATH, or model runtime settings. MAVEN loads
-    its selected private .env and login cache itself. Explicit trust paths are
-    nonsecret and carried even by clients that sanitize process environments.
-    """
-    home = home.expanduser().absolute()
-    user_home = (user_home or Path.home()).expanduser().absolute()
-    base_env = {'MAVEN_HOME': str(home), 'HOME': str(Path.home())}
-    if guidance is None:
-        guidance = resource_path('templates/harness/startup.md').read_text()
-    receipts = _owned_integrations(home)
-    changes = []
-    for harness in dict.fromkeys(harnesses):
-        config, instructions, _ = HARNESS_PATHS[harness]
-        path, context_path = (paths or {}).get(
-            harness, (user_home / config, user_home / instructions))
-        path, context_path = Path(path).absolute(), Path(context_path).absolute()
-        if harness == 'codex' and harness not in (paths or {}):
-            override = context_path.with_name('AGENTS.override.md')
-            if _read(override):
-                context_path = override
-        environment = dict(base_env)
-        ca_keys = ('AWS_CA_BUNDLE', 'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE')
-        selected_ca = str(ca_bundle) if ca_bundle else None
-        if selected_ca is None:
-            # Refresh the profile without dropping its installer-owned corporate trust.
-            text = receipts.get((str(path), 'text-block', 'maven'), {})
-            entry = receipts.get((str(path), 'json-entry', 'maven'), {})
-            old_env = (text.get('server') or entry.get('value') or {}).get('env', {})
-            original = old_env.get(ca_keys[0])
-            if isinstance(original, str) and all(old_env.get(key) == original for key in ca_keys):
-                selected_ca = original
-        if selected_ca is not None:
-            environment.update(dict.fromkeys(ca_keys, selected_ca))
-        if any('$' in value or '\n' in value or '\r' in value for value in environment.values()):
-            raise ValueError('Integration paths must be literal, without environment interpolation or newlines')
-        server = {'command': str(home / 'venv/bin/maven-mcp'), 'args': [], 'env': environment}
-        if harness in ('claude', 'omp'):
-            server['type'] = 'stdio'
-        elif harness == 'copilot':
-            server.update(type='local', tools=['*'])
-        if harness == 'codex':
-            body = '[mcp_servers.maven]\ncommand = ' + json.dumps(server['command'])
-            body += '\nargs = []\nenv = { ' + ', '.join(
-                json.dumps(key) + ' = ' + json.dumps(value) for key, value in environment.items()) + ' }'
-            changes.append(_text_change(path, body, toml=True, prior=receipts.get((str(path), 'text-block', 'maven'))))
-        else:
-            before = _read(path)
-            value = _json(before)
-            if harness == 'gemini' and harness not in (paths or {}):
-                filenames = value.get('context', {}).get('fileName', 'GEMINI.md')
-                if 'GEMINI.md' not in ([filenames] if isinstance(filenames, str) else filenames):
-                    raise ValueError('Gemini uses custom context filenames; select --harness-context explicitly.')
-            servers = value.setdefault('mcpServers', {})
-            if 'maven' in servers:
-                if servers['maven'] != server:
-                    raise ValueError(f'Existing MAVEN MCP entry differs; preserved: {path}')
-                changes.append(Change(path, before, before, {
-                    'path': str(path), 'format': 'json-entry', 'key': 'maven',
-                    'value': server, 'created': False, 'owned': False,
-                    'created_container': False,
-                }))
-            else:
-                servers['maven'] = server
-                receipt = {'path': str(path), 'format': 'json-entry', 'key': 'maven',
-                           'value': server, 'created': before is None,
-                           'created_container': not before or 'mcpServers' not in _json(before)}
-                changes.append(Change(path, before, _encode(value), receipt))
-        changes.append(_text_change(context_path, guidance, prior=receipts.get((str(context_path), 'text-block', 'maven'))))
-    if len({change.path for change in changes}) != len(changes):
-        raise ValueError('Integration targets overlap; select distinct configuration/context files')
-    return changes
+def _mcp_change(home, harness, path, ca_bundle, receipts):
+    """Carry only the previously reviewed corporate CA, never ambient credentials."""
+    environment = {'MAVEN_HOME': str(home), 'HOME': str(Path.home())}
+    ca_keys = ('AWS_CA_BUNDLE', 'SSL_CERT_FILE', 'REQUESTS_CA_BUNDLE')
+    text = receipts.get((str(path), 'text-block', 'maven'))
+    entry = receipts.get((str(path), 'json-entry', 'maven'))
+    prior = text or entry or {}
+    old_env = (prior.get('server') or prior.get('value') or {}).get('env', {})
+    original = old_env.get(ca_keys[0])
+    if ca_bundle is not None:
+        environment.update(dict.fromkeys(ca_keys, str(ca_bundle)))
+    elif isinstance(original, str) and all(old_env.get(key) == original for key in ca_keys):
+        environment.update(dict.fromkeys(ca_keys, original))
+    if any('$' in value or '\n' in value or '\r' in value for value in environment.values()):
+        raise ValueError('Integration paths must be literal, without environment interpolation or newlines')
+    server = {'command': str(home / 'venv/bin/maven-mcp'), 'args': [], 'env': environment}
+    if harness in ('claude', 'omp'):
+        server['type'] = 'stdio'
+    elif harness == 'copilot':
+        server.update(type='local', tools=['*'])
+    if harness == 'codex':
+        body = '[mcp_servers.maven]\ncommand = ' + json.dumps(server['command'])
+        body += '\nargs = []\nenv = { ' + ', '.join(
+            json.dumps(key) + ' = ' + json.dumps(value) for key, value in environment.items()) + ' }'
+        return _text_change(path, body, toml=True, prior=text)
+    before = _read(path)
+    value = _json(before)
+    created_container = 'mcpServers' not in value
+    servers = value.setdefault('mcpServers', {})
+    if entry and servers.get('maven') != entry['value']:
+        raise ValueError(f'Installer-owned MAVEN MCP entry missing or modified; preserved: {path}')
+    receipt = {'path': str(path), 'format': 'json-entry', 'key': 'maven',
+               'value': server, 'created': before is None, 'created_container': created_container}
+    if 'maven' in servers:
+        if servers['maven'] != server:
+            raise ValueError(f'Existing MAVEN MCP entry differs; preserved: {path}')
+        return Change(path, before, before, {**receipt, 'owned': False})
+    servers['maven'] = server
+    return Change(path, before, _encode(value), receipt)
 
 
 def _statusline_change(home: Path, path: Path) -> Change:
@@ -715,14 +793,7 @@ def _statusline_change(home: Path, path: Path) -> Change:
 
 
 def _owned_integrations(home: Path) -> dict:
-    from tools.uninstall.common import read_private
-    from tools.uninstall.local import MANIFEST
-    path = home / MANIFEST
-    if not path.exists():
-        return {}
-    prior = read_private(path)
-    if prior.get('schema') != 1 or prior.get('home') != str(home):
-        raise ValueError('Installer ownership receipt does not match this home.')
+    prior = _active_manifest(home)
     return {(item['path'], item['format'], item['key']): item
             for item in prior.get('integrations', []) if item.get('owned', True)}
 
@@ -732,6 +803,121 @@ def _hook_map(document, path):
     if not isinstance(hooks, dict) or any(not isinstance(value, list) for value in hooks.values()):
         raise ValueError(f'Unsupported hooks configuration preserved: {path}')
     return hooks
+
+
+def _native_entries(home, harness):
+    from tools.turn_native import NATIVE_EVENTS, POST_MATCHERS
+    entries = {}
+    subscriptions = list(zip(NATIVE_EVENTS[harness], ('begin', 'observe', 'end'), strict=True))
+    if harness == 'copilot':
+        subscriptions.append(('preToolUse', 'guard'))
+    for event, phase in subscriptions:
+        command = shlex.join([str(home / 'venv/bin/python'), '-I', '-m', 'tools.turn_hook',
+                              harness, phase, '--home', str(home)])
+        matcher = {'matcher': POST_MATCHERS[harness]} if phase == 'observe' else {}
+        if harness == 'copilot':
+            entry = {'type': 'command', 'bash': command, **matcher}
+        else:
+            hook = {'type': 'command', 'command': command}
+            if harness == 'gemini':
+                hook['name'] = 'maven-turn'
+            entry = {**matcher, 'hooks': [hook]}
+        entries[event] = [entry]
+    return entries
+
+
+def _turn_marker(value):
+    content = json.dumps(value)
+    return 'tools.turn_hook' in content or 'maven-turn' in content
+
+
+def _turn_change(home, harness, config, path, before, prior, template):
+    """Replace only exact owned subscriptions; never adopt or repair foreign commands."""
+    if '\n' in str(home) or '\r' in str(home) or '$' in str(home):
+        raise ValueError('Hook installation requires literal non-interpolated paths.')
+    if harness in ('omp', 'copilot') and path.parent.is_dir():
+        suffixes = {'.js', '.mjs', '.ts'} if harness == 'omp' else {'.json'}
+        for sibling in path.parent.iterdir():
+            if sibling != path and sibling.suffix in suffixes:
+                raw = _read(sibling) or b''
+                if b'tools.turn_hook' in raw:
+                    raise ValueError(f'Another native registration exists; no duplicate was added: {sibling}')
+    receipt = {'path': str(path), 'key': 'maven-turn', 'created': prior['created'] if prior else before is None}
+    if harness == 'omp':
+        template = resource_path('templates/harness/maven-turn.js') if template is None else Path(template)
+        source = template.read_text()
+        if source.count('__MAVEN_HOME_JSON__') != 1:
+            raise ValueError('Invalid packaged OMP extension: expected one literal home parameter.')
+        body = source.replace('__MAVEN_HOME_JSON__', json.dumps(str(home)))
+        if prior and before != prior['value'].encode():
+            raise ValueError(f'Missing or modified installer-owned turn extension; preserved: {path}')
+        if not prior and before is not None:
+            raise ValueError(f'Existing unowned turn extension; preserved: {path}')
+        return Change(path, before, body.encode(), {**receipt, 'format': 'file', 'value': body})
+    if harness == 'codex':
+        settings = tomllib.loads((_read(config) or b'').decode())
+        features = settings.get('features', {})
+        if (not isinstance(features, dict) or features.get('hooks', features.get('codex_hooks')) is False
+                or settings.get('allow_managed_hooks_only')
+                or not isinstance(settings.get('hooks', {}), dict)
+                or any(_turn_marker(v) for v in settings.get('hooks', {}).values() if isinstance(v, list))):
+            raise ValueError('Codex hooks disabled, managed-only, or already registered inline; guidance only.')
+    document = _json(before)
+    policies = [document]
+    if harness == 'copilot':
+        if path.parent.name != 'hooks':
+            raise ValueError('Copilot requires a user-profile hooks/ directory; guidance only.')
+        settings = _json(_read(path.parent.parent / 'settings.json'))
+        if _turn_marker(settings.get('hooks', {})):
+            raise ValueError('MAVEN hooks already registered in Copilot settings; no duplicate was added.')
+        policies.append(settings)
+    for policy in policies:
+        strict = policy.get('strictPluginOnlyCustomization', False)
+        if (policy.get('disableAllHooks') or policy.get('allowManagedHooksOnly')
+                or not isinstance(strict, (list, bool)) or strict is True or isinstance(strict, list) and 'hooks' in strict):
+            raise ValueError('Hooks disabled or managed-only in the selected profile; guidance only.')
+    if harness == 'gemini':
+        options = document.get('hooksConfig', {})
+        if (not isinstance(options, dict) or options.get('enabled') is False
+                or not isinstance(options.get('disabled', []), list) or 'maven-turn' in options.get('disabled', [])):
+            raise ValueError('Gemini MAVEN hooks disabled in the selected profile; guidance only.')
+    created_version = False
+    if harness == 'copilot':
+        if before is not None and not prior:
+            raise ValueError(f'Unowned Copilot hook file; preserved: {path}')
+        if prior and document.get('version') != 1:
+            raise ValueError(f'Missing or modified Copilot hook file version; preserved: {path}')
+        created_version = 'version' not in document
+        document.setdefault('version', 1)
+    created_container = 'hooks' not in document
+    hooks = _hook_map(document, path)
+    if 'maven-turn' in hooks.get('disabled', []):
+        raise ValueError('The selected profile disables maven-turn; guidance only.')
+    entries = _native_entries(home, harness)
+    old = prior['value'] if prior else {}
+    marked = {event: [item for item in items if _turn_marker(item)] for event, items in hooks.items()}
+    if {event: items for event, items in marked.items() if items} != old:
+        raise ValueError(f'Unowned, missing, duplicated or modified MAVEN turn subscription; preserved: {path}')
+    receipt.update(format='json-hooks', value=entries,
+                   created_container=prior['created_container'] if prior else created_container,
+                   created_version=prior.get('created_version', False) if prior else created_version,
+                   created_events=sorted(event for event in entries if event not in hooks or
+                                         prior and event in prior.get('created_events', [])))
+    if old == entries:
+        return Change(path, before, before, receipt)
+    for event, previous in old.items():
+        items = hooks[event]
+        index = items.index(previous[0])
+        for entry in previous:
+            items.remove(entry)
+        if event in entries:
+            items[index:index] = entries[event]
+        elif not items and event in prior.get('created_events', []):
+            del hooks[event]
+    for event, new in entries.items():
+        if event not in old:
+            hooks.setdefault(event, []).extend(new)
+    return Change(path, before, _encode(document), receipt)
 
 
 def _replace(path: Path, before: bytes | None, after: bytes) -> None:
@@ -792,7 +978,7 @@ def _removal_bytes(receipt, before):
     path = Path(receipt['path'])
     if receipt['format'] == 'file':
         if before != receipt['value'].encode():
-            raise ValueError(f'Modified lifecycle extension preserved: {path}')
+            raise ValueError(f'Modified MAVEN extension preserved: {path}')
         return b''
     if receipt['format'] == 'json-hooks':
         document = _json(before)
@@ -801,9 +987,9 @@ def _removal_bytes(receipt, before):
             current = hooks.get(event, [])
             for entry in entries:
                 if current.count(entry) != 1:
-                    raise ValueError(f'Modified or missing MAVEN lifecycle hook preserved: {path}')
+                    raise ValueError(f'Modified or missing MAVEN hook preserved: {path}')
                 current.remove(entry)
-            if not current:
+            if not current and ('created_events' not in receipt or event in receipt['created_events']):
                 hooks.pop(event, None)
         if not hooks and receipt.get('created_container'):
             document.pop('hooks', None)

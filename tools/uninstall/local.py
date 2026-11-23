@@ -158,6 +158,9 @@ def record_installation(home, source, owned_paths, skill_references, *, cache_ro
             if item['format'] == 'text-block':
                 left, right = left.lstrip('\n'), right.lstrip('\n')
             if left == right:
+                for field in ('harness', 'target', 'profile', 'adapter_path'):
+                    if field in item:
+                        previous[field] = item[field]
                 continue  # Keep the original exact ownership/removal receipt.
         integration_map[key] = item
     save_private(target, {'schema': 1, 'home': str(home), 'source': str(source), 'skill_roots': sorted(roots),
@@ -1177,6 +1180,18 @@ def _plan_integrations(fragment, home, manifest, selected_homes):
         try:
             if uncertain or path in shared:
                 raise UninstallError('Integration is shared or unselected installation ownership is uncertain')
+            # A customized turn subscription is not authority to erase it, and is
+            # not a reason to strand an intact MCP/statusLine entry in the same file.
+            safe = []
+            for item in receipts:
+                try:
+                    if removal_content(item) is not None:
+                        safe.append(item)
+                except (OSError, ValueError, UninstallError) as error:
+                    fragment['retained'].append({'path': path, 'reason': f'{item["key"]}: {error}'})
+            receipts = safe
+            if not receipts:
+                continue
             after = (grouped_removal_content(receipts) if len(receipts) > 1
                      else removal_content(receipts[0]))
             if after is None:

@@ -8,8 +8,9 @@ The harness runs the agent; its local `maven-mcp` process provides deterministic
 | --- | --- |
 | Installation home (`MAVEN_HOME`, default `~/.maven`) | Installed software, selected instance settings and private administrative reviews. AWS sign-in caches are separate from `.env`. |
 | `<root>/.maven/project.json` | Reviewed folder and project binding; schema 2 pins the signed cloud identity. Schema 1 does not authorize reconciliation. |
-| Installation `home.json` | Optional, per-machine selection of a Home project and local folder, not a default destination for an unrelated chat. |
+| Installation `home.json` | Reviewed, per-machine Nexus selection. Supplies global preferences alongside a tracked project and serves as the turn destination in genuinely untracked directories. Never a recovery path for a broken binding. |
 | `<root>/.maven/reconcile/<project-id>.sqlite3` | Durable local project records and history, including the orientation brief and skill index derived from records. Exclude this private directory from Git. |
+| Installation `runtime/turns/` | Private, content-free local receipt and opt-out per native conversation. No locks across turns, cloud leases, transcripts or knowledge history. See the [persistence inventory](security.md). |
 | Selected AWS instance | Project records and their histories accessed through the signed service. Access to the deployed reconcile capability requires matching service and schema; the agent does not connect directly to the database. |
 
 Stable project and record IDs distinguish projects and versions of the same record across machines. They do not identify a running assistant. No per-machine sync bookmark, global current conversation, peer lease or exit receipt is required.

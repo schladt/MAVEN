@@ -255,11 +255,11 @@ Instance readiness checks the signed reconcile capability. Project and Home sele
 
 ### First use and everyday work
 
-Read the brief locally. Ask “Remember this decision” to save useful evidence on this machine or “Reconcile this project” to compare it with the cloud. Outside an enabled root, the assistant does not capture. There is no mandatory cloud check on opening or closing the harness. See the [project workflow](workflow.md) and [reconcile procedure](../maven_resources/templates/skills/maven/references/reconcile.md).
+Each owner turn consults local preferences before work and reports whether MAVEN was updated. Ask “Remember this decision” to save evidence locally or “Reconcile this project” to compare with the cloud. There is no cloud check on opening, saving or closing. See the [project workflow](workflow.md) and [client capabilities](integrations.md#harness-capability-matrix).
 
 ### MAVEN Home
 
-Home is an optional, per-machine selection for personal tasks and people or organization knowledge. Use the installer's **Set up or change MAVEN Home** or explicitly ask the assistant to configure it. To share Home, select the same cloud project ID on each machine; names alone do not establish identity. Disabling the pointer is not deletion. Request Home explicitly: unrelated folders do not silently switch to it.
+Home is an optional, per-machine selection for personal knowledge and cross-project preferences. Use the installer's **Set up or change MAVEN Home** or explicitly ask the assistant to configure it. To share Home, select the same cloud project ID on each machine; names alone do not establish identity. Outside tracked roots, local turn capture defaults to this configured Home. Missing or damaged configuration is reported, not repaired implicitly. Disabling the pointer is not deletion.
 
 ### Installer options and harnesses
 
@@ -278,8 +278,7 @@ The installer ships one [MAVEN skill](../maven_resources/templates/skills/maven/
 
 To stage selected integrations without live writes, use `--stage-harnesses PATH`.
 For custom profiles, pair `--harness-config NAME=ABSOLUTE_FILE` with
-`--harness-context NAME=ABSOLUTE_FILE` and an explicit `--skill-dir PATH`. Actual
-integration changes require review. Restart the affected harnesses and verify discovery; the installer does not restart an existing MCP process.
+`--harness-context NAME=ABSOLUTE_FILE`, `--skill-dir PATH`, and the exact `--harness-adapter NAME=ABSOLUTE_PATH` for native turn events. A headless `--local-only` integration change first prints the planned writes and review digest without applying them. Review, then repeat with `--approve-harness-review SHA256` using that digest. Restart the affected clients and verify the first-turn preference check and footer; the installer does not restart an existing MCP process.
 
 ### Optional AWS Agent Toolkit
 

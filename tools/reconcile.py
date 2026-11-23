@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import stat
 from uuid import UUID, uuid4
 
 from tools.project import ProjectError, load_project
@@ -30,9 +31,23 @@ def select_project(cwd: str | Path, home: Path, *, use_home=False) -> dict | Non
             if switching.exists() and barrier_path(home, candidate).exists():
                 raise ProjectError('folder switch in progress; do not select an enclosing project')
             binding = candidate / '.maven/project.json'
-            if binding.parent.is_symlink():
-                raise ProjectError('project configuration directory must not be a symlink')
-            if binding.exists() or binding.is_symlink():
+            try:
+                mode = binding.parent.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISDIR(mode):
+                raise ProjectError('project configuration directory is unsafe or a symlink')
+            try:
+                binding_mode = binding.lstat().st_mode
+            except FileNotFoundError:
+                # A removed binding beside an existing record store is not an
+                # untracked folder. Do not redirect its writes to an ancestor/Home.
+                orphan = binding.parent / 'reconcile'
+                if orphan.exists() or orphan.is_symlink():
+                    raise ProjectError('local memory is missing its project binding')
+            else:
+                if not stat.S_ISREG(binding_mode):
+                    raise ProjectError('project binding must be a regular file and not a symlink')
                 root = candidate
                 break
         if root is None:
@@ -41,7 +56,9 @@ def select_project(cwd: str | Path, home: Path, *, use_home=False) -> dict | Non
     if project['schema'] != 2:
         raise ProjectError('legacy binding; review a project switch before using sessionless memory')
     is_home = bool(selected and selected.get('root') == str(root) and
-                   selected.get('project_id') == project['project_id'])
+                   all(selected.get(key) == project[key] for key in ('project_id', 'instance_id', 'recovery_epoch')))
+    if use_home and not is_home:
+        raise ProjectError('configured Home binding changed')
     return {'root': str(root), 'project_id': project['project_id'], 'mode': 'home' if is_home else 'project',
             'label': selected['label'] if is_home else root.name}
 

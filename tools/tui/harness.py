@@ -7,7 +7,7 @@ from pathlib import Path
 
 from maven_resources import resource_path
 from tools.harness import (
-    HARNESS_PATHS, SKILL_FILES, _read, apply_reviewed_integration, integration_plan, installed_targets,
+    HARNESS_PATHS, SKILL_FILES, TURN_LIMITS, _read, apply_reviewed_integration, integration_plan, installed_targets,
     skill_cutover_plan, retire_skills, validate_default_profiles,
     launcher_permission_plan, repair_launcher_permissions,
 )
@@ -113,7 +113,8 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
         values = ui.form('Choose the harnesses you use', fields,
                          description=('Select any installed harnesses, or leave all unchecked to skip. '
                                       'Recorded destinations are retained; new selections use default profiles. Differing MAVEN '
-                                      'entries and unrelated files will be preserved. No credentials are copied.'),
+                                      'entries and unrelated files will be preserved. Includes native local turn hooks '
+                                      'when the selected profile supports them. No credentials are copied.'),
                          submit='Review selected / Skip', back=True)
         if values is None:
             return result
@@ -152,6 +153,9 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                                      for root in recorded['skill_roots'] if root not in known_defaults)
             roots.extend(user_home / HARNESS_PATHS[name][2] for name in available if name not in destinations)
             roots = list(dict.fromkeys(roots))
+            if available and not roots:
+                conflicts.append({'target': ', '.join(available), 'component': 'skill', 'status': 'conflict',
+                                  'reason': 'No canonical skill root is in scope; select an explicit --skill-dir.'})
             prior = _ownership(home)
             recorded_launcher = prior.get('owned', {}).get(str(home / 'venv'), {}).get('bin/maven-mcp')
             launcher_repair = launcher_permission_plan(home, recorded=recorded_launcher)
@@ -159,13 +163,14 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                 _launcher_owned(home, prior, launcher_repair)
             if ca_bundle is None and os.environ.get('AWS_CA_BUNDLE'):
                 ca_bundle = Path(os.environ['AWS_CA_BUNDLE']).expanduser().absolute()
-            changes = integration_plan(home, available, ca_bundle=ca_bundle,
-                                       statusline=statusline and 'claude' in available,
-                                       paths={name: destinations[name] for name in available if name in destinations})
+            profile_options = dict(ca_bundle=ca_bundle, statusline=statusline and 'claude' in available,
+                                   paths={name: destinations[name] for name in available if name in destinations})
+            changes = integration_plan(home, available, **profile_options)
             skills, retired, ready_roots = skill_cutover_plan(home, roots, conflicts=conflicts)
             pending_targets = [root / name for root in ready_roots for name in SKILL_FILES]
             pending_skills = pending_owned_skills(home, pending_targets)
             conflicts.extend({'target': str(change.path), 'status': 'conflict',
+                              'component': change.receipt.get('target'), 'harness': change.receipt.get('harness'),
                               'reason': change.receipt['conflict']} for change in changes
                              if change.receipt.get('conflict'))
             result['targets'] = list(conflicts)
@@ -206,7 +211,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                 continue
             action = ('Remove exact legacy hook' if change.receipt.get('retired') else
                       'Preserve identical content' if change.before == change.after else 'Write MAVEN content')
-            visible.append(f'{action}: {change.path}')
+            visible.append(f'{action} ({change.receipt.get("target", "legacy hook")}): {change.path}')
             details.append(f'{change.path}\nExact MAVEN entry/block:\n' +
                            json.dumps(change.receipt['value'], indent=2, ensure_ascii=False))
         for target, body, expected in skills:
@@ -220,6 +225,7 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
         for target, expected in retired:
             visible.append(f'Remove exact installer-owned legacy skill: {target}')
             details.append(f'Retirement inventory for {target}:\n' + json.dumps(expected, indent=2))
+        visible.extend(f'{NAMES[name]}: {TURN_LIMITS[name]}' for name in available)
         visible.extend([f'Update selective uninstall ownership: {home / MANIFEST}',
                         'Update the existing local installation discovery registry.',
                         'Unrelated settings remain. No credentials, cloud changes, package reinstall or project binding.',
@@ -243,6 +249,8 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                 raise ValueError('This home requires explicit local reinstallation after uninstall; no harness files changed.')
             prior = _ownership(home)
             source = Path(prior['source']) if prior.get('source') else resource_path('templates').parent
+            if integration_plan(home, available, **profile_options) != changes:
+                raise ValueError('Harness settings or ownership changed after review; no harness files changed.')
             if pending_owned_skills(home, pending_targets) != pending_skills:
                 raise ValueError('Pending local installation intents changed since review; review the original evidence again.')
             checked = set()
@@ -283,11 +291,13 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
                 if change.before != change.after:
                     result['written'].append(str(change.path))
                 result['targets'].append({'target': str(change.path),
+                                          'component': change.receipt.get('target'), 'harness': change.receipt.get('harness'),
                                           'status': 'written' if change.before != change.after else 'unchanged'})
             for target, expected in retired:
                 retire_skills(home, [(target, expected)])
                 result['written'].append(str(target))
-        result.update(status='conflict' if conflicts else ('written' if result['written'] else 'unchanged'),
+        result.update(status=('partial' if result['written'] else 'conflict') if conflicts else
+                      ('written' if result['written'] else 'unchanged'),
                       reason='Safe reviewed targets configured; conflicting targets preserved.' if conflicts
                       else 'Reviewed local integration is configured.')
     except (OSError, ValueError, UninstallError) as exc:
@@ -315,7 +325,7 @@ def show_completion(ui, home, result, *, outcome=None):
     lines = [cloud, local, result.get('reason', '')]
     if result.get('targets'):
         lines.append('Per-target outcomes:\n' + '\n'.join(
-            item['status'] + ': ' + item['target'] +
+            item['status'] + ': ' + (item['component'] + ' — ' if item.get('component') else '') + item['target'] +
             (' — ' + item['reason'] if item.get('reason') else '') for item in result['targets']))
     if result.get('written'):
         lines.append('Completed local changes:\n' + '\n'.join(result['written']))
@@ -324,6 +334,9 @@ def show_completion(ui, home, result, *, outcome=None):
     else:
         lines.append('Restart: no new harness configuration was applied in this step.')
     lines.append('Harness MCP connection: NOT YET VERIFIED. A successful cloud check does not prove a harness can connect.')
+    if result.get('selected') and status != 'skipped':
+        lines.append('Native hook execution: NOT VERIFIED.\n' + '\n'.join(
+            f'{NAMES[name]}: {TURN_LIMITS[name]}' for name in result['selected']))
     if status in ('written', 'unchanged') and result['selected']:
         for name in result['selected']:
             lines.append(f'{NAMES[name]}: open an enabled project to read its local orientation brief. '

@@ -20,6 +20,7 @@ class ProjectPackagingTests(unittest.TestCase):
     def test_resources_are_contained(self):
         self.assertTrue(resource_path('templates/environment.example').is_file())
         self.assertTrue(resource_path('templates/harness/startup.md').is_file())
+        self.assertTrue(resource_path('templates/harness/maven-turn.js').is_file())
         skills = resource_path('templates/skills')
         self.assertEqual(list(skills.rglob('SKILL.md')), [skills / 'maven/SKILL.md'])
         router = (skills / 'maven/SKILL.md').read_text()
@@ -57,6 +58,9 @@ from maven_resources import resource_path
 from tools.harness import skill_plan, write_skill
 packaged = resource_path('templates/skills')
 assert packaged.is_relative_to(Path('installed').resolve())
+assert '__MAVEN_HOME_JSON__' in resource_path('templates/harness/maven-turn.js').read_text()
+from tools.turn_native import NATIVE_EVENTS
+assert set(NATIVE_EVENTS) == {'claude', 'codex', 'copilot', 'gemini'}
 root = Path('custom profile/skills').resolve()
 for target, body, expected in skill_plan([root]):
     write_skill(target, body, expected)

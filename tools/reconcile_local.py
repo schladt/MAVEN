@@ -216,12 +216,33 @@ class LocalStore:
                 db.execute("UPDATE project SET token=? WHERE id=?", (token, self.project_id))
             return {"token": token, "changed": changed}
 
+    def _orientation(self, db):
+        row = db.execute("SELECT record FROM records WHERE id=? AND kind='brief'", (self.brief_id,)).fetchone()
+        skills = []
+        for item, in db.execute("SELECT item FROM records WHERE kind='skill' ORDER BY id"):
+            index = json.loads(item)
+            skills.append({key: index[key] for key in ("id", "name", "when_to_use")})
+        return {"brief_id": self.brief_id, "brief": json.loads(row[0]) if row else None, "skills": skills}
+
     def orient(self) -> dict:
         with self._transaction() as (db, token):
-            row = db.execute("SELECT record FROM records WHERE id=? AND kind='brief'", (self.brief_id,)).fetchone()
-            skills = []
-            for item, in db.execute("SELECT item FROM records WHERE kind='skill' ORDER BY id"):
-                index = json.loads(item)
-                skills.append({key: index[key] for key in ("id", "name", "when_to_use")})
-            return {"source": "local", "project_id": self.project_id, "token": token, "brief_id": self.brief_id,
-                    "brief": json.loads(row[0]) if row else None, "skills": skills}
+            return {"source": "local", "project_id": self.project_id, "token": token, **self._orientation(db)}
+
+    def turn_view(self, *, active: bool, nexus: bool, known_token: str | None) -> dict:
+        """Conditionally load one scoped snapshot; never read history or unrelated Home records."""
+        with self._transaction() as (db, token):
+            if token == known_token:
+                return {"token": token, "unchanged": True}
+            view = self._orientation(db) if active else {}
+            rows = db.execute(
+                "SELECT id, json_extract(record,'$.data.scope'), json_type(record,'$.data.summary'), "
+                "json_extract(record,'$.data.summary') FROM records WHERE kind='setting' "
+                "AND json_extract(record,'$.data.category')='preference' "
+                "AND json_extract(record,'$.data.scope') IN (?,?) ORDER BY id",
+                ("project" if active else None, "nexus" if nexus else None))
+            preferences = []
+            for key, scope, summary_type, summary in rows:
+                if summary_type != "text" or not summary.strip():
+                    raise ValueError("scoped preference lacks a usable summary")
+                preferences.append({"id": key, "scope": scope, "summary": summary})
+            return {**view, "preferences": preferences, "token": token, "unchanged": False}

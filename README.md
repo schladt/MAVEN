@@ -20,7 +20,7 @@ Alternatively, extract the source archive and run `python3 install.py` there. No
 
 Review the exact harness integration, restart the affected harness, and confirm it lists MAVEN. Writing a configuration file isn't a verified MCP connection. [Harness configuration](docs/integrations.md#harness-capability-matrix) covers OMP, Claude Code, Codex, Copilot CLI and Gemini CLI.
 
-Open the intended folder and ask **“Enable MAVEN for this project.”** Review the absolute root, instance and cloud project ID. The source checkout isn't enabled by installation. If the folder has a legacy schema-1 binding, explicitly review a switch to the intended project; don't edit it in place. For Home, explicitly select the configured Home project. Outside an enabled project MAVEN does not capture or silently select Home.
+Open the intended folder and ask **“Enable MAVEN for this project.”** Review the absolute root, instance and cloud project ID. The source checkout isn't enabled by installation. A schema-1 binding requires a reviewed switch; don't edit it in place. With turn capture enabled, untracked folders use configured Nexus Home for local memory without enabling those folders. A damaged binding never redirects project work into Home.
 
 ## Working with project memory
 
@@ -30,7 +30,7 @@ Open the intended folder and ask **“Enable MAVEN for this project.”** Review
 | “Remember why we chose this.” | Updates the relevant local record, keeping evidence and distinguishing a proposal from an accepted decision. |
 | “Reconcile this project.” | Compares both inventories, reconciles compatible work, and verifies what reached both sides. A disputed decision is reported separately; unrelated work can still converge. |
 
-The [reconcile procedure](maven_resources/templates/skills/maven/references/reconcile.md) defines this workflow, whether requested or run after a material batch of work. It synchronizes project knowledge, not source files, transcripts or secrets. Project skills can link a repository-owned procedure; discovering one does not execute it. **Git publication, secret use, deployment and policy activation are separate actions with their own approvals.**
+The [MAVEN skill](maven_resources/templates/skills/maven/SKILL.md) defines the every-turn local check and status footer. Its [reconcile procedure](maven_resources/templates/skills/maven/references/reconcile.md) synchronizes project knowledge **only when requested**, not source files, transcripts or secrets. Project skills can link a repository-owned procedure; discovering one does not execute it. **Git publication, secret use, deployment and policy activation are separate actions with their own approvals.**
 
 ## Setup, update and removal
 

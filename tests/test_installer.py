@@ -25,6 +25,8 @@ def setUpModule():
     # macOS spells its default temp path via /var -> /private/var. Real integration
     # targets must have no symlink ancestors, even in a throwaway user profile.
     unittest.enterModuleContext(patch.object(tempfile, 'tempdir', str(Path(tempfile.gettempdir()).resolve())))
+    test_home = unittest.enterModuleContext(tempfile.TemporaryDirectory())
+    unittest.enterModuleContext(patch.dict(os.environ, {'HOME': test_home, 'MAVEN_HOME': str(Path(test_home) / 'unused')}))
 
 
 class InstallerTests(unittest.TestCase):
@@ -395,9 +397,17 @@ with using(object()):
                         patch('venv.EnvBuilder.create', side_effect=create_runtime), \
                         patch.object(install.subprocess, 'run', return_value=Mock(returncode=0)), \
                         patch.object(install, '_install_command', side_effect=install_package), \
-                        redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-                    result = install.main(['--local-only', '--home', str(home), '--harness', 'omp',
-                                           '--stage-harnesses', str(staged)])
+                        redirect_stdout(io.StringIO()) as review, redirect_stderr(io.StringIO()):
+                    options = ['--local-only', '--home', str(home), '--stage-harnesses', str(staged)]
+                    for name in HARNESS_PATHS:
+                        options.extend(['--harness', name])
+                    self.assertEqual(install.main(options), 1)
+                    token = review.getvalue().split('--approve-harness-review ')[-1].split()[0]
+                    self.assertFalse(home.exists())
+                    self.assertFalse(staged.exists())
+                    self.assertEqual(install.main([*options, '--approve-harness-review', 'wrong']), 1)
+                    self.assertFalse(home.exists())
+                    result = install.main([*options, '--approve-harness-review', token])
             finally:
                 os.umask(mask)
             self.assertEqual(result, 0)
@@ -410,17 +420,20 @@ with using(object()):
             self.assertFalse((user / '.omp').exists())
             config = staged / HARNESS_PATHS['omp'][0]
             self.assertEqual(json.loads(_read(config))['mcpServers']['maven']['command'], str(launcher))
-            root = staged / HARNESS_PATHS['omp'][2]
-            self.assertEqual(list(root.rglob('SKILL.md')), [root / 'maven/SKILL.md'])
-            for relative in ('SKILL.md', 'references/project.md', 'references/reconcile.md',
-                             'references/secrets.md', 'references/update.md'):
-                skill = root / 'maven' / relative
-                self.assertEqual(skill.stat().st_mode & 0o777, 0o600)
-                self.assertIsNotNone(_read(skill))
-                self.assertEqual(receipt['owned'][str(skill)], inventory(skill))
-            for item in receipt['integrations']:
-                remove_integration(item)
-                self.assertFalse(Path(item['path']).exists())
+            from tools.harness import SKILL_FILES, TURN_PATHS, remove_integrations
+            for name, (_, _, skill_root) in HARNESS_PATHS.items():
+                root = staged / skill_root
+                self.assertEqual(list(root.rglob('SKILL.md')), [root / 'maven/SKILL.md'])
+                for relative in SKILL_FILES:
+                    skill = root / relative
+                    self.assertEqual(skill.stat().st_mode & 0o777, 0o600)
+                    self.assertIsNotNone(_read(skill))
+                    self.assertEqual(receipt['owned'][str(skill)], inventory(skill))
+                self.assertIsNotNone(_read(staged / TURN_PATHS[name]))
+                self.assertFalse((user / TURN_PATHS[name]).exists())
+            for path in {item['path'] for item in receipt['integrations']}:
+                remove_integrations([item for item in receipt['integrations'] if item['path'] == path])
+                self.assertFalse(Path(path).exists())
 
     def test_harness_install_and_selective_removal_preserve_unrelated_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -474,13 +487,18 @@ with using(object()):
                 self.assertNotIn('never-copy', raw)
                 self.assertEqual(server['env']['MAVEN_HOME'], str(root / 'instance with spaces'))
             again = integration_plan(root / 'instance with spaces', HARNESS_PATHS, user_home=root)
-            self.assertTrue(all(change.receipt['owned'] is False for change in again))
-            self.assertTrue(all(change.before == change.after for change in again))
+            for change in again:
+                self.assertIs(change.receipt['owned'], False)
+                if change.receipt['target'] == 'adapter':
+                    self.assertIn('conflict', change.receipt, 'never adopt pre-existing native code')
+                else:
+                    self.assertEqual(change.before, change.after)
             with self.assertRaises(ValueError):
                 remove_integration(again[0].receipt)
-            for change in changes:
-                remove_integration(change.receipt)
-                self.assertFalse(change.path.exists())
+            from tools.harness import remove_integrations
+            for path in {change.path for change in changes}:
+                remove_integrations([c.receipt for c in changes if c.path == path])
+                self.assertFalse(path.exists())
 
     def test_codex_unrelated_tables_survive_and_changed_owned_table_blocks_removal(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -525,7 +543,7 @@ with using(object()):
             root = Path(directory)
             settings = root / '.claude/settings.json'
             plain = integration_plan(root / 'instance', ['claude'], user_home=root)
-            self.assertNotIn(settings, [change.path for change in plain])
+            self.assertFalse(any(c.receipt['key'] == 'statusLine' for c in plain))
             settings.parent.mkdir()
             original = {'theme': 'dark', 'permissions': {'allow': ['Bash(ls)']}}
             settings.write_text(json.dumps(original))
@@ -533,7 +551,9 @@ with using(object()):
             changes = integration_plan(root / 'instance', ['claude'], user_home=root, statusline=True)
             change = next(change for change in changes if change.path == settings)
             receipts = [apply_integration(item) for item in changes]
-            self.assertEqual(json.loads(settings.read_text()), dict(original, statusLine={
+            data = json.loads(settings.read_text())
+            self.assertIn('UserPromptSubmit', data.pop('hooks'))
+            self.assertEqual(data, dict(original, statusLine={
                 'type': 'command', 'command': shlex.join([
                     'env', 'MAVEN_HOME=' + str(root / 'instance'), str(root / 'instance/venv/bin/maven-statusline')])}))
             self.assertIsNot(change.receipt.get('owned'), False)
@@ -575,10 +595,12 @@ with using(object()):
             self.assertIn('conflict', change.receipt)
             for item in changes:
                 apply_integration(item)
-            self.assertEqual(json.loads(settings.read_text()), owner)
+            after = json.loads(settings.read_text())
+            self.assertIn('Stop', after.pop('hooks'))
+            self.assertEqual(after, owner)
             with self.assertRaises(ValueError):
                 removal_content(change.receipt)
-            self.assertEqual(json.loads(settings.read_text()), owner)
+            self.assertEqual(json.loads(settings.read_text())['statusLine'], owner['statusLine'])
 
             settings.write_text(json.dumps({'model': 'opus'}))
             change = next(change for change in integration_plan(
