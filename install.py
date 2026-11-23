@@ -21,8 +21,8 @@ import tempfile
 from uuid import UUID, uuid4
 from tools.interaction import Field, OperationPaused, checkpoint, current, message, require, stage
 from tools.harness import (
-    HARNESS_PATHS as INTEGRATIONS, SKILL_FILES, TURN_LIMITS, apply_reviewed_integration, integration_plan,
-    skill_cutover_plan, retire_skills, validate_default_profiles,
+    HARNESS_PATHS as INTEGRATIONS, SKILL_FILES, apply_reviewed_integration, integration_plan,
+    installed_targets, recorded_integration_plan, skill_cutover_plan, retire_skills, validate_default_profiles,
     launcher_permission_plan, repair_launcher_permissions,
 )
 
@@ -197,7 +197,7 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--home', type=Path, help='Private instance home (default MAVEN_HOME or ~/.maven)')
     parser.add_argument('--harness', choices=tuple(HARNESS_PATHS), action='append', default=[],
-                        help='Review stdio MCP, guidance, skills and native turn hooks; repeatable')
+                        help='Review stdio MCP, workspace guidance and skills; repeatable')
     parser.add_argument('--skill-dir', type=Path, action='append', default=[],
                         help='Explicit alternate skill root for a custom profile or inactive staging directory')
     parser.add_argument('--stage-harnesses', type=Path,
@@ -206,8 +206,13 @@ def main(argv=None) -> int:
                         help='Explicit custom-profile MCP config file; pair with --harness-context; --skill-dir selects skills')
     parser.add_argument('--harness-context', action='append', default=[], metavar='NAME=PATH',
                         help='Explicit custom-profile startup context file')
-    parser.add_argument('--harness-adapter', action='append', default=[], metavar='NAME=PATH',
-                        help='Exact native hook settings/extension destination for a paired custom profile')
+    parser.add_argument('--refresh-integrations', action='store_true',
+                        help='With --local-only, review all previously recorded harness profiles and skill roots')
+    # Old local-update handoffs included the recorded adapter destination. Accept
+    # it only as a cross-check of the receipt, never as a registration or removal request.
+    parser.add_argument('--harness-adapter', action='append', default=[], help=argparse.SUPPRESS)
+    parser.add_argument('--claude-settings', type=Path,
+                        help='Exact settings.json for --claude-statusline in a custom Claude profile')
     parser.add_argument('--approve-harness-review', metavar='SHA256',
                         help='Headless only: apply the exact harness review printed by the first invocation')
     parser.add_argument('--harness-stopped', action='store_true',
@@ -221,6 +226,12 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     if args.approve_harness_review and not args.local_only:
         parser.error('--approve-harness-review applies only to --local-only')
+    if args.refresh_integrations and (not args.local_only or args.harness or args.skill_dir or args.stage_harnesses
+                                      or args.harness_config or args.harness_context or args.harness_adapter
+                                      or args.claude_statusline or args.claude_settings):
+        parser.error('--refresh-integrations requires --local-only and no explicit harness targets')
+    if args.claude_settings and not args.claude_statusline:
+        parser.error('--claude-settings requires --claude-statusline')
     if args.claude_statusline and 'claude' not in args.harness:
         parser.error('--claude-statusline applies only together with --harness claude')
     try:
@@ -474,25 +485,6 @@ def _advanced_options(args):
         args.stage_harnesses = Path(selected['stage_harnesses']) if selected['stage_harnesses'] else None
 
 
-def _update_targets(args, home):
-    """Refresh recorded destinations unless this invocation explicitly selected different ones."""
-    if (getattr(args, 'harness', None) or getattr(args, 'skill_dir', None)
-            or getattr(args, 'stage_harnesses', None)):
-        return
-    from tools.harness import installed_targets
-    recorded = installed_targets(home)
-    args.harness = list(recorded['paths'])
-    args.harness_config = [f'{name}={pair[0]}' for name, pair in recorded['paths'].items()]
-    args.harness_context = [f'{name}={pair[1]}' for name, pair in recorded['paths'].items()]
-    args.harness_adapter = [f'{name}={path}' for (name, config, context), path in recorded['adapters'].items()
-                            if path and recorded['paths'].get(name) == (config, context)]
-    args.skill_dir = recorded['skill_roots']
-    args.claude_statusline = recorded['statusline'] and 'claude' in args.harness
-    if recorded['unresolved']:
-        _notify('Ambiguous recorded destinations preserved. Select explicit profile paths to update: '
-                + ', '.join(recorded['unresolved']))
-
-
 def _options(args):
     ui = require()
     args.refresh_integrations = False
@@ -679,9 +671,6 @@ def _package_source(source):
 def _install(args, handoff=None):
     installation_locks = contextlib.ExitStack()
     try:
-        if getattr(args, 'refresh_integrations', False):
-            args = argparse.Namespace(**vars(args))
-            _update_targets(args, args.home)
         if current() is None:
             _notify('\nStep 1/4 — Check prerequisites')
         else:
@@ -692,6 +681,11 @@ def _install(args, handoff=None):
         _no_symlink_parents(home)
         ca_bundle = _configure_ca(args.ca_bundle)
         source = Path(__file__).resolve().parent
+        refresh = (getattr(args, 'refresh_integrations', False) and not
+                   (args.harness or args.skill_dir or getattr(args, 'stage_harnesses', None)))
+        recorded = installed_targets(home) if refresh else None
+        if refresh and not (home / 'venv/pyvenv.cfg').is_file() and current() is None:
+            raise ValueError('No existing virtual environment at the selected home; nothing updated.')
         staging = getattr(args, 'stage_harnesses', None)
         integration_home = staging.expanduser().absolute() if staging else Path.home()
         if staging and (integration_home == Path.home()
@@ -710,25 +704,39 @@ def _install(args, handoff=None):
             return result
         configs = custom_paths(getattr(args, 'harness_config', []))
         adapters = custom_paths(getattr(args, 'harness_adapter', []))
-        if not adapters.keys() <= configs.keys():
-            raise ValueError('--harness-adapter requires a paired explicit custom profile.')
+        if adapters:
+            saved_sites = installed_targets(home)['adapters']
         contexts = custom_paths(getattr(args, 'harness_context', []))
         if configs.keys() != contexts.keys():
             raise ValueError('Custom profiles require paired --harness-config/--harness-context.')
+        if adapters and any(name not in configs or path != saved_sites.get((name, configs[name], contexts[name]))
+                            for name, path in adapters.items()):
+            raise ValueError('Obsolete --harness-adapter must match this installation’s recorded profile; '
+                             'use --refresh-integrations to review the complete inventory.')
+        if getattr(args, 'claude_settings', None) and 'claude' not in configs:
+            raise ValueError('--claude-settings requires an explicit paired Claude profile.')
         if staging and configs:
             raise ValueError('Choose either an inactive staging home or explicit custom destination paths, not both.')
         custom = {name: (path, contexts[name]) for name, path in configs.items()}
         if not staging:
             validate_default_profiles(name for name in args.harness if name not in custom)
-        roots = [integration_home / HARNESS_PATHS[name] for name in args.harness if name not in custom]
-        roots.extend(path.expanduser().absolute() for path in args.skill_dir)
-        selected_harnesses = list(args.harness)
+        roots = (list(recorded['skill_roots']) if refresh else
+                 [integration_home / HARNESS_PATHS[name] for name in args.harness if name not in custom]
+                 + [path.expanduser().absolute() for path in args.skill_dir])
+        selected_harnesses = sorted({name for name, _, _ in recorded['profiles']}) if refresh else list(args.harness)
         deferred = False
         require_stopped = bool(roots and not args.harness_stopped and not (staging and not args.skill_dir))
         if require_stopped and current() is None:
             _notify('Restart affected harnesses to load updated tools. Concurrent harness configuration writes '
                     'can overwrite the reviewed integration; unrelated configuration is preserved.')
         skill_conflicts = []
+        if refresh:
+            skill_conflicts.extend({'target': path, 'status': 'conflict',
+                                    'reason': 'Ambiguous recorded destination; specify exact paths separately.'}
+                                   for path in recorded['unresolved'])
+            if selected_harnesses and not roots:
+                skill_conflicts.append({'target': ', '.join(selected_harnesses), 'status': 'conflict',
+                                        'reason': 'No recorded canonical skill root; select --skill-dir.'})
         if not args.skill_dir:
             skill_conflicts.extend({'target': name, 'status': 'conflict', 'component': 'skill',
                                     'reason': 'Custom profile has no selected canonical skill root; use --skill-dir.'}
@@ -736,9 +744,16 @@ def _install(args, handoff=None):
         from tools.update import pending_owned_skills
         try:
             plan, retired_skills, ready_roots = skill_cutover_plan(home, roots, conflicts=skill_conflicts)
-            profile_options = dict(user_home=integration_home, ca_bundle=ca_bundle, paths=custom,
-                                   statusline=getattr(args, 'claude_statusline', False), adapter_paths=adapters)
-            integrations = integration_plan(home, selected_harnesses, **profile_options)
+            def plan_integrations():
+                if refresh:
+                    targets = installed_targets(home)
+                    if targets != recorded:
+                        raise ValueError('Recorded harness destinations changed; review the new plan.')
+                    return recorded_integration_plan(home, targets, ca_bundle=ca_bundle)
+                return integration_plan(home, selected_harnesses, user_home=integration_home, ca_bundle=ca_bundle,
+                                        paths=custom, statusline=getattr(args, 'claude_statusline', False),
+                                        claude_settings=getattr(args, 'claude_settings', None))
+            integrations = plan_integrations()
         except ValueError as exc:
             if current() is None:
                 raise
@@ -747,7 +762,7 @@ def _install(args, handoff=None):
             selected_harnesses, require_stopped = [], False
         pending_targets = [home / 'activate', *(root / name for root in ready_roots for name in SKILL_FILES)]
         pending_skills = pending_owned_skills(home, pending_targets)
-        review_files = bool(roots or integrations)
+        review_files = bool(roots or integrations or refresh)
         if current() is not None or review_files:
             if current() is not None:
                 stage('Review installation')
@@ -768,22 +783,21 @@ def _install(args, handoff=None):
                 'Exact owned legacy skills to retire:\n' + ('\n'.join(
                     str(path) for path, _ in retired_skills) or '(none)'),
                 f'Integration mode: {"inactive staging" if staging else "live"}',
-                'Native turn hooks run the private local bridge; no cloud or session lifecycle hooks.',
-                *(f'{name}: {TURN_LIMITS[name]}' for name in selected_harnesses),
+                'MCP, workspace guidance and skills only. No turn or lifecycle hooks will be installed.',
                 'Exact MAVEN integration content (unrelated configuration preserved):\n' + ('\n'.join(
                     (f'Conflict, not changed: {change.receipt["conflict"]}' if change.receipt.get('conflict')
-                     else ('Remove exact legacy hook: ' if change.receipt.get('retired') else '')
-                     + f'{change.path}\n{change.receipt["value"]}') for change in integrations
+                     else change.retirement_review() if change.receipt.get('retired')
+                     else f'{change.path}\n{change.receipt["value"]}') for change in integrations
                     if change.receipt is not None) or '(none)'),
             ])
         if current() is None and review_files:
-            # Bind the prospective native programs, skill bytes, old file snapshots and
-            # selective removal ownership without echoing unrelated profile contents.
+            # Bind skill bytes, old file snapshots and selective removal ownership
+            # without echoing unrelated profile contents.
             def digest(raw):
                 return hashlib.sha256(raw).hexdigest() if raw is not None else None
             inputs = [body, [(str(p), digest(b), expected) for p, b, expected in plan],
                       [(str(p), inventory) for p, inventory in retired_skills],
-                      [(c.receipt, digest(c.before), digest(c.after)) for c in integrations]]
+                      [(c.receipt, c.remaining, digest(c.before), digest(c.after)) for c in integrations]]
             token = digest(json.dumps(inputs, sort_keys=True).encode())
             if getattr(args, 'approve_harness_review', None) != token:
                 _notify(body)
@@ -812,6 +826,8 @@ def _install(args, handoff=None):
         _private_directory(home)
         from tools.uninstall.local import _lock, reinstall_marker, finish_reinstallation
         installation_locks.enter_context(_lock(home / 'runtime/registry.lock'))
+        if not deferred and (selected_harnesses or refresh) and plan_integrations() != integrations:
+            raise ValueError('Harness configuration or ownership changed after review; re-plan before writing.')
         if pending_owned_skills(home, pending_targets) != pending_skills:
             raise ValueError('Pending file installation intents changed after review; review the original intents again.')
         completed_marker = reinstall_marker(home)
@@ -879,8 +895,6 @@ def _install(args, handoff=None):
         save_private(runtime_intent[0], runtime_intent[1])
         # Journal exact ownership before mutation: interruption leaves either an
         # absent entry or a safely removable exact entry, never an orphan.
-        if selected_harnesses and integration_plan(home, selected_harnesses, **profile_options) != integrations:
-            raise ValueError('Harness configuration or adapter ownership changed after review; re-plan before writing.')
         for change in integrations:
             apply_reviewed_integration(home, source, change)
         retire_skills(home, retired_skills)
@@ -904,8 +918,6 @@ def _install(args, handoff=None):
                         'Review and install against the selected profile after affected harnesses stop.')
             else:
                 _notify('Restart affected harnesses to load local project orientation and the maven skill.')
-            for name in selected_harnesses:
-                _notify(f'{name}: {TURN_LIMITS[name]}')
         elif deferred:
             _notify('Harness integration is pending. Stage with --stage-harnesses, or rerun after closing '
                     'affected harnesses with --harness-stopped.')

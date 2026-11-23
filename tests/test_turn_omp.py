@@ -13,7 +13,6 @@ from uuid import uuid4
 
 
 HERE = Path(__file__).resolve().parent
-TEMPLATE = HERE.parent / 'maven_resources/templates/harness/maven-turn.js'
 
 
 class OmpTests(unittest.TestCase):
@@ -26,8 +25,6 @@ class OmpTests(unittest.TestCase):
         self.profile = self.root / 'user/.omp/agent'
         for d in (self.home, self.cwd, self.profile):
             d.mkdir(mode=0o700, parents=True)
-        self.extension = self.root / 'maven-turn.mjs'
-        self.extension.write_text(TEMPLATE.read_text().replace('__MAVEN_HOME_JSON__', json.dumps(str(self.home))))
         env = self.home / 'venv'
         venv.EnvBuilder(with_pip=False, symlinks=True).create(env)
         self.python = env / 'bin/python'
@@ -38,50 +35,8 @@ class OmpTests(unittest.TestCase):
                     'PI_BASH_NO_LOGIN': '1', 'PI_NO_TITLE': '1', 'OTEL_SDK_DISABLED': 'true',
                     'AWS_EC2_METADATA_DISABLED': 'true', 'OMP_MCP_REQUIRE_READY': '1'}
 
-    @unittest.skipUnless(shutil.which('node'), 'Node.js required for OMP callback fixture')
-    def test_native_callbacks_and_private_bridge(self):
-        module = self.lib / 'tools'
-        module.mkdir()
-        (module / '__init__.py').touch()
-        (module / 'turn_hook.py').write_text('''
-import json, os, sys
-from pathlib import Path
-assert sys.flags.isolated and sys.argv[1] == 'omp'
-phase = sys.argv[2]
-home = Path(sys.argv[4]); assert home == Path.cwd() and sys.argv[3] == '--home'
-assert 'PRIVATE_FIXTURE_SECRET' not in os.environ
-p = json.load(sys.stdin)
-with (home / 'calls.jsonl').open('a') as f: print(json.dumps(dict(phase=phase, **p)), file=f)
-off, dirty, asked = [home / k for k in ('off', 'dirty', 'asked')]
-if phase == 'begin':
-    if p['disable']: off.touch()
-    if p['enable']: off.unlink(missing_ok=True)
-    dirty.unlink(missing_ok=True); asked.unlink(missing_ok=True)
-    rev = (home / 'version').read_text() if (home / 'version').exists() else '1'
-    unchanged = p.get('known', {}).get('proj') == rev
-    view = {'project_id':'proj','token':rev,'unchanged':unchanged}
-    if not unchanged: view['preferences'] = ['manual-commit preference ' + rev]
-    ctx = {'turn_key':p['turn_id'], 'active':view, 'nexus':'same_as_active'}
-    r = {'status':'off', 'text':'MAVEN is off for this conversation.'} if off.exists() else {'status':'consulted','text':'Header\\n' + json.dumps(ctx),
-                                                'turn_key':p['turn_id'], 'context':ctx}
-    if (home / 'fail').exists(): raise SystemExit(1)
-elif phase == 'observe':
-    dirty.touch(); r = {'status':'observed'}
-else:
-    if dirty.exists() and not asked.exists():
-        asked.touch(); r = {'status':'incomplete','request_capture':True,'message':'Classify the actual work.'}
-    else: r = {'status':'complete','request_capture':False,'footer':'fixture: verified'}
-print(json.dumps(r))
-''')
-        # A project import or executable on PATH must not intercept the helper.
-        (self.cwd / 'tools').mkdir()
-        (self.cwd / 'tools/__init__.py').write_text('raise RuntimeError("wrong import root")')
-        subprocess.run([shutil.which('node'), HERE / 'test_turn_omp_callbacks.mjs', self.extension,
-                        self.home, self.cwd], cwd=self.cwd, env={**self.env, 'PYTHONPATH': str(self.cwd),
-                        'PRIVATE_FIXTURE_SECRET': 'do-not-inherit'}, check=True, timeout=45)
-
     @unittest.skipUnless(os.environ.get('MAVEN_TEST_OMP_LIVE') == '1', 'opt-in real OMP qualification')
-    def test_offline_binary_commit_message(self):
+    def test_retained_context_and_before_reply_save(self):
         from tools.home import save_home
         from tools.memory.boundary import save_private
         from tools.reconcile import local_write
@@ -130,25 +85,44 @@ print(json.dumps(r))
         def git_state():
             return {str(p.relative_to(self.cwd)): p.read_bytes() for p in (self.cwd / '.git').rglob('*') if p.is_file()}
         untouched = git_state()
-        profile_extension = self.profile / 'extensions/maven-turn.js'
-        profile_extension.parent.mkdir()
-        shutil.copyfile(self.extension, profile_extension)
+        templates = HERE.parent / 'maven_resources/templates'
+        shutil.copyfile(templates / 'harness/startup.md', self.profile / 'AGENTS.md')
+        shutil.copytree(templates / 'skills/maven', self.profile / 'skills/maven')
         provider = self.root / 'fixture-provider.js'
         shutil.copyfile(HERE / 'test_turn_omp_provider.js', provider)
         (self.profile / 'config.yml').write_text('mcp:\n  shared: false\n  startupTimeoutMs: 0\n')
         (self.profile / 'mcp.json').write_text(json.dumps({'mcpServers': {'maven': {'type':'stdio',
             'command':str(self.python), 'args':['-I', '-m', 'tools.mcp.server', '--home', str(self.home)]}}}))
-        run = subprocess.run([*sandbox, omp, '--trusted-extension', profile_extension, '--trusted-extension', provider,
-            '--model', 'maven-fixture/commit-message', '--no-session', '--no-title', '--no-context-files',
-            '--no-skills', '--no-rules', '--no-lsp', '--no-pty', '--max-time', '35', '-p', '--mode', 'json',
-            'Draft only a commit message.'], cwd=self.cwd, env=self.env, text=True,
-            capture_output=True, timeout=60)
-        self.assertEqual(run.returncode, 0, run.stderr[-1500:])
-        events = [json.loads(line) for line in run.stdout.splitlines() if line.startswith('{')]
-        answers = [part.get('text') for e in events if e.get('type') == 'message_end'
-                   for part in e.get('message', {}).get('content', []) if isinstance(part, dict) and part.get('type') == 'text']
-        self.assertTrue(any(answer.startswith('Draft: Respect manual Git commits.\nMAVEN · ')
-                            and answer.count('consulted, no update') == 2 for answer in answers),
-                        'Missing fixture answer: check isolated OMP model, context injection and actual MCP receipt.')
-        self.assertEqual(git_state(), untouched)
+        def ask(prompt, expected, calls, *, resume=True):
+            run = subprocess.run([*sandbox, omp, '--trusted-extension', provider,
+                '--model', 'maven-fixture/commit-message', '--no-title', '--no-rules', '--no-lsp',
+                '--no-pty', '--max-time', '35', '--session-dir', str(self.root / 'sessions'),
+                *(['--continue'] if resume else []), '-p', '--mode', 'json', prompt],
+                cwd=self.cwd, env=self.env, text=True, capture_output=True, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stderr[-1500:])
+            events = [json.loads(line) for line in run.stdout.splitlines() if line.startswith('{')]
+            messages = [e['message'] for e in events if e.get('type') == 'message_end'
+                        and e.get('message', {}).get('role') == 'assistant']
+            answers = [b['text'] for m in messages for b in m['content'] if b['type'] == 'text']
+            commands = [b['arguments']['command'].split(' ', 1)[0] for m in messages
+                        for b in m['content'] if b['type'] == 'toolCall']
+            self.assertEqual((answers, commands), ([expected], calls))
+
+        ask('Draft only a commit message.', 'Draft: Respect manual Git commits.\nMAVEN · widget: no local change.',
+            ['mcp__maven_context'], resume=False)
+        ask('Should you commit it?', 'No; commits are manual.\nMAVEN · widget: no local change.', [])
         self.assertEqual((pref.inventory(), active.inventory()), before)
+        ask('Remember the widget decision.', 'Recorded the widget decision.\nMAVEN · widget: saved locally.',
+            ['mcp__maven_local_write'])
+        self.assertEqual([(r['kind'], r['summary']) for r in active.inventory()['items']],
+                         [('decision', 'Build the widget offline')])
+        # Another writer advances the store while OMP retains the last write token.
+        local_write(active, active.inventory()['token'], 'note', {'title':'Concurrent update'}, 'Fixture writer.')
+        concurrent = active.inventory()
+        ask('Record the second decision.', 'Another writer changed the project.\nMAVEN · widget: not saved.',
+            ['mcp__maven_local_write'])
+        self.assertEqual(active.inventory(), concurrent)
+        ask('Turn off MAVEN for this session.', 'MAVEN is off for this conversation.', [])
+        ask('What is two plus two?', 'Four.', [])
+        self.assertEqual(git_state(), untouched)
+        self.assertEqual(pref.inventory(), before[0])

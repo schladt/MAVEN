@@ -2,7 +2,6 @@
 import json
 from pathlib import Path
 import shutil
-import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -25,10 +24,6 @@ def uid():
 
 def preference(scope, summary, **extra):
     return {'category': 'preference', 'title': 'Owner preference', 'scope': scope, 'summary': summary, **extra}
-
-
-def retained(view):
-    return {v['project_id']: v['token'] for v in (view['active'], view['nexus']) if v}
 
 
 class TurnMemoryTests(unittest.TestCase):
@@ -105,53 +100,46 @@ class TurnMemoryTests(unittest.TestCase):
                         'private procedure'):
             self.assertNotIn(private, json.dumps(result))
 
-    def test_retained_scope_skips_all_record_queries_and_changed_view_refreshes_only_that_store(self):
+    def test_workspace_change_invalidates_even_a_shared_nexus_token(self):
         first = consult(self.app, self.project.root)
-        queries = []
-        connect = sqlite3.connect
-
-        def traced(*args, **kwargs):
-            db = connect(*args, **kwargs)
-            db.set_trace_callback(queries.append)
-            return db
-
-        with patch.object(sqlite3, 'connect', side_effect=traced):
-            unchanged = consult(self.app, self.project.root, retained(first))
-        self.assertEqual(unchanged['status'], 'consulted')
-        self.assertTrue(queries)
-        self.assertFalse(any('from records' in sql.lower() for sql in queries))
-        for side in ('active', 'nexus'):
-            self.assertTrue(unchanged[side]['unchanged'])
-            self.assertNotIn('preferences', unchanged[side])
-            self.assertEqual(unchanged[side]['binding'], first[side]['binding'])
-        self.seed(self.nexus, 'setting', preference('nexus', 'Updated locally'))
-        refreshed = consult(self.app, self.project.root, retained(first))
-        self.assertTrue(refreshed['active']['unchanged'])
-        self.assertFalse(refreshed['nexus']['unchanged'])
-        self.assertEqual(refreshed['nexus']['preferences'][0]['summary'], 'Updated locally')
-        self.assertEqual(refreshed['nexus']['binding'], first['nexus']['binding'])
         second = self.bind(self.base / 'second')
-        moved = consult(self.app, second.root, retained(refreshed))
-        self.assertFalse(moved['active']['unchanged'])
-        self.assertTrue(moved['nexus']['unchanged'])
-        self.assertFalse(consult(self.app, second.root)['nexus']['unchanged'])  # Resume with no retained context.
+        with self.assertRaises(StaleView):
+            self.write(first['nexus'], cwd=second.root, kind='setting',
+                       data=preference('nexus', 'From another workspace'))
+        self.assertEqual(self.nexus.inventory()['items'], [])
+        second_view = consult(self.app, second.root)
+        self.assertNotEqual(first['nexus']['token'], second_view['nexus']['token'])
+
+    def test_active_home_keeps_project_and_nexus_preferences_distinct_on_correction(self):
+        view = consult(self.app, self.nexus.root)['active']
+        saved = self.write(view, cwd=self.nexus.root, kind='setting', data=preference('project', 'Only here'))
+        with self.assertRaises(ProjectError):
+            self.write(view, cwd=self.nexus.root, expected_token=saved['token'], record_id=saved['id'],
+                       kind='setting', data=preference('nexus', 'Apply everywhere instead'))
+        fresh = consult(self.app, self.nexus.root)['active']
+        self.assertEqual(fresh['token'], saved['token'])
+        self.assertEqual(fresh['preferences'], [{'id': saved['id'], 'scope': 'project', 'summary': 'Only here'}])
 
     def test_active_home_reads_once_and_requires_new_projection_then_allows_untracked_capture(self):
         self.seed(self.nexus, 'brief', {'purpose': 'Only when active'})
         self.seed(self.nexus, 'setting', preference('nexus', 'global'))
         self.seed(self.nexus, 'setting', preference('project', 'scoped to the Home project'))
         separate = consult(self.app, self.project.root)
-        with patch.object(LocalStore, 'turn_view', autospec=True, side_effect=LocalStore.turn_view) as reads:
-            same = consult(self.app, self.nexus.root, retained(separate))
+        with patch.object(LocalStore, 'context_view', autospec=True, side_effect=LocalStore.context_view) as reads:
+            same = consult(self.app, self.nexus.root)
         self.assertEqual(reads.call_count, 1)
-        self.assertEqual(same['active'], same['nexus'])
-        self.assertFalse(same['active']['unchanged'])
+        self.assertEqual(same['nexus'], 'same_as_active')
         self.assertEqual(same['active']['brief']['data']['purpose'], 'Only when active')
         self.assertCountEqual([p['summary'] for p in same['active']['preferences']], ['global', 'scoped to the Home project'])
-        untracked = consult(self.app, self.untracked, retained(same))
-        self.assertTrue(untracked['active']['unchanged'])
+        untracked = consult(self.app, self.untracked)
+        self.assertEqual(untracked['nexus'], 'same_as_active')
         self.assertTrue(self.write(untracked['active'], cwd=self.untracked)['changed'])
         self.assertFalse((self.untracked / '.maven').exists())
+        another = self.base / 'another-untracked'
+        another.mkdir()
+        fresh = consult(self.app, self.untracked)
+        with self.assertRaises(StaleView):
+            self.write(fresh['active'], cwd=another)
         with self.assertRaises(StaleView):
             self.write(separate['nexus'], cwd=self.nexus.root)
 
@@ -226,9 +214,8 @@ class TurnMemoryTests(unittest.TestCase):
         clone = self.bind(self.base / 'other-root', self.project.project_id)
         shutil.copytree(self.project.path.parent, clone.path.parent)
         self.assertEqual(self.project.inventory()['token'], clone.inventory()['token'])
-        other = consult(self.app, clone.root, retained(original))
-        self.assertFalse(other['active']['unchanged'])
-        self.assertNotEqual(other['active']['binding'], original['active']['binding'])
+        other = consult(self.app, clone.root)
+        self.assertNotEqual(other['active']['token'], original['active']['token'])
         with self.assertRaises(StaleView):
             self.write(original['active'], cwd=clone.root)
         self.assertEqual(clone.inventory()['items'], [])
@@ -242,7 +229,7 @@ class TurnMemoryTests(unittest.TestCase):
         self.assertEqual(result['active']['brief']['data']['purpose'], 'Independent checkout')
         self.assertFalse(result['active']['preferences'])
         self.assertEqual(result['nexus']['preferences'][0]['summary'], 'Use the configured copy only')
-        self.assertNotEqual(result['nexus']['binding'], result['active']['binding'])
+        self.assertNotEqual(result['nexus']['token'], result['active']['token'])
         with self.assertRaises(StaleView):
             self.write(result['active'], cwd=checkout.root, use_home=True, kind='setting',
                        data=preference('nexus', 'Wrong checkout token'))
@@ -254,7 +241,7 @@ class TurnMemoryTests(unittest.TestCase):
             first = consult(self.app, self.project.root)
             self.assertEqual(first['status'], 'consulted')
             self.bind(self.project.root, self.project.project_id, instance_id=uid())
-            changed = consult(self.app, self.project.root, retained(first))
+            changed = consult(self.app, self.project.root)
             self.assertEqual((changed['status'], changed['error']), ('unavailable', 'project_unavailable'))
             with self.assertRaises(ProjectError):
                 self.write(first['active'])
@@ -278,7 +265,7 @@ class TurnMemoryTests(unittest.TestCase):
                 self.assertEqual((result['status'], result['error']), ('unavailable', 'project_unavailable'))
                 self.assertIsNone(result['active'])
                 with self.assertRaises(ProjectError):
-                    self.write(good['nexus'], cwd=bound, kind='setting', data=preference('nexus', 'Never write this'))
+                    self.write(good['active'], cwd=bound, kind='setting', data=preference('nexus', 'Never write this'))
         self.assertEqual(self.nexus.inventory()['items'], [])
 
     def test_missing_invalid_undeliverable_and_foreign_cohort_home_leave_valid_project_usable(self):
@@ -306,19 +293,20 @@ class TurnMemoryTests(unittest.TestCase):
                 if condition != 'other epoch':
                     self.assertEqual(consult(self.app, self.untracked)['status'], 'unavailable')
 
-    def test_learned_replica_markers_apply_before_cache_check_or_capture(self):
+    def test_learned_replica_markers_prevent_stale_capture_and_resurrection(self):
         key = self.seed(self.nexus, 'setting', preference('nexus', 'Remove this old preference'))
         view = consult(self.app, self.project.root)
         replica = Replica(self.home, self.ident['instance_id'])
         with replica.locked():
             replica.remember([{'kind': 'project_record', 'project_id': self.nexus.project_id, 'id': key}])
-        after = consult(self.app, self.project.root, retained(view))
-        self.assertFalse(after['nexus']['unchanged'])
+        with self.assertRaises(StaleView):
+            self.write(view['nexus'], record_id=key, kind='setting', data=preference('nexus', 'Revive'))
+        after = consult(self.app, self.project.root)
         self.assertEqual(after['nexus']['preferences'], [])
         with self.assertRaisesRegex(ValueError, 'erased'):
             self.write(after['nexus'], record_id=key, kind='setting', data=preference('nexus', 'Revive'))
         with replica.locked():
             replica.remember([{'kind': 'project', 'id': self.project.project_id}])
-        self.assertEqual(consult(self.app, self.project.root, retained(after))['status'], 'unavailable')
+        self.assertEqual(consult(self.app, self.project.root)['status'], 'unavailable')
         with self.assertRaisesRegex(SetupPending, 'retired'):
             self.write(after['nexus'], kind='setting', data=preference('nexus', 'Do not capture'))

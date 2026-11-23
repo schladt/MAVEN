@@ -17,7 +17,7 @@ The first stage compares the installed software and installer-owned skills with 
 - A form `Update local MAVEN software` shows the differences; relay them and ask whether to update or continue without it.
 - A `local_update` handoff gives the exact installer command. It must run in a separate terminal because it replaces the software this MCP server runs from and rewrites this harness's MAVEN skills and configuration. Give the owner the command; they choose **Update local MAVEN software** and review its changes there. Then the harness must be restarted so it loads the new MAVEN; afterwards continue the same operation ID. If advance says the process is still running old software, the restart has not happened yet.
 - Skills the owner modified, or that another installation shares, are preserved and reported, not overwritten.
-- Older installers may have printed the retired `--no-lifecycle-hooks` option. If the checkout rejects it, omit that option only. Review local turn adapters in the installer; they are not the retired MAVEN work-session lifecycle. Keep the same selected home, recorded destinations and operation ID.
+- Review retirement of old installer-owned turn hooks with the other local changes. Preserve unrelated configuration. Keep the selected home, recorded destinations and update operation ID.
 
 ## 3. Sign-in and reviews
 

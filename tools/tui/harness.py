@@ -7,7 +7,7 @@ from pathlib import Path
 
 from maven_resources import resource_path
 from tools.harness import (
-    HARNESS_PATHS, SKILL_FILES, TURN_LIMITS, _read, apply_reviewed_integration, integration_plan, installed_targets,
+    HARNESS_PATHS, SKILL_FILES, _read, apply_reviewed_integration, integration_plan, installed_targets,
     skill_cutover_plan, retire_skills, validate_default_profiles,
     launcher_permission_plan, repair_launcher_permissions,
 )
@@ -113,8 +113,8 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
         values = ui.form('Choose the harnesses you use', fields,
                          description=('Select any installed harnesses, or leave all unchecked to skip. '
                                       'Recorded destinations are retained; new selections use default profiles. Differing MAVEN '
-                                      'entries and unrelated files will be preserved. Includes native local turn hooks '
-                                      'when the selected profile supports them. No credentials are copied.'),
+                                      'entries and unrelated files will be preserved. Exact installer-owned obsolete '
+                                      'hooks are retired. No credentials are copied.'),
                          submit='Review selected / Skip', back=True)
         if values is None:
             return result
@@ -130,6 +130,9 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
             available = []
             for name in selected:
                 try:
+                    if name not in destinations and any(profile[0] == name for profile in recorded['profiles']):
+                        raise ValueError('Multiple recorded profiles: use the local software update to refresh all, '
+                                         'or select one with explicit installer paths.')
                     if name not in destinations:
                         if recorded['unresolved']:
                             raise ValueError('An existing custom destination is ambiguous; use explicit installer paths '
@@ -209,9 +212,11 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
             if change.receipt.get('conflict'):
                 visible.append('Conflict, not changed: ' + change.receipt['conflict'])
                 continue
-            action = ('Remove exact legacy hook' if change.receipt.get('retired') else
-                      'Preserve identical content' if change.before == change.after else 'Write MAVEN content')
-            visible.append(f'{action} ({change.receipt.get("target", "legacy hook")}): {change.path}')
+            if change.receipt.get('retired'):
+                visible.append(change.retirement_review())
+                continue
+            action = 'Preserve identical content' if change.before == change.after else 'Write MAVEN content'
+            visible.append(f'{action} ({change.receipt["target"]}): {change.path}')
             details.append(f'{change.path}\nExact MAVEN entry/block:\n' +
                            json.dumps(change.receipt['value'], indent=2, ensure_ascii=False))
         for target, body, expected in skills:
@@ -225,7 +230,6 @@ def configure_harnesses(ui, home, *, ca_bundle=None, context=''):
         for target, expected in retired:
             visible.append(f'Remove exact installer-owned legacy skill: {target}')
             details.append(f'Retirement inventory for {target}:\n' + json.dumps(expected, indent=2))
-        visible.extend(f'{NAMES[name]}: {TURN_LIMITS[name]}' for name in available)
         visible.extend([f'Update selective uninstall ownership: {home / MANIFEST}',
                         'Update the existing local installation discovery registry.',
                         'Unrelated settings remain. No credentials, cloud changes, package reinstall or project binding.',
@@ -334,9 +338,6 @@ def show_completion(ui, home, result, *, outcome=None):
     else:
         lines.append('Restart: no new harness configuration was applied in this step.')
     lines.append('Harness MCP connection: NOT YET VERIFIED. A successful cloud check does not prove a harness can connect.')
-    if result.get('selected') and status != 'skipped':
-        lines.append('Native hook execution: NOT VERIFIED.\n' + '\n'.join(
-            f'{NAMES[name]}: {TURN_LIMITS[name]}' for name in result['selected']))
     if status in ('written', 'unchanged') and result['selected']:
         for name in result['selected']:
             lines.append(f'{NAMES[name]}: open an enabled project to read its local orientation brief. '

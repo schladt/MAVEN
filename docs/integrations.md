@@ -8,19 +8,17 @@ so client PATH differences cannot select another installation. Do not put creden
 in MCP configuration. Preserve unrelated entries and use the selected profile/custom
 destination. No public endpoint, listening port or mandatory OMP plugin is needed.
 
-The installer uses the same skill and short global pointer in all five clients. Native hooks back that policy where the host exposes events. An installed file, successful contract test or MCP handshake alone does **not** prove turn enforcement in a live client.
+All five clients use one standing instruction and the same [MAVEN skill](../maven_resources/templates/skills/maven/SKILL.md). No MAVEN prompt, tool or stop hooks are needed.
 
-| Client | Config / standing guidance | Local turn integration and limits |
+| Client | MCP config | Standing instruction |
 | --- | --- | --- |
-| [OMP](https://omp.sh/docs/mcp) | `~/.omp/agent/mcp.json` / `AGENTS.md` | `extensions/maven-turn.js` supplies preferences before tools, observes tool results, and checks the reply at stop. Restart with the reviewed extension enabled. |
-| [Claude Code](https://code.claude.com/docs/en/hooks) | `~/.claude.json` / `CLAUDE.md` | `~/.claude/settings.json`: `UserPromptSubmit`, `PostToolUse`, `Stop`. The prompt hook can also fire for synthetic events without owner attribution. After opting out, use a **new conversation** to resume; a synthetic “on” prompt must not re-enable capture. |
-| [Codex](https://developers.openai.com/codex/hooks/) | `~/.codex/config.toml` / `AGENTS.override.md` or `AGENTS.md` | `~/.codex/hooks.json`: prompt, tool and stop hooks. Review/trust definitions in `/hooks`; disabled or untrusted hooks do not run. |
-| [Copilot CLI](https://docs.github.com/en/copilot/reference/hooks-reference) | `~/.copilot/mcp-config.json` / `copilot-instructions.md` | User-profile `hooks/maven-turn.json`. Prompt-hook output is not model context. A pre-tool guard supplies the current key and requires keyed MCP refresh before consequential tools. Stop can report the receipt in the timeline, not rewrite an answer. |
-| [Gemini CLI](https://geminicli.com/docs/hooks/reference/) | `~/.gemini/settings.json` / `GEMINI.md` or selected custom context | `BeforeAgent`, `AfterTool`, `AfterAgent`. Requires enabled hooks; delegated/custom tools may not expose file effects. |
+| OMP | `~/.omp/agent/mcp.json` | `AGENTS.md` |
+| Claude Code | `~/.claude.json` | `CLAUDE.md` |
+| Codex | `~/.codex/config.toml` | `AGENTS.override.md` or `AGENTS.md` |
+| Copilot CLI | `~/.copilot/mcp-config.json` | `copilot-instructions.md` |
+| Gemini CLI | `~/.gemini/settings.json` | `GEMINI.md` or selected custom context |
 
-Each client reads local state, not AWS. The agent classifies semantic changes and shell/delegated effects; hooks see only supported events, not an operating-system write audit. They cannot force every model or interrupted response to include a line in already-delivered text. A normal reply should append the receipt; the adapter can ask once for completion or display the verified status separately. When native signals are absent, the pointer can guide the agent but cannot enforce timing, opt-out retention after context loss or footer delivery. Never infer success from missing events.
-
-**Qualification:** OMP 19.1.0 was exercised offline in an isolated live client with a deterministic provider, real stdio MCP and temporary SQLite stores. A commit-message-only prompt saw the Nexus preference before the first model request, left Git and both inventories unchanged and produced one verified footer. The other four clients were exercised with native event fixtures through the real hook subprocesses and SQLite; their actual binaries, trust settings and rendered UI were not tested. On each installed profile, restart, request a commit message in a different tracked project, and check the preference, unchanged Git state and final local status before treating that profile as verified.
+The agent loads local context once, reuses it, saves qualifying changes before replying and reports the result on one line in the answer. No fresh MAVEN call is needed on a retained, unchanged turn. A resumed conversation without that context must load it again. Preferences can be stale until refresh; writes still require the current local token. This is guidance, not an audit of file activity or a guarantee that a model follows instructions.
 
 The optional Claude status line identifies the **local** selected project, not a live cloud connection. During a reviewed integration update, retire only exact, unmodified installer-owned legacy hooks and skills; preserve edited, shared or unowned files for owner review.
 
@@ -32,8 +30,7 @@ running-harness configuration risk separately from any required writer quiescenc
 
 Use `--stage-harnesses PATH` to inspect a staged home layout without changing live
 configuration. Custom profiles use paired `--harness-config NAME=ABSOLUTE_FILE` and
-`--harness-context NAME=ABSOLUTE_FILE`, `--skill-dir PATH` and, for native integration in a custom profile, `--harness-adapter NAME=ABSOLUTE_PATH`. In a headless `--local-only` run the installer first prints the changes and review digest; rerun the same selection with `--approve-harness-review SHA256` using the displayed value. Do not substitute a digest from a different plan. Supported native targets are OMP, Claude Code,
-Codex, Copilot CLI and Gemini CLI, not every client accepting a similar skill format.
+`--harness-context NAME=ABSOLUTE_FILE` and `--skill-dir PATH`. In a headless `--local-only` run the installer prints the review; repeat the same selection with `--approve-harness-review SHA256` only for the exact reviewed changes.
 
 Codex integration uses an existing nonempty `AGENTS.override.md` when present,
 otherwise `AGENTS.md`. If Gemini's custom `context.fileName` excludes `GEMINI.md`,
@@ -43,7 +40,7 @@ content. Legacy CLI skills are retired only when their bytes match the prior
 installer inventory and ownership is unshared; modified, unowned or shared copies
 block cutover and require separate review rather than deletion.
 
-First-time project enablement is explicit. Installing turn integration does not configure a Home, authorize cloud changes or grant secret access. The local update report inventories guidance, skills, MCP and adapters and reports edited/shared/conflicting targets without silently replacing them. Verify the effective trust/profile after restarting. See [Getting started](getting-started.md).
+Installing harness guidance does not configure a project or Home, authorize cloud changes or grant secret access. Restart affected clients to load updated tools and guidance. See [Getting started](getting-started.md).
 
 ## Configured AWS and workspace services
 

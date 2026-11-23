@@ -429,7 +429,10 @@ with using(object()):
                     self.assertEqual(skill.stat().st_mode & 0o777, 0o600)
                     self.assertIsNotNone(_read(skill))
                     self.assertEqual(receipt['owned'][str(skill)], inventory(skill))
-                self.assertIsNotNone(_read(staged / TURN_PATHS[name]))
+                if name == 'gemini':  # MCP shares Gemini settings.json; never install hooks there.
+                    self.assertNotIn('hooks', json.loads(_read(staged / TURN_PATHS[name])))
+                else:
+                    self.assertFalse((staged / TURN_PATHS[name]).exists())
                 self.assertFalse((user / TURN_PATHS[name]).exists())
             for path in {item['path'] for item in receipt['integrations']}:
                 remove_integrations([item for item in receipt['integrations'] if item['path'] == path])
@@ -489,10 +492,7 @@ with using(object()):
             again = integration_plan(root / 'instance with spaces', HARNESS_PATHS, user_home=root)
             for change in again:
                 self.assertIs(change.receipt['owned'], False)
-                if change.receipt['target'] == 'adapter':
-                    self.assertIn('conflict', change.receipt, 'never adopt pre-existing native code')
-                else:
-                    self.assertEqual(change.before, change.after)
+                self.assertEqual(change.before, change.after)
             with self.assertRaises(ValueError):
                 remove_integration(again[0].receipt)
             from tools.harness import remove_integrations
@@ -552,7 +552,7 @@ with using(object()):
             change = next(change for change in changes if change.path == settings)
             receipts = [apply_integration(item) for item in changes]
             data = json.loads(settings.read_text())
-            self.assertIn('UserPromptSubmit', data.pop('hooks'))
+            self.assertNotIn('hooks', data)
             self.assertEqual(data, dict(original, statusLine={
                 'type': 'command', 'command': shlex.join([
                     'env', 'MAVEN_HOME=' + str(root / 'instance'), str(root / 'instance/venv/bin/maven-statusline')])}))
@@ -596,7 +596,7 @@ with using(object()):
             for item in changes:
                 apply_integration(item)
             after = json.loads(settings.read_text())
-            self.assertIn('Stop', after.pop('hooks'))
+            self.assertNotIn('hooks', after)
             self.assertEqual(after, owner)
             with self.assertRaises(ValueError):
                 removal_content(change.receipt)

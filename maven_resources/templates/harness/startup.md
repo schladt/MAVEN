@@ -1,3 +1,3 @@
 ## MAVEN project memory
 
-Every owner turn, before acting, follow the installed `maven` skill’s **Every turn** procedure, even when the prompt does not mention MAVEN. Use the native local turn context if supplied; otherwise use the skill’s guidance-only fallback. Honor conversation opt-out. Finish with the verified local status. No implicit cloud sync or exit ritual.
+Follow the installed `maven` skill’s **Every turn** policy, even when MAVEN is not mentioned. Load local project and Nexus context once per workspace; reuse it. Decide on every turn, save changes before answering, and end the original answer with one MAVEN status line. No tool call just for status. Honor conversation opt-out; sync only on request.

@@ -1,4 +1,4 @@
-"""Local-only harness bootstrap and selective retirement of previously installed lifecycle hooks."""
+"""Local harness bootstrap and receipt-scoped retirement of historical native hooks."""
 import json
 import os
 import shlex
@@ -57,9 +57,48 @@ class HarnessIntegrationTests(unittest.TestCase):
             'target': 'lifecycle', 'value': value, 'created': harness == 'omp'}])
         return path
 
-    def test_staged_native_rollout_and_machine_removal_for_all_five_clients(self):
+    def previous_turn(self, harness, *, base=None, profile=None, target=None):
+        """A historical registration and its receipt; no retired program/template is needed."""
+        base = base or self.user
+        profile = profile or tuple(base / p for p in HARNESS_PATHS[harness][:2])
+        target = target or base / TURN_PATHS[harness]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        receipt = {'path': str(target), 'key': 'maven-turn', 'harness': harness,
+                   'target': 'adapter', 'profile': list(map(str, profile)), 'created': not target.exists()}
+        if harness == 'omp':
+            body = '// previously installed extension for ' + json.dumps(str(self.home)) + '\n'
+            target.write_text(body)
+            receipt.update(format='file', value=body)
+        else:
+            events = {
+                'claude': ('UserPromptSubmit', 'PostToolUse', 'Stop'),
+                'codex': ('UserPromptSubmit', 'PostToolUse', 'Stop'),
+                'gemini': ('BeforeAgent', 'AfterTool', 'AfterAgent'),
+                'copilot': ('userPromptSubmitted', 'postToolUse', 'agentStop', 'preToolUse'),
+            }[harness]
+            document = json.loads(target.read_text()) if target.exists() else {}
+            receipt.update(format='json-hooks', created_container='hooks' not in document,
+                           created_version=harness == 'copilot' and 'version' not in document)
+            if harness == 'copilot':
+                document.setdefault('version', 1)
+            hooks = document.setdefault('hooks', {})
+            receipt['created_events'] = [event for event in events if event not in hooks]
+            value = {}
+            for event, phase in zip(events, ('begin', 'observe', 'end', 'guard')):
+                cmd = shlex.join([str(self.home / 'venv/bin/python'), '-I', '-m', 'tools.turn_hook',
+                                  harness, phase, '--home', str(self.home)])
+                entry = ({'type': 'command', 'bash': cmd} if harness == 'copilot' else
+                         {'hooks': [{'type': 'command', 'command': cmd}]})
+                value[event] = [entry]
+                hooks.setdefault(event, []).append(entry)
+            target.write_text(json.dumps(document))
+            receipt['value'] = value
+        target.chmod(0o600)
+        record_installation(self.home, self.source, [], [], integrations=[receipt])
+        return target, receipt
+
+    def test_staged_install_and_machine_removal_for_all_five_clients(self):
         from tools.uninstall import local
-        from tools.turn_native import NATIVE_EVENTS, POST_MATCHERS
         stage = self.user / 'inactive'
         changes = integration_plan(self.home, HARNESS_PATHS, user_home=stage)
         self.assertFalse(stage.exists(), 'planning may not create files or directories')
@@ -70,24 +109,11 @@ class HarnessIntegrationTests(unittest.TestCase):
             with self.subTest(harness=name):
                 self.assertIn('Every turn', (stage / context).read_text())
                 target = stage / TURN_PATHS[name]
-                if name == 'omp':
-                    self.assertIn(json.dumps(str(self.home)), target.read_text())
-                    self.assertNotIn('__MAVEN_HOME_JSON__', target.read_text())
-                    continue
-                hooks = json.loads(target.read_text())['hooks']
-                events = dict(zip(NATIVE_EVENTS[name], ('begin', 'observe', 'end')))
-                if name == 'copilot':
-                    events['preToolUse'] = 'guard'
-                self.assertEqual(set(hooks), set(events))
-                for event, phase in events.items():
-                    entry, = hooks[event]
-                    if phase == 'observe':
-                        self.assertEqual(entry['matcher'], POST_MATCHERS[name])
-                    else:
-                        self.assertNotIn('matcher', entry)
-                    command = entry['bash'] if name == 'copilot' else entry['hooks'][0]['command']
-                    self.assertEqual(shlex.split(command), [str(self.home / 'venv/bin/python'), '-I', '-m',
-                                     'tools.turn_hook', name, phase, '--home', str(self.home)])
+                if name == 'gemini':
+                    self.assertNotIn('hooks', json.loads(target.read_text()))
+                else:
+                    self.assertFalse(target.exists())
+        self.assertEqual({c.receipt['target'] for c in changes}, {'config', 'context'})
         again = integration_plan(self.home, HARNESS_PATHS, user_home=stage)
         self.assertTrue(all(c.before == c.after and not c.receipt.get('conflict') for c in again))
         plan = local.plan_machine(self.home, offline=True)
@@ -98,14 +124,13 @@ class HarnessIntegrationTests(unittest.TestCase):
             self.assertFalse(c.path.exists(), c.path)
         self.assertFalse(any((self.user / path[0]).exists() for path in HARNESS_PATHS.values()))
 
-    def test_modified_subscriptions_are_preserved_and_restoring_exact_bytes_reenables_updates(self):
-        from tools.harness import remove_integrations
+    def test_modified_subscription_is_preserved_while_other_exact_entries_retire(self):
         path = self.user / TURN_PATHS['claude']
         path.parent.mkdir()
         original = {'theme': 'owner', 'hooks': {'UserPromptSubmit': [], 'Stop': [
             {'hooks': [{'type': 'command', 'command': 'my-check'}]}]}}
         path.write_text(json.dumps(original))
-        self.apply(['claude'])
+        self.previous_turn('claude')
         correct = path.read_bytes()
         document = json.loads(correct)
         document['hooks']['Stop'][-1]['hooks'][0]['command'] = 'owner-edit'
@@ -113,17 +138,111 @@ class HarnessIntegrationTests(unittest.TestCase):
         path.write_bytes(changed)
         attempt = self.apply(['claude'])
         self.assertEqual([c.path for c in attempt if c.receipt.get('conflict')], [path])
-        self.assertEqual(path.read_bytes(), changed)
-        path.write_bytes(correct)
-        revised = {'claude': '^Write$'}
-        with patch('tools.turn_native.POST_MATCHERS', revised):
-            upgrade = self.apply(['claude'])
-            owned = next(c for c in upgrade if c.receipt['key'] == 'maven-turn')
-            self.assertNotEqual(owned.before, owned.after)
-            self.assertEqual(json.loads(owned.after)['hooks']['PostToolUse'][0]['matcher'], '^Write$')
-        receipts = [r for r in read_private(self.home / MANIFEST)['integrations'] if r['path'] == str(path)]
-        remove_integrations(receipts)
+        after = json.loads(path.read_text())
+        self.assertEqual(after['hooks'], {**original['hooks'], 'Stop': document['hooks']['Stop']})
+        self.assertEqual(after['theme'], original['theme'])
+        remaining, = [r for r in read_private(self.home / MANIFEST)['integrations'] if r['key'] == 'maven-turn']
+        self.assertEqual(set(remaining['value']), {'Stop'})
+        after['hooks']['Stop'][-1] = json.loads(correct)['hooks']['Stop'][-1]
+        path.write_text(json.dumps(after))
+        self.apply(['claude'])
         self.assertEqual(json.loads(path.read_text()), original)
+
+    def test_duplicate_and_unowned_registrations_are_not_adopted(self):
+        from tools.uninstall.common import save_private
+        extension, unowned = self.previous_turn('omp')
+        path, receipt = self.previous_turn('copilot')
+        manifest = read_private(self.home / MANIFEST)
+        next(item for item in manifest['integrations'] if item['path'] == str(extension))['owned'] = False
+        save_private(self.home / MANIFEST, manifest)
+        document = json.loads(path.read_text())
+        event = 'agentStop'
+        document['hooks'][event] += receipt['value'][event]
+        document['editor'] = 'owner'
+        path.write_text(json.dumps(document))
+        changes = self.apply(['omp', 'copilot'])
+        self.assertEqual({c.path for c in changes if c.receipt.get('conflict')}, {extension, path})
+        self.assertEqual(extension.read_text(), unowned['value'])
+        self.assertEqual(json.loads(path.read_text()), {'editor': 'owner', 'version': 1,
+                                                       'hooks': {event: document['hooks'][event]}})
+
+    def test_saved_launcher_accepts_only_a_matching_recorded_legacy_destination(self):
+        from contextlib import redirect_stderr, redirect_stdout
+        import io
+        import install
+        config, context = self.user / 'separate/mcp.json', self.user / 'separate/AGENTS.md'
+        path, receipt = self.previous_turn('omp', profile=(config, context),
+                                           target=self.user / 'separate/extensions/maven-turn.js')
+        arguments = ['--local-only', '--home', str(self.home), '--harness', 'omp',
+                     '--harness-config', f'omp={config}', '--harness-context', f'omp={context}',
+                     '--skill-dir', str(self.user / 'separate/skills'), '--harness-adapter']
+        with patch.object(install, '_prerequisites'), redirect_stdout(io.StringIO()) as out, \
+                redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(install.main([*arguments, f'omp={path.with_name("other.js")}']), 1)
+            self.assertIn('must match', err.getvalue())
+            self.assertNotIn('--approve-harness-review', out.getvalue())
+            self.assertEqual(install.main([*arguments, f'omp={path}']), 1)
+            self.assertIn(f'{path} | maven-turn | SHA256', out.getvalue())
+        self.assertEqual(path.read_text(), receipt['value'])
+        self.assertFalse(config.exists())
+
+    def test_headless_existing_install_review_then_cutover_without_recreating_runtime(self):
+        import hashlib
+        import io
+        from contextlib import redirect_stdout
+        import install
+
+        # Isolate subprocess/package installation; the real planner, locks,
+        # manifest, selective mutations and review digest run end to end.
+        runtime = self.home / 'venv'
+        (runtime / 'bin').mkdir(parents=True)
+        (runtime / 'pyvenv.cfg').write_text('home = fixture\n')
+        (runtime / 'bin/python').touch()
+        launcher = runtime / 'bin/maven-mcp'
+        launcher.touch(mode=0o755)
+        settings = self.home / '.env'
+        settings.write_text('OWNER=unchanged\n')
+        settings.chmod(0o600)
+        inactive = self.user / 'inactive'
+        roots = [inactive / p[2] for p in HARNESS_PATHS.values()]
+        record_installation(self.home, self.source, [runtime], [], skill_roots=roots)
+        hooks = {}
+        for name in HARNESS_PATHS:
+            target, receipt = self.previous_turn(name, base=inactive)
+            hooks[target] = receipt['value']
+        manifest = (self.home / MANIFEST).read_bytes()
+        runtime_ino = runtime.stat().st_ino
+        options = ['--local-only', '--home', str(self.home), '--refresh-integrations']
+        with patch.object(install, '_prerequisites') as prerequisites, \
+                patch('venv.EnvBuilder.create', side_effect=AssertionError('healthy environment replaced')), \
+                patch.object(install.subprocess, 'run', return_value=Mock(returncode=0)), \
+                patch.object(install, '_install_command') as pip, patch('tools.update.record_package_inputs'), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(install.main(options), 1)
+            review = output.getvalue()
+            pip.assert_not_called()
+            self.assertEqual((self.home / MANIFEST).read_bytes(), manifest)
+            for target, value in hooks.items():
+                raw = value.encode() if isinstance(value, str) else json.dumps(
+                    value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
+                self.assertIn(f'{target} | maven-turn | SHA256 {hashlib.sha256(raw).hexdigest()}', review)
+            self.assertNotIn('previously installed extension', review)
+            self.assertNotIn('tools.turn_hook', review)
+            token = review.split('--approve-harness-review ')[-1].split()[0]
+            self.assertEqual(install.main([*options, '--approve-harness-review', token]), 0)
+            prerequisites.assert_called_with(require_aws=False)
+            pip.assert_called_once()
+        self.assertEqual(runtime.stat().st_ino, runtime_ino)
+        self.assertEqual(settings.read_text(), 'OWNER=unchanged\n')
+        for name, (config, context, skills) in HARNESS_PATHS.items():
+            self.assertTrue((inactive / config).exists())
+            self.assertTrue((inactive / context).exists())
+            self.assertTrue((inactive / skills / 'maven/SKILL.md').exists())
+            self.assertFalse((self.user / config).exists())
+            if name == 'gemini':
+                self.assertNotIn('hooks', json.loads((inactive / config).read_text()))
+            else:
+                self.assertFalse((inactive / TURN_PATHS[name]).exists())
 
     def test_native_drift_inventory_is_independent_of_pointer_and_skill_drift(self):
         from tools.harness import SKILL_FILES, skill_plan
@@ -133,7 +252,8 @@ class HarnessIntegrationTests(unittest.TestCase):
         extension, skills = custom / 'extensions/maven-turn.js', custom / 'skills'
         plan = skill_plan([skills], self.home)
         apply_owned_skills(self.home, self.source, plan, [p for p, _, _ in plan])
-        self.apply(['omp'], paths={'omp': (config, pointer)}, adapter_paths={'omp': extension})
+        self.apply(['omp'], paths={'omp': (config, pointer)})
+        self.previous_turn('omp', profile=(config, pointer), target=extension)
         self.apply(['claude'], guidance='old guidance')
         drift = {extension: 'owner extension', pointer: 'owner pointer', skills / SKILL_FILES[0]: 'owner skill'}
         for path, value in drift.items():
@@ -143,12 +263,12 @@ class HarnessIntegrationTests(unittest.TestCase):
         self.assertEqual(set(item['target'] for item in report['preserved']), {str(p) for p in drift})
         self.assertIn(str(self.user / HARNESS_PATHS['claude'][1]), report['integration_changes'])
         self.assertEqual({(i['component'], i['status']) for i in report['integration_inventory']
-                          if i['harness'] == 'omp'}, {('adapter', 'conflict'), ('config', 'current'),
-                                                      ('context', 'conflict')})
+                          if i['harness'] == 'omp'}, {('retired-hook', 'conflict'), ('config', 'current'),
+                                                     ('context', 'conflict')})
         self.assertEqual({p: p.read_text() for p in drift}, drift)
         self.assertFalse((self.user / '.omp').exists())
 
-    def test_disabled_foreign_and_duplicate_hooks_never_activate(self):
+    def test_foreign_hooks_and_disabled_policies_are_never_adopted_or_changed(self):
         codex = self.user / HARNESS_PATHS['codex'][0]
         codex.parent.mkdir()
         codex.write_text('[features]\nhooks = false\n')
@@ -161,7 +281,8 @@ class HarnessIntegrationTests(unittest.TestCase):
         other.parent.mkdir(parents=True)
         other.write_text('run("tools.turn_hook")')
         changes = self.apply(HARNESS_PATHS)
-        self.assertEqual({c.receipt['harness'] for c in changes if c.receipt.get('conflict')}, set(HARNESS_PATHS))
+        self.assertFalse(any(c.receipt.get('conflict') for c in changes))
+        self.assertEqual(other.read_text(), 'run("tools.turn_hook")')
         self.assertFalse((self.user / TURN_PATHS['omp']).exists())
         self.assertFalse((self.user / TURN_PATHS['codex']).exists())
         self.assertTrue(json.loads((self.user / TURN_PATHS['claude']).read_text())['disableAllHooks'])
@@ -170,6 +291,7 @@ class HarnessIntegrationTests(unittest.TestCase):
     def test_uninstall_removes_intact_mcp_but_preserves_modified_native_group(self):
         from tools.uninstall import local
         self.apply(['gemini'])
+        self.previous_turn('gemini')
         path = self.user / TURN_PATHS['gemini']
         document = json.loads(path.read_text())
         document['hooks']['AfterAgent'][0]['hooks'][0]['command'] = 'owner-custom'
@@ -183,11 +305,17 @@ class HarnessIntegrationTests(unittest.TestCase):
         self.assertEqual(json.loads(path.read_text()), {'hooks': document['hooks']})
 
     def test_cutover_removes_exact_owned_hooks_and_keeps_owner_entries(self):
+        # Several clients host lifecycle, turn, MCP and/or status line in one file.
         for name in HARNESS_PATHS:
             self.legacy(name)
+            self.previous_turn(name)
         changes = self.apply(HARNESS_PATHS, statusline=True)
         self.assertFalse(any(change.receipt.get('conflict') for change in changes))
-        self.assertEqual(sum(bool(c.receipt.get('retired')) for c in changes), len(HARNESS_PATHS))
+        self.assertEqual(sum(bool(c.receipt.get('retired')) for c in changes), 2 * len(HARNESS_PATHS))
+        manifest = read_private(self.home / MANIFEST)
+        self.assertFalse(any(r['key'] in ('maven-turn', 'maven-lifecycle') for r in manifest['integrations']))
+        for name in ('omp', 'copilot'):
+            self.assertFalse((self.user / TURN_PATHS[name]).exists())
         for name, relative in LIFECYCLE_PATHS.items():
             path = self.user / relative
             if name == 'omp':
@@ -281,15 +409,23 @@ class HarnessIntegrationTests(unittest.TestCase):
         self.assertNotIn(str(old), receipt['owned'])
         self.assertNotIn(str(old), receipt['skill_references'])
 
-    def test_custom_install_refresh_carries_recorded_paths_not_defaults(self):
-        import argparse
-        import install
+    def test_recorded_refresh_includes_every_custom_profile_without_touching_defaults(self):
+        from tools.harness import installed_targets, recorded_integration_plan
         custom = self.user / 'inactive profile'
-        self.apply(['codex'], paths={'codex': (custom / 'config.toml', custom / 'guidance.md')})
-        args = argparse.Namespace(harness=[], skill_dir=[], stage_harnesses=None)
-        install._update_targets(args, self.home)
-        self.assertEqual(args.harness_config, ['codex=' + str(custom / 'config.toml')])
-        self.assertEqual(args.harness_context, ['codex=' + str(custom / 'guidance.md')])
+        for profile in ('first', 'second'):
+            config, context = custom / profile / 'config.toml', custom / profile / 'guidance.md'
+            self.apply(['codex'], paths={'codex': (config, context)}, guidance='old guidance')
+            self.previous_turn('codex', profile=(config, context), target=config.parent / 'hooks.json')
+        targets = installed_targets(self.home)
+        self.assertEqual(targets['unresolved'], [])
+        changes = recorded_integration_plan(self.home, targets, guidance='new guidance')
+        self.assertEqual({c.path for c in changes if c.receipt.get('retired')},
+                         {custom / p / 'hooks.json' for p in ('first', 'second')})
+        for change in changes:
+            apply_reviewed_integration(self.home, self.source, change)
+        for profile in ('first', 'second'):
+            self.assertIn('new guidance', (custom / profile / 'guidance.md').read_text())
+            self.assertFalse((custom / profile / 'hooks.json').exists())
         self.assertFalse((self.user / '.codex').exists())
 
     def test_custom_profile_requires_explicit_configuration(self):

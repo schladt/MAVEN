@@ -255,7 +255,7 @@ Instance readiness checks the signed reconcile capability. Project and Home sele
 
 ### First use and everyday work
 
-Each owner turn consults local preferences before work and reports whether MAVEN was updated. Ask “Remember this decision” to save evidence locally or “Reconcile this project” to compare with the cloud. There is no cloud check on opening, saving or closing. See the [project workflow](workflow.md) and [client capabilities](integrations.md#harness-capability-matrix).
+The agent loads local preferences on first use, reuses them, and reports whether MAVEN changed on each enabled turn. Ask “Remember this decision” to save evidence locally or “Reconcile this project” to compare with the cloud. See the [project workflow](workflow.md) and [client capabilities](integrations.md#harness-capability-matrix).
 
 ### MAVEN Home
 
@@ -278,7 +278,7 @@ The installer ships one [MAVEN skill](../maven_resources/templates/skills/maven/
 
 To stage selected integrations without live writes, use `--stage-harnesses PATH`.
 For custom profiles, pair `--harness-config NAME=ABSOLUTE_FILE` with
-`--harness-context NAME=ABSOLUTE_FILE`, `--skill-dir PATH`, and the exact `--harness-adapter NAME=ABSOLUTE_PATH` for native turn events. A headless `--local-only` integration change first prints the planned writes and review digest without applying them. Review, then repeat with `--approve-harness-review SHA256` using that digest. Restart the affected clients and verify the first-turn preference check and footer; the installer does not restart an existing MCP process.
+`--harness-context NAME=ABSOLUTE_FILE` and `--skill-dir PATH`. A headless `--local-only` change first prints the planned writes and review digest. Review, then repeat with `--approve-harness-review SHA256` using that digest. Restart affected clients to load the new guidance and tools.
 
 ### Optional AWS Agent Toolkit
 

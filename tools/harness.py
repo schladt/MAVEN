@@ -1,7 +1,7 @@
 """Stdlib-only, reviewable harness configuration with selective ownership.
 
-The installer manages documented stdio, standing-instruction and native
-turn-hook surfaces. Configuration on disk is not proof a client ran a hook.
+The installer manages stdio MCP and standing instructions. Obsolete hook
+registrations are removed only against private installation receipts.
 """
 from __future__ import annotations
 
@@ -48,13 +48,6 @@ TURN_PATHS = {
     'copilot': '.copilot/hooks/maven-turn.json',
     'gemini': '.gemini/settings.json',
 }
-TURN_LIMITS = {
-    'omp': 'Restart OMP with extensions enabled; extension loading is not verified here.',
-    'claude': 'Restart Claude Code; enterprise settings and hook permission decisions still apply.',
-    'codex': 'Review and trust the exact definitions in /hooks; untrusted hooks do not execute.',
-    'copilot': 'Prompt-hook output is not model context: first-load preferences require the skill/MCP fallback.',
-    'gemini': 'Use a hook-capable Gemini CLI; disabled hooks, custom agents and policy can limit coverage.',
-}
 
 
 @dataclass(frozen=True)
@@ -63,6 +56,18 @@ class Change:
     before: bytes | None
     after: bytes | None
     receipt: dict | None
+    remaining: dict | None = None  # Unmatched hook ownership after a partial retirement.
+
+    def retirement_review(self):
+        """Identify exact obsolete code without printing it into the installation review."""
+        value = self.receipt['value']
+        if self.remaining:
+            unmatched = self.remaining['value']
+            value = {event: exact for event, entries in value.items()
+                     if (exact := [item for item in entries if item not in unmatched.get(event, [])])}
+        raw = value.encode() if isinstance(value, str) else json.dumps(
+            value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()
+        return f'Remove exact legacy hook: {self.path} | {self.receipt["key"]} | SHA256 {hashlib.sha256(raw).hexdigest()}'
 
 
 
@@ -443,7 +448,7 @@ def installed_targets(home: Path) -> dict:
     manifest = _active_manifest(home)
     destinations, unresolved = {}, []
     statusline_candidates = set()
-    retired = {}
+    retired = []
     adapter_sites = {}
     known_profiles = set()
     for item in manifest.get('integrations', []):
@@ -466,7 +471,9 @@ def installed_targets(home: Path) -> dict:
             if target is not None:
                 adapter_sites.setdefault((harness, config, context), set()).add(target)
         if item.get('key') == 'maven-turn':
-            if not valid_profile or role != 'adapter':
+            if valid_profile and role == 'adapter':
+                retired.append((harness, item))
+            else:
                 unresolved.append(str(path))
             continue
         if item.get('key') == 'maven-lifecycle':
@@ -475,7 +482,7 @@ def installed_targets(home: Path) -> dict:
                            if path.parts[-len(Path(suffix).parts):] == Path(suffix).parts]
                 harness = matches[0] if len(matches) == 1 else None
             if harness is not None:
-                retired.setdefault(harness, []).append(item)
+                retired.append((harness, item))
             else:
                 unresolved.append(str(path))
             continue
@@ -501,20 +508,13 @@ def installed_targets(home: Path) -> dict:
             paths[harness] = (next(iter(slots['config'])), next(iter(slots['context'])))
             known_profiles.add((harness, *paths[harness]))
         else:
-            unresolved.extend(str(path) for group in slots.values() for path in group)
+            paired = {p for name, config, context in known_profiles if name == harness for p in (config, context)}
+            unresolved.extend(str(path) for group in slots.values() for path in group if path not in paired)
     adapters = {}
     for key, sites in adapter_sites.items():
         adapters[key] = next(iter(sites)) if len(sites) == 1 else None
         if len(sites) != 1:
             unresolved.extend(map(str, sites))
-    retired_hooks = []
-    for harness, receipts in retired.items():
-        if len(receipts) == 1:
-            retired_hooks.append((harness, receipts[0]))
-        else:
-            unresolved.extend(item['path'] for item in receipts)
-    if len(statusline_candidates) > 1:
-        unresolved.extend(map(str, statusline_candidates))
     roots = set()
     for recorded in manifest.get('skill_roots', []):
         root = Path(recorded)
@@ -538,13 +538,18 @@ def installed_targets(home: Path) -> dict:
             'profiles': sorted(known_profiles), 'statusline_paths': statusline_candidates,
             'adapters': adapters,
             'skill_roots': sorted(roots),
-            'unresolved': sorted(set(unresolved)), 'statusline': bool(statusline_candidates),
-            'retired_hooks': retired_hooks}
+            'unresolved': sorted(set(unresolved)),
+            'retired_hooks': retired}
+
+
+def _conflict(path, error, harness, target, key='maven'):
+    return Change(path, None, b'', {'path': str(path), 'format': 'conflict', 'key': key, 'value': None,
+                  'owned': False, 'conflict': str(error), 'harness': harness, 'target': target})
 
 
 def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
                      ca_bundle: Path | None = None, paths=None, statusline: bool = False,
-                     guidance: str | None = None, adapter_paths=None, adapter_template=None) -> list[Change]:
+                     guidance: str | None = None, claude_settings: Path | None = None, recorded=None) -> list[Change]:
     """Plan independent harness targets; conflicts never suppress safe optional targets."""
     home = Path(home).expanduser().absolute()
     user_home = (user_home or Path.home()).expanduser().absolute()
@@ -555,12 +560,8 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
     receipts = _owned_integrations(home)
     if guidance is None:
         guidance = resource_path('templates/harness/startup.md').read_text()
-    recorded = installed_targets(home)
-
-    def conflict(path, error, harness, target):
-        return Change(path, None, b'', {'path': str(path), 'format': 'conflict',
-                      'key': 'maven', 'value': None, 'owned': False, 'conflict': str(error),
-                      'harness': harness, 'target': target})
+    if recorded is None:
+        recorded = installed_targets(home)
 
     for harness in harnesses:
         config, context, _ = HARNESS_PATHS[harness]
@@ -603,38 +604,31 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
                 change.receipt.update(harness=harness, target=role)
                 changes.append(change)
             except (OSError, ValueError) as error:
-                changes.append(conflict(path, error, harness, role))
-    adapter_targets = {}
-    for harness, pair in profiles.items():
-        pin = (harness, *pair)
-        recorded_target = recorded['adapters'].get(pin)
-        requested = (adapter_paths or {}).get(harness)
-        target = (Path(requested) if requested is not None else recorded_target
-                  or (baselines[harness] / TURN_PATHS[harness] if baselines[harness] else None))
-        if (pin in recorded['adapters'] and (recorded_target is None or target != recorded_target)):
-            changes.append(conflict(target or pair[0], 'Ambiguous or different recorded adapter; '
-                                    'remove the old registration through a reviewed operation first.', harness, 'adapter'))
-        elif target is None:
-            changes.append(conflict(pair[0], 'Guidance only: custom profile has no selected native adapter. '
-                                    'Select its exact --harness-adapter NAME=ABSOLUTE_PATH.', harness, 'adapter'))
-        else:
-            adapter_targets[harness] = target
+                changes.append(_conflict(path, error, harness, role))
     if statusline:
         if 'claude' not in harnesses:
             raise ValueError('The MAVEN status line is a Claude Code option; select the claude harness.')
-        target = adapter_targets.get('claude')
+        pair = profiles['claude']
+        base = baselines['claude']
+        target = recorded['adapters'].get(('claude', *pair)) or (base / CLAUDE_SETTINGS if base else None)
+        status_pins = [Path(item['path']) for item in _active_manifest(home).get('integrations', [])
+                       if item.get('key') == 'statusLine' and item.get('profile') == list(map(str, pair))]
+        if len(status_pins) == 1:
+            target = status_pins[0]
+        if claude_settings is not None:
+            target = Path(claude_settings)
         try:
             if target is None or not target.is_absolute() or '..' in target.parts or target.name != 'settings.json':
-                raise ValueError('Custom Claude profile: select its exact settings.json; default settings preserved.')
+                raise ValueError('Custom Claude profile: supply --claude-settings /absolute/path/to/settings.json.')
             change = _statusline_change(home, target)
             if target in destinations:
                 raise ValueError('Status line target overlaps a configuration or context file.')
             if change.before != change.after:
                 _require_unshared(home, target)
-            change.receipt.update(harness='claude', target='statusline')
+            change.receipt.update(harness='claude', target='statusline', profile=list(map(str, pair)))
             changes.append(change)
         except (OSError, ValueError) as error:
-            changes.append(conflict(target or profiles['claude'][0], error, 'claude', 'statusline'))
+            changes.append(_conflict(target or profiles['claude'][0], error, 'claude', 'statusline'))
 
     # Only consider receipts for the exact profile being configured. A staged
     # preview must never retire a hook from the user's live configuration.
@@ -642,56 +636,99 @@ def integration_plan(home: Path, harnesses, *, user_home: Path | None = None,
         if harness not in harnesses:
             continue
         target = Path(receipt['path'])
-        adapter = adapter_targets.get(harness)
-        if (adapter is None or adapter.name != Path(TURN_PATHS[harness]).name
-                or target != adapter.with_name(Path(LIFECYCLE_PATHS[harness]).name)):
-            continue
-        try:
-            if not receipt.get('owned', True):
-                raise ValueError(f'Unowned legacy hook preserved: {target}')
-            _require_unshared(home, target)
-            earlier = next((c for c in reversed(changes) if c.path == target and not c.receipt.get('conflict')), None)
-            before = earlier.after if earlier else _read(target)
-            after = _removal_bytes(receipt, before) if before is not None else None
-            if after == b'' and receipt.get('created'):
-                after = None
-            changes.append(Change(target, before, after, {**receipt, 'retired': True}))
-        except (OSError, ValueError) as error:
-            changes.append(conflict(target, error, harness, 'retired-hook'))
-    for harness, target in adapter_targets.items():
-        config, context = profiles[harness]
-        try:
-            if (not target.is_absolute() or '..' in target.parts
-                    or target.name != Path(TURN_PATHS[harness]).name
-                    or (harness == 'gemini' and target != config)
-                    or (target in destinations and (harness != 'gemini' or destinations.count(target) != 1))
-                    or list(adapter_targets.values()).count(target) != 1):
-                raise ValueError(f'Unsupported or overlapping native adapter destination; guidance only: {target}')
-            if any(c.receipt.get('target') == 'statusline' and c.path == target and harness != 'claude'
-                   for c in changes):
-                raise ValueError(f'Adapter overlaps another profile setting; preserved: {target}')
-            if any(c.receipt.get('harness') == harness and c.receipt.get('target') == 'config'
-                   and c.receipt.get('conflict') for c in changes):
-                raise ValueError('Native adapter not activated: this profile has a conflicting MAVEN MCP target.')
-            earlier = next((c for c in reversed(changes) if c.path == target and not c.receipt.get('conflict')), None)
-            before = earlier.after if earlier else _read(target)
-            fmt = 'file' if harness == 'omp' else 'json-hooks'
-            prior = receipts.get((str(target), fmt, 'maven-turn'))
-            if prior and prior.get('profile') != [str(config), str(context)]:
-                raise ValueError('Native adapter belongs to a different recorded profile.')
-            _require_unshared(home, target)
-            change = _turn_change(home, harness, config, target, before, prior, adapter_template)
-            change.receipt.update(harness=harness, target='adapter', profile=[str(config), str(context)])
-            changes.append(change)
-        except (OSError, ValueError) as error:
-            changes.append(conflict(target, error, harness, 'adapter'))
+        pair = profiles[harness]
+        if receipt['key'] == 'maven-turn':
+            if receipt['profile'] != list(map(str, pair)):
+                continue
+        else:
+            base = baselines[harness]
+            site = recorded['adapters'].get((harness, *pair))
+            if not (base and target == base / LIFECYCLE_PATHS[harness] or site and
+                    target == site.with_name(Path(LIFECYCLE_PATHS[harness]).name)):
+                continue
+        changes.extend(_retire_hook(home, harness, receipt, changes))
     for change in changes:
         item = change.receipt
         if not item.get('conflict') and item.get('target') in ('config', 'context'):
             name = item['harness']
             item['profile'] = list(map(str, profiles[name]))
-            if name in adapter_targets:
-                item['adapter_path'] = str(adapter_targets[name])
+    return changes
+
+
+def _retire_hook(home, harness, receipt, changes):
+    """Use the saved values, never today's templates or a search for command names."""
+    target = Path(receipt['path'])
+    def conflict(error):
+        return _conflict(target, error, harness, 'retired-hook', receipt['key'])
+    try:
+        layout = TURN_PATHS if receipt['key'] == 'maven-turn' else LIFECYCLE_PATHS
+        if (not receipt.get('owned', True) or not target.is_absolute() or '..' in target.parts
+                or target.name != Path(layout[harness]).name
+                or receipt['format'] != ('file' if harness == 'omp' else 'json-hooks')):
+            raise ValueError(f'Unowned or unsupported legacy hook preserved: {target}')
+        _require_unshared(home, target)
+        earlier = next((c for c in reversed(changes) if c.path == target and not c.receipt.get('conflict')), None)
+        before = earlier.after if earlier else _read(target)
+        remaining = None
+        exact = receipt
+        if before is not None and receipt['format'] == 'json-hooks':
+            hooks = _hook_map(_json(before), target)
+            matched, unmatched = {}, {}
+            for event, entries in receipt['value'].items():
+                for entry in entries:
+                    group = matched if hooks.get(event, []).count(entry) == 1 else unmatched
+                    group.setdefault(event, []).append(entry)
+            if unmatched:
+                if not matched:
+                    raise ValueError(f'Modified, missing or duplicated MAVEN hooks preserved: {target}')
+                remaining = {**receipt, 'value': unmatched}
+                exact = {**receipt, 'value': matched}
+        after = _removal_bytes(exact, before) if before is not None else None
+        if after == b'' and receipt.get('created'):
+            after = None
+        result = [Change(target, before, after, {**receipt, 'retired': True}, remaining)]
+        if remaining:
+            result.append(conflict(f'Modified, missing or duplicated MAVEN hooks preserved: {target}'))
+        return result
+    except (OSError, ValueError) as error:
+        return [conflict(error)]
+
+
+def recorded_integration_plan(home, targets, *, ca_bundle=None, guidance=None):
+    """Refresh every recorded profile, including multiple staged/custom profiles of one harness."""
+    changes = []
+    profiles_only = {**targets, 'retired_hooks': []}
+    used, overlap = set(), set()
+    for name, config, context in targets['profiles']:
+        pair = (config, context)
+        overlap.update(used.intersection(pair))
+        used.update(pair)
+        changes.extend(integration_plan(home, [name], paths={name: pair}, ca_bundle=ca_bundle,
+                                        guidance=guidance, recorded=profiles_only))
+    if overlap:
+        changes = [_conflict(c.path, 'Overlapping recorded profiles; target preserved.', c.receipt['harness'],
+                             c.receipt['target']) if c.path in overlap else c for c in changes]
+    # Retire from exact receipts independently of surviving profile pairs. A
+    # historical lifecycle-only installation need not acquire a new configuration.
+    for name, receipt in targets['retired_hooks']:
+        target = Path(receipt['path'])
+        if target not in overlap:
+            changes.extend(_retire_hook(home, name, receipt, changes))
+    # A status line predates profile tagging. Refresh its recorded settings file,
+    # not a default or a different Claude profile. A retirement may share the path.
+    for target in sorted(targets['statusline_paths']):
+        try:
+            if target in used:
+                raise ValueError('Recorded status line overlaps a profile configuration or context file; preserved.')
+            earlier = next((c for c in reversed(changes) if c.path == target and not c.receipt.get('conflict')), None)
+            before = earlier.after if earlier else _read(target)
+            change = _statusline_bytes(home, target, before)
+            if change.before != change.after:
+                _require_unshared(home, target)
+            change.receipt.update(harness='claude', target='statusline')
+            changes.append(change)
+        except (OSError, ValueError) as error:
+            changes.append(_conflict(target, error, 'claude', 'statusline', 'statusLine'))
     return changes
 
 
@@ -715,6 +752,8 @@ def apply_reviewed_integration(home, source, change):
         original = {k: v for k, v in receipt.items() if k != 'retired'}
         manifest = read_private(home / MANIFEST)
         manifest['integrations'].remove(original)
+        if change.remaining:
+            manifest['integrations'].append(change.remaining)
         apply_integration(change)
         save_private(home / MANIFEST, manifest)
 
@@ -769,9 +808,12 @@ def _mcp_change(home, harness, path, ca_bundle, receipts):
 
 def _statusline_change(home: Path, path: Path) -> Change:
     """Plan the owned top-level statusLine; never replace an owner's different one."""
+    return _statusline_bytes(home, path, _read(path))
+
+
+def _statusline_bytes(home, path, before):
     entry = {'type': 'command', 'command': shlex.join(
         ['env', 'MAVEN_HOME=' + str(home), str(home / 'venv/bin/maven-statusline')])}
-    before = _read(path)
     value = _json(before)
     receipt = {'path': str(path), 'format': 'json-setting', 'key': 'statusLine', 'value': entry}
     if 'statusLine' in value:
@@ -803,121 +845,6 @@ def _hook_map(document, path):
     if not isinstance(hooks, dict) or any(not isinstance(value, list) for value in hooks.values()):
         raise ValueError(f'Unsupported hooks configuration preserved: {path}')
     return hooks
-
-
-def _native_entries(home, harness):
-    from tools.turn_native import NATIVE_EVENTS, POST_MATCHERS
-    entries = {}
-    subscriptions = list(zip(NATIVE_EVENTS[harness], ('begin', 'observe', 'end'), strict=True))
-    if harness == 'copilot':
-        subscriptions.append(('preToolUse', 'guard'))
-    for event, phase in subscriptions:
-        command = shlex.join([str(home / 'venv/bin/python'), '-I', '-m', 'tools.turn_hook',
-                              harness, phase, '--home', str(home)])
-        matcher = {'matcher': POST_MATCHERS[harness]} if phase == 'observe' else {}
-        if harness == 'copilot':
-            entry = {'type': 'command', 'bash': command, **matcher}
-        else:
-            hook = {'type': 'command', 'command': command}
-            if harness == 'gemini':
-                hook['name'] = 'maven-turn'
-            entry = {**matcher, 'hooks': [hook]}
-        entries[event] = [entry]
-    return entries
-
-
-def _turn_marker(value):
-    content = json.dumps(value)
-    return 'tools.turn_hook' in content or 'maven-turn' in content
-
-
-def _turn_change(home, harness, config, path, before, prior, template):
-    """Replace only exact owned subscriptions; never adopt or repair foreign commands."""
-    if '\n' in str(home) or '\r' in str(home) or '$' in str(home):
-        raise ValueError('Hook installation requires literal non-interpolated paths.')
-    if harness in ('omp', 'copilot') and path.parent.is_dir():
-        suffixes = {'.js', '.mjs', '.ts'} if harness == 'omp' else {'.json'}
-        for sibling in path.parent.iterdir():
-            if sibling != path and sibling.suffix in suffixes:
-                raw = _read(sibling) or b''
-                if b'tools.turn_hook' in raw:
-                    raise ValueError(f'Another native registration exists; no duplicate was added: {sibling}')
-    receipt = {'path': str(path), 'key': 'maven-turn', 'created': prior['created'] if prior else before is None}
-    if harness == 'omp':
-        template = resource_path('templates/harness/maven-turn.js') if template is None else Path(template)
-        source = template.read_text()
-        if source.count('__MAVEN_HOME_JSON__') != 1:
-            raise ValueError('Invalid packaged OMP extension: expected one literal home parameter.')
-        body = source.replace('__MAVEN_HOME_JSON__', json.dumps(str(home)))
-        if prior and before != prior['value'].encode():
-            raise ValueError(f'Missing or modified installer-owned turn extension; preserved: {path}')
-        if not prior and before is not None:
-            raise ValueError(f'Existing unowned turn extension; preserved: {path}')
-        return Change(path, before, body.encode(), {**receipt, 'format': 'file', 'value': body})
-    if harness == 'codex':
-        settings = tomllib.loads((_read(config) or b'').decode())
-        features = settings.get('features', {})
-        if (not isinstance(features, dict) or features.get('hooks', features.get('codex_hooks')) is False
-                or settings.get('allow_managed_hooks_only')
-                or not isinstance(settings.get('hooks', {}), dict)
-                or any(_turn_marker(v) for v in settings.get('hooks', {}).values() if isinstance(v, list))):
-            raise ValueError('Codex hooks disabled, managed-only, or already registered inline; guidance only.')
-    document = _json(before)
-    policies = [document]
-    if harness == 'copilot':
-        if path.parent.name != 'hooks':
-            raise ValueError('Copilot requires a user-profile hooks/ directory; guidance only.')
-        settings = _json(_read(path.parent.parent / 'settings.json'))
-        if _turn_marker(settings.get('hooks', {})):
-            raise ValueError('MAVEN hooks already registered in Copilot settings; no duplicate was added.')
-        policies.append(settings)
-    for policy in policies:
-        strict = policy.get('strictPluginOnlyCustomization', False)
-        if (policy.get('disableAllHooks') or policy.get('allowManagedHooksOnly')
-                or not isinstance(strict, (list, bool)) or strict is True or isinstance(strict, list) and 'hooks' in strict):
-            raise ValueError('Hooks disabled or managed-only in the selected profile; guidance only.')
-    if harness == 'gemini':
-        options = document.get('hooksConfig', {})
-        if (not isinstance(options, dict) or options.get('enabled') is False
-                or not isinstance(options.get('disabled', []), list) or 'maven-turn' in options.get('disabled', [])):
-            raise ValueError('Gemini MAVEN hooks disabled in the selected profile; guidance only.')
-    created_version = False
-    if harness == 'copilot':
-        if before is not None and not prior:
-            raise ValueError(f'Unowned Copilot hook file; preserved: {path}')
-        if prior and document.get('version') != 1:
-            raise ValueError(f'Missing or modified Copilot hook file version; preserved: {path}')
-        created_version = 'version' not in document
-        document.setdefault('version', 1)
-    created_container = 'hooks' not in document
-    hooks = _hook_map(document, path)
-    if 'maven-turn' in hooks.get('disabled', []):
-        raise ValueError('The selected profile disables maven-turn; guidance only.')
-    entries = _native_entries(home, harness)
-    old = prior['value'] if prior else {}
-    marked = {event: [item for item in items if _turn_marker(item)] for event, items in hooks.items()}
-    if {event: items for event, items in marked.items() if items} != old:
-        raise ValueError(f'Unowned, missing, duplicated or modified MAVEN turn subscription; preserved: {path}')
-    receipt.update(format='json-hooks', value=entries,
-                   created_container=prior['created_container'] if prior else created_container,
-                   created_version=prior.get('created_version', False) if prior else created_version,
-                   created_events=sorted(event for event in entries if event not in hooks or
-                                         prior and event in prior.get('created_events', [])))
-    if old == entries:
-        return Change(path, before, before, receipt)
-    for event, previous in old.items():
-        items = hooks[event]
-        index = items.index(previous[0])
-        for entry in previous:
-            items.remove(entry)
-        if event in entries:
-            items[index:index] = entries[event]
-        elif not items and event in prior.get('created_events', []):
-            del hooks[event]
-    for event, new in entries.items():
-        if event not in old:
-            hooks.setdefault(event, []).extend(new)
-    return Change(path, before, _encode(document), receipt)
 
 
 def _replace(path: Path, before: bytes | None, after: bytes) -> None:

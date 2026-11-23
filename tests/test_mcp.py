@@ -52,7 +52,11 @@ class OfflineStdioTests(unittest.IsolatedAsyncioTestCase):
                 await client.initialize()
                 self.assertEqual((await call(client, 'maven_orient', {'cwd': str(ordinary)}))['status'], 'not_enabled')
                 self.assertFalse((ordinary / '.maven').exists())
-                state = await call(client, 'maven_orient', {'cwd': str(child)})
+                context = await call(client, 'maven_context', {'cwd': str(child)})
+                self.assertEqual(context['status'], 'partial')  # No configured Nexus.
+                self.assertIsNone(context['nexus'])
+                self.assertNotIn('turn_key', context)
+                state = context['active']
                 write = await call(client, 'maven_local_write', {**selected, 'expected_token': state['token'],
                     'kind': 'brief', 'data': {'purpose': 'Measure verified offline progress.'}, 'reason': 'Owner scope'})
                 self.assertEqual(write['id'], state['brief_id'])
@@ -61,21 +65,23 @@ class OfflineStdioTests(unittest.IsolatedAsyncioTestCase):
             # A fresh transport knows nothing about its predecessor. No wrap-up or cloud credentials.
             async with stdio_client(params) as (rx, tx), ClientSession(rx, tx) as client:
                 await client.initialize()
-                state = await call(client, 'maven_orient', {'cwd': str(root)})
+                context = await call(client, 'maven_context', {'cwd': str(root)})
+                state = context['active']
                 self.assertEqual(state['brief']['data']['purpose'], 'Measure verified offline progress.')
-                self.assertFalse(state['cloud_checked'])
+                self.assertFalse(context['cloud_checked'])
                 other = {**selected, 'project_id': str(uuid4()), 'expected_token': state['token']}
                 await call(client, 'maven_local_write', {**other, 'kind': 'brief', 'data': {'purpose': 'wrong scope'},
                            'reason': 'Wrong selected project'}, ok=False)
                 await call(client, 'maven_reconcile', {**selected, 'action': 'verify'}, ok=False)
-                again = await call(client, 'maven_orient', {'cwd': str(root)})
-                receipt = await call(client, 'maven_turn', {'cwd': str(child), 'action': 'begin'})
-                self.assertEqual(receipt['status'], 'partial')  # Valid project, no configured Nexus.
-                turn = {'cwd': str(child), 'turn_key': receipt['turn_key']}
-                change = await call(client, 'maven_turn', {**turn, 'action': 'capture', 'project_id': project,
-                    'kind': 'action', 'data': {'summary': 'Adjusted fixture files'}, 'reason': 'Verified', 'covers_files': True})
+                change = await call(client, 'maven_local_write', {**selected, 'expected_token': state['token'],
+                    'kind': 'action', 'data': {'summary': 'Adjusted fixture files'}, 'reason': 'Verified'})
                 self.assertTrue(change['changed'])
-                status = await call(client, 'maven_turn', {**turn, 'action': 'finish'})
-                self.assertIn('updated locally', status['footer'])
-                self.assertIn('Nexus preferences unavailable', status['footer'])
+                bad = await call(client, 'maven_local_write', {**selected, 'expected_token': change['token'],
+                    'kind': 'setting', 'data': {'category': 'preference', 'summary': 'Unscoped'}, 'reason': 'Bad'},
+                    ok=False)
+                self.assertNotIn('changed', bad)
+                again = (await call(client, 'maven_context', {'cwd': str(child)}))['active']
+                self.assertEqual(again['token'], change['token'])
                 self.assertEqual(again['brief'], state['brief'])
+                self.assertFalse((home / 'runtime' / 'turns').exists())
+                self.assertNotIn('maven_turn', [tool.name for tool in (await client.list_tools()).tools])

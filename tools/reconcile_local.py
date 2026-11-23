@@ -228,11 +228,9 @@ class LocalStore:
         with self._transaction() as (db, token):
             return {"source": "local", "project_id": self.project_id, "token": token, **self._orientation(db)}
 
-    def turn_view(self, *, active: bool, nexus: bool, known_token: str | None) -> dict:
-        """Conditionally load one scoped snapshot; never read history or unrelated Home records."""
+    def context_view(self, *, active: bool, nexus: bool) -> dict:
+        """Read a scoped snapshot, without history or unrelated Home records."""
         with self._transaction() as (db, token):
-            if token == known_token:
-                return {"token": token, "unchanged": True}
             view = self._orientation(db) if active else {}
             rows = db.execute(
                 "SELECT id, json_extract(record,'$.data.scope'), json_type(record,'$.data.summary'), "
@@ -245,4 +243,4 @@ class LocalStore:
                 if summary_type != "text" or not summary.strip():
                     raise ValueError("scoped preference lacks a usable summary")
                 preferences.append({"id": key, "scope": scope, "summary": summary})
-            return {**view, "preferences": preferences, "token": token, "unchanged": False}
+            return {**view, "preferences": preferences, "token": token}

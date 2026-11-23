@@ -30,7 +30,7 @@ Open the intended folder and ask **“Enable MAVEN for this project.”** Review
 | “Remember why we chose this.” | Updates the relevant local record, keeping evidence and distinguishing a proposal from an accepted decision. |
 | “Reconcile this project.” | Compares both inventories, reconciles compatible work, and verifies what reached both sides. A disputed decision is reported separately; unrelated work can still converge. |
 
-The [MAVEN skill](maven_resources/templates/skills/maven/SKILL.md) defines the every-turn local check and status footer. Its [reconcile procedure](maven_resources/templates/skills/maven/references/reconcile.md) synchronizes project knowledge **only when requested**, not source files, transcripts or secrets. Project skills can link a repository-owned procedure; discovering one does not execute it. **Git publication, secret use, deployment and policy activation are separate actions with their own approvals.**
+The [MAVEN skill](maven_resources/templates/skills/maven/SKILL.md) loads local project context and Nexus preferences once, saves qualifying work before answering, and ends each enabled reply with one status line. A no-change follow-up needs no MAVEN call. The [reconcile procedure](maven_resources/templates/skills/maven/references/reconcile.md) syncs knowledge **only on request**, not source files, transcripts or secrets. **Git publication, secret use, deployment and policy activation require separate approvals.**
 
 ## Setup, update and removal
 

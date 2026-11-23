@@ -1,4 +1,4 @@
-"""Local turn consultation and conditional capture. No MCP transport or cloud client needed."""
+"""Offline workspace context and conditional, destination-bound capture."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -13,7 +13,7 @@ from tools.reconcile_redaction import Replica
 
 
 class LocalApplication:
-    """The same locked, replica-protected store for both native hooks and MCP."""
+    """Open selected stores under binding and replica protection."""
 
     def __init__(self, *, home=None, env=None):
         self.home = (Path(home).expanduser().resolve() if home else
@@ -73,27 +73,21 @@ def _destination(app, cwd, tracked, selected, *, active, cohort=None):
             raise ProjectError('Home does not belong to the active instance and recovery epoch')
         # The SQLite token alone is insufficient: restored/copied worktrees can share it,
         # and a preferences-only Nexus view cannot stand in for an active project's brief.
-        scope = digest(['turn-view-v1', str(app.home), str(store.root), store.project_id, identity,
-                        selected['mode'], active])
+        scope = digest(['workspace-context-v1', str(app.home), str(store.root), store.project_id, identity,
+                        selected['mode'], active, tracked['root'] if tracked else str(Path(cwd).resolve()),
+                        tracked['project_id'] if tracked else None])
         yield store, scope, identity
 
 
-def _view(app, cwd, tracked, selected, *, active, known, cohort=None):
+def _view(app, cwd, tracked, selected, *, active, cohort=None):
     with _destination(app, cwd, tracked, selected, active=active, cohort=cohort) as (store, scope, identity):
-        cached = known.get(store.project_id)
-        prefix = scope + '.'
-        revision = cached[len(prefix):] if isinstance(cached, str) and cached.startswith(prefix) else None
         nexus = selected['mode'] == 'home'
-        view = store.turn_view(active=active, nexus=nexus, known_token=revision)
-        return {**selected, **view, 'binding': scope, 'token': prefix + view['token'], 'use_home': nexus}, identity
+        view = store.context_view(active=active, nexus=nexus)
+        return {**selected, **view, 'token': scope + '.' + view['token'], 'use_home': nexus}, identity
 
 
-def consult(app, cwd, known=None):
-    """Read before action. Pass only tokens for projections *retained* by this conversation."""
-    if known is None:
-        known = {}
-    if not isinstance(known, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in known.items()):
-        raise ValueError('known must map project IDs to retained turn-view tokens')
+def consult(app, cwd):
+    """Load one workspace context; the caller retains it until a refresh is needed."""
     result = {'status': 'unavailable', 'active': None, 'nexus': None, 'cloud_checked': False}
     error = 'project_unavailable'
     try:
@@ -101,18 +95,18 @@ def consult(app, cwd, known=None):
         if tracked is None:
             error = 'nexus_unavailable'
         selected = tracked or select_project(cwd, app.home, use_home=True)
-        active, identity = _view(app, cwd, tracked, selected, active=True, known=known)
+        active, identity = _view(app, cwd, tracked, selected, active=True)
         result['active'] = active
         if selected['mode'] == 'home':
-            nexus = active
+            nexus = 'same_as_active'
         else:
             error = 'nexus_unavailable'
             selected = select_project(cwd, app.home, use_home=True)
-            nexus, _ = _view(app, cwd, tracked, selected, active=False, known=known, cohort=identity)
+            nexus, _ = _view(app, cwd, tracked, selected, active=False, cohort=identity)
         return {**result, 'status': 'consulted', 'nexus': nexus}
     except Exception:
         # A damaged binding, guard, or unreadable store never enables a fallback. Do not
-        # reflect file names or exception text across the automatic hook boundary.
+        # reflect file names or exception text across the workspace context boundary.
         return {**result, 'status': 'partial' if result['active'] is not None else 'unavailable', 'error': error}
 
 
@@ -135,12 +129,13 @@ def capture(app, cwd, *, project_id, use_home, expected_token, reason, kind=None
     preference = not erase and kind == 'setting' and data.get('category') == 'preference'
     if preference:
         scope = data.get('scope')
-        if scope not in ('project', 'nexus') or not isinstance(data.get('summary'), str) or not data['summary'].strip():
-            raise ValueError('a preference requires its owner-selected scope and summary')
+        if scope not in ('project', 'nexus') or not all(
+                isinstance(data.get(key), str) and data[key].strip() for key in ('title', 'summary')):
+            raise ValueError('a preference requires its owner-selected scope, title and summary')
         if (scope == 'nexus' and not use_home) or (scope == 'project' and not active):
             raise ProjectError('preference scope does not match the selected destination')
     elif not active:
-        raise ProjectError('ordinary turn capture belongs to the active project')
+        raise ProjectError('ordinary capture belongs to the active project')
 
     cohort = None
     if not active:
@@ -150,13 +145,18 @@ def capture(app, cwd, *, project_id, use_home, expected_token, reason, kind=None
     with _destination(app, cwd, tracked, selected, active=active, cohort=cohort) as (store, binding, _):
         prefix = binding + '.'
         if not isinstance(expected_token, str) or not expected_token.startswith(prefix):
-            raise StaleView('turn view is not bound to this destination; consult again')
-        if not active and record_id:
+            raise StaleView('workspace context is not bound to this destination; reload context')
+        if record_id and preference:
             previous = store.lookup(record_id, expected_token[len(prefix):])
             if previous is not None:
                 old = previous['record']
+                if old.get('erased'):
+                    raise ValueError('erased records cannot be restored')
                 fields = old.get('data', {})
-                if old.get('kind') != 'setting' or fields.get('category') != 'preference' or fields.get('scope') != 'nexus':
-                    raise ProjectError('only a consulted Nexus preference may be corrected across project boundaries')
+                if old.get('kind') == 'setting' and fields.get('category') == 'preference':
+                    if fields.get('scope') != data['scope']:
+                        raise ProjectError('a correction cannot change preference scope')
+                elif not active:
+                    raise ProjectError('only a Nexus preference may be corrected across project boundaries')
         result = local_write(store, expected_token[len(prefix):], kind, data, reason, record_id=record_id, erase=erase)
         return {**result, 'changed': bool(result['changed']), 'token': prefix + result['token']}

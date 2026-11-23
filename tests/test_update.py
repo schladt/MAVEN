@@ -154,7 +154,7 @@ class LocalUpdateTests(unittest.TestCase):
                 self.assertTrue(read_private(intent)['completed'])
                 self.assertFalse(target.exists())
 
-    def test_update_command_preserves_recorded_custom_destinations_and_private_settings(self):
+    def test_guided_update_uses_the_selected_home_not_ambient_profiles(self):
         from tools.harness import apply_integration, integration_plan
         custom = self.base / 'custom-profile'
         custom.mkdir()
@@ -174,9 +174,7 @@ class LocalUpdateTests(unittest.TestCase):
             local.record_installation(self.home, self.checkout, [], references, integrations=[change.receipt])
             apply_integration(change)
         command = update.install_command(self.home, self.checkout)
-        self.assertIn('omp=' + str(config), command)
-        self.assertIn('omp=' + str(context), command)
-        self.assertIn(str(skills), command)
+        self.assertEqual(command[1:], [str(self.checkout / 'install.py'), '--home', str(self.home)])
         self.assertNotIn(str(self.base / '.omp/agent/mcp.json'), command)
         self.assertEqual(json.loads(config.read_text())['owner'], {'keep': True})
         self.assertTrue(context.read_text().startswith('Owner context\n'))

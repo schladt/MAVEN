@@ -155,7 +155,7 @@ def _git(checkout: Path) -> dict:
 
 def local_report(home: Path, checkout: Path) -> dict:
     """Compare the installed software and installer-owned harness skills with the checkout."""
-    from tools.harness import TURN_LIMITS, installed_targets, integration_plan, skill_bodies, skill_cutover_plan
+    from tools.harness import installed_targets, recorded_integration_plan, skill_bodies, skill_cutover_plan
     home, checkout = Path(home), Path(checkout)
     if not (checkout / 'install.py').is_file() or not (checkout / 'pyproject.toml').is_file():
         raise ValueError(f'Not a MAVEN checkout (install.py and pyproject.toml required): {checkout}')
@@ -184,15 +184,8 @@ def local_report(home: Path, checkout: Path) -> dict:
         conflicts.extend({'target': name, 'component': 'skill', 'status': 'conflict',
                           'reason': 'No canonical skill root recorded for this profile; select --skill-dir.'}
                          for name in harnesses)
-    integrations = []
     guidance = (templates / 'harness/startup.md').read_text() if harnesses else ''
-    for name, config, context in targets['profiles']:
-        adapter = targets['adapters'].get((name, config, context))
-        statusline = name == 'claude' and (adapter in targets['statusline_paths'] or
-                                           adapter is None and targets['paths'].get(name) == (config, context)
-                                           and targets['statusline'])
-        integrations.extend(integration_plan(home, [name], paths={name: (config, context)}, statusline=statusline,
-                                            adapter_template=templates / 'harness/maven-turn.js', guidance=guidance))
+    integrations = recorded_integration_plan(home, targets, guidance=guidance)
     changed_integrations = [str(change.path) for change in integrations if not change.receipt.get('conflict')
                             and (change.before != change.after or change.receipt.get('retired'))]
     conflicts.extend({'target': str(change.path), 'component': change.receipt.get('target'),
@@ -220,25 +213,13 @@ def local_report(home: Path, checkout: Path) -> dict:
             'limitations': ['Installed package bytes and recorded installation inputs are compared; '
                             'dependency environment health is not verified.',
                             'Git ahead/behind uses the last fetch; nothing was fetched.',
-                            *(f'{name}: {TURN_LIMITS[name]}' for name in harnesses)]}
+                            'Restart affected harnesses to load updated software and workspace guidance.']}
 
 
 def install_command(home: Path, checkout: Path) -> list[str]:
-    from tools.harness import installed_targets
-    targets = installed_targets(home)
-    command = [sys.executable, str(Path(checkout) / 'install.py'), '--home', str(home)]
-    # Recorded destinations, not today's ambient profile, determine update targets.
-    for harness, (config, context) in targets['paths'].items():
-        command.extend(['--harness', harness, '--harness-config', f'{harness}={config}',
-                        '--harness-context', f'{harness}={context}'])
-        adapter = targets['adapters'].get((harness, config, context))
-        if adapter is not None:
-            command.extend(['--harness-adapter', f'{harness}={adapter}'])
-    for root in targets['skill_roots']:
-        command.extend(['--skill-dir', str(root)])
-    if targets['statusline'] and 'claude' in targets['paths']:
-        command.append('--claude-statusline')
-    return command
+    # The guided "Update local MAVEN software" task reads the complete private
+    # inventory at review time, including multiple profiles of one harness.
+    return [sys.executable, str(Path(checkout) / 'install.py'), '--home', str(home)]
 
 
 def pending_owned_skills(home, targets=None):
