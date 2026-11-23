@@ -25,6 +25,8 @@ class PreservedArchiveUnavailable(SetupPending):
         'then start a fresh reconcile inspection. If it is gone, keep any unsynced local work here '
         'and use another installation bound to the same cloud project to access the cloud copy. '
         'That does not recover local-only records.'
+        ' For an intentionally deleted archive, acknowledge that exact absent directory with '
+        'maven-project acknowledge-deleted-archive --archive ABSOLUTE_PATH.'
     )
 
 
@@ -511,6 +513,56 @@ def _bound_instance(private, binding):
     return None
 
 
+def _archive_absent(archive):
+    # Only ENOENT counts as absence. Broken links, partial archives and access
+    # errors must not become permission to skip a preserved root.
+    try:
+        archive.lstat()
+    except FileNotFoundError:
+        archive.parent.stat()
+        return True
+    return False
+
+
+def _disposition(candidate, archive, instance_id):
+    return {'schema': 1, 'state': 'owner_acknowledged_deleted', 'instance_id': instance_id,
+            'operation_id': candidate['operation_id'], 'archive': str(archive),
+            'project_id': record_uuid(candidate['old_project']['project_id']),
+            'old_directory': candidate['old_directory'], 'parent_inode': archive.parent.stat().st_ino}
+
+
+def acknowledge_deleted_archive(home, archive):
+    """Local owner attestation; never edit a switch journal, archive, or cloud record."""
+    match = re.fullmatch(r'\.maven-preserved-(' + _UUID + ')', archive.name)
+    if not match or not archive.is_absolute() or archive != archive.resolve():
+        raise SetupPending('Specify the exact absolute preserved archive path from the failure.')
+    directory = home / 'runtime' / 'project-switches'
+    _owned_dir(directory)
+    key = match[1]
+    path = directory / (key + '.json')
+    journal = _json(path)
+    candidate = journal['intent']['candidate']
+    instance = record_uuid(candidate['instance_id'])
+    root = Path(candidate['root'])
+    with Replica(home, instance).locked(), project_binding_lock(home, root, shared=True):
+        if (_json(path) != journal or journal.get('phase') != 'completed'
+                or candidate['operation_id'] != key or candidate['preservation_path'] != str(archive)
+                or root.parent != archive.parent or root != root.resolve() or not root.is_dir()
+                or candidate['old_project']['root'] != str(root)
+                or candidate['old_project'].get('instance_id', instance) != instance):
+            raise SetupPending('A matching completed switch at this installation is required.')
+        if not _archive_absent(archive):
+            raise SetupPending('The original archive path is occupied; no acknowledgment was recorded.')
+        marker = directory / (key + '.disposition.json')
+        receipt = _disposition(candidate, archive, instance)
+        if _exists(marker):
+            if _json(marker) != receipt:
+                _unsafe()
+        else:
+            save_json(marker, receipt)
+        return receipt
+
+
 def _sweep_preserved(home, instance_id, targets, bundle_check, receive_project=None):
     directory = home / 'runtime' / 'project-switches'
     if not _exists(directory):
@@ -541,20 +593,28 @@ def _sweep_preserved(home, instance_id, targets, bundle_check, receive_project=N
         if (not root.is_absolute() or root != root.resolve() or candidate['operation_id'] != match[1]
                 or old['root'] != str(root) or candidate['preservation_path'] != str(archive)):
             _unsafe()
-        if not _exists(archive) or not _exists(archive / '.maven'):
-            raise PreservedArchiveUnavailable(f'Preserved archive {archive.name} is missing or incomplete.')
-        _owned_dir(archive)
-        private = archive / '.maven'
-        _owned_dir(private)
-        # A remount can assign a different device number to the same directory.
-        if candidate['old_directory'].get('inode') != private.stat().st_ino:
-            raise PreservedArchiveUnavailable(f'Preserved archive {archive.name} is not the recorded directory.')
-        binding = _json(private / 'project.json')
-        if binding.get('project_id') != project or binding.get('root') != str(root):
-            _unsafe()
-        old_bound = _bound_instance(private, binding) == instance_id
-        if old.get('instance_id') == instance_id and not old_bound:
-            _unsafe()
+        disposition = directory / (match[1] + '.disposition.json')
+        acknowledged_absence = (_exists(disposition) and _archive_absent(archive)
+                                and candidate.get('instance_id') == instance_id
+                                and _json(disposition) == _disposition(candidate, archive, instance_id))
+        if acknowledged_absence:
+            # No archive to inspect. Only the switch file can establish the old instance.
+            old_bound = old.get('instance_id') == instance_id
+        else:
+            if not _exists(archive) or not _exists(archive / '.maven'):
+                raise PreservedArchiveUnavailable(f'Preserved archive {archive.name} is missing or incomplete.')
+            _owned_dir(archive)
+            private = archive / '.maven'
+            _owned_dir(private)
+            # A remount can assign a different device number to the same directory.
+            if candidate['old_directory'].get('inode') != private.stat().st_ino:
+                raise PreservedArchiveUnavailable(f'Preserved archive {archive.name} is not the recorded directory.')
+            binding = _json(private / 'project.json')
+            if binding.get('project_id') != project or binding.get('root') != str(root):
+                _unsafe()
+            old_bound = _bound_instance(private, binding) == instance_id
+            if old.get('instance_id') == instance_id and not old_bound:
+                _unsafe()
         if old_bound and receive_project is not None:
             targets = receive_project(project)
             retired_projects = {t['id'] for t in targets if t['kind'] == 'project'}
@@ -563,13 +623,15 @@ def _sweep_preserved(home, instance_id, targets, bundle_check, receive_project=N
         if destination_retired or old_bound and project in retired_projects:
             if not journal.get('redacted'):
                 pinned = {key: candidate[key] for key in ('operation_id', 'root', 'old_directory', 'preservation_path')}
+                if 'instance_id' in candidate:
+                    pinned['instance_id'] = candidate['instance_id']
                 pinned['old_project'] = {key: old[key] for key in ('root', 'project_id', 'instance_id') if key in old}
                 if old_bound:
                     pinned['old_project']['instance_id'] = instance_id
                 _changed(path, {'schema': 1, 'phase': 'completed', 'redacted': True,
                                 'intent': {'candidate': pinned}})
                 count += 1
-        if not old_bound:
+        if acknowledged_absence or not old_bound:
             continue
         store = LocalStore(archive, project)
         if _exists(store.path):

@@ -169,6 +169,72 @@ class ReplicaTests(unittest.TestCase):
         self.assertNotIn(SENSITIVE, json.dumps(actual_admin))
         self.assertEqual(json.loads((home / f'runtime/administration/{keep_op}.json').read_text()), other_admin)
 
+    def test_acknowledged_absence_is_exact_and_never_covers_a_returned_archive(self):
+        from tools.reconcile_redaction import (
+            PreservedArchiveUnavailable, _sweep_preserved, acknowledge_deleted_archive)
+        store = self.machine('acknowledged')
+        home, instance = store.replica.home, self.identity['instance_id']
+        def missing():
+            key = uid()
+            archive = self.base / ('.maven-preserved-' + key)
+            candidate = {'operation_id': key, 'root': str(store.root), 'instance_id': instance,
+                         'old_project': {'root': str(store.root), 'project_id': self.project},
+                         'preservation_path': str(archive), 'old_directory': {'device': 1, 'inode': 2}}
+            save_private(home, f'runtime/project-switches/{key}.json',
+                         {'phase': 'completed', 'intent': {'candidate': candidate}})
+            return archive
+        archive = missing()
+        def sweep():
+            return _sweep_preserved(home, instance, [], None)
+        with self.assertRaises(PreservedArchiveUnavailable):
+            sweep()
+        receipt = acknowledge_deleted_archive(home, archive)
+        self.assertEqual(acknowledge_deleted_archive(home, archive), receipt)
+        self.assertEqual(sweep(), 0)
+        archive.mkdir(mode=0o700)
+        with self.assertRaises(PreservedArchiveUnavailable):
+            sweep()
+        with self.assertRaises(SetupPending):
+            acknowledge_deleted_archive(home, archive)
+        archive.rmdir()
+        neighbor = missing()
+        with self.assertRaisesRegex(PreservedArchiveUnavailable, neighbor.name):
+            sweep()
+
+    def test_retirement_clears_switch_file_after_acknowledging_deleted_archive(self):
+        from tools.reconcile_redaction import _sweep_preserved, acknowledge_deleted_archive
+        for retire_old in (False, True):
+            with self.subTest(retire_old=retire_old):
+                store = self.machine('retired-old' if retire_old else 'retired-destination')
+                home, instance = store.replica.home, self.identity['instance_id']
+                key, destination = uid(), uid()
+                archive = self.base / ('.maven-preserved-' + key)
+                old = {'root': str(store.root), 'project_id': self.project}
+                if retire_old:
+                    old['instance_id'] = instance
+                candidate = {'operation_id': key, 'root': str(store.root), 'instance_id': instance,
+                             'old_project': old, 'new_project': {'project_id': destination},
+                             'destination': {'data': {'name': 'Retired fixture project'}},
+                             'preservation_path': str(archive), 'old_directory': {'device': 1, 'inode': 2}}
+                path = home / f'runtime/project-switches/{key}.json'
+                journal = {'phase': 'completed', 'intent': {'candidate': candidate,
+                                                           'source': {'excerpt': 'Approved fixture switch'}}}
+                save_private(home, path.relative_to(home), journal)
+                acknowledgment = acknowledge_deleted_archive(home, archive)
+                _sweep_preserved(home, instance, [{'kind': 'project', 'id': uid()}], None)
+                self.assertEqual(json.loads(path.read_text()), journal)
+
+                targets = [{'kind': 'project', 'id': self.project if retire_old else destination}]
+                _sweep_preserved(home, instance, targets, None)
+                cleaned = json.loads(path.read_text())
+                self.assertTrue(cleaned['redacted'])
+                self.assertNotIn('source', cleaned['intent'])
+                self.assertNotIn('destination', cleaned['intent']['candidate'])
+                self.assertNotIn(destination, json.dumps(cleaned))
+                self.assertEqual(acknowledge_deleted_archive(home, archive), acknowledgment)
+                self.assertEqual(_sweep_preserved(home, instance, targets, None), 0)
+                self.assertFalse(archive.exists())
+
     def test_preserved_archive_on_renumbered_device_is_swept_without_touching_neighbor(self):
         store = self.machine('switched')
         ident = uid()

@@ -403,6 +403,8 @@ def _run_cli(argv):
     git_setup.add_argument('--accepted-url', required=True)
     git_setup.add_argument('--branch', required=True)
     git_setup.add_argument('--json', action='store_true')
+    ack = commands.add_parser('acknowledge-deleted-archive', help='Record intentional deletion of one absent local preservation; deletes nothing')
+    ack.add_argument('--archive', type=Path, required=True)
     show = commands.add_parser('show', help='Show the explicit local project, without cloud access')
     show.add_argument('--root', type=Path, required=True)
     show.add_argument('--json', action='store_true')
@@ -418,6 +420,9 @@ def _run_cli(argv):
                     'Project selection', 'Project binding',
                 ], lambda ui: interactive_project(args))
             result = setup_project(args)
+        elif args.command == 'acknowledge-deleted-archive':
+            from tools.reconcile_redaction import acknowledge_deleted_archive
+            result = acknowledge_deleted_archive(instance_home(), args.archive)
         elif args.command == 'git':
             result = configure_git(args.root, remote=args.remote, accepted_url=args.accepted_url,
                                    branch=args.branch, env=args.env)

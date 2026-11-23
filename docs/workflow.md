@@ -28,6 +28,10 @@ An absent record is not a deletion. Cancel or supersede it explicitly. A bad mer
 
 A changed disk number does not invalidate a preserved archive. A missing archive is different: the failure names the archive and offers recovery. Put the original directory back if available. Otherwise, another installation bound to the same project can access the cloud copy; it cannot recover work saved only on this machine. For any failure, report the next recovery action rather than silently retrying a write.
 
+If the owner intentionally deleted the **entire** preserved directory, run `maven-project acknowledge-deleted-archive --archive ABSOLUTE_PATH` with the exact path from that switch, then reconcile again. This records a private local acknowledgment alongside the unchanged switch receipt. It does not delete or restore anything, recover unsynced data, or attest to backups or offline devices. It applies to that archive only while the whole path is absent. A returned, partial or different archive still goes through normal validation.
+
+Acknowledging deletion skips only the missing directory. If the project is later retired, MAVEN still removes the saved project details and old approval from the local file that recorded the switch.
+
 ## Optional Git publication
 
 Memory does not need Git. Only ask to configure or publish Git when that external effect is intended. Review the actual current branch, remote and accepted push URL; never embed credentials in the URL. Publication requires the destination already to equal the reviewed HEAD. Before publishing, review the exact candidate: paths and bytes, commit message, HEAD and destination, configured checks and their results, and proposed effects. Actual owner approval and confirmation that relevant writers have stopped apply to **that candidate only**. Changed bytes, branch, destination or check results invalidate the review. Approving a candidate with failed checks does not make it integration-ready. A saved decision, a reconcile or a previously approved push grants no new publication approval.
