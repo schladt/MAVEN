@@ -1000,7 +1000,7 @@ class AdminOperations:
             elif mode == 'profile':
                 self._question(state, 'deploy_identity', 'Select the separate deployment sign-in', [
                     Field('profile', 'Named AWS login-only profile', values.get('MAVEN_DEPLOY_PROFILE', ''),
-                          help='Use a separate deployment login. No access keys, tokens, or passwords.'),
+                          help='Choose a separate local profile name. AWS login can create it here. Do not enter keys, tokens or passwords.'),
                     Field('cache', 'Private deployment login-cache directory', values.get('MAVEN_DEPLOY_LOGIN_CACHE',
                           str(self.home / 'runtime/aws-deploy-login-cache')), help='Separate from the daily login cache.')],
                     'deploy_access_inspect', description='Expected account: ' + account +
@@ -1217,7 +1217,7 @@ class AdminOperations:
                     principal=wizard.values.get(prefix + 'EXPECTED_PRINCIPAL', 'Unknown'))
                 self._question(state, step, 'Select daily-use access', [
                     Field('profile', 'Named AWS login-only profile', wizard.values.get(prefix + 'PROFILE', ''),
-                          help='A local AWS CLI profile name selects who signs in, not a permission grant. Daily-use accesses memory; maintenance manages infrastructure or reads required stack metadata. Never enter access keys.'),
+                          help='Enter an existing or new local profile name. If it is new, the installer offers AWS sign-in to create it. Use your daily identity, not root or access keys.'),
                     Field('cache', 'Private sign-in cache directory', wizard.values.get(prefix + 'LOGIN_CACHE',
                           str(self.home / 'runtime' / 'aws-login-cache')),
                           help='An absolute owner-private local folder for AWS login tokens. Use separate folders for daily-use and maintenance so sign-ins cannot replace each other.')], step + '_inspect',

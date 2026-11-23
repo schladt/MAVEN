@@ -934,7 +934,7 @@ class AdministrationTests(unittest.TestCase):
             aws.assert_not_called()
             self.preflight.assert_not_called()
 
-    def test_unknown_account_offers_typed_external_login_without_starting_it(self):
+    def test_first_use_offers_signin_for_absent_profile_but_not_broken_configuration(self):
         result = self.controller.begin('setup', {'mode': 'existing'})
         result = self.respond(result, {'mode': 'existing', 'connection': 'saved-stack', 'region': 'us-east-1'})
         result = self.advance_to_question(result)
@@ -943,17 +943,28 @@ class AdministrationTests(unittest.TestCase):
         self.assertIn('Unknown', question['description'])
         self.assertTrue(all(field['help'] for field in question['fields']))
         result = self.respond(result, {'profile': 'daily-owner', 'cache': str(self.home / 'runtime/daily-login')})
-        with patch('tools.setup_common.inspect_login_identity', side_effect=MemoryClientError('authentication_required')), \
+        config = self.base / 'aws-config'
+        environment = {'AWS_CONFIG_FILE': str(config),
+                       'AWS_SHARED_CREDENTIALS_FILE': str(self.base / 'absent-credentials')}
+        with patch.dict(os.environ, environment), patch('botocore.session.Session.create_client') as network, \
                 patch('subprocess.run') as launch:
             result = self.controller.advance(result['operation_id'])
+            network.assert_not_called()
         launch.assert_not_called()
         self.assertEqual(result['handoff']['type'], 'aws_login')
+        self.assertEqual(result['handoff']['reason'], 'selected_login_profile_missing')
         self.assertEqual(result['handoff']['command'],
                          ['aws', 'login', '--profile', 'daily-owner', '--region', 'us-east-1'])
         self.assertIn('Unknown', result['handoff']['account'])
         self.assertEqual(result['handoff']['environment'],
                          {'AWS_LOGIN_CACHE_DIRECTORY': str(self.home / 'runtime/daily-login')})
         self.assertFalse(result['presentation']['verified'])
+        self.assertFalse(config.exists())
+        config.write_text('[malformed')
+        with patch.dict(os.environ, environment):
+            broken = self.controller.advance(result['operation_id'])
+        self.assertEqual(broken['error'], 'selected_login_configuration_unavailable')
+        self.assertNotIn('handoff', broken)
 
     def test_saved_account_blocks_other_login_before_confirmation_or_cloud_work(self):
         wizard = Wizard(self.home)

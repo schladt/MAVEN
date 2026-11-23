@@ -16,7 +16,7 @@ from botocore.config import Config
 from botocore.credentials import CredentialResolver, LoginProvider, RefreshableCredentials
 from botocore.session import Session as BotocoreSession
 from botocore.utils import JSONFileCache
-from botocore.exceptions import BotoCoreError, ClientError
+from botocore.exceptions import BotoCoreError, ClientError, ProfileNotFound
 
 from tools.project import default_environment
 from .client import (AUTHENTICATION_CODES, CONFIG_KEYS, OPTIONAL_CONFIG_KEYS,
@@ -231,6 +231,10 @@ def login_session(values, *, deploy=False, region=None):
         if credentials is None or credentials.method != 'login':
             raise MemoryClientError('selected_profile_requires_login')
         return session
+    except ProfileNotFound as error:
+        if error.kwargs.get('profile') == profile:
+            raise MemoryClientError('selected_login_profile_missing') from None
+        raise aws_error(error) from None
     except (BotoCoreError, ClientError) as error:
         raise aws_error(error) from None
     except (KeyError, TypeError, ValueError):

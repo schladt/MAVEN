@@ -52,7 +52,8 @@ class MemoryClientError(Exception):
         self.detail = detail
 
 
-AUTHENTICATION_CODES = frozenset({'authentication_required', 'selected_login_unavailable_or_expired'})
+AUTHENTICATION_CODES = frozenset({'authentication_required', 'selected_login_unavailable_or_expired',
+                                  'selected_login_profile_missing'})
 
 
 def authority_scope(project_id=None):

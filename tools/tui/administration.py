@@ -59,6 +59,8 @@ _CODE_HELP = {
                                           'settings may not exist or may not trust this user.',
     'selected_login_unavailable_or_expired': 'The AWS sign-in for the selected profile is missing or expired. '
                                              'Sign in again with that profile.',
+    'selected_login_profile_missing': 'This AWS profile does not exist on this machine. AWS login creates it '
+                                      'when you sign in; no .env import or access keys are needed.',
     'unexpected_login_identity': 'The AWS sign-in belongs to a different principal than the one confirmed '
                                  'for this setup. Sign in as the confirmed principal or change the selection.',
     'authentication_required': 'The MAVEN service did not accept the request credentials. Sign in again.',
@@ -157,7 +159,7 @@ def _instructions(result, home, identifier):
     prerequisite = ('AWS sign-in required.' if handoff and handoff.get('type') == 'aws_login'
                     else 'Local software update required.' if handoff and handoff.get('type') == 'local_update'
                     else 'External prerequisite required.')
-    error = result.get('error') or prerequisite
+    error = result.get('error') or (handoff or {}).get('reason') or prerequisite
     instructions = [f'Stopped at: {stage} (step "{result.get("step", "unknown")}")', f'Error: {error}']
     if error in _CODE_HELP:
         instructions.append(_CODE_HELP[error])
@@ -195,7 +197,12 @@ def _instructions(result, home, identifier):
     if handoff:
         command = ['env', *(key + '=' + value for key, value in handoff.get('environment', {}).items()),
                    *handoff['command']]
-        instructions.extend(['', handoff['reason'], '', 'External command:', shlex.join(command)])
+        exact = shlex.join(command)
+        if handoff.get('type') == 'aws_login':
+            instructions[:0] = ['Browser on this machine: ' + exact,
+                                'Browser on another device: ' + exact + ' --remote', '']
+        else:
+            instructions.extend(['', handoff['reason'], '', 'External command:', exact])
     if result.get('probe_status') and result['probe_status'] != 'awake':
         status = result['probe_status']
         instructions.extend(['', 'Latest read-only database probe: ' + status,
@@ -220,9 +227,12 @@ def _aws_login(ui, controller, result, home, identifier):
     """Only this typed handoff may launch authentication, after an explicit choice."""
     handoff = result['handoff']
     instructions = _instructions(result, home, identifier)
-    status = 'Signing in does not approve deployment or verify the AWS identity. The next check inspects the actual account and principal.'
+    first_use = handoff.get('reason') == 'selected_login_profile_missing'
+    action = 'Create profile and sign in' if first_use else 'Sign in'
+    status = 'MAVEN checks the AWS account and principal after sign-in. This does not approve deployment.'
     while True:
-        choices = [('Sign in with the selected AWS profile', 'signin'),
+        choices = [(action + ' — browser on this machine', 'signin'),
+                   (action + ' — browser on another device (SSH/headless)', 'remote'),
                    ('Show manual sign-in instructions', 'manual')]
         if 'back' in result.get('next_actions', []):
             choices.append(('Back to change the AWS selection', 'back'))
@@ -244,7 +254,8 @@ def _aws_login(ui, controller, result, home, identifier):
                 return {**current, 'login_status': 'handoff_changed'}
             # This TUI choice already confirmed launch; never ask for a second key.
             selected = owner_login.confirmed_command(handoff)
-            login = ui.external(selected['argv'], env={**os.environ, **selected['environment']}, check=False)
+            argv = [*selected['argv'], '--remote'] if choice == 'remote' else selected['argv']
+            login = ui.external(argv, env={**os.environ, **selected['environment']}, check=False)
             if login.returncode == 0:
                 ui.message('Sign-in command exited with status 0; checking the actual AWS identity.')
                 return owner_login.after_admin_login(controller, result, verify=True)

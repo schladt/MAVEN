@@ -134,8 +134,13 @@ label, not an access grant. Saved/imported account and principal details are lab
 as expected, not verified. On a first install they may be unknown until sign-in;
 setup then explicitly confirms the actual STS account and principal before changes.
 An identity differing from saved bindings is blocked, not silently substituted.
-Choose **Sign in**, manual instructions, Back or pause; login is never launched
-without that choice. A failed login offers manual recovery, not a readiness claim.
+On a new machine, enter the profile name you want to create. You do not need an
+existing AWS profile or a MAVEN `.env` from another machine. Choose **Create profile
+and sign in** with a browser on this machine or **on another device (SSH/headless)**.
+The latter runs `aws login --remote` in the installer terminal: open the AWS link
+on your browser device, then paste the code back into that terminal, not into chat.
+The installer shows both exact commands and only launches the one you select.
+A failed login offers manual recovery, not a readiness claim.
 
 MAVEN keeps the daily AWS login in its selected private cache. A separate deployment
 profile has its own private cache; role mode instead assumes the exact deployment

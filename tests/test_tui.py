@@ -305,6 +305,49 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                         controller.respond.assert_not_called()
                         await pilot.press('ctrl+q')
 
+    async def test_new_profile_headless_signin_shows_and_launches_the_same_scoped_command(self):
+        import shlex
+        from tools.administration import AdminOperations
+        from tools.setup import Wizard
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            home, cache = root / 'home', root / 'cache with spaces'
+            env = {'AWS_CONFIG_FILE': str(root / 'absent-config'),
+                   'AWS_SHARED_CREDENTIALS_FILE': str(root / 'absent-credentials')}
+            controller = AdminOperations(home)
+            identifier = controller.begin('setup', {'mode': 'existing'})['operation_id']
+            Wizard(home).settings({'MAVEN_STACK_NAME': 'test-stack', 'MAVEN_AWS_REGION': 'us-east-1'})
+            # Resume the blocked identity inspection saved by a pre-fix installer.
+            state = controller._load(identifier)
+            state.update(step='identity_inspect', state='blocked', pending_interaction=None,
+                         error='selected_login_configuration_unavailable')
+            state['answers']['identity'] = {'profile': 'fresh-owner', 'cache': str(cache)}
+            controller._save(state)
+            app = WorkflowApp('Existing stack', [], lambda ui: present(ui, home, operation_id=identifier))
+            identity = {'Account': '123456789012', 'Arn': 'arn:aws:iam::123456789012:user/test-owner'}
+            with patch.dict(os.environ, env), patch.object(app, 'external', return_value=Mock(returncode=0)) as launch:
+                async with app.run_test(size=(100, 34)) as pilot:
+                    await pilot.pause()
+                    await pilot.click('#accept')  # Retry the stopped inspection, not the login.
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, ChooseScreen)
+                    expected = ['aws', 'login', '--profile', 'fresh-owner', '--region', 'us-east-1', '--remote']
+                    shown = app.screen.query_one('#choice-details', TextArea).text
+                    self.assertIn(shlex.join(['env', 'AWS_LOGIN_CACHE_DIRECTORY=' + str(cache), *expected]), shown)
+                    self.assertIn('Create profile', {v: k for k, v in app.screen.choices}['remote'])
+                    launch.assert_not_called()
+                    with patch('tools.setup_common.inspect_login_identity', return_value=identity) as inspect:
+                        await pilot.press('down', 'enter')
+                        await pilot.pause()
+                    launch.assert_called_once_with(expected, {'env': {**os.environ, 'AWS_LOGIN_CACHE_DIRECTORY': str(cache)},
+                                                              'check': False})
+                    inspect.assert_called_once()
+                    review = controller.status(identifier)['pending_interaction']
+                    self.assertEqual(review['review']['identity'], identity)
+                    self.assertEqual(review['key'], 'identity_approval')
+                    await pilot.press('ctrl+q')
+
     async def test_rejected_migration_shows_safe_diagnostics_without_auto_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             identifier = str(uuid4())
@@ -383,7 +426,7 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                         async with app.run_test(size=(100, 34)) as pilot:
                             await pilot.pause()
                             options = app.screen.query_one('#choices', OptionList)
-                            options.highlighted = {'manual': 1, 'back': 2, 'pause': 3}[action]
+                            options.highlighted = [value for _, value in app.screen.choices].index(action)
                             await pilot.press('enter')
                             await pilot.pause()
                             if action == 'manual':
@@ -426,7 +469,8 @@ class TuiBoundaryTests(unittest.IsolatedAsyncioTestCase):
                             external.assert_called_once()
                             controller.advance.assert_not_called()
                             controller.respond.assert_not_called()
-                            app.screen.query_one('#choices', OptionList).highlighted = 1
+                            app.screen.query_one('#choices', OptionList).highlighted = [
+                                value for _, value in app.screen.choices].index('manual')
                             await pilot.press('enter')
                             await pilot.pause()
                             self.assertIsInstance(app.screen, ReviewScreen)
