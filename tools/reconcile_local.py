@@ -11,7 +11,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from .reconcile_records import (
-    MAX_BATCH, accept_change, brief_id, canonical, record_uuid, summarize, validate_project_envelope,
+    MAX_BATCH, REDACTION_TIMESTAMP, accept_change, brief_id, canonical, record_uuid, summarize,
+    validate_project_envelope,
 )
 
 
@@ -85,9 +86,10 @@ class LocalStore:
         self.project_id = record_uuid(project_id)
         self.brief_id = brief_id(project_id)
         self.path = self.root / ".maven" / "reconcile" / f"{project_id}.sqlite3"
+        self.replica = None
 
     @contextmanager
-    def _transaction(self, *, write=False):
+    def _transaction(self, *, write=False, redacting=False):
         _directory(self.path.parent.parent, private=False)
         _directory(self.path.parent, private=True)
         _private_database(self.path)
@@ -112,7 +114,10 @@ class LocalStore:
                     db.execute("PRAGMA user_version=1")
                 db.commit()
             db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
-            if db.execute("PRAGMA user_version").fetchone()[0] != 1:
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            if version == 2 and not redacting:
+                raise ValueError("retired project identity; offline work cannot be replayed")
+            if version not in (1, 2):
                 raise ValueError("unsupported local memory schema")
             row = db.execute("SELECT token FROM project WHERE id=?", (self.project_id,)).fetchone()
             if row is None:
@@ -126,6 +131,30 @@ class LocalStore:
     def _guard(actual, expected):
         if actual != expected:
             raise StaleView("local project changed; inspect the current inventory")
+
+    def install_redactions(self, ids, *, retired=False):
+        """Apply learned, authoritative markers without loading stale payloads into Python.
+
+        Version 2 is terminal: preserve unrelated unpublished work but bar opening
+        its old identity, including with older version-1 local store clients.
+        """
+        if not ids and not retired:
+            return
+        with self._transaction(write=True, redacting=True) as (db, token):
+            changed = False
+            for key in ids:
+                record = {"erased": True, "id": record_uuid(key), "written_at": REDACTION_TIMESTAMP}
+                item = summarize({"record": record, "history": []})
+                cursor = db.execute(
+                    "INSERT INTO records(id,kind,item,record,history) VALUES(?,'erased',?,?,'[]') "
+                    "ON CONFLICT(id) DO UPDATE SET kind='erased',item=excluded.item,record=excluded.record,history='[]' "
+                    "WHERE kind<>'erased' OR record<>excluded.record OR item<>excluded.item OR history<>'[]'",
+                    (key, canonical(item), canonical(record)))
+                changed |= bool(cursor.rowcount)
+            if retired:
+                db.execute("PRAGMA user_version=2")
+            if changed:
+                db.execute("UPDATE project SET token=? WHERE id=?", (str(uuid4()), self.project_id))
 
     def inventory(self) -> dict:
         with self._transaction() as (db, token):

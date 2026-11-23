@@ -379,6 +379,20 @@ class AdministrationTests(unittest.TestCase):
         self.assertTrue(result['outcome']['instance_ready'])
         self.assertFalse(result['outcome']['secrets_ready'])
 
+    def test_redaction_upgrade_deploys_protections_before_ledger_genesis(self):
+        mocks = self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'JournalBucketPolicy',
+                                      'ResourceType': 'AWS::S3::BucketPolicy', 'Replacement': 'False'}])
+        mocks['schema_status'].return_value = {'state': 'pending', 'pending': ['026_reviewed_redaction.sql']}
+        answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_access': {'mode': 'profile'},
+                   'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')}}
+        effects = []
+        with patch('tools.memory.bootstrap.apply', side_effect=lambda *a, **k: effects.append('bucket-policy') or {}), \
+                patch('tools.memory.bootstrap.initialize', side_effect=lambda *a, **k: effects.append('ledger') or {}):
+            result = self.run_update(answers)
+        self.assertEqual(result['state'], 'completed', result)
+        self.assertEqual(effects, ['bucket-policy', 'ledger'])
+
     def test_safe_field_diagnostic_does_not_require_environment_or_hide_original_error(self):
         detail = 'Unknown field: extra'
         with patch.object(AdminOperations, '_project', side_effect=MemoryClientError('invalid_request', detail=detail)):

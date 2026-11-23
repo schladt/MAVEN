@@ -335,6 +335,10 @@ def _download(client, bundle):
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
         body = response['Body']
+        # The redaction sentinel deliberately occupies this immutable key forever.
+        # Do not try historic versions or another bucket if normal access is denied.
+        if response.get('Metadata', {}).get('maven-redacted') == 'true':
+            _fail('skill_bundle_redacted')
         if response.get('ContentLength') != bundle['size_bytes']:
             _fail()
         raw = body.read(bundle['size_bytes'] + 1)
@@ -382,7 +386,7 @@ def register_bundle(client, request: dict, bundle_path: Path) -> dict:
                       ContentType='application/zip', ServerSideEncryption='AES256')
     except Exception:
         # Includes a precondition conflict and an uncertain transport result.
-        # Reconcile the exact immutable key, never overwrite or guess success.
+        # Never replace a live bundle OR the terminal zero-byte redaction sentinel.
         existing = _download(client, bundle)
         _verified(existing, bundle, candidate['slug'])
     return client.invoke('/v1/proposals/create', request)

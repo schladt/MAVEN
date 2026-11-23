@@ -85,13 +85,15 @@ class CloudContractTests(unittest.TestCase):
                                              '018_skill_discovery.sql', '019_secret_catalog.sql',
                                              '020_secret_adapter_grants.sql', '021_secret_adapter_scope_guard.sql',
                                              '022_reviewed_cleanup.sql', '023_retired_work_visibility.sql',
-                                             '024_immutable_secret_consumption.sql', '025_project_reconciliation.sql'])
+                                             '024_immutable_secret_consumption.sql', '025_project_reconciliation.sql',
+                                             '026_reviewed_redaction.sql', '027_redaction_delivery.sql', '028_redaction_outbox.sql',
+                                             '029_narrow_erase_restore.sql'])
         installed = {name: digest for name, digest, _ in bundle[:first_new]}
         old = {**store.control_document(CONFIG, 'ready'), 'schema_version': 1,
                'app_secret_arn': CONFIG['app_secret_arn'], 'app_secret_version': 'fixture-version'}
         database.scalar.side_effect = [True, True, json.dumps(installed), json.dumps(old)]
         secrets = Mock()
-        admin._install(database, CONFIG, secrets, store.control_document(CONFIG, 'maintenance'), upgrade=True)
+        admin._install(database, CONFIG, secrets, store.control_document(CONFIG, 'maintenance'), ledger_gate=Mock(), upgrade=True)
         secrets.get_secret_value.assert_not_called()
         registrations = [call for call in database.execute.call_args_list
                          if call.args[0].startswith('INSERT INTO maven.schema_migrations')]
@@ -141,6 +143,7 @@ class CloudContractTests(unittest.TestCase):
                 session.client.return_value = data
                 with patch.object(admin, '_config'), patch.object(admin, 'authorized_actor'), \
                         patch.object(admin, '_check_logging'), \
+                        patch.object(admin.redaction_ledger, 'cluster_identity', return_value='a'*64), \
                         patch.object(admin, '_control', return_value=(store.control_document(CONFIG, 'maintenance'), 'etag')), \
                         patch.object(store.DataAPI, 'scalar', side_effect=[
                             True, True, json.dumps(installed), json.dumps(state)]):
@@ -213,6 +216,10 @@ class CleanupAdminTests(unittest.TestCase):
                  'app_secret_version': 'fixture-version'}
         with patch.object(admin, 'DataAPI', return_value=database) as adapter, \
                 patch.object(admin, '_check_logging') as logging_check, \
+                patch.object(admin, 'fetch_control', return_value=({'redaction_bound': True}, 'etag')), \
+                patch.object(admin.redaction_ledger, 'cluster_identity', return_value='a'*64), \
+                patch.object(admin.redaction_ledger, 'verify'), \
+                patch.object(admin.erase_fence, 'record_legacy_erase'), \
                 patch.object(admin, '_state', return_value=state):
             value = call(session)
         self.assertTrue(adapter.call_args.kwargs['admin'])
@@ -269,7 +276,6 @@ class CleanupAdminTests(unittest.TestCase):
                 CONFIG, session, [self.RECORD], operation_id=self.OPERATION, expected_revisions={self.RECORD: 1},
                 actor='owner', reason='Erase', approval_digest=self.DIGEST), None, capability=False)
         self.assertEqual(error.exception.status, 'cleanup_upgrade_required')
-        self.assertIn('ordinary memory remains available', error.exception.metadata['detail'])
         result, _ = self.run_cleanup(lambda session: admin.cleanup_describe(CONFIG, session, [self.RECORD]),
                                      [], capability=False)
         self.assertEqual(result, [])

@@ -335,7 +335,7 @@ def _project_execute(action, progress, save, db, s3):
 
 
 def _freeze(action, progress, save, db, s3):
-    from tools.memory.store import control_document, fetch_control
+    from tools.memory.store import fetch_control
     details = action['details']
     config = details['config']
     token = details['barrier_token']
@@ -347,7 +347,7 @@ def _freeze(action, progress, save, db, s3):
     if control.get('uninstall') != token:
         if control != details['control'] or etag != details['control_etag'] or control['state'] != 'ready':
             raise UninstallError('cloud control identity changed; preserve maintenance and create a new plan')
-        frozen = dict(control_document(config, 'maintenance'), uninstall=token)
+        frozen = dict(control, state='maintenance', uninstall=token)
         s3.put_object(Bucket=config['journal_bucket'], Key='control.json', Body=canonical(frozen),
                       ContentType='application/json', ServerSideEncryption='AES256', IfMatch=etag)
     control, _ = fetch_control(s3, config, allow_maintenance=True)

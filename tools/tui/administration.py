@@ -161,6 +161,8 @@ def _instructions(result, home, identifier):
     instructions = [f'Stopped at: {stage} (step "{result.get("step", "unknown")}")', f'Error: {error}']
     if error in _CODE_HELP:
         instructions.append(_CODE_HELP[error])
+    if result.get('outcome') and result.get('kind') == 'cleanup' and result.get('parameters', {}).get('action') == 'redact':
+        instructions.append('Verified and outstanding effects:\n' + _text(result['outcome']))
     if result.get('error_detail'):
         instructions.append(result['error_detail'])
     # The sign-in screen offers its own choices; Resume applies only to the stopped-step screen.
@@ -256,8 +258,8 @@ def _aws_login(ui, controller, result, home, identifier):
         ui.message(status)
 
 
-def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=None):
-    controller = AdminOperations(home)
+def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=None, controller=None):
+    controller = controller if controller is not None else AdminOperations(home)
     parameters = dict(parameters or {})
     if mode is not None:
         parameters['mode'] = mode
@@ -315,6 +317,8 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
                 # Old checkpoints without a target-aware summary retain the full
                 # artifact in the main view. Metadata never replaces the bound review.
                 summary = question.get('description') or artifact
+                if 'owner_phrase' in question:
+                    summary += '\n\nComplete bound review:\n' + artifact
                 technical = (details + '\n\n' if details else '') + 'Complete bound review:\n' + artifact
                 approved = ui.review(question['title'], summary, details=technical,
                                      identity=question['review_digest'], identity_label='Review digest', back=can_back)
@@ -327,23 +331,32 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
                 response = {'approved': True, 'review_digest': question['review_digest']}
                 # Record the observed terminal action, not an invented owner quote
                 # or a claim that a harness/chat supplied the approval.
-                response['source'] = {
-                    'origin': 'owner MAVEN administration TUI',
-                    'excerpt': 'Owner selected Approve for ' + question['title'] +
-                               ' / review digest ' + question['review_digest'],
-                }
+                if 'owner_phrase' in question:
+                    typed = ui.form('Confirm this exact review', [Field('phrase', 'Exact owner approval phrase')],
+                                    description='Read the complete review. To authorize it, enter exactly:\n' +
+                                    question['owner_phrase'], details=artifact, back=True)
+                    if typed is None:
+                        continue
+                    response['source'] = {'origin': 'owner_terminal', 'excerpt': typed['phrase']}
+                else:
+                    response['source'] = {
+                        'origin': 'owner MAVEN administration TUI',
+                        'excerpt': 'Owner selected Approve for ' + question['title'] +
+                                   ' / review digest ' + question['review_digest'],
+                    }
                 confirmations = question.get('confirmations', {})
                 if confirmations:
                     values = ui.form('Separate destructive confirmations', [
-                        Field(key, 'Enter exact instance for ' + key,
-                              help='Exact destructive target: ' + str(target)) for key, target in confirmations.items()],
+                        Field(key, ('Attest ' if 'owner_phrase' in question else 'Enter exact instance for ') + key,
+                              help='Enter exactly: ' + str(target)) for key, target in confirmations.items()],
                         description='These separate confirmations authorize only the exact destructive targets listed. No action has been submitted.',
                         details=_text(question['review']), back=True)
                     if values is None:
                         continue
                     response['confirmations'] = values
             try:
-                result = controller.respond(identifier, question['interaction_id'], question['revision'], response)
+                terminal = {'owner_terminal': True} if 'owner_phrase' in question else {}
+                result = controller.respond(identifier, question['interaction_id'], question['revision'], response, **terminal)
             except AdminInputError as error:
                 # The saved question is unchanged; show why and ask it again.
                 ui.message('Not accepted: ' + str(error))
@@ -390,19 +403,94 @@ def present(ui, home, *, operation_id=None, mode=None, kind='setup', parameters=
             result = controller.advance(identifier)
 
 
+def _typed_target(value):
+    from tools.administration import _PROVIDER_KINDS, _redaction_targets
+    parts = value.split(':')
+    if len(parts) == 2:
+        target = {'kind': parts[0], 'id': parts[1]}
+    elif len(parts) == 3 and parts[0] == 'project_record':
+        target = {'kind': parts[0], 'project_id': parts[1], 'id': parts[2]}
+    else:
+        raise argparse.ArgumentTypeError('Use KIND:UUID or project_record:PROJECT_UUID:RECORD_UUID.')
+    try:
+        _redaction_targets([target], provider=target['kind'] in _PROVIDER_KINDS)
+    except AdminInputError:
+        raise argparse.ArgumentTypeError('Expected a supported kind and canonical UUID(s), never a locator.') from None
+    return target
+
+
+def _private_locator():
+    import getpass
+    import warnings
+    # Never fall back to redirected stdin/stderr or a visible terminal echo.
+    with open('/dev/tty', 'w', encoding='utf-8', buffering=1) as tty, warnings.catch_warnings():
+        if not tty.isatty():
+            raise ValueError
+        warnings.simplefilter('error', getpass.GetPassWarning)
+        return getpass.getpass('Private provider selector (never a value or credential): ', stream=tty)
+
+
 def main(argv=None):
-    """Terminal entry for MAVEN Home: enable, change or turn off, or resume one exact operation."""
+    """Begin a reviewed Home or redaction operation, or resume its exact administration UUID."""
     parser = argparse.ArgumentParser(description=main.__doc__)
     parser.add_argument('--home', type=Path, default=Path(os.environ.get('MAVEN_HOME', str(Path.home() / '.maven'))))
-    parser.add_argument('--action', choices=('enable', 'disable'), default='enable')
-    parser.add_argument('--operation', help='Resume the exact persisted administration operation UUID')
+    from tools.administration import _REDACTION_ACTIONS
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--action', choices=('enable', 'disable'))
+    selection.add_argument('--cleanup', choices=_REDACTION_ACTIONS, help='Reviewed redaction administration')
+    selection.add_argument('--operation', help='Resume the exact persisted administration operation UUID')
+    parser.add_argument('--job-id', help='Original durable job UUID for --cleanup retry_objects')
+    parser.add_argument('--after', type=_typed_target, help='Continue redaction_candidates after this exact typed identity')
+    parser.add_argument('--target', action='append', type=_typed_target,
+                        help='Exact KIND:UUID (project_record:PROJECT_UUID:RECORD_UUID); repeat to select more')
+    parser.add_argument('--private-selector', choices=('ssm', 'encrypted-file', 'skill_bundle', 'recovery_object'),
+                        help='Read a provider selector privately on the owner terminal; never pass its name in argv')
     args = parser.parse_args(argv)
     home = args.home.expanduser().absolute()
     os.environ['MAVEN_HOME'] = str(home)
     from tools.tui import run_workflow
-    return run_workflow('MAVEN Home', ['Choose the Home folder', 'Review', 'Apply'],
-                        lambda ui: present(ui, home, operation_id=args.operation, kind='home',
-                                           parameters={'action': args.action}))
+    if args.target and args.cleanup not in ('redact', 'purge_provider'):
+        parser.error('--target requires --cleanup redact or purge_provider')
+    controller = AdminOperations(home)
+    parameters = {'action': args.cleanup or args.action or 'enable'}
+    if args.after:
+        if args.cleanup != 'redaction_candidates':
+            parser.error('--after applies only to --cleanup redaction_candidates')
+        parameters['after'] = args.after
+    if args.cleanup == 'retry_objects' or args.job_id is not None:
+        from tools.administration import _canonical_uuid
+        if args.cleanup != 'retry_objects' or not _canonical_uuid(args.job_id):
+            parser.error('--job-id requires --cleanup retry_objects and the canonical original job UUID.')
+        parameters['job_id'] = args.job_id
+    if args.private_selector:
+        private_secret = args.private_selector in ('ssm', 'encrypted-file')
+        if args.operation:
+            original = controller.status(args.operation)
+            if (args.private_selector != 'ssm' or original['kind'] != 'cleanup'
+                    or original['parameters'].get('action') != 'purge_provider'
+                    or original['parameters']['targets'][0]['kind'] != 'ssm'
+                    or original['step'] != 'redaction_apply' or not original.get('effect_started')):
+                parser.error('Private resume is only for verifying a submitted SSM purge.')
+        elif args.cleanup != ('purge_provider' if private_secret else 'redact'):
+            parser.error('Select the matching cleanup action for the private provider selector.')
+        try:
+            locator = _private_locator()
+            if args.operation:
+                controller = AdminOperations(home, private_provider_retry=(args.operation, locator))
+            else:
+                from tools.redaction_administration import private_target
+                target = private_target(controller, args.private_selector, locator)
+                args.target = [*(args.target or ()), target]
+        except Exception:
+            parser.error('Private selector unavailable; confirm the owner terminal, store binding and admin access.')
+    if args.target:
+        parameters['targets'] = args.target
+    if args.cleanup in ('redact', 'purge_provider') and not args.target:
+        parser.error('Select exact typed UUID(s) with --target or use --private-selector.')
+    kind = 'cleanup' if args.cleanup else 'home'
+    return run_workflow('MAVEN administration', ['Select', 'Review', 'Apply'],
+                        lambda ui: present(ui, home, operation_id=args.operation, kind=kind,
+                                           parameters=parameters, controller=controller))
 
 
 if __name__ == '__main__':

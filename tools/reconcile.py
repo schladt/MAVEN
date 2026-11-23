@@ -68,6 +68,11 @@ def local_write(store, expected_token, kind, data, reason, *, record_id=None, er
 
 
 def _views(local, cloud, local_token=None, cloud_token=None):
+    # The signed marker-only route remains available even when ordinary project
+    # access is forbidden. Never read/disclose either live inventory or upload a
+    # reviewed payload before durably accepting this delivery.
+    if local.replica is not None:
+        local.replica.receive(local, cloud)
     left = local.inventory()
     if local_token is not None and left['token'] != local_token:
         raise StaleView('local project changed; inspect again')

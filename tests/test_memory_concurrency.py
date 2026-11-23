@@ -159,7 +159,8 @@ class ApplicationVerificationTests(unittest.TestCase):
             GRANT CONNECT ON DATABASE maven TO maven_app;
             GRANT USAGE ON SCHEMA maven TO maven_app;
             GRANT SELECT ON maven.service_state, maven.record_versions TO maven_app;
-            GRANT EXECUTE ON FUNCTION maven.reconcile_request(text,jsonb), maven.instruction_read(jsonb) TO maven_app;
+            GRANT EXECUTE ON FUNCTION maven.reconcile_request(text,jsonb), maven.instruction_read(jsonb),
+              maven.redaction_delivery(jsonb) TO maven_app;
         """)
         admin._verify_application(db, config)
         db.query('SAVEPOINT missing_grant; REVOKE EXECUTE ON FUNCTION maven.reconcile_request(text,jsonb) FROM maven_app;')
@@ -183,8 +184,10 @@ class ApplicationVerificationTests(unittest.TestCase):
                 db.query('ROLLBACK TO bad_grant; RELEASE bad_grant;')
 
 
-@unittest.skipUnless(ENABLED, 'requires explicit isolated PostgreSQL DSN/create-database opt-in and psql')
-class ConcurrentPostgreSQLTests(unittest.TestCase):
+class PostgreSQLFixture:
+    """Shared UUID-named isolated database and transaction/authority fixtures."""
+    before_migration = {}
+
     @classmethod
     def setUpClass(cls):
         cls.parent_dsn = os.environ['MAVEN_MEMORY_TEST_DSN']
@@ -195,7 +198,8 @@ class ConcurrentPostgreSQLTests(unittest.TestCase):
         run_sql(cls.parent_dsn, 'CREATE DATABASE "' + cls.database + '";')
         try:
             statements = ['BEGIN; CREATE SCHEMA maven;']
-            for _, _, migration in admin.migrations():
+            for name, _, migration in admin.migrations():
+                statements.extend(cls.before_migration.get(name, ()))
                 statements.extend(statement + ';' for statement in migration)
             statements.append("INSERT INTO maven.service_state(singleton,instance_id,recovery_epoch,schema_version,data_scope,state,app_secret_arn,app_secret_version) "
                               "VALUES(true,gen_random_uuid(),gen_random_uuid(),2,'owner_memory','ready','fixture-app','fixture-version'); COMMIT;")
@@ -231,11 +235,41 @@ class ConcurrentPostgreSQLTests(unittest.TestCase):
             time.sleep(0.01)
         self.fail('expected real competing transaction never blocked on its holder')
 
+    def adapter_fixture(self, *, mode='single-use', ref=None):
+        home = self.create('entity', {'entity_type': 'project', 'name': 'Grant fixture Home', 'aliases': []})['record_id']
+        reference = ref or {'provider': 'ssm', 'name': '/fixture/concurrent:1'}
+        catalog = self.create('setting', {'key': 'secret:fixture.concurrent', 'scope': 'project', 'value': {'store_id': 'a' * 64},
+                                          'secret_ref': reference}, project_id=home)
+        suffix = uuid4().hex
+        adapter_slug, grant_slug = 'secret-adapter-' + suffix, 'secret-grant-' + suffix
+        adapter_page, grant_page = str(uuid4()), str(uuid4())
+        adapter_candidate = {**candidate(definition()), 'slug': adapter_slug, 'scope': {'project': home}}
+        self.observer.query(f"SELECT pg_temp.adapter_publish({literal(adapter_candidate)},'{adapter_page}');")
+        invocation = {'home_id': home, 'invocation_id': str(uuid4()), 'adapter': adapter_slug, 'adapter_revision': 1,
+                      'secret_name': 'fixture.concurrent', 'secret_ref': reference, 'purpose': 'Concurrent fixture',
+                      'operation': 'check', 'destination': 'fixture.invalid', 'parameters': {},
+                      'catalog_record_id': catalog['record_id'], 'catalog_revision': 1, 'store_id': 'a' * 64}
+        digest = hashlib.sha256(json.dumps(invocation, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+        grant = {key: value for key, value in invocation.items() if key not in ('home_id', 'invocation_id')}
+        grant.update(kind='secret-grant', version=1, mode=mode, expires_at='2099-01-01T00:00:00Z')
+        if mode == 'single-use':
+            grant['invocation_digest'] = digest
+        grant_candidate = {**adapter_candidate, 'slug': grant_slug, 'body_markdown': json.dumps(grant)}
+        self.observer.query(f"SELECT pg_temp.adapter_publish({literal(grant_candidate)},'{grant_page}');")
+        request = {'invocation': invocation, 'invocation_digest': digest, 'grant': grant_slug, 'grant_revision': 1}
+        return request, catalog, grant_candidate, grant_page
+
+    def consume(self, request):
+        return f"maven.secret_adapter_consume({literal(request)},'fixture-owner')"
+
     def create(self, kind='note', data=None, **extra):
         body = {**record(kind, data), **extra}
         self.assertNotIn('status', self.observer.json(write_expression(body)))
         return body
 
+
+@unittest.skipUnless(ENABLED, 'requires explicit isolated PostgreSQL DSN/create-database opt-in and psql')
+class ConcurrentPostgreSQLTests(PostgreSQLFixture, unittest.TestCase):
     def test_cleanup_compares_review_after_competing_writer_commits(self):
         body = self.create()
         writer, cleanup = self.connect(), self.connect()
@@ -319,33 +353,6 @@ class ConcurrentPostgreSQLTests(unittest.TestCase):
         self.assertEqual(self.observer.json(self.observer.attempt(expression)), {'error': 'project_archived'})
         self.observer.query("SELECT maven.require_project_scope('{\"project\":\"LegacyTeam\"}');")
         self.assertEqual(self.observer.json("to_jsonb(maven.project_scope_key('LegacyTeam'))"), 'LegacyTeam')
-
-    def adapter_fixture(self, *, mode='single-use', ref=None):
-        home = self.create('entity', {'entity_type': 'project', 'name': 'Grant fixture Home', 'aliases': []})['record_id']
-        reference = ref or {'provider': 'ssm', 'name': '/fixture/concurrent:1'}
-        catalog = self.create('setting', {'key': 'secret:fixture.concurrent', 'scope': 'project', 'value': {'store_id': 'a' * 64},
-                                          'secret_ref': reference}, project_id=home)
-        suffix = uuid4().hex
-        adapter_slug, grant_slug = 'secret-adapter-' + suffix, 'secret-grant-' + suffix
-        adapter_page, grant_page = str(uuid4()), str(uuid4())
-        adapter_candidate = {**candidate(definition()), 'slug': adapter_slug, 'scope': {'project': home}}
-        self.observer.query(f"SELECT pg_temp.adapter_publish({literal(adapter_candidate)},'{adapter_page}');")
-        invocation = {'home_id': home, 'invocation_id': str(uuid4()), 'adapter': adapter_slug, 'adapter_revision': 1,
-                      'secret_name': 'fixture.concurrent', 'secret_ref': reference, 'purpose': 'Concurrent fixture',
-                      'operation': 'check', 'destination': 'fixture.invalid', 'parameters': {},
-                      'catalog_record_id': catalog['record_id'], 'catalog_revision': 1, 'store_id': 'a' * 64}
-        digest = hashlib.sha256(json.dumps(invocation, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
-        grant = {key: value for key, value in invocation.items() if key not in ('home_id', 'invocation_id')}
-        grant.update(kind='secret-grant', version=1, mode=mode, expires_at='2099-01-01T00:00:00Z')
-        if mode == 'single-use':
-            grant['invocation_digest'] = digest
-        grant_candidate = {**adapter_candidate, 'slug': grant_slug, 'body_markdown': json.dumps(grant)}
-        self.observer.query(f"SELECT pg_temp.adapter_publish({literal(grant_candidate)},'{grant_page}');")
-        request = {'invocation': invocation, 'invocation_digest': digest, 'grant': grant_slug, 'grant_revision': 1}
-        return request, catalog, grant_candidate, grant_page
-
-    def consume(self, request):
-        return f"maven.secret_adapter_consume({literal(request)},'fixture-owner')"
 
     def test_cross_connection_single_use_grant_has_one_spend_and_no_successful_replay(self):
         request, _, _, _ = self.adapter_fixture()

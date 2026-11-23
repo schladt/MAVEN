@@ -8,6 +8,7 @@ import json
 import re
 import time
 
+from . import redaction_ledger as ledger
 from .validation import (MEMORY_ROUTES, MemoryError, MUTATION_ROUTES, RECONCILE_ROUTES, SCHEMA_VERSION, canonical, decode_json, digest,
                          fields, uuid_string)
 
@@ -15,8 +16,6 @@ CONTROL_KEYS = {"instance_id", "recovery_epoch", "schema_version", "state", "dat
 ROLLOUT_SCOPE = "owner_memory"
 JSON_CHUNK_BYTES = 4096
 MAX_JSON_RESULT_BYTES = 655360
-# Reads may reuse a ready control document this long; mutations always fetch it fresh.
-CONTROL_TTL_SECONDS = 5
 
 
 def json_result_sql(expression):
@@ -73,18 +72,23 @@ def safe_provider_error(error):
                        else "temporarily_unavailable")
 
 
-def control_document(config, state):
-    return {"instance_id": config["instance_id"], "recovery_epoch": config["recovery_epoch"],
-            "schema_version": SCHEMA_VERSION, "state": state, "data_scope": ROLLOUT_SCOPE}
+def control_document(config, state, *, redaction_bound=False):
+    document = {"instance_id": config["instance_id"], "recovery_epoch": config["recovery_epoch"],
+                "schema_version": SCHEMA_VERSION, "state": state, "data_scope": ROLLOUT_SCOPE}
+    if redaction_bound:
+        document["redaction_bound"] = True
+    return document
 
 
 def parse_control(raw, config, *, allow_maintenance=False, allow_legacy=False):
     try:
         document = decode_json(raw)
-        fields(document, CONTROL_KEYS, {"uninstall"})
+        fields(document, CONTROL_KEYS, {"uninstall", "redaction_bound"})
         uuid_string(document["instance_id"])
         uuid_string(document["recovery_epoch"])
-        expected = control_document(config, document["state"])
+        if "redaction_bound" in document and document["redaction_bound"] is not True:
+            raise ValueError
+        expected = control_document(config, document["state"], redaction_bound=document.get("redaction_bound"))
         if "uninstall" in document:
             marker = document["uninstall"]
             if (document["state"] != "maintenance" or not isinstance(marker, str)
@@ -127,6 +131,7 @@ class DataAPI:
                      "secretArn": config["admin_secret_arn" if admin else "app_secret_arn"],
                      "database": config["database"]}
         self.deadline = deadline
+        self.service_fence = None
 
     def budget(self, reserve=7):
         if self.deadline is not None and self.deadline - time.monotonic() < reserve:
@@ -157,6 +162,13 @@ class DataAPI:
     def json_scalar(self, expression, values=None, transaction=None, *,
                     overflow_status="temporarily_unavailable"):
         """Reassemble one bounded JSON value without Data API's 64 KiB row limit."""
+        if self.service_fence is not None:
+            # Do not even evaluate a payload query on an unsanitized database. This
+            # share lock conflicts with the admin's checkpoint lock until commit.
+            expression = ("CASE WHEN maven.lock_service_state() = CAST(:service_fence AS jsonb) "
+                          f"THEN ({expression})::json ELSE "
+                          "json_build_object('service_state',NULL,'authority_generation',0) END")
+            values = {**(values or {}), "service_fence": canonical(self.service_fence)}
         rows = self.execute(json_result_sql(expression), values, transaction).get("records", [])
         try:
             if not rows or len(rows) > (MAX_JSON_RESULT_BYTES + JSON_CHUNK_BYTES - 1) // JSON_CHUNK_BYTES:
@@ -282,52 +294,21 @@ def route_result(result):
     return result
 
 
-class ControlCache:
-    """Per-container ready control document; only reads may reuse it, briefly."""
-
-    def __init__(self, ttl=CONTROL_TTL_SECONDS, clock=time.monotonic):
-        self.ttl = ttl
-        self.clock = clock
-        self.clear()
-
-    @staticmethod
-    def _key(config):
-        return config["journal_bucket"], config["instance_id"], config["recovery_epoch"]
-
-    def get(self, config):
-        if self.document is None or self.key != self._key(config) or self.clock() - self.fetched_at > self.ttl:
-            return None
-        return dict(self.document)
-
-    def put(self, config, document):
-        self.key, self.document, self.fetched_at = self._key(config), dict(document), self.clock()
-
-    def clear(self):
-        self.key = self.document = self.fetched_at = None
-
-
 class Store:
-    def __init__(self, config, data_client, s3_client, *, deadline=None, control_cache=None):
+    def __init__(self, config, data_client, s3_client, rds_client, *, deadline=None):
         self.config = config
         self.db = DataAPI(data_client, config, deadline=deadline)
         self.s3 = s3_client
-        self.cache = control_cache
+        self.rds = rds_client
 
-    def control(self, *, fresh=True):
-        if not fresh and self.cache is not None:
-            cached = self.cache.get(self.config)
-            if cached is not None:
-                return cached
+    def control(self):
         self.db.budget()
-        try:
-            document = fetch_control(self.s3, self.config)[0]
-        except Exception:
-            if self.cache is not None:
-                self.cache.clear()
-            raise
-        if self.cache is not None:
-            self.cache.put(self.config, document)
-        return document
+        document = fetch_control(self.s3, self.config)[0]
+        if document.pop("redaction_bound", None) is not True:
+            raise MemoryError("context_stale")
+        physical = ledger.cluster_identity(self.rds, self.config)
+        tip = ledger.latest(self.s3, self.config)
+        return {**document, "redaction_checkpoint": ledger.bound(tip, self.config, physical)}
 
     def envelope(self, raw, expected):
         """Trust a result only under the expected locked service state; return its generation."""
@@ -337,13 +318,8 @@ class Store:
                 raise ValueError
         except ValueError:
             raise MemoryError("temporarily_unavailable") from None
-        try:
-            if value["service_state"] is None or parse_control(canonical(value["service_state"]), self.config) != expected:
-                raise MemoryError("context_stale")
-        except MemoryError:
-            if self.cache is not None:
-                self.cache.clear()
-            raise MemoryError("context_stale") from None
+        if value["service_state"] != expected or expected.get("redaction_checkpoint") is None:
+            raise MemoryError("context_stale")
         generation = value["authority_generation"]
         if type(generation) is not int or generation < 0:
             raise MemoryError("temporarily_unavailable")
@@ -352,10 +328,14 @@ class Store:
     def perform(self, route, request, actor, *, client_protocol=1):
         """Return (result, authority_generation) for one validated request."""
         mutation = route in WRITE_ROUTES
-        expected = self.control(fresh=mutation)
+        expected = self.control()
+        self.db.service_fence = expected
         if route in RECONCILE_ROUTES:
             from .reconcile_transport import perform
-            return perform(self, route, request, expected)
+            answer = perform(self, route, request, expected)
+            if not mutation and self.control() != expected:
+                raise MemoryError("context_stale")
+            return answer
         if route not in DISPATCHED_ROUTES:
             return self._legacy(route, request, expected, client_protocol)
         values = {"route": route, "request": canonical(request),
@@ -367,6 +347,8 @@ class Store:
             # One autocommitted statement; the application role's session timeouts bound it.
             raw = self.db.json_scalar(DISPATCH, values, overflow_status=overflow)
             value, generation = self.envelope(raw, expected)
+            if self.control() != expected:
+                raise MemoryError("context_stale")
             return route_result(value.get("result")), generation
         # Mutations keep an explicit transaction so a changed control document rolls them back.
         with self.db.transaction(timeouts=False) as tx:
@@ -400,4 +382,6 @@ class Store:
                 if raw is None:
                     raise MemoryError("operation_unavailable", 404)
             result = route_result(json.loads(raw))
+            if self.control() != expected:
+                raise MemoryError("context_stale")
         return result, generation

@@ -44,6 +44,85 @@ Store the minimum useful facts. Do not put credentials, refresh tokens, wrapping
 
 **Erasure.** Only erase an explicitly owner-selected record. Its managed current content and history are removed; a terminal content-free marker remains and defeats later offline edits for that ID. An offline machine retains its local copy until it reconciles. Backups, exports, linked files, other records, Git, external models and transcripts have independent retention. Record erasure is not a secure wipe of disks, an instant recall, or instance deletion.
 
+### Managed-data redaction contract
+
+**Forget** changes visibility and is reversible. **Erase** keeps the scope of
+its original approval. **Redact** is a separate, irreversible owner decision:
+the review must identify the instance, typed object IDs, exact versions and
+shared dependents, not quote the material being removed. A matching string in
+an unrelated record is not a citation: select that copy explicitly. A digest
+of a short value, an account name, a path or a relationship can itself disclose
+information. Do not substitute a plain hash of the old payload for deletion.
+
+Persistence inventory (including historical rows reached through older APIs):
+
+| Surface | Payload requiring a redaction path | Control data and residual boundary |
+|---|---|---|
+| `sources`, `facts`, `memory_items`, `record_versions`, `record_sources` | Origin/excerpt, predicate/value, JSON, tags, historical snapshots, reasons, actors, old content hashes, sensitive citation/subject/object/session links | Opaque row and revision identities may prevent stale resurrection. A shared source needs an explicit dependency review, not silent retention or a cascade into unrelated projects. |
+| `records`, `project_lifecycle`, `pages`, `instruction_proposals`, `instruction_challenges`, `page_publications` | Names/slugs, titles, scope, candidates, identity text, approval evidence and candidate hashes | Fixed state, revision and generation are concurrency controls. Redaction invalidates challenges and revokes affected authority; a replacement needs a fresh approval. No fallback to older wording. |
+| `operations`, `memory_receipts`, `instruction_receipts`, `cleanup_receipts`, `cleanup_operations`, `secret_adapter_consumptions` | Results, historical request/content/approval digests, free-text identity/reason, sensitive selectors and associations | Keep only the terminal identity needed to refuse another execution. Redacting a receipt must never refund a spent grant or replay a mutation. |
+| `reconcile_projects`, `reconcile_records` | Full canonical `wire` including every history entry, plus `item` (summary and digest) | A terminal marker with empty history beats every stale replica; project view tokens change. Project deletion/archival cannot hide an outstanding marker from a returning machine. |
+| `schema_migrations`, `instruction_state`, `service_state` | No owner prose or arbitrary values permitted. Application credential locators are operational configuration, not secret values. | Fixed migration names and code hashes, instance identity, generations and service configuration bind the correct database. Rotate/rebind a credential separately; never blank a control fence while serving. |
+| Skill bucket and recovery bucket | Skill ZIPs (including orphaned uploads), versioned objects, contaminated recovery manifests and metadata | Enumerate exact versions, including noncurrent versions and delete markers. A missing current object is not proof. Never delete the live `control.json` fence or roll back the erasure ledger. Shared references, holds, replica destinations and unknown outcomes must be reported. |
+| Independent erasure ledger | No prose, raw payload, original content digests, untrusted filenames or secret locators | Keep opaque permanent identities, order and integrity of **sanitized** operations outside the database restore timeline. Absence or inconsistent evidence blocks service, not a request to seed a new empty ledger. |
+| Secret providers | SSM parameter values and versions, encrypted S3 files and their versions, wrapping material | Catalog redaction is not provider deletion. Review exact provider effects separately, including collateral versions or shared keys. Revoke a leaked credential with its issuer as well. |
+| Device storage | SQLite projections/history, managed skill copies, cached record or operation bodies, local reviews and recovery artifacts | Remove selected content without replay. A disconnected or unidentified machine is **unverified**, not wiped. Device backups, free disk sectors, Git, owner exports, third-party model transcripts and non-managed linked files have independent retention. |
+| Aurora backups, clones, WAL and snapshots | Historical database bytes | Isolated backup retention is permitted; no in-place per-record purge is claimed. Reapply and verify independent erasures on an isolated restore **before** normal access. Copied/manual snapshots need their own retention decision. KMS rotation does not erase historical ciphertext. |
+| Logging and forwarding | Reject payloads, provider exception text, free-form approval excerpts, credential material and sensitive object locators before emission | Fixed status/route codes and server-generated IDs only. Review pre-existing log streams and forwarded copies separately; masking a display or reaching a nominal expiry is not deletion evidence. |
+
+**Release rule:** every new persisted field, object, cache or log sink needs a
+tested redaction handler or an explicit non-content invariant in this inventory.
+Report SQL redaction, verified external deletion, outstanding backup retention,
+offline copies, and blockers separately. A database commit is not an S3 deletion
+receipt. Nothing here certifies a live installation or authorizes a production
+purge, migration, restore or deployment.
+
+**Operator sequence.** Start `maven_admin(action="begin", kind="cleanup",
+parameters={"action":"redact","targets":[{"kind":"project_record",
+"project_id":"<project UUID>","id":"<record UUID>"}]})` with actual opaque IDs.
+The complete review binds the selected instance/epoch, affected closure, row
+revision tokens, opaque object-version pins and operation. Declining or changing
+it invalidates the approval phrase. The database rechecks the review under lock.
+The independent ledger receives only the sanitized identities and pins, before
+the SQL transaction commits. After commit the provider enumerates and verifies
+the approved versions. Read `redaction_pending` from any authorized machine;
+`retry_objects` requires the original job ID and cannot broaden the pinned set.
+A held, replicated, newly changed or unverifiable object is not a successful purge.
+`redaction_candidates` returns typed SQL and object identities; pass `next_after`
+as `after` to continue. Discovery does not itself authorize any erasure. Resolve
+private provider names only in the private terminal selector. If today's
+`control.json` is malformed, do not delete it: keep service isolated, separately
+review repair of the fence against the original ledger, then review its former
+version. Foreign-instance prefixes require their own owner's review.
+The separate `purge_provider` action requires a verified MemoryAdminRole session
+and explicit revocation/quiescence confirmation. Grant only the selected store:
+SSM metadata listing and version inspection, and deletion on its value prefix;
+or S3 version listing, metadata inspection and version deletion on its encrypted
+file prefix (`DeleteObject` may also be required for a null version). Never
+select a wrapping key. Provider audit trails may retain resource names. Replicas
+created by prior S3 replication rules need independent destination-side proof;
+removing a rule, terminating a client, or installing an empty current version is
+not proof that older bytes have disappeared.
+
+The older narrow Erase APIs do not gain permission to redact proposals, revoke
+other skills, or erase shared sources. Their existing terminal project records
+and legacy cleanup scopes have separate immutable restore witnesses. The live
+migration adopts historical witnesses before activation. Restore reapplies only
+that scope; unexpected dependencies or missing evidence keep the database isolated.
+
+**Recovery trust boundary.** Keep the original versioned journal outside snapshot
+rollback; do not copy it from a backup or restore archived Lambda code. No
+non-admin Data API principal, SQL login, or TCP path may reach a newly restored
+cluster before release. IAM bindings and a dedicated no-ingress security group
+must be reviewed before exposing that cluster's endpoint. Database snapshots
+cannot prove their own freshness. Removing **all** independent controls, granting
+raw database access to another principal, or rolling back bucket policies as the
+AWS account owner is outside the guarantees of the runtime. CloudWatch log
+events cannot be edited individually: if an earlier installation emitted content,
+quiesce its writer, identify affected log streams and destinations without copying
+their bodies to MAVEN, separately authorize deletion of those streams and verify
+absence at each destination. Do not count routine 14-day retention as verification.
+
 ## Local state
 
 Keep instance and project private configuration owner-owned and inaccessible to other

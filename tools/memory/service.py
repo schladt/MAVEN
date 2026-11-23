@@ -6,7 +6,7 @@ import json
 import os
 import time
 
-from .store import ControlCache, Store, safe_provider_error, sdk_config
+from .store import Store, safe_provider_error, sdk_config
 from .validation import (APPROVAL_ROUTES, CLIENT_PROTOCOL, MemoryError, ROUTES, authorized_actor,
                          decode_json, request_limit, uuid_string, validate)
 
@@ -30,16 +30,15 @@ def configuration():
     return config
 
 
-# Lambda containers reuse SDK clients and briefly reuse the ready control document for reads.
+# Clients may be reused; serving authority may not.
 _CLIENTS = {}
-CONTROL_CACHE = ControlCache()
 
 
 def make_store(config, deadline):
     if not _CLIENTS:
         import boto3
-        _CLIENTS.update({name: boto3.client(name, config=sdk_config()) for name in ("rds-data", "s3")})
-    return Store(config, _CLIENTS["rds-data"], _CLIENTS["s3"], deadline=deadline, control_cache=CONTROL_CACHE)
+        _CLIENTS.update({name: boto3.client(name, config=sdk_config()) for name in ("rds-data", "rds", "s3")})
+    return Store(config, _CLIENTS["rds-data"], _CLIENTS["s3"], _CLIENTS["rds"], deadline=deadline)
 
 
 def response(status_code, body):

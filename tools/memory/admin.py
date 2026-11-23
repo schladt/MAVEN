@@ -9,10 +9,12 @@ import hashlib
 import json
 import logging
 import re
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .store import DataAPI, ROLLOUT_SCOPE, control_document, fetch_control, safe_provider_error, sdk_config
-from .validation import MemoryError, SCHEMA_VERSION, authorized_actor, canonical, uuid_string
+from . import erase_fence, redaction_ledger, redaction_objects
+from .validation import MemoryError, SCHEMA_VERSION, authorized_actor, canonical, digest, uuid_string
 
 MIGRATION_SEPARATOR = "\n-- statement\n"
 MIGRATION_FILES = ("001_foundation.sql", "002_fact_change.sql", "003_current_versions.sql",
@@ -25,7 +27,8 @@ MIGRATION_FILES = ("001_foundation.sql", "002_fact_change.sql", "003_current_ver
                    "019_secret_catalog.sql", "020_secret_adapter_grants.sql",
                    "021_secret_adapter_scope_guard.sql", "022_reviewed_cleanup.sql",
                    "023_retired_work_visibility.sql", "024_immutable_secret_consumption.sql",
-                   "025_project_reconciliation.sql")
+                   "025_project_reconciliation.sql", "026_reviewed_redaction.sql",
+                   "027_redaction_delivery.sql", "028_redaction_outbox.sql", "029_narrow_erase_restore.sql")
 CLEANUP_LIMIT = 200
 _CLEANUP_REFUSAL = re.compile(r"cleanup_refused:([a-z_]{1,40})")
 
@@ -61,9 +64,9 @@ def _config(config):
         _refuse()
 
 
-def _put_control(s3, config, state, *, etag=None, absent=False):
+def _put_control(s3, config, state, *, etag=None, absent=False, bound=False):
     args = {"Bucket": config["journal_bucket"], "Key": "control.json",
-            "Body": canonical(control_document(config, state)).encode("utf-8"),
+            "Body": canonical(control_document(config, state, redaction_bound=bound)).encode("utf-8"),
             "ContentType": "application/json", "ServerSideEncryption": "AES256"}
     if absent:
         args["IfNoneMatch"] = "*"
@@ -74,7 +77,10 @@ def _put_control(s3, config, state, *, etag=None, absent=False):
     s3.put_object(**args)
 
 
-def _control(s3, config):
+def _control(s3, config, *, existing=False):
+    if existing:
+        # A legacy DB or restored snapshot must not manufacture a missing fence.
+        return fetch_control(s3, config, allow_maintenance=True, allow_legacy=True)
     try:
         # Without ListBucket, S3 returns 403 for an absent object. Conditional
         # creation needs no listing permission and never replaces existing state.
@@ -139,7 +145,7 @@ def _grant_instructions(db, tx):
     # transaction for reads, so their timeouts are the application role's session defaults.
     db.execute("GRANT EXECUTE ON FUNCTION maven.memory_service_state(), "
                "maven.memory_request(text,jsonb,text,text,text,integer), "
-               "maven.reconcile_request(text,jsonb) TO maven_app", transaction=tx)
+               "maven.reconcile_request(text,jsonb), maven.redaction_delivery(jsonb) TO maven_app", transaction=tx)
     db.execute("REVOKE EXECUTE ON FUNCTION maven.memory_request_before_reconcile(text,jsonb,text,text,text,integer), "
                "maven.memory_write(text,jsonb,text,text), maven.change_fact(jsonb,text,text) FROM maven_app", transaction=tx)
     db.execute("ALTER ROLE maven_app SET statement_timeout = '5s'", transaction=tx)
@@ -162,7 +168,7 @@ def _apply_migration(db, tx, name, sha, statements):
         raise MemoryError(status, detail=f"Migration: {name}; statement: {position}; SQLSTATE: {sqlstate}") from None
 
 
-def _install(db, config, secrets, control, *, upgrade=False):
+def _install(db, config, secrets, control, *, ledger_gate, upgrade=False):
     bundle = migrations()
     with db.transaction() as tx:
         db.execute("SELECT 1 FROM pg_advisory_xact_lock(1967318421)", transaction=tx)
@@ -176,6 +182,7 @@ def _install(db, config, secrets, control, *, upgrade=False):
             expected = {name: sha for name, sha, _ in bundle}
             if installed == expected:
                 _identity(_state(db, tx), config)
+                ledger_gate(tx, False)
                 return
             # Only a byte-identical ordered prefix may advance. No repair,
             # down migration, credential rotation, or implicit upgrade.
@@ -188,6 +195,7 @@ def _install(db, config, secrets, control, *, upgrade=False):
             for name, sha, statements in bundle[len(installed):]:
                 _apply_migration(db, tx, name, sha, statements)
             _grant_instructions(db, tx)
+            ledger_gate(tx, "026_reviewed_redaction.sql" not in installed)
             return
         if upgrade:
             _refuse()
@@ -229,39 +237,50 @@ def _install(db, config, secrets, control, *, upgrade=False):
                    {"instance": config["instance_id"], "epoch": config["recovery_epoch"],
                     "secret": config["app_secret_arn"], "version": version, "scope": ROLLOUT_SCOPE,
                     "schema": SCHEMA_VERSION}, tx)
+        ledger_gate(tx, True)
 
 
-def _verify_application(db, config):
+def _verify_application(db, config, *, pre_login=False):
     with db.transaction() as tx:
         _identity(_state(db, tx), config)
-        allowed = db.scalar("SELECT current_user = 'maven_app' "
+        identity = ("current_user = 'maven_admin' AND NOT rolcanlogin" if pre_login else "current_user = 'maven_app'")
+        allowed = db.scalar("SELECT " + identity + " "
                             "AND NOT rolsuper AND NOT rolcreatedb AND NOT rolcreaterole AND NOT rolreplication "
                             "AND NOT EXISTS (SELECT 1 FROM pg_auth_members WHERE member = pg_roles.oid) "
-                            "AND NOT has_database_privilege(current_user, 'maven', 'CREATE') "
-                            "AND NOT has_database_privilege(current_user, 'maven', 'TEMP') "
-                            "AND NOT has_schema_privilege(current_user, 'maven', 'CREATE') "
-                            "AND NOT has_schema_privilege(current_user, 'public', 'CREATE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.bootstrap_app(text)', 'EXECUTE') "
-                            "AND has_function_privilege(current_user, 'maven.reconcile_request(text,jsonb)', 'EXECUTE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.change_fact(jsonb,text,text)', 'EXECUTE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.memory_write(text,jsonb,text,text)', 'EXECUTE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.memory_request_before_reconcile(text,jsonb,text,text,text,integer)', 'EXECUTE') "
-                            "AND NOT has_table_privilege(current_user, 'maven.reconcile_records', 'SELECT,INSERT,UPDATE,DELETE') "
-                            "AND NOT has_table_privilege(current_user, 'maven.reconcile_projects', 'SELECT,INSERT,UPDATE,DELETE') "
-                            "AND NOT has_table_privilege(current_user, 'maven.records', 'INSERT,UPDATE,DELETE') "
-                            "AND NOT has_table_privilege(current_user, 'maven.record_versions', 'INSERT,UPDATE,DELETE') "
-                            "AND NOT has_table_privilege(current_user, 'maven.service_state', 'INSERT,UPDATE,DELETE') "
-                            "AND has_table_privilege(current_user, 'maven.record_versions', 'SELECT') "
-                            "AND NOT has_table_privilege(current_user, 'maven.pages', 'INSERT,UPDATE,DELETE') "
-                            "AND NOT has_table_privilege(current_user, 'maven.instruction_proposals', 'INSERT,UPDATE,DELETE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.change_fact_foundation(jsonb,text,text)', 'EXECUTE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.forget_records(uuid[],boolean,uuid,jsonb,text,text,text)', 'EXECUTE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.erase_records(uuid[],uuid,jsonb,text,text,text)', 'EXECUTE') "
-                            "AND NOT has_function_privilege(current_user, 'maven.cleanup_mutate(text,uuid[],uuid,jsonb,text,text,text)', 'EXECUTE') "
-                            "AND NOT has_table_privilege(current_user, 'maven.cleanup_receipts', 'SELECT,INSERT,UPDATE,DELETE') "
-                            "AND NOT has_table_privilege(current_user, 'maven.cleanup_operations', 'SELECT,INSERT,UPDATE,DELETE') "
-                            "AND has_function_privilege(current_user, 'maven.instruction_read(jsonb)', 'EXECUTE') "
-                            "FROM pg_roles WHERE rolname = current_user", transaction=tx)
+                            "AND NOT has_database_privilege(rolname, 'maven', 'CREATE') "
+                            "AND NOT has_database_privilege(rolname, 'maven', 'TEMP') "
+                            "AND NOT has_schema_privilege(rolname, 'maven', 'CREATE') "
+                            "AND NOT has_schema_privilege(rolname, 'public', 'CREATE') "
+                            "AND NOT has_function_privilege(rolname, 'maven.bootstrap_app(text)', 'EXECUTE') "
+                            "AND has_function_privilege(rolname, 'maven.reconcile_request(text,jsonb)', 'EXECUTE') "
+                            "AND has_function_privilege(rolname, 'maven.redaction_delivery(jsonb)', 'EXECUTE') "
+                            "AND NOT EXISTS (SELECT FROM pg_proc p WHERE p.pronamespace='maven'::regnamespace "
+                            "AND (starts_with(p.proname,'redaction_') OR starts_with(p.proname,'narrow_')) "
+                            "AND p.oid <> 'maven.redaction_delivery(jsonb)'::regprocedure "
+                            "AND has_function_privilege(rolname,p.oid,'EXECUTE')) "
+                            "AND NOT EXISTS (SELECT FROM pg_class c WHERE c.relnamespace='maven'::regnamespace "
+                            "AND (starts_with(c.relname,'redaction_') OR starts_with(c.relname,'narrow_')) AND c.relkind IN ('r','v') "
+                            "AND (has_table_privilege(rolname,c.oid,'SELECT,INSERT,UPDATE,DELETE,TRUNCATE,TRIGGER,REFERENCES') "
+                            "OR has_any_column_privilege(rolname,c.oid,'SELECT,INSERT,UPDATE,REFERENCES'))) "
+                            "AND NOT has_function_privilege(rolname, 'maven.change_fact(jsonb,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(rolname, 'maven.memory_write(text,jsonb,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(rolname, 'maven.memory_request_before_reconcile(text,jsonb,text,text,text,integer)', 'EXECUTE') "
+                            "AND NOT has_table_privilege(rolname, 'maven.reconcile_records', 'SELECT,INSERT,UPDATE,DELETE') "
+                            "AND NOT has_table_privilege(rolname, 'maven.reconcile_projects', 'SELECT,INSERT,UPDATE,DELETE') "
+                            "AND NOT has_table_privilege(rolname, 'maven.records', 'INSERT,UPDATE,DELETE') "
+                            "AND NOT has_table_privilege(rolname, 'maven.record_versions', 'INSERT,UPDATE,DELETE') "
+                            "AND NOT has_table_privilege(rolname, 'maven.service_state', 'INSERT,UPDATE,DELETE') "
+                            "AND has_table_privilege(rolname, 'maven.record_versions', 'SELECT') "
+                            "AND NOT has_table_privilege(rolname, 'maven.pages', 'INSERT,UPDATE,DELETE') "
+                            "AND NOT has_table_privilege(rolname, 'maven.instruction_proposals', 'INSERT,UPDATE,DELETE') "
+                            "AND NOT has_function_privilege(rolname, 'maven.change_fact_foundation(jsonb,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(rolname, 'maven.forget_records(uuid[],boolean,uuid,jsonb,text,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(rolname, 'maven.erase_records(uuid[],uuid,jsonb,text,text,text)', 'EXECUTE') "
+                            "AND NOT has_function_privilege(rolname, 'maven.cleanup_mutate(text,uuid[],uuid,jsonb,text,text,text)', 'EXECUTE') "
+                            "AND NOT has_table_privilege(rolname, 'maven.cleanup_receipts', 'SELECT,INSERT,UPDATE,DELETE') "
+                            "AND NOT has_table_privilege(rolname, 'maven.cleanup_operations', 'SELECT,INSERT,UPDATE,DELETE') "
+                            "AND has_function_privilege(rolname, 'maven.instruction_read(jsonb)', 'EXECUTE') "
+                            "FROM pg_roles WHERE rolname = 'maven_app'", transaction=tx)
         if allowed is not True:
             _refuse()
 
@@ -281,16 +300,38 @@ def _run(config, session, *, upgrade=False):
         s3 = session.client("s3", **kwargs)
         db = DataAPI(data, config, admin=True)
         _check_logging(db)
-        control, etag = _control(s3, config)
+        control, etag = _control(s3, config, existing=upgrade)
         if control.get("uninstall"):
             _refuse()
         if upgrade and (control["state"] == "ready" or control["data_scope"] != ROLLOUT_SCOPE
                         or control["schema_version"] != SCHEMA_VERSION):
-            _put_control(s3, config, "maintenance", etag=etag)
+            _put_control(s3, config, "maintenance", etag=etag, bound=control.get("redaction_bound", False))
             control, _ = fetch_control(s3, config, allow_maintenance=True)
             if control["state"] != "maintenance":
                 _refuse()
-        _install(db, config, session.client("secretsmanager", **kwargs), control, upgrade=upgrade)
+        rds = session.client("rds", **kwargs)
+        physical = redaction_ledger.cluster_identity(rds, config)
+
+        def ledger_gate(tx, can_seed):
+            if not can_seed:
+                redaction_ledger.verify(db, tx, s3, config, physical)
+                return
+            if control.get("redaction_bound") or control["state"] != "maintenance":
+                _refuse()
+            if upgrade:
+                # A restored legacy cluster has a new physical creation time. Its SQL
+                # installation predates that physical cluster; it cannot adopt a new ledger.
+                clusters = rds.describe_db_clusters(DBClusterIdentifier=config["cluster_arn"])["DBClusters"]
+                if len(clusters) != 1 or clusters[0]["DBClusterArn"] != config["cluster_arn"]:
+                    _refuse()
+                created = clusters[0]["ClusterCreateTime"].isoformat()
+                if db.scalar("SELECT CAST(:created AS timestamptz) <= min(installed_at) FROM maven.schema_migrations",
+                             {"created": created}, tx) is not True:
+                    _refuse()
+            redaction_ledger.genesis(db, tx, s3, config, physical)
+            erase_fence.initialize(db, tx, s3, config)
+
+        _install(db, config, session.client("secretsmanager", **kwargs), control, ledger_gate=ledger_gate, upgrade=upgrade)
         _verify_application(DataAPI(data, config), config)
         control, etag = fetch_control(s3, config, allow_maintenance=True)
         if control.get("uninstall"):
@@ -298,11 +339,12 @@ def _run(config, session, *, upgrade=False):
         with db.transaction() as tx:
             db.execute("SELECT 1 FROM pg_advisory_xact_lock(1967318421)", transaction=tx)
             _identity(_state(db, tx), config)
+            redaction_ledger.verify(db, tx, s3, config, physical)
             db.execute("UPDATE maven.service_state SET state = 'ready' WHERE singleton", transaction=tx)
-        if control["state"] == "maintenance":
-            _put_control(s3, config, "ready", etag=etag)
+        if control["state"] == "maintenance" or not control.get("redaction_bound"):
+            _put_control(s3, config, "ready", etag=etag, bound=True)
         verified, _ = fetch_control(s3, config)
-        if verified != control_document(config, "ready"):
+        if verified != control_document(config, "ready", redaction_bound=True):
             _refuse()
         return {"status": "ready", "instance_id": config["instance_id"],
                 "recovery_epoch": config["recovery_epoch"], "schema_version": SCHEMA_VERSION,
@@ -369,35 +411,60 @@ def _cleanup_error(error):
     return safe_provider_error(error)
 
 
-def _cleanup(config, session, expression, values=None, *, reviewed=False):
-    """One clean-up statement under the administration role; agents' memory tools never reach it."""
+@contextmanager
+def _admin_transaction(config, session, *, job=None, review_digest=None):
+    """Pin the live physical database and erasure head while using admin privileges."""
     previous_logging = logging.root.manager.disable
     logging.disable(logging.CRITICAL)
     try:
         _config(config)
         kwargs = {"region_name": config["region"], "config": sdk_config()}
-        identity = session.client("sts", **kwargs).get_caller_identity()
-        authorized_actor({"requestContext": {"authorizer": {"iam": {"userArn": identity["Arn"]}}}},
-                         config["admin_role_arn"])
-        db = DataAPI(session.client("rds-data", **kwargs), config, admin=True)
-        _check_logging(db)
-        with db.transaction() as tx:
-            _identity(_state(db, tx), config)
-            if reviewed and db.scalar(
-                    "SELECT to_regprocedure('maven.forget_records(uuid[],boolean,uuid,jsonb,text,text,text)') IS NOT NULL "
-                    "AND to_regprocedure('maven.erase_records(uuid[],uuid,jsonb,text,text,text)') IS NOT NULL",
-                    transaction=tx) is not True:
-                raise MemoryError(
-                    "cleanup_upgrade_required", 409,
-                    detail="Review and apply the memory schema update before cleanup; ordinary memory remains available.")
-            raw = db.json_scalar(expression, values, tx)
-        return json.loads(raw)
+        with ExitStack() as clients:
+            def client(name):
+                item = session.client(name, **kwargs)
+                clients.callback(item.close)
+                return item
+            identity = client("sts").get_caller_identity()
+            authorized_actor({"requestContext": {"authorizer": {"iam": {"userArn": identity["Arn"]}}}},
+                             config["admin_role_arn"])
+            s3 = client("s3")
+            control, _ = fetch_control(s3, config)
+            if control.get("redaction_bound") is not True:
+                raise MemoryError("redaction_ledger_unverified", 409)
+            physical = redaction_ledger.cluster_identity(client("rds"), config)
+            db = DataAPI(client("rds-data"), config, admin=True)
+            _check_logging(db)
+            with db.transaction() as tx:
+                redaction_ledger.verify(db, tx, s3, config, physical, job=job, plan_digest=review_digest)
+                state = _state(db, tx)
+                _identity(state, config)
+                if state["state"] != "ready":
+                    raise MemoryError("context_stale", 409)
+                yield db, tx, s3, physical
+    except redaction_objects.ObjectRedactionError as error:
+        raise MemoryError("redaction_scope_changed", 409, detail=error.code) from None
     except MemoryError:
         raise
     except Exception as error:
         raise _cleanup_error(error) from None
     finally:
         logging.disable(previous_logging)
+
+
+def _cleanup(config, session, expression, values=None, *, reviewed=False, erase_job=None):
+    with _admin_transaction(config, session) as (db, tx, s3, physical):
+        if reviewed and db.scalar(
+                "SELECT to_regprocedure('maven.forget_records(uuid[],boolean,uuid,jsonb,text,text,text)') IS NOT NULL "
+                "AND to_regprocedure('maven.erase_records(uuid[],uuid,jsonb,text,text,text)') IS NOT NULL",
+                transaction=tx) is not True:
+            raise MemoryError("cleanup_upgrade_required", 409)
+        result = json.loads(db.json_scalar(expression, values, tx))
+        if erase_job:
+            erase_fence.record_legacy_erase(db, tx, s3, config, erase_job)
+            if fetch_control(s3, config)[0].get("redaction_bound") is not True:
+                raise MemoryError("context_stale", 409)
+            redaction_ledger.verify(db, tx, s3, config, physical)
+        return result
 
 
 _ID_ARRAY = "ARRAY(SELECT jsonb_array_elements_text(CAST(:ids AS jsonb))::uuid)"
@@ -438,4 +505,143 @@ def erase_records(config, session, record_ids, *, operation_id, expected_revisio
               **_cleanup_approval(actor, reason, approval_digest)}
     return _cleanup(config, session,
                     f"maven.erase_records({_ID_ARRAY}, CAST(:operation_id AS uuid), "
-                    "CAST(:expected_revisions AS jsonb), :actor, :reason, :digest)", values, reviewed=True)
+                    "CAST(:expected_revisions AS jsonb), :actor, :reason, :digest)", values, reviewed=True,
+                    erase_job=operation_id)
+
+
+def _salt(db, tx):
+    return uuid_string(db.scalar("SELECT maven.redaction_salt()::text", transaction=tx))
+
+
+def redaction_salt(config, session):
+    """Internal input for the separately authorized secret provider. Never a review field."""
+    with _admin_transaction(config, session) as (db, tx, _, _):
+        return _salt(db, tx)
+
+
+def redaction_candidates(config, session, after=None):
+    """Content-free keyset discovery, not an approval or stable snapshot."""
+    def key(target):
+        return target["kind"], target.get("project_id", ""), target["id"]
+
+    cursor = key(after) if after else ("", "", "")
+    with _admin_transaction(config, session) as (db, tx, _, _):
+        rows = _sql_json(db, tx, """(SELECT coalesce(jsonb_agg(target ORDER BY k,p,i),'[]'::jsonb) FROM (
+            SELECT DISTINCT target,(target->>'kind') COLLATE "C" AS k,
+                coalesce(target->>'project_id','') COLLATE "C" AS p,(target->>'id') COLLATE "C" AS i
+            FROM maven.redaction_versions
+            WHERE ((target->>'kind') COLLATE "C",coalesce(target->>'project_id','') COLLATE "C",
+                   (target->>'id') COLLATE "C") > (:kind,:project,:id) ORDER BY k,p,i LIMIT 101
+        ) page)""", kind=cursor[0], project=cursor[1], id=cursor[2])
+        for target in redaction_objects.candidates(config, session, _salt(db, tx)):
+            if key(target) > cursor:
+                rows.append(target)
+        by_key = {key(target): target for target in rows}
+        page = [by_key[k] for k in sorted(by_key)[:100]]
+        return {"candidates": page, "next_after": page[-1] if len(by_key) > len(page) else None}
+
+
+def _sql_json(db, tx, expression, **values):
+    return json.loads(db.json_scalar(expression, values, tx))
+
+
+def _redaction_review(db, tx, config, session, targets):
+    value = _sql_json(db, tx, "maven.redaction_review(CAST(:targets AS jsonb))", targets=canonical(targets))
+    objects = [item for item in value["permanent_targets"] if item["kind"] in {"skill_bundle", "recovery_object"}]
+    keys = (_sql_json(db, tx, "maven.redaction_bundle_keys(CAST(:ids AS jsonb))", ids=canonical(value["bundles"]))
+            if value["bundles"] else {})
+    salt = _salt(db, tx)
+    plan = redaction_objects.review(config, session, salt, objects, missing_keys=keys)
+    return {**value, "objects": plan, "instance_id": config["instance_id"], "recovery_epoch": config["recovery_epoch"]}, keys
+
+
+def review_redaction(config, session, targets):
+    with _admin_transaction(config, session) as (db, tx, _, _):
+        review, _ = _redaction_review(db, tx, config, session, targets)
+        return review
+
+
+def _outbox(db, tx, job):
+    return _sql_json(db, tx, "COALESCE((SELECT jsonb_build_object('digest',review_digest,'plan',object_plan) "
+                     "FROM maven.redaction_outbox WHERE job_id=CAST(:job AS uuid)), 'null'::jsonb)", job=job)
+
+
+def redaction_pending(config, session):
+    with _admin_transaction(config, session) as (db, tx, _, _):
+        return _sql_json(db, tx, "(SELECT coalesce(jsonb_agg(jsonb_build_object('job_id',job_id, "
+                         "'objects',(SELECT jsonb_agg(jsonb_build_object('kind',o->'kind','id',o->'id')) "
+                         "FROM jsonb_array_elements(object_plan->'objects') o)) ORDER BY job_id),'[]'::jsonb) "
+                         "FROM maven.redaction_outbox WHERE NOT verified)")
+
+
+def review_redaction_objects(config, session, job_id):
+    with _admin_transaction(config, session) as (db, tx, _, _):
+        entry = _outbox(db, tx, uuid_string(job_id))
+        if entry is None:
+            raise MemoryError("record_unavailable", 404)
+        return entry["plan"]
+
+
+def finish_redaction_objects(config, session, job_id):
+    """Only the already authorized pins may be acted on, even after a process crash."""
+    job = uuid_string(job_id)
+    try:
+        with _admin_transaction(config, session) as (db, tx, _, _):
+            entry = _outbox(db, tx, job)
+            if entry is None:
+                raise MemoryError("record_unavailable", 404)
+            try:
+                result = redaction_objects.apply(config, session, _salt(db, tx), entry["plan"])
+            except redaction_objects.ObjectRedactionError as error:
+                return {"status": "blocked", "code": error.code}
+            db.execute("UPDATE maven.redaction_outbox SET verified=true WHERE job_id=CAST(:job AS uuid) AND NOT verified",
+                       {"job": job}, tx)
+        return result
+    except MemoryError as error:
+        if error.status == "record_unavailable":
+            raise
+        # The SQL redaction is already committed; do not claim the provider phase completed.
+        return {"status": "blocked", "code": "provider_unverified"}
+
+
+def apply_redaction(config, session, *, operation_id, review):
+    job = uuid_string(operation_id)
+    if not isinstance(review, dict) or review.get("instance_id") != config["instance_id"] or review.get("recovery_epoch") != config["recovery_epoch"]:
+        raise MemoryError("redaction_scope_changed", 409)
+    fingerprint = digest(review)
+    with _admin_transaction(config, session, job=job, review_digest=fingerprint) as (db, tx, s3, physical):
+        entry = _outbox(db, tx, job)
+        if entry is not None:
+            if entry["digest"] != fingerprint:
+                raise MemoryError("redaction_scope_changed", 409)
+        else:
+            verified, keys = _redaction_review(db, tx, config, session, review.get("targets"))
+            if verified != review:
+                raise MemoryError("redaction_scope_changed", 409)
+            values = {"job": job, "targets": canonical(verified["targets"]), "plan": verified["plan_digest"]}
+            result = _sql_json(db, tx, "maven.redaction_apply(CAST(:job AS uuid),CAST(:targets AS jsonb),:plan)", **values)
+            if (result["job_id"] != job or result["live_data_redacted"] is not True
+                    or sorted(result["pending_bundles"]) != sorted(verified["bundles"])):
+                raise MemoryError("redaction_scope_changed", 409)
+            redaction_objects.prepare_missing(config, session, _salt(db, tx), verified["objects"], keys)
+            db.execute("INSERT INTO maven.redaction_outbox(job_id,review_digest,object_plan,verified) "
+                       "VALUES(CAST(:job AS uuid),:fingerprint,CAST(:objects AS jsonb),:empty)",
+                       {"job": job, "fingerprint": fingerprint, "objects": canonical(verified["objects"]),
+                        "empty": not verified["objects"]["objects"]}, tx)
+            # Database CAS succeeded under lock. Journal the exact approved intent before commit;
+            # a lost SQL commit reply cannot leave a restorable pre-erasure snapshot unprotected.
+            redaction_ledger.record_applied(db, tx, s3, config, physical, job, verified["permanent_targets"],
+                                            fingerprint, object_plan=verified["objects"])
+    objects = finish_redaction_objects(config, session, job)
+    return {"job_id": job, "live_data_redacted": True, "objects": objects,
+            "backup_retention_pending": True, "offline_copies_unverified": True}
+
+
+def redaction_restore_review(config, session):
+    from . import redaction_recovery
+    return redaction_recovery.review(config, session)
+
+
+def redaction_restore_apply(config, session, review):
+    from . import redaction_recovery
+    return redaction_recovery.apply(config, session, review)

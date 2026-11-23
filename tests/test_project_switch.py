@@ -67,7 +67,7 @@ class ProjectSwitchTests(unittest.TestCase):
             return {'data': deepcopy(self.entities[body['record_id']])}
         if route == '/v1/memory/search':
             return {'data': {'records': [deepcopy(item) for item in self.entities.values()
-                                         if 'maven-home' in item['tags']]}}
+                                         if 'maven-home' in item['tags']], 'next_after_id': None}}
         if route == '/v1/memory/write':
             self.writes.append(deepcopy(body))
             record = self.entities[body['record_id']]

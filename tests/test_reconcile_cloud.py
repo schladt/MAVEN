@@ -26,7 +26,8 @@ PROJECT = str(uuid4())
 CONFIG = {'instance_id': str(uuid4()), 'recovery_epoch': str(uuid4()),
           'client_role_arn': 'arn:aws:iam::123456789012:role/MavenClient',
           'approval_role_arn': 'arn:aws:iam::123456789012:role/MavenApproval',
-          'cluster_arn': 'fixture-cluster', 'database': 'fixture', 'app_secret_arn': 'fixture-secret'}
+          'cluster_arn': 'fixture-cluster', 'database': 'fixture', 'app_secret_arn': 'fixture-secret',
+          'journal_bucket': 'fixture-journal'}
 TARGET = {k: CONFIG[k] for k in ('instance_id', 'recovery_epoch')}
 TOKEN = 'a' * 64
 
@@ -48,7 +49,7 @@ def ready(data):
 class ReconciliationBoundaryTests(unittest.TestCase):
     def test_every_route_refuses_approval_role_before_provider_access(self):
         with patch.object(service, 'configuration', return_value=CONFIG), patch.object(service, 'make_store') as provider:
-            for action in ('status', 'inventory', 'read', 'apply'):
+            for action in ('status', 'inventory', 'read', 'apply', 'markers'):
                 with self.subTest(action=action):
                     self.assertEqual(service.handler(event(action, {}, 'MavenApproval'), None)['statusCode'], 403)
             provider.assert_not_called()
@@ -94,6 +95,9 @@ class SQLTransport:
         self.conn = conn
 
     def json_scalar(self, expression, values, tx=None, **kwargs):
+        if expression == 'maven.redaction_delivery(CAST(:request AS jsonb))':
+            from test_memory_concurrency import literal
+            return '\n'.join(self.conn.query('SELECT maven.redaction_delivery(' + literal(json.loads(values['request'])) + ');'))
         if expression != 'maven.reconcile_request(:action, CAST(:request AS jsonb))':
             raise AssertionError('unexpected expression')
         return '\n'.join(self.conn.query('SELECT ' + self.expression(values['action'], json.loads(values['request'])) + ';'))
@@ -116,13 +120,23 @@ class SQLTransport:
             self.conn.query('COMMIT;')
 
 
+class EraseFenceBucket:
+    def __init__(self):
+        self.keys = set()
+
+    def put_object(self, *, Bucket, Key, IfNoneMatch, **fields):
+        assert Bucket == CONFIG['journal_bucket'] and IfNoneMatch == '*' and Key not in self.keys
+        self.keys.add(Key)
+        return {'VersionId': str(uuid4()), 'ETag': '"fixture"'}
+
+
 class Endpoint:
     config = CONFIG
 
     def __init__(self, conn):
-        self.store = Store(CONFIG, None, None)
+        self.store = Store(CONFIG, None, EraseFenceBucket(), None)
         self.store.db = SQLTransport(conn)
-        self.store.control = lambda **kwargs: control_document(CONFIG, 'ready')
+        self.store.control = lambda: {**control_document(CONFIG, 'ready'), 'redaction_checkpoint': 'a' * 64}
         self.actions = []
 
     def invoke(self, route, request):
@@ -151,8 +165,8 @@ class PostgreSQLReconciliationTests(unittest.TestCase):
         statements = ['BEGIN; CREATE SCHEMA maven;']
         for _, _, migration in admin.migrations():
             statements.extend(s + ';' for s in migration)
-        statements.append("INSERT INTO maven.service_state(singleton,instance_id,recovery_epoch,schema_version,data_scope,state,app_secret_arn,app_secret_version) "
-                          f"VALUES(true,'{TARGET['instance_id']}','{TARGET['recovery_epoch']}',2,'owner_memory','ready','fixture','1'); COMMIT;")
+        statements.append("INSERT INTO maven.service_state(singleton,instance_id,recovery_epoch,schema_version,data_scope,state,app_secret_arn,app_secret_version,redaction_checkpoint) "
+                          f"VALUES(true,'{TARGET['instance_id']}','{TARGET['recovery_epoch']}',2,'owner_memory','ready','fixture','1',repeat('a',64)); COMMIT;")
         run_sql(cls.dsn, '\n'.join(statements))
 
     def connect(self):

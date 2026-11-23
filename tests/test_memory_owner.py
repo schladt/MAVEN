@@ -831,7 +831,7 @@ BEGIN
  SELECT generation INTO generation_value FROM maven.instruction_state WHERE singleton;
  envelope:=maven.memory_request('/v1/memory/search','{"query":"ble","tag":"perf-fixture"}',NULL,NULL,'fixture-reader',4);
  PERFORM pg_temp.assert_equal(((envelope->'service_state')-'instance_id'::text)-'recovery_epoch'::text,
-   '{"schema_version":2,"state":"ready","data_scope":"owner_memory"}','dispatcher service state');
+   '{"schema_version":2,"state":"ready","data_scope":"owner_memory","redaction_checkpoint":null}','dispatcher service state');
  PERFORM pg_temp.assert_equal(envelope->'authority_generation',to_jsonb(generation_value),'dispatcher generation');
  PERFORM pg_temp.assert_equal(envelope->'result',maven.memory_search('{"query":"ble","tag":"perf-fixture"}'),'dispatcher route result');
  envelope:=maven.memory_request('/v1/memory/context','{}',NULL,NULL,'fixture-reader',4);

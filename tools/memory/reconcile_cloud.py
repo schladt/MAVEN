@@ -1,5 +1,5 @@
 """Session-free facade over the selected instance's signed IAM service (never the database)."""
-from tools.reconcile_records import KINDS, MAX_BATCH, record_uuid, validate_project_envelope
+from tools.reconcile_records import KINDS, MAX_BATCH, record_uuid, redaction_target, validate_project_envelope
 from .client import MemoryClientError
 from .reconcile_transport import TOKEN
 from .validation import MemoryError, validate
@@ -63,6 +63,48 @@ class CloudStore:
 
     def _call(self, action, **args):
         return _request(self.client, action, {'project_id': self.project_id, **args})
+
+    def marker_pages(self, project_id=None):
+        """Read the complete permanent set, even for projects barred from normal reads."""
+        project_id = self.project_id if project_id is None else record_uuid(project_id)
+        cursor = token = total = None
+        seen = 0
+        while True:
+            request = {'after_kind': cursor[0], 'after_id': cursor[1], 'expected_token': token} if cursor else {}
+            page = self._call('markers', project_id=project_id, **request)
+            if set(page) != {'total', 'token', 'targets', 'more'}:
+                raise MemoryClientError('snapshot_incomplete')
+            if token is None:
+                token, total = page['token'], page['total']
+            entries = page['targets']
+            if (not _token(token) or page['token'] != token or type(page['total']) is not int
+                    or page['total'] != total or not isinstance(entries, list) or len(entries) > 64
+                    or type(page['more']) is not bool):
+                raise MemoryClientError('snapshot_incomplete')
+            for entry in entries:
+                try:
+                    redaction_target(entry, project_id=project_id)
+                except (TypeError, ValueError):
+                    raise MemoryClientError('snapshot_incomplete') from None
+                key = entry['kind'], entry['id']
+                if cursor is not None and key <= cursor:
+                    raise MemoryClientError('snapshot_incomplete')
+                cursor = key
+            seen += len(entries)
+            if seen > total or page['more'] != (seen < total) or page['more'] and len(entries) != 64:
+                raise MemoryClientError('snapshot_incomplete')
+            yield entries
+            if not page['more']:
+                return
+
+    def retired_bundles(self, hashes):
+        result = self._call('markers', bundle_hashes=hashes)
+        retired = result.get('retired')
+        if (set(result) != {'retired'} or not isinstance(retired, list)
+                or any(type(i) is not int or not 0 <= i < len(hashes) for i in retired)
+                or retired != sorted(set(retired))):
+            raise MemoryClientError('snapshot_incomplete')
+        return set(retired)
 
     def inventory(self):
         items = []

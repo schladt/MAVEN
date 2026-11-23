@@ -13,6 +13,8 @@ from tools.memory.validation import MemoryError as CredentialError, reject_secre
 
 MAX_BATCH = 50
 MAX_ENVELOPE_BYTES = 512 * 1024
+REDACTION_KINDS = frozenset("record source page project project_record proposal challenge publication instruction_receipt operation memory_receipt consumption cleanup lifecycle citation skill_bundle recovery_object".split())
+REDACTION_TIMESTAMP = "1970-01-01T00:00:00Z"
 KINDS = frozenset("decision task risk action outcome note reference plan research lesson question cheatsheet link entity fact relationship setting skill brief".split())
 STATES = {
     "decision": {"proposed", "accepted", "superseded"},
@@ -35,6 +37,21 @@ def digest(value) -> str:
 def record_uuid(value) -> str:
     if not isinstance(value, str) or str(UUID(value)) != value:
         raise ValueError("expected canonical UUID")
+    return value
+
+
+def redaction_target(value, *, project_id=None):
+    """A delivery marker never carries content, original digests, or storage locators."""
+    if not isinstance(value, dict) or not isinstance(value.get("kind"), str) or value["kind"] not in REDACTION_KINDS:
+        raise ValueError("invalid redaction target kind")
+    key = record_uuid(value.get("id"))
+    kind = value["kind"]
+    if kind == "project_record":
+        scope = record_uuid(value.get("project_id"))
+        if set(value) != {"kind", "id", "project_id"} or project_id is not None and scope != project_id:
+            raise ValueError("invalid scoped redaction target")
+    elif set(value) != {"kind", "id"} or kind == "project" and project_id is not None and key != project_id:
+        raise ValueError("invalid redaction target")
     return value
 
 

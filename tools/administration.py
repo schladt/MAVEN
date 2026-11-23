@@ -21,10 +21,14 @@ import sys
 from uuid import UUID, uuid4, uuid5
 
 from tools.interaction import Field
+from tools.memory.redaction_ledger import KINDS as _REDACTION_KINDS
 from tools.setup_common import SetupPending, private_directory, read_private, save_json, setup_lock
 
 HOME_TAG = 'maven-home'
-CLEANUP_ACTIONS = ('review', 'forget', 'restore', 'erase')
+_REDACTION_INVENTORIES = ('redaction_candidates', 'provider_candidates', 'redaction_pending')
+_REDACTION_ACTIONS = ('redact', 'purge_provider', 'restore_redactions', 'retry_objects', *_REDACTION_INVENTORIES)
+CLEANUP_ACTIONS = ('review', 'forget', 'restore', 'erase', *_REDACTION_ACTIONS)
+_PROVIDER_KINDS = frozenset(('ssm', 'encrypted-file'))
 CLEANUP_LIMIT = 200
 _LIFECYCLE_KINDS = ('session', 'checkpoint', 'operation')
 _DEPLOY_KEYS = frozenset('MAVEN_DEPLOY_' + key for key in (
@@ -141,6 +145,59 @@ def _discover_stacks(values):
                            'Check the account/region and deployment status. Discovery requires valid MAVEN '
                            'outputs and CREATE_COMPLETE or UPDATE_COMPLETE. Nothing was deployed or selected.')
     return sorted(found, key=lambda item: (item['name'], item['stack_id']))
+
+
+def _canonical_uuid(value):
+    try:
+        return isinstance(value, str) and str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _redaction_targets(targets, *, provider=False):
+    if not isinstance(targets, list) or not 1 <= len(targets) <= (1 if provider else CLEANUP_LIMIT):
+        raise AdminInputError('Select one provider target or 1–200 typed redaction targets.')
+    identities = set()
+    for target in targets:
+        if (not isinstance(target, dict) or not isinstance(target.get('kind'), str)
+                or target['kind'] not in (_PROVIDER_KINDS if provider else _REDACTION_KINDS)):
+            raise AdminInputError('Select a supported redaction target kind.')
+        keys = {'kind', 'id', 'project_id'} if target['kind'] == 'project_record' else {'kind', 'id'}
+        if set(target) != keys or not all(_canonical_uuid(target[key]) for key in keys - {'kind'}):
+            raise AdminInputError('Supply only the exact typed canonical UUIDs; never supply a label or locator.')
+        identity = (target['kind'], target.get('project_id'), target['id'])
+        if identity in identities:
+            raise AdminInputError('Select each typed redaction target only once.')
+        identities.add(identity)
+
+
+def _private_cleanup(state):
+    return (state['kind'] == 'cleanup'
+            and state['parameters'].get('action') in _REDACTION_ACTIONS)
+
+
+def _owner_phrase(operation, question):
+    return f"APPROVE {operation} {question['interaction_id']} {question['revision']} {question['review_digest']}"
+
+
+def _redaction_response(question, response, owner_terminal):
+    """Never allow owner prose (including declined approvals) into the operation journal."""
+    if type(response.get('approved')) is not bool or response.get('review_digest') != question['review_digest']:
+        raise AdminInputError('Name the full current review digest and explicitly approve or decline.')
+    if not response['approved']:
+        if set(response) != {'approved', 'review_digest'}:
+            raise AdminInputError('Decline with only approved=false and the reviewed digest.')
+        return
+    keys = {'approved', 'review_digest', 'source'}
+    if question['confirmations']:
+        keys.add('confirmations')
+    if set(response) != keys:
+        raise AdminInputError('Send only the displayed approval fields; never send target labels or explanations.')
+    source = response['source']
+    if (not isinstance(source, dict) or set(source) != {'origin', 'excerpt'}
+            or source['origin'] != ('owner_terminal' if owner_terminal else 'owner_chat')
+            or source['excerpt'] != question['owner_phrase']):
+        raise AdminInputError('Relay the exact displayed phrase from the owner, or use the private approval terminal.')
 
 
 def _cleanup_ids(value):
@@ -312,9 +369,11 @@ def sweep_erased(roots, ids, tombstone):
 class AdminOperations:
     """Explicit, restartable setup/install/project/removal/recovery operations."""
 
-    def __init__(self, home=None):
+    def __init__(self, home=None, *, private_provider_retry=None):
         self.home = Path(home or os.environ.get('MAVEN_HOME', '~/.maven')).expanduser().absolute()
         self.directory = self.home / 'runtime' / 'administration'
+        # Optional owner-terminal input for verifying an SSM deletion after a lost reply. Never serialized.
+        self._private_provider_retry = private_provider_retry
 
     def _prepare(self):
         for directory in (self.home, self.home / 'runtime', self.directory):
@@ -332,7 +391,10 @@ class AdminOperations:
         state = read_private(path, maximum=32 * 1024 * 1024)
         if state.get('schema') != 1 or state.get('home') != str(self.home):
             raise SetupPending('Administration state/home mismatch; preserve the original evidence.')
-        return state
+        # A newly received marker already retires matching evidence even when a crash
+        # interrupted the file sweep. Neither status nor advance may expose or replay it.
+        from tools.reconcile_redaction import shadow_admin
+        return shadow_admin(self.home, state)
 
     def _save(self, state):
         state['revision'] += 1
@@ -353,13 +415,17 @@ class AdminOperations:
                           'output', 'adopt_legacy', 'plan_path'},
             'recovery': {'operation_id', 'action'},
             'home': {'action', 'root', 'project_id', 'label'},
-            'cleanup': {'action', 'record_ids', 'reason'},
+            'cleanup': {'action', 'record_ids', 'reason', 'targets', 'job_id', 'after'},
             'project_lifecycle': {'action', 'project_id'},
         }
         if kind not in allowed or not isinstance(parameters, dict) or set(parameters) - allowed[kind]:
             raise AdminInputError('Unsupported administration kind or parameters.')
-        if kind == 'recovery' and not parameters.get('operation_id'):
-            raise AdminInputError('Select the exact administration operation_id for recovery.')
+        if kind == 'recovery':
+            if (not _canonical_uuid(parameters.get('operation_id'))
+                    or parameters.get('action', 'diagnose') not in ('diagnose', 'recover')):
+                raise AdminInputError('Select the exact operation UUID and recovery action diagnose or recover.')
+            if _private_cleanup(self._load(parameters['operation_id'])):
+                raise AdminInputError('Use status/advance on the original redaction UUID. Do not copy it into another recovery operation.')
         if kind == 'setup' and parameters.get('mode') not in (None, 'existing', 'new', 'update'):
             raise AdminInputError('Setup mode must be existing, new or update.')
         if kind == 'setup' and 'checkout' in parameters and (
@@ -384,7 +450,23 @@ class AdminOperations:
                 raise AdminInputError('Project lifecycle requires a canonical project UUID.')
         if kind == 'cleanup':
             if parameters.get('action') not in CLEANUP_ACTIONS:
-                raise AdminInputError('Clean-up action must be review, forget, restore or erase.')
+                raise AdminInputError('Select a supported memory clean-up action.')
+            if parameters['action'] in _REDACTION_ACTIONS:
+                selected = parameters['action'] in ('redact', 'purge_provider')
+                expected = {'action', 'targets'} if selected else {'action'}
+                if parameters['action'] == 'redaction_candidates' and 'after' in parameters:
+                    _redaction_targets([parameters['after']])
+                    expected.add('after')
+                if parameters['action'] == 'retry_objects':
+                    expected.add('job_id')
+                    if not _canonical_uuid(parameters.get('job_id')):
+                        raise AdminInputError('Select the canonical UUID of the original reviewed object-purge job.')
+                if set(parameters) != expected:
+                    raise AdminInputError('Supply only the action and its required typed UUID selection.')
+                if selected:
+                    _redaction_targets(parameters['targets'], provider=parameters['action'] == 'purge_provider')
+            elif set(parameters) & {'targets', 'job_id', 'after'}:
+                raise AdminInputError('Typed targets require a separately reviewed redaction action.')
             if parameters['action'] == 'review' and set(parameters) != {'action'}:
                 raise AdminInputError('The clean-up review is read-only and takes no records or reason.')
             if 'record_ids' in parameters:
@@ -426,17 +508,19 @@ class AdminOperations:
             result['next_actions'].append('back')
         return result
 
-    def respond(self, operation_id, interaction_id, revision, response):
+    def respond(self, operation_id, interaction_id, revision, response, *, owner_terminal=False):
         self._prepare()
         with setup_lock(self.directory):
             state = self._load(operation_id)
             question = state['pending_interaction']
             if (not question or question['interaction_id'] != interaction_id
-                    or question['revision'] != revision):
+                    or type(revision) is not int or question['revision'] != revision):
                 raise AdminInputError('Stale interaction; inspect the current full review before responding.')
             if not isinstance(response, dict):
                 raise AdminInputError('A structured response is required.')
             if question['kind'] == 'review':
+                if _private_cleanup(state):
+                    _redaction_response(question, response, owner_terminal)
                 if set(response) - {'approved', 'review_digest', 'source', 'confirmations'}:
                     raise AdminInputError('Unsupported approval response fields: '
                                           + ', '.join(sorted(set(response) - {'approved', 'review_digest', 'source', 'confirmations'}))
@@ -448,6 +532,8 @@ class AdminOperations:
                     raise AdminInputError('Approval must be explicitly true or false.')
                 if not response['approved']:
                     question = {**question, 'interaction_id': str(uuid4()), 'revision': state['revision'] + 1}
+                    if _private_cleanup(state):
+                        question['owner_phrase'] = _owner_phrase(operation_id, question)
                     state.update(state='paused', pending_interaction=question)
                     state.setdefault('responses', []).append({'interaction_id': interaction_id, 'revision': revision, 'response': response})
                     self._save(state)
@@ -734,18 +820,31 @@ class AdminOperations:
         state.update(state='working', live_state_checked=False)
         for key in ('error', 'error_detail', 'handoff', 'read_only_retry'):
             state.pop(key, None)
+        if _private_cleanup(state):
+            state.pop('recovery', None)
         if state['step'] in ('connection', 'plan', 'apply', 'initialize', 'migrate',
                               'migration_bind',
                               'update_service_apply', 'project_apply', 'removal_apply', 'recover',
                               'home_apply', 'home_disable', 'cleanup_apply', 'cleanup_sweep',
-                              'project_lifecycle_apply'):
+                              'redaction_apply', 'redaction_sweep', 'project_lifecycle_apply'):
             state['effect_sequence'] = state.get('effect_sequence', 0) + 1
             state['effect_started'] = True
         self._save(state)
         try:
-            with redirect_stdout(sys.stderr):
-                getattr(self, '_' + state['kind'])(state)
+            if _private_cleanup(state):
+                # There is no console transcript for a redaction. Only structured, checked results
+                # are published; incidental prints must not be redirected to the harness log.
+                with open(os.devnull, 'w') as discard, redirect_stdout(discard):
+                    self._cleanup(state)
+            else:
+                with redirect_stdout(sys.stderr):
+                    getattr(self, '_' + state['kind'])(state)
         except Exception as error:
+            if _private_cleanup(state):
+                from tools.redaction_administration import stop
+                stop(state, error)
+                self._save(state)
+                return
             code = _error_code(error)
             uncertain = any(word in code.lower() for word in ('unknown', 'uncertain', 'timeout'))
             if state.get('effect_started') and not isinstance(error, (SetupPending, ValueError)):
@@ -1321,6 +1420,18 @@ class AdminOperations:
                 upgrade = step.startswith('migra')
                 from importlib.resources import files
                 from tools.memory.admin import MIGRATION_FILES
+                if upgrade and (state['parameters'].get('mode') != 'update'
+                                or state.get('update_return_step') == 'update_service'):
+                    # A pre-cutover update can resume at an old SQL review. Do not
+                    # seed an erasure ledger until its bucket policy and serving gate exist.
+                    from tools.update import schema_status
+                    if '026_reviewed_redaction.sql' in schema_status(wizard.values).get('pending', ()):
+                        if state['parameters'].get('mode') != 'update':
+                            raise SetupPending('The redaction gate and bucket protections must be deployed before this schema. '
+                                               'Use the reviewed setup update; this operation made no SQL change.')
+                        state.pop('update_return_step')
+                        state.update(step='update_service', service_return_step='migration_review')
+                        return
                 review = {'instance': _connection_config(wizard.values), 'environment': dict(wizard.values), 'upgrade': upgrade,
                           'sql': {name: files('tools.memory').joinpath('migrations', name).read_text(encoding='utf-8') for name in MIGRATION_FILES}}
                 # Corrected pending SQL needs a new exact review, not the old approval or a new operation.
@@ -1330,7 +1441,7 @@ class AdminOperations:
                     self._review(state, 'schema', 'Review exact SQL ' + ('upgrade' if upgrade else 'initialization'), review, 'migrate' if upgrade else 'initialize')
                 else:
                     self._approved(state, 'schema', review)
-                    # An update deploys the matching service next; verify readiness at the end instead.
+                    # Older ordered upgrades verify after service cutover; redaction cutover deploys the gate first.
                     result = bootstrap.initialize(wizard.values, confirm_instance=review['instance']['instance_id'], upgrade=upgrade,
                                                   verify_service=not state.get('update_return_step'))
                     self._receipt(state, step, result)
@@ -1462,7 +1573,9 @@ class AdminOperations:
                 raise SetupPending('The deployed database schema is not an ordered prefix of this version\'s migrations '
                                    '(applied: ' + ', '.join(status['applied']) + '). Nothing was changed; this '
                                    'software cannot upgrade it. Use the MAVEN version that matches the instance.')
-            if status['state'] == 'pending':
+            if '026_reviewed_redaction.sql' in status.get('pending', ()):
+                state.update(step='update_service', service_return_step='migration_review')
+            elif status['state'] == 'pending':
                 state['update_return_step'] = 'update_service'
                 state['step'] = 'migration_review'
             else:
@@ -1500,11 +1613,11 @@ class AdminOperations:
                 live = bootstrap._outputs(stack)
                 self._receipt(state, step, {'service': 'current', 'stack': stack['StackId']})
                 if live != _connection_config(wizard.values):
-                    state['update_return_step'] = 'verify'
+                    state['update_return_step'] = state.pop('service_return_step', 'verify')
                     self._review(state, 'reconnect', 'Review current service outputs to reconnect this installation',
                                  live, 'migration_bind')
                 else:
-                    state['step'] = 'verify'
+                    state['step'] = state.pop('service_return_step', 'verify')
                 return
             review_path = service_directory / 'service-change-set.json'
             bootstrap.plan(wizard.values, package, review_path, change_type='UPDATE')
@@ -1543,7 +1656,7 @@ class AdminOperations:
                                      confirm_review=review['review_sha256'])
             wizard.values = load_environment(wizard.env)
             self._receipt(state, step, result)
-            state['step'] = 'verify'
+            state['step'] = state.pop('service_return_step', 'verify')
         else:
             raise SetupPending('Unknown update phase; retain evidence and use the matching implementation.')
 
@@ -2059,6 +2172,9 @@ class AdminOperations:
         from tools.setup_common import expected_account
         step, parameters = state['step'], state['parameters']
         action = parameters['action']
+        if _private_cleanup(state):
+            from tools import redaction_administration
+            return redaction_administration.advance(self, state)
         if step == 'start':
             values, config, session = self._cleanup_admin()
             state['presentation'] = {

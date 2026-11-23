@@ -19,7 +19,7 @@ MEMORY_KINDS = {"entity", "fact", "relationship", "task", "decision", "risk",
 MEMORY_ROUTES = {"/v1/memory/" + action for action in ("write", "read", "search", "context",
                                                        "secret_lookup", "secret_catalog",
                                                        "secret_adapter_policy", "secret_adapter_consume")}
-RECONCILE_ROUTES = {"/v1/reconcile/" + action for action in ("status", "inventory", "read", "apply")}
+RECONCILE_ROUTES = {"/v1/reconcile/" + action for action in ("status", "inventory", "read", "apply", "markers")}
 APPROVAL_ROUTES = {"/v1/proposals/challenge", "/v1/proposals/resolve"}
 MUTATION_ROUTES = {"/v1/proposals/create", "/v1/proposals/resolve", "/v1/reconcile/apply",
                    "/v1/memory/write", "/v1/memory/secret_catalog"}

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import base64
 from contextlib import closing, contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import io
 import json
@@ -20,6 +20,7 @@ from botocore.exceptions import ClientError
 from tools.aws.settings import prefix, required
 from tools.aws.secrets import KEY_ID, NAME, StorageRejected, StoreError, file_keyring
 from tools.memory.secrets_contract import validate_consumer_ref
+from tools.memory import redaction_objects as redact
 from tools.memory.environment import selected_aws_session
 
 MAX_VALUE_BYTES = 4096
@@ -119,7 +120,168 @@ class SecretStore:
         self.binding = MappingProxyType(binding)
         self.store_id = hashlib.sha256(json.dumps(binding, sort_keys=True,
                                                  separators=(',', ':')).encode()).hexdigest()
-        self.session = session or selected_aws_session(self.values, region=self.binding['region'])
+        self._explicit_session = session is not None
+        self.session = session if session is not None else selected_aws_session(self.values, region=self.binding['region'])
+
+    def _redaction_admin(self):
+        from tools.memory.validation import authorized_actor
+        if not self._explicit_session or self.session.region_name != self.binding['region']:
+            redact.refuse('invalid_redaction_scope')
+        with closing(self.session.client('sts')) as sts:
+            identity = sts.get_caller_identity()
+        if identity.get('Account') != self.binding['account']:
+            redact.refuse('invalid_redaction_scope')
+        authorized_actor({'requestContext': {'authorizer': {'iam': {'userArn': identity.get('Arn')}}}},
+                         self.values.get('MAVEN_MEMORY_ADMIN_ROLE_ARN'))
+
+    @redact.guarded
+    def redaction_target(self, kind, name, salt):
+        """Private owner-terminal lookup. Names are never part of the returned review."""
+        if kind not in ('ssm', 'encrypted-file'):
+            redact.refuse('invalid_redaction_scope')
+        return {'kind': kind, 'id': redact.handle(salt, kind, self.store_id + ':' + valid_name(name))}
+
+    def _redaction_names(self, kind):
+        if kind == 'encrypted-file':
+            prefix = self.binding['object_prefix']
+            keys = redact.secret_file_keys(self.session.client('s3'), self.binding['bucket'], self.binding['account'], prefix)
+            return {key[len(prefix):] for key in keys if NAME.fullmatch(key[len(prefix):])}
+        if kind != 'ssm':
+            redact.refuse('invalid_redaction_scope')
+        prefix = self.binding['parameter_prefix']
+        ssm = self.session.client('ssm')
+        names, seen, args = set(), set(), {}
+        while True:
+            page = ssm.describe_parameters(ParameterFilters=[
+                {'Key': 'Name', 'Option': 'BeginsWith', 'Values': [prefix]}], MaxResults=50, **args)
+            for item in page['Parameters']:
+                name = item['Name']
+                if not name.startswith(prefix):
+                    redact.refuse('inventory_unverified')
+                if item.get('Type') == 'SecureString' and NAME.fullmatch(name[len(prefix):]):
+                    names.add(name[len(prefix):])
+            token = page.get('NextToken')
+            if token is None:
+                return names
+            if not isinstance(token, str) or not token or token in seen:
+                redact.refuse('inventory_unverified')
+            seen.add(token)
+            args = {'NextToken': token}
+
+    @redact.guarded
+    def redaction_candidates(self, salt):
+        self._redaction_admin()
+        return sorted((self.redaction_target(kind, name, salt) for kind in ('ssm', 'encrypted-file')
+                       for name in self._redaction_names(kind)), key=lambda item: (item['kind'], item['id']))
+
+    def _redaction_name(self, target, salt):
+        if (not isinstance(target, dict) or set(target) != {'kind', 'id'} or
+                str(uuid.UUID(target['id'])) != target['id']):
+            redact.refuse('invalid_redaction_scope')
+        kind = target['kind']
+        matches = [name for name in self._redaction_names(kind) if self.redaction_target(kind, name, salt) == target]
+        if len(matches) > 1:
+            redact.refuse('ambiguous_redaction_target')
+        return matches[0] if matches else None
+
+    def _ssm_versions(self, name, salt, ident):
+        ssm, args, seen, versions = self.session.client('ssm'), {}, set(), {}
+        parameter = self.parameter(name)
+        while True:
+            page = ssm.get_parameter_history(Name=parameter, WithDecryption=False, MaxResults=50, **args)
+            for item in page['Parameters']:
+                item.pop('Value', None)  # Ciphertext is not input to a receipt.
+                version, modified = item['Version'], item['LastModifiedDate']
+                if (item['Name'] != parameter or item['Type'] != 'SecureString' or type(version) is not int
+                        or version < 1 or version in versions or not isinstance(modified, datetime)
+                        or modified.tzinfo is None):
+                    redact.refuse('inventory_unverified')
+                versions[version] = redact.pin(salt, ident, 'parameter-version', version,
+                                              modified.astimezone(timezone.utc).isoformat())
+            token = page.get('NextToken')
+            if token is None:
+                break
+            if not isinstance(token, str) or not token or token in seen:
+                redact.refuse('inventory_unverified')
+            seen.add(token)
+            args = {'NextToken': token}
+        current = ssm.get_parameter(Name=parameter, WithDecryption=False)['Parameter']
+        current.pop('Value', None)
+        if (not versions or current.get('Name') != parameter or current.get('Type') != 'SecureString'
+                or current.get('Version') != max(versions) or
+                redact.pin(salt, ident, 'parameter-version', current['Version'],
+                           current['LastModifiedDate'].astimezone(timezone.utc).isoformat()) != versions[current['Version']]):
+            redact.refuse('version_scope_changed')
+        return sorted(versions.values())
+
+    @redact.guarded
+    def review_redaction(self, target, salt):
+        self._redaction_admin()
+        name = self._redaction_name(target, salt)
+        if name is None:
+            redact.refuse('object_not_found')
+        kind, ident = target['kind'], target['id']
+        if kind == 'ssm':
+            versions = self._ssm_versions(name, salt, ident)
+        else:
+            versions = redact.secret_file_versions(self.session.client('s3'), self.binding['bucket'],
+                self.binding['account'], self.binding['object_prefix'] + name, salt, ident)
+        if not versions:
+            redact.refuse('object_not_found')
+        return {'format': 1, 'scope': redact.handle(salt, 'secret_store', self.store_id),
+                'kind': kind, 'id': ident, 'versions': versions}
+
+    @redact.guarded
+    def apply_redaction(self, plan, salt, *, issuer_revoked=False, writers_quiesced=False, private_name=None):
+        """Separate exact approval only. SSM has no conditional delete: isolate ALL writers first."""
+        if issuer_revoked is not True:
+            redact.refuse('issuer_revocation_required')
+        if writers_quiesced is not True:
+            redact.refuse('writer_isolation_required')
+        if (not isinstance(plan, dict) or set(plan) != {'format', 'scope', 'kind', 'id', 'versions'}
+                or type(plan['format']) is not int or plan['format'] != 1
+                or plan['scope'] != redact.handle(salt, 'secret_store', self.store_id)):
+            redact.refuse('invalid_redaction_scope')
+        redact.validate_pins(plan['versions'])
+        if not plan['versions']:
+            redact.refuse('invalid_redaction_scope')
+        self._redaction_admin()
+        kind, ident = plan['kind'], plan['id']
+        target = {'kind': kind, 'id': ident}
+        name = self._redaction_name(target, salt)
+        if private_name is not None:
+            if self.redaction_target(kind, private_name, salt) != target:
+                redact.refuse('invalid_redaction_scope')
+            name = private_name
+        if kind == 'ssm':
+            if name is None:
+                # DescribeParameters is not authoritative negative evidence; never claim
+                # an uncertain deletion solely because the discovery index omitted it.
+                redact.refuse('provider_locator_required')
+            ssm, parameter = self.session.client('ssm'), self.parameter(name)
+            try:
+                versions = self._ssm_versions(name, salt, ident)
+            except ClientError as exc:
+                if exc.response.get('Error', {}).get('Code') != 'ParameterNotFound':
+                    raise
+            else:
+                if versions != plan['versions']:
+                    redact.refuse('version_scope_changed')
+                ssm.delete_parameter(Name=parameter)  # Entire parameter, not a single catalog revision.
+            try:
+                ssm.get_parameter(Name=parameter, WithDecryption=False)
+            except ClientError as exc:
+                if exc.response.get('Error', {}).get('Code') != 'ParameterNotFound':
+                    raise
+            else:
+                redact.refuse('provider_deletion_unverified')
+        elif name is not None:
+            redact.purge_secret_file(self.session.client('s3'), self.binding['bucket'], self.binding['account'],
+                                     self.binding['object_prefix'] + name, salt, ident, plan['versions'])
+        else:
+            redact.verify_absent_secret_file(self.session.client('s3'), self.binding['bucket'], self.binding['account'])
+        return {'status': 'provider_deletion_verified', 'kind': kind, 'id': ident,
+                'versions': len(plan['versions']), 'issuer_revocation': 'owner_attested'}
 
     def parameter(self, name):
         return self.binding['parameter_prefix'] + valid_name(name)

@@ -550,6 +550,12 @@ versioned resources, secrets, encryption dependencies, deployed runtime code, an
 recovery metadata before removing running infrastructure. The recovery manifest is
 saved locally and in the recovery bucket. Snapshot availability and manifest/object
 verification are **not** proof of a successful restore.
+Do not serve that snapshot by redeploying its archived Lambda. Restore into
+isolation with no normal credentials or network access; retain the **original**
+recovery bucket, including its independent erasure ledger. Use the matching
+current maintenance tooling to replay and verify every erasure before binding
+the restored physical cluster for normal use. If the original ledger is missing,
+stale or unverifiable, leave the restore isolated. See [security](security.md).
 
 `--cloud-mode purge` requires the separate instance confirmation and removes only
 reviewed instance resources. It handles retained infrastructure, deletion

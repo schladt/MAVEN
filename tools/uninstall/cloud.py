@@ -512,6 +512,11 @@ def _plan(cloud, values, home, mode, optional, retained_resources):
                     'parameter': (wrapping_prefix + values['MAVEN_SECRETS_KEY_ID']) if wrapping_prefix and values.get('MAVEN_SECRETS_KEY_ID') else None}}
     details['snapshot_id'] = 'maven-retire-' + digest(details)[:40]
     details['recovery_key'] = 'uninstall/' + instance + '/' + digest(details) + '.json'
+    if mode == 'purge':
+        for bucket in buckets:
+            if any(v['key'].startswith(('redaction-ledger/', 'narrow-erases/')) for v in bucket['versions']):
+                retained.append({'target': 'arn:aws:s3:::' + bucket['name'], 'status': 'retained',
+                                 'reason': 'Independent erasure ledger retained outside the database restore timeline.'})
     if mode == 'retire':
         for bucket in buckets:
             retained.append({'target': 'arn:aws:s3:::' + bucket['name'], 'status': 'retained', 'reason': 'Verified recovery/skill versions; ongoing storage charges.'})
@@ -777,10 +782,10 @@ def _recovery(cloud, details, snapshot, operation_dir=None):
                 'automated_backups': details['preserved_automated_backups'],
                 'lifecycle': details['lifecycle'], 'wrapping_key_dependency': details['wrapping_key_dependency'],
                 'verification': 'Snapshot available; retained object version metadata checked; manifest read back. No live restore performed.',
-                'restore_requirements': ['Retain snapshot KMS key, database secrets and versioned skill/recovery buckets.',
-                    'Recreate the reviewed private network and restore the cluster from the exact snapshot; do not create an empty replacement database.',
-                    'Rebind restored cluster, secrets and bucket identities using reviewed deployment/admin credentials; retain schema migration source.',
-                    'Keep restored service frozen until administrative recovery assigns a new recovery epoch and reconciles sessions/receipts; never silently clear the barrier.']}
+                'restore_requirements': ['Retain snapshot KMS key, database secrets, original erasure ledger and versioned skill/recovery buckets.',
+                    'Restore the exact snapshot in isolation without access for any ordinary principal; do not deploy the archived runtime.',
+                    'Use the current reviewed redaction recovery operation to verify the original independent ledger and reapply all erasures.',
+                    'Do not release credentials or enable ordinary service until replay is verified against the latest ledger and restored physical cluster.']}
     body = canonical(manifest)
     if len(body) > 32 * 1024 * 1024:
         raise UninstallError('Recovery manifest exceeds the bounded recovery size.')
@@ -959,6 +964,8 @@ def _purge_bucket(cloud, expected, details, entry, save):
     if _call(s3, 'head_bucket', Bucket=name, ExpectedBucketOwner=account) is None:
         return {'status': 'removed'}
     actual = _bucket(cloud, name, account)
+    def ledger(item):
+        return item['key'].startswith(('redaction-ledger/', 'narrow-erases/'))
     if actual['tags'] != expected['tags']:
         raise UninstallError('Bucket ownership tags changed since approval.')
     if expected.get('exclusive'):
@@ -989,15 +996,18 @@ def _purge_bucket(cloud, expected, details, entry, save):
         except Exception as error:
             if _code(error) != 'NoSuchUpload':
                 raise
-    for start in range(0, len(actual['versions']), 1000):
-        batch = actual['versions'][start:start + 1000]
+    removable = [item for item in actual['versions'] if not ledger(item)]
+    for start in range(0, len(removable), 1000):
+        batch = removable[start:start + 1000]
         result = s3.delete_objects(Bucket=name, ExpectedBucketOwner=account,
             Delete={'Objects': [{'Key': item['key'], 'VersionId': item['version']} for item in batch], 'Quiet': True})
         if result.get('Errors'):
             raise UninstallError('Some reviewed S3 versions could not be deleted (object lock, MFA or permissions); resume after resolving the blocker.')
     remaining = _bucket(cloud, name, account)
-    if remaining['versions'] or remaining['uploads']:
+    if remaining['versions'] != [item for item in expected['versions'] if ledger(item)] or remaining['uploads']:
         raise UninstallError('Bucket is not empty; concurrent writes are protected, not swept.')
+    if remaining['versions']:
+        return {'status': 'retained-erasure-ledger', 'bucket': name}
     s3.delete_bucket(Bucket=name, ExpectedBucketOwner=account)
     return {'status': 'removed', 'bucket': name}
 

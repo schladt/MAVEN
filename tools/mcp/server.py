@@ -39,22 +39,32 @@ class MavenApplication:
         self._unbound_client = None
 
     @contextmanager
-    def local(self, cwd, *, project_id=None, use_home=False):
+    def local(self, cwd, *, project_id=None, use_home=False, delivering=False):
         selection = select_project(cwd, self.home, use_home=use_home)
         if not selection or project_id is not None and project_id != selection['project_id']:
             raise ProjectError('workspace does not select the requested project')
         root = Path(selection['root'])
-        with project_binding_lock(self.home, root):
+        from tools.project import load_project
+        from tools.reconcile_redaction import Replica
+        binding = load_project(root)
+        replica = Replica(self.home, binding['instance_id'])
+        with replica.locked(), project_binding_lock(self.home, root):
             ensure_available(self.home, root)
-            if selection != select_project(cwd, self.home, use_home=use_home):
+            if selection != select_project(cwd, self.home, use_home=use_home) or load_project(root) != binding:
                 raise ProjectError('workspace selection changed')
             if self.env.exists() or self.env.is_symlink():
                 from tools.memory.environment import load_environment
-                from tools.project import load_project, require_binding
+                from tools.project import require_binding
                 values = load_environment(self.env)
-                require_binding(load_project(root), {k: values.get('MAVEN_MEMORY_' + k.upper())
-                                                     for k in ('instance_id', 'recovery_epoch')})
-            yield LocalStore(root, selection['project_id'])
+                context = {k: values.get('MAVEN_MEMORY_' + k.upper()) for k in ('instance_id', 'recovery_epoch')}
+                if not delivering or context['instance_id'] != binding['instance_id']:
+                    require_binding(binding, context)
+                elif context['recovery_epoch'] != binding['recovery_epoch']:
+                    self.close()  # Marker-only reconnect must use the newly configured epoch, not a cached client.
+            store = LocalStore(root, selection['project_id'])
+            store.replica = replica
+            replica.protect(store, delivering=delivering)
+            yield store
 
     def unbound_client(self):
         if self._unbound_client is None:
@@ -101,7 +111,7 @@ class Choice(BaseModel):
 def create_server(application=None):
     app = application or MavenApplication()
     server = MavenMCPServer('MAVEN', instructions=INSTRUCTIONS, log_level='WARNING')
-    read_hint = ToolAnnotations(read_only_hint=True, open_world_hint=False)
+    local_hint = ToolAnnotations(read_only_hint=False, idempotent_hint=True, open_world_hint=False)
 
     def guarded(fn):
         @wraps(fn)
@@ -126,21 +136,21 @@ def create_server(application=None):
                         'next_action': 'Inspect actual state; do not assume a write failed or succeeded.'}
         return call
 
-    @server.tool(annotations=read_hint)
+    @server.tool(annotations=local_hint)
     @guarded
     def maven_orient(cwd: str, use_home: bool = False) -> dict[str, Any]:
-        """Read the local orientation brief, skill index and write token. No network. Home only on explicit selection."""
+        """Read the local brief, skill index and token. Offline; reapplies known terminal markers before reading. Home only on explicit selection."""
         selected = select_project(cwd, app.home, use_home=use_home)
         if selected is None:
             return {'status': 'not_enabled', 'cloud_checked': False}
         with app.local(cwd, project_id=selected['project_id'], use_home=use_home) as store:
             return {**store.orient(), **selected, 'status': 'local', 'cloud_checked': False}
 
-    @server.tool(annotations=read_hint)
+    @server.tool(annotations=local_hint)
     @guarded
     def maven_local_read(cwd: str, project_id: str, ids: list[str] | None = None,
                          expected_token: str | None = None, use_home: bool = False) -> dict[str, Any]:
-        """No IDs: compact local inventory. IDs: read exact records & history against expected_token (max 50). Offline."""
+        """No IDs: compact local inventory. IDs: exact records & history against expected_token (max 50). Offline; previously received redactions are enforced first."""
         with app.local(cwd, project_id=project_id, use_home=use_home) as store:
             if ids is None:
                 return {'status': 'local', **store.inventory()}
@@ -164,7 +174,7 @@ def create_server(application=None):
                         ids: list[str] | None = None, choices: list[Choice] | None = None,
                         after_id: str | None = None, limit: int = 100, use_home: bool = False,
                         interactive_login: bool = False) -> dict[str, Any]:
-        """Inspect, read, apply reviewed choices, or verify. Supply both original tokens for paging. For an explicit reconcile, interactive_login offers one owner-terminal sign-in and resumes only a fresh inspection."""
+        """Inspect, read, apply reviewed choices, or verify. All actions receive and locally enforce terminal markers first, even for archived projects. Only apply uploads choices. Supply both original tokens for paging. Interactive login resumes only a fresh inspection."""
         from tools.memory.reconcile_cloud import CloudStore
         from tools.project import load_project, require_binding
 
@@ -172,14 +182,19 @@ def create_server(application=None):
 
         def run(*, fresh=False):
             nonlocal original_binding
-            with app.local(cwd, project_id=project_id, use_home=use_home) as store:
+            with app.local(cwd, project_id=project_id, use_home=use_home, delivering=True) as store:
                 binding = (store.root, load_project(store.root))
                 if fresh and binding != original_binding:
                     raise StaleView('project changed during sign-in')
                 original_binding = binding
                 client = app.unbound_client()
-                require_binding(binding[1], client.config)
                 cloud = CloudStore(client, project_id)
+                if (binding[1].get('instance_id') == client.config.get('instance_id') and
+                        binding[1].get('recovery_epoch') != client.config.get('recovery_epoch')):
+                    # Same installation, old epoch: terminal notices only. Never
+                    # make a stale binding eligible for live inventory or uploads.
+                    store.replica.receive(store, cloud)
+                require_binding(binding[1], client.config)
                 if fresh:
                     return inspect_views(store, cloud, limit=limit)
                 if action in ('inspect', 'verify'):

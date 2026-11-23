@@ -66,8 +66,8 @@ def scalar(value):
     return {"records": [[{"stringValue": json.dumps(value)}]]}
 
 
-def control_response(state="ready"):
-    return {"Body": BytesIO(json.dumps(store.control_document(CONFIG, state)).encode()), "ETag": '"v1"'}
+def control_response(state="ready", *, bound=False):
+    return {"Body": BytesIO(json.dumps(store.control_document(CONFIG, state, redaction_bound=bound)).encode()), "ETag": '"v1"'}
 
 
 class ValidationTests(unittest.TestCase):
@@ -492,10 +492,10 @@ class HandlerTests(unittest.TestCase):
         self.addCleanup(service._CLIENTS.clear)
         with patch.object(boto3, "client") as client:
             first, second = REAL_MAKE_STORE(CONFIG, None), REAL_MAKE_STORE(CONFIG, None)
-        self.assertEqual(sorted(call.args[0] for call in client.call_args_list), ["rds-data", "s3"])
+        self.assertEqual(sorted(call.args[0] for call in client.call_args_list), ["rds", "rds-data", "s3"])
         self.assertIs(first.db.client, second.db.client)
         self.assertIs(first.s3, second.s3)
-        self.assertIs(first.cache, service.CONTROL_CACHE)
+        self.assertIs(first.rds, second.rds)
 
 
 def wire_rows(document):
@@ -507,8 +507,14 @@ def wire_rows(document):
                         for offset in range(0, len(raw), store.JSON_CHUNK_BYTES)]}
 
 
+PHYSICAL = {"DBClusterArn": CONFIG["cluster_arn"], "DbClusterResourceId": "cluster-ABCDEF123456"}
+GENESIS = {"instance_id": INSTANCE, "epoch": EPOCH, "sequence": 0, "type": "genesis", "salt": KEY,
+           "previous": None, "cluster": validation.digest({"arn": CONFIG["cluster_arn"], "resource_id": PHYSICAL["DbClusterResourceId"]})}
+
+
 def envelope(result, *, state="ready", generation=5):
-    return {"service_state": store.control_document(CONFIG, state), "authority_generation": generation,
+    return {"service_state": {**store.control_document(CONFIG, state), "redaction_checkpoint": validation.digest(GENESIS)},
+            "authority_generation": generation,
             "result": result}
 
 
@@ -517,9 +523,11 @@ class DataAPIContractTests(unittest.TestCase):
         self.data = Mock()
         self.data.begin_transaction.return_value = {"transactionId": "tx"}
         self.s3 = Mock()
-        self.s3.get_object.side_effect = lambda **_: control_response()
-        self.cache = store.ControlCache()
-        self.storage = store.Store(CONFIG, self.data, self.s3, control_cache=self.cache)
+        self.s3.get_object.side_effect = lambda **_: control_response(bound=True)
+        self.rds = Mock()
+        self.rds.describe_db_clusters.return_value = {"DBClusters": [PHYSICAL]}
+        self.ledger = self.enterContext(patch.object(store.ledger, "latest", return_value=GENESIS))
+        self.storage = store.Store(CONFIG, self.data, self.s3, self.rds)
 
     def script_result(self, result):
         """Exact fact reads still use a protocol-checked explicit transaction."""
@@ -552,7 +560,7 @@ class DataAPIContractTests(unittest.TestCase):
         self.assertEqual(parameters["request_hash"], validation.digest(request))
         self.assertEqual(parameters["protocol"], 1)
 
-    def test_read_is_one_data_api_call_and_reuses_control_briefly(self):
+    def test_read_is_one_data_api_call_but_never_reuses_serving_authority(self):
         # Before migration 013 a read was begin, set_config, lock_service_state, set_config,
         # memory_protocol_allowed, route statement and commit: seven Data API calls.
         for _ in range(2):
@@ -564,15 +572,14 @@ class DataAPIContractTests(unittest.TestCase):
         self.data.begin_transaction.assert_not_called()
         self.data.commit_transaction.assert_not_called()
         self.assertNotIn("transactionId", self.data.execute_statement.call_args.kwargs)
-        self.assertEqual(self.s3.get_object.call_count, 1)
+        self.assertEqual(self.s3.get_object.call_count, 4)
+        self.assertEqual(self.ledger.call_count, 4)
+        self.assertEqual(self.rds.describe_db_clusters.call_count, 4)
         self.assertIsNone(self.parameters()["request_hash"])
-        self.cache.fetched_at -= store.CONTROL_TTL_SECONDS + 1
-        self.dispatch({"records": []})
-        self.storage.perform("/v1/memory/search", {}, ACTOR)
-        self.assertEqual(self.s3.get_object.call_count, 2)
+        self.assertEqual(json.loads(self.parameters()["service_fence"]), envelope(None)["service_state"])
+        self.assertIn("CASE WHEN maven.lock_service_state()", self.data.execute_statement.call_args.kwargs["sql"])
 
     def test_mutation_is_one_statement_inside_rollbackable_transaction(self):
-        self.cache.put(CONFIG, store.control_document(CONFIG, "ready"))
         self.dispatch({"record_id": RECORD, "revision": 1, "request_key": KEY, "replayed": False})
         result, generation = self.storage.perform("/v1/memory/write", project_creation(), ACTOR)
         self.assertEqual((result["revision"], generation), (1, 5))
@@ -580,18 +587,17 @@ class DataAPIContractTests(unittest.TestCase):
         self.assertEqual(self.data.execute_statement.call_args.kwargs["transactionId"], "tx")
         self.data.begin_transaction.assert_called_once()
         self.data.commit_transaction.assert_called_once()
-        # Mutations never trust the cache: control is fetched before and after the statement.
+        # Control is fetched before and after the statement.
         self.assertEqual(self.s3.get_object.call_count, 2)
         self.dispatch({"record_id": RECORD, "revision": 1})
-        self.s3.get_object.side_effect = [control_response(), control_response("maintenance")]
+        self.s3.get_object.side_effect = [control_response(bound=True), control_response("maintenance", bound=True)]
         with self.assertRaises(validation.MemoryError) as error:
             self.storage.perform("/v1/memory/write", project_creation(), ACTOR)
         self.assertEqual(error.exception.status, "context_stale")
         self.assertEqual(self.data.commit_transaction.call_count, 1)
         self.data.rollback_transaction.assert_called_once()
-        self.assertIsNone(self.cache.get(CONFIG))
 
-    def test_database_state_mismatch_is_stale_and_clears_cache(self):
+    def test_database_state_mismatch_is_stale(self):
         for document in [envelope({"records": []}, state="maintenance"),
                          {**envelope({"records": []}), "service_state": {
                              **store.control_document(CONFIG, "ready"), "recovery_epoch": RECORD}},
@@ -600,7 +606,6 @@ class DataAPIContractTests(unittest.TestCase):
             with self.subTest(document=document["service_state"]), self.assertRaises(validation.MemoryError) as error:
                 self.storage.perform("/v1/memory/search", {}, ACTOR)
             self.assertEqual(error.exception.status, "context_stale")
-            self.assertIsNone(self.cache.get(CONFIG))
 
     def test_route_statuses_map_exactly_and_unknown_is_ambiguous(self):
         for result, status, http in [({"status": "client_incompatible"}, "client_incompatible", 409),
@@ -692,7 +697,7 @@ class AdminContractTests(unittest.TestCase):
                  "app_secret_arn": CONFIG["app_secret_arn"], "app_secret_version": "v1"}
         db.scalar.side_effect = [True, True, json.dumps(hashes), json.dumps(state)]
         secrets = Mock()
-        admin._install(db, CONFIG, secrets, store.control_document(CONFIG, "maintenance"))
+        admin._install(db, CONFIG, secrets, store.control_document(CONFIG, "maintenance"), ledger_gate=Mock())
         secrets.get_secret_value.assert_not_called()
         db.execute.assert_called_once()
 
@@ -706,7 +711,7 @@ class AdminContractTests(unittest.TestCase):
                  "app_secret_arn": CONFIG["app_secret_arn"], "app_secret_version": "v1"}
         db.scalar.side_effect = [True, True, json.dumps(installed), json.dumps(state)]
         secrets = Mock()
-        admin._install(db, CONFIG, secrets, store.control_document(CONFIG, "maintenance"), upgrade=True)
+        admin._install(db, CONFIG, secrets, store.control_document(CONFIG, "maintenance"), ledger_gate=Mock(), upgrade=True)
         secrets.get_secret_value.assert_not_called()
         registrations = []
         calls = db.execute.call_args_list
@@ -727,7 +732,7 @@ class AdminContractTests(unittest.TestCase):
         db.scalar.side_effect = [
             True, True, json.dumps({name: sha for name, sha, _ in admin.migrations()}), json.dumps(state)]
         with self.assertRaises(validation.MemoryError):
-            admin._install(db, CONFIG, Mock(), store.control_document(CONFIG, "maintenance"), upgrade=True)
+            admin._install(db, CONFIG, Mock(), store.control_document(CONFIG, "maintenance"), ledger_gate=Mock(), upgrade=True)
 
 
     def test_migration_drift_is_refused(self):
@@ -737,7 +742,7 @@ class AdminContractTests(unittest.TestCase):
         db.scalar.side_effect = [True, True, json.dumps({"001_foundation.sql": "wrong"})]
         secrets = Mock()
         with self.assertRaises(validation.MemoryError) as error:
-            admin._install(db, CONFIG, secrets, store.control_document(CONFIG, "maintenance"))
+            admin._install(db, CONFIG, secrets, store.control_document(CONFIG, "maintenance"), ledger_gate=Mock())
         self.assertEqual(error.exception.status, "bootstrap_refused")
         secrets.get_secret_value.assert_not_called()
 
@@ -750,7 +755,8 @@ class AdminContractTests(unittest.TestCase):
                     "Arn": "arn:aws:sts::123456789012:assumed-role/memory-admin/test"}
                 s3 = session.client.return_value
                 s3.get_object.side_effect = [
-                    control_response("maintenance"), control_response("maintenance"), control_response()]
+                    control_response("maintenance"), control_response("maintenance"),
+                    {"Body": BytesIO(json.dumps(store.control_document(CONFIG, "ready", redaction_bound=True)).encode()), "ETag": '"v2"'}]
                 db = Mock()
                 db.transaction.return_value.__enter__ = Mock(return_value="tx")
                 db.transaction.return_value.__exit__ = Mock(return_value=False)
@@ -758,7 +764,7 @@ class AdminContractTests(unittest.TestCase):
                     **store.control_document(CONFIG, "maintenance"),
                     "app_secret_arn": CONFIG["app_secret_arn"], "app_secret_version": "v1"})
 
-                def install(database, config, secrets, control, *, upgrade):
+                def install(database, config, secrets, control, *, ledger_gate, upgrade):
                     self.assertTrue(upgrade)
                     self.assertEqual(control, store.control_document(CONFIG, "maintenance"))
                     publication = s3.put_object.call_args.kwargs
@@ -767,6 +773,8 @@ class AdminContractTests(unittest.TestCase):
 
                 with patch.object(admin, "DataAPI", return_value=db), \
                         patch.object(admin, "_check_logging"), \
+                        patch.object(admin.redaction_ledger, "cluster_identity", return_value="a"*64), \
+                        patch.object(admin.redaction_ledger, "verify"), \
                         patch.object(admin, "_control", return_value=(legacy, '"legacy"')), \
                         patch.object(admin, "_install", side_effect=install) as installer, \
                         patch.object(admin, "_verify_application"):
@@ -774,7 +782,7 @@ class AdminContractTests(unittest.TestCase):
                 installer.assert_called_once()
                 self.assertEqual(result["data_scope"], store.ROLLOUT_SCOPE)
                 self.assertEqual(json.loads(s3.put_object.call_args.kwargs["Body"]),
-                                 store.control_document(CONFIG, "ready"))
+                                 store.control_document(CONFIG, "ready", redaction_bound=True))
                 s3.get_secret_value.assert_not_called()
 
     def test_control_publication_requires_an_explicit_precondition(self):

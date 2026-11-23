@@ -513,6 +513,8 @@
           "Status": "Enabled"
         },
         "Tags": [
+          {"Key": "MavenInstanceId", "Value": {"Ref": "InstanceId"}},
+          {"Key": "MavenExclusive", "Value": "true"},
           {
             "Key": "MavenMemoryInstance",
             "Value": {
@@ -540,6 +542,28 @@
         "PolicyDocument": {
           "Version": "2012-10-17",
           "Statement": [
+            {
+              "Sid": "NeverRemoveErasureLedger",
+              "Effect": "Deny", "Principal": "*",
+              "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion", "s3:PutObjectTagging", "s3:DeleteObjectTagging", "s3:PutObjectVersionTagging", "s3:DeleteObjectVersionTagging", "s3:PutObjectRetention"],
+              "Resource": [{"Fn::Sub": "${RecoveryBucket.Arn}/redaction-ledger/*"}, {"Fn::Sub": "${RecoveryBucket.Arn}/narrow-erases/*"}]
+            },
+            {
+              "Sid": "OnlyAppendLedgerEntries",
+              "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject",
+              "Resource": [{"Fn::Sub": "${RecoveryBucket.Arn}/redaction-ledger/*"}, {"Fn::Sub": "${RecoveryBucket.Arn}/narrow-erases/*"}],
+              "Condition": {"StringNotEquals": {"s3:if-none-match": "*"}}
+            },
+            {
+              "Sid": "OnlyAdministratorMayAppend",
+              "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject",
+              "Resource": [
+                {"Fn::Sub": "${RecoveryBucket.Arn}/redaction-ledger/*"},
+                {"Fn::Sub": "${RecoveryBucket.Arn}/narrow-erases/*/*/legacy/*"},
+                {"Fn::Sub": "${RecoveryBucket.Arn}/narrow-erases/*/*/bound*"}
+              ],
+              "Condition": {"ArnNotEquals": {"aws:PrincipalArn": {"Fn::GetAtt": ["MemoryAdminRole", "Arn"]}}}
+            },
             {
               "Sid": "DenyInsecureTransport",
               "Effect": "Deny",
@@ -618,7 +642,45 @@
               "Principal": "*",
               "Action": "s3:PutObject",
               "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
-              "Condition": {"StringNotEquals": {"s3:if-none-match": "*"}}
+              "Condition": {
+                "StringNotEquals": {"s3:if-none-match": "*"},
+                "ArnNotEquals": {"aws:PrincipalArn": {"Fn::GetAtt": ["MemoryAdminRole", "Arn"]}}
+              }
+            },
+            {
+              "Sid": "OnlyTaggedAdminSentinel",
+              "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject",
+              "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
+              "Condition": {"ArnEquals": {"aws:PrincipalArn": {"Fn::GetAtt": ["MemoryAdminRole", "Arn"]}},
+                            "StringNotEquals": {"s3:RequestObjectTag/maven-redacted": "true"}}
+            },
+            {
+              "Sid": "NoHistoricalBundleAccessForUsers",
+              "Effect": "Deny", "Principal": "*", "Action": ["s3:GetObjectVersion", "s3:DeleteObject", "s3:DeleteObjectVersion"],
+              "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
+              "Condition": {"ArnEquals": {"aws:PrincipalArn": [{"Fn::GetAtt": ["MemoryClientRole", "Arn"]}, {"Fn::GetAtt": ["MemoryApprovalRole", "Arn"]}]}}
+            },
+            {
+              "Sid": "RejectUnconditionalSentinel",
+              "Effect": "Deny", "Principal": "*", "Action": "s3:PutObject",
+              "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
+              "Condition": {"Null": {"s3:if-match": "true", "s3:if-none-match": "true"}}
+            },
+            {
+              "Sid": "OnlyAdminMayTagBundles",
+              "Effect": "Deny", "Principal": "*",
+              "Action": ["s3:PutObjectTagging", "s3:DeleteObjectTagging", "s3:PutObjectVersionTagging", "s3:DeleteObjectVersionTagging"],
+              "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
+              "Condition": {"ArnNotEquals": {"aws:PrincipalArn": {"Fn::GetAtt": ["MemoryAdminRole", "Arn"]}}}
+            },
+            {
+              "Sid": "NeverReadRetiredBundleAsClient",
+              "Effect": "Deny", "Principal": "*", "Action": ["s3:GetObject", "s3:GetObjectVersion"],
+              "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
+              "Condition": {
+                "StringEquals": {"s3:ExistingObjectTag/maven-redacted": "true"},
+                "ArnNotEquals": {"aws:PrincipalArn": {"Fn::GetAtt": ["MemoryAdminRole", "Arn"]}}
+              }
             }
           ]
         }
@@ -710,6 +772,9 @@
                     },
                     {
                       "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/inventory"
+                    },
+                    {
+                      "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/markers"
                     },
                     {
                       "Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/read"
@@ -1125,6 +1190,22 @@
         "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/apply"}
       }
     },
+    "ReconcileMarkersRoute": {
+      "Type": "AWS::ApiGatewayV2::Route",
+      "Condition": "ApprovedTarget",
+      "Properties": {
+        "ApiId": {"Ref": "MemoryApi"}, "RouteKey": "POST /v1/reconcile/markers", "AuthorizationType": "AWS_IAM",
+        "Target": {"Fn::Join": ["/", ["integrations", {"Ref": "MemoryIntegration"}]]}
+      }
+    },
+    "ReconcileMarkersInvokePermission": {
+      "Type": "AWS::Lambda::Permission", "Condition": "ApprovedTarget",
+      "Properties": {
+        "Action": "lambda:InvokeFunction", "FunctionName": {"Ref": "MemoryFunction"},
+        "Principal": "apigateway.amazonaws.com", "SourceAccount": {"Ref": "AWS::AccountId"},
+        "SourceArn": {"Fn::Sub": "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${MemoryApi}/$default/POST/v1/reconcile/markers"}
+      }
+    },
     "ReconcileInventoryRoute": {
       "Type": "AWS::ApiGatewayV2::Route",
       "Condition": "ApprovedTarget",
@@ -1282,6 +1363,45 @@
               "Version": "2012-10-17",
               "Statement": [
                 {
+                  "Effect": "Allow", "Action": "ec2:DescribeSecurityGroups", "Resource": "*",
+                  "Condition": {"StringEquals": {"aws:RequestedRegion": {"Ref": "AWS::Region"}}}
+                },
+                {
+                  "Effect": "Allow", "Action": "rds:DescribeDBClusters",
+                  "Resource": {"Fn::GetAtt": ["DatabaseCluster", "DBClusterArn"]}
+                },
+                {
+                  "Effect": "Allow", "Action": "s3:ListBucket", "Resource": {"Fn::GetAtt": ["RecoveryBucket", "Arn"]},
+                  "Condition": {"StringLike": {"s3:prefix": [{"Fn::Sub": "redaction-ledger/${InstanceId}/*"}, {"Fn::Sub": "narrow-erases/${InstanceId}/*"}]}}
+                },
+                {
+                  "Effect": "Allow", "Action": "s3:GetObject",
+                  "Resource": {"Fn::Sub": "${RecoveryBucket.Arn}/redaction-ledger/${InstanceId}/*"}
+                },
+                {
+                  "Effect": "Allow", "Action": "s3:PutObject",
+                  "Resource": [{"Fn::Sub": "${RecoveryBucket.Arn}/redaction-ledger/${InstanceId}/*"}, {"Fn::Sub": "${RecoveryBucket.Arn}/narrow-erases/${InstanceId}/*"}],
+                  "Condition": {"StringEquals": {"s3:if-none-match": "*"}}
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:ListBucketVersions", "s3:ListBucketMultipartUploads", "s3:GetBucketTagging", "s3:GetBucketVersioning", "s3:GetReplicationConfiguration", "s3:GetBucketObjectLockConfiguration"],
+                  "Resource": [{"Fn::GetAtt": ["SkillBucket", "Arn"]}, {"Fn::GetAtt": ["RecoveryBucket", "Arn"]}]
+                },
+                {
+                  "Effect": "Allow",
+                  "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging", "s3:GetObjectVersionTagging", "s3:GetObjectRetention", "s3:GetObjectLegalHold", "s3:DeleteObjectVersion", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"],
+                  "Resource": [
+                    {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
+                    {"Fn::Sub": "${RecoveryBucket.Arn}/*"}
+                  ]
+                },
+                {
+                  "Effect": "Allow", "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                  "Resource": {"Fn::Sub": "${SkillBucket.Arn}/skills/${InstanceId}/bundles/*"},
+                  "Condition": {"StringEquals": {"s3:RequestObjectTag/maven-redacted": "true"}}
+                },
+                {
                   "Effect": "Allow",
                   "Action": [
                     "rds-data:BeginTransaction",
@@ -1402,6 +1522,27 @@
             "PolicyDocument": {
               "Version": "2012-10-17",
               "Statement": [
+                {
+                  "Effect": "Allow", "Action": "rds:DescribeDBClusters",
+                  "Resource": {"Fn::GetAtt": ["DatabaseCluster", "DBClusterArn"]}
+                },
+                {
+                  "Effect": "Allow", "Action": "s3:ListBucket", "Resource": {"Fn::GetAtt": ["RecoveryBucket", "Arn"]},
+                  "Condition": {"StringLike": {"s3:prefix": {"Fn::Sub": "redaction-ledger/${InstanceId}/*"}}}
+                },
+                {
+                  "Effect": "Allow", "Action": "s3:GetObject",
+                  "Resource": {"Fn::Sub": "${RecoveryBucket.Arn}/redaction-ledger/${InstanceId}/*"}
+                },
+                {
+                  "Effect": "Allow", "Action": "s3:PutObject",
+                  "Resource": [{"Fn::Sub": "${RecoveryBucket.Arn}/narrow-erases/${InstanceId}/entries/project/*"}, {"Fn::Sub": "${RecoveryBucket.Arn}/narrow-erases/${InstanceId}/seals/project/*"}],
+                  "Condition": {"StringEquals": {"s3:if-none-match": "*"}}
+                },
+                {
+                  "Effect": "Allow", "Action": "s3:GetObject",
+                  "Resource": [{"Fn::Sub": "${RecoveryBucket.Arn}/narrow-erases/${InstanceId}/entries/project/*"}, {"Fn::Sub": "${RecoveryBucket.Arn}/narrow-erases/${InstanceId}/seals/project/*"}]
+                },
                 {
                   "Effect": "Allow",
                   "Action": [

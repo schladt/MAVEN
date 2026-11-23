@@ -1,7 +1,7 @@
 """Service-only project request validation and transactional dispatch; no SDK credentials here."""
 import re
 
-from tools.reconcile_records import MAX_BATCH, accept_change, digest, summarize, validate_project_envelope
+from tools.reconcile_records import MAX_BATCH, REDACTION_KINDS, accept_change, digest, summarize, validate_project_envelope
 from .validation import MemoryError, canonical, fields, invalid, string_list, uuid_string
 
 
@@ -16,6 +16,8 @@ def validate_request(route, request):
         required.add('project_id')
     if action == 'inventory':
         optional.update(('after_id', 'expected_token'))
+    elif action == 'markers':
+        optional.update(('after_id', 'after_kind', 'expected_token', 'bundle_hashes'))
     elif action in ('read', 'apply'):
         required.update(('expected_token', 'ids' if action == 'read' else 'changes'))
     fields(request, required, optional)
@@ -27,6 +29,17 @@ def validate_request(route, request):
     if 'expected_token' in request and (not isinstance(request['expected_token'], str)
                                         or not TOKEN.fullmatch(request['expected_token'])):
         invalid('invalid cloud view token')
+    if action == 'markers':
+        paging = {'after_id', 'after_kind', 'expected_token'} & request.keys()
+        if paging and (len(paging) != 3 or 'bundle_hashes' in request
+                       or not isinstance(request['after_kind'], str) or request['after_kind'] not in REDACTION_KINDS):
+            invalid('incomplete marker cursor')
+        if 'bundle_hashes' in request:
+            hashes = request['bundle_hashes']
+            if (not isinstance(hashes, list) or not 1 <= len(hashes) <= MAX_BATCH
+                    or any(not isinstance(s, str) or not TOKEN.fullmatch(s) for s in hashes)
+                    or len(hashes) != len(set(hashes))):
+                invalid('invalid bundle membership query')
     if action == 'read':
         string_list(request['ids'], MAX_BATCH, 36, validator=uuid_string, name='ids')
     if action == 'apply':
@@ -48,6 +61,12 @@ def validate_request(route, request):
 def perform(store, route, request, expected):
     from .store import route_result
     action = route.rsplit('/', 1)[-1]
+
+    if action == 'markers':
+        raw = store.db.json_scalar('maven.redaction_delivery(CAST(:request AS jsonb))',
+                                   {'request': canonical(request)}, overflow_status='snapshot_incomplete')
+        value, generation = store.envelope(raw, expected)
+        return route_result(value.get('result')), generation
 
     def call(name, body, tx=None):
         raw = store.db.json_scalar('maven.reconcile_request(:action, CAST(:request AS jsonb))',
@@ -92,6 +111,11 @@ def perform(store, route, request, expected):
                 'prior_digest': prior_digests.get(env['record']['id'])} for env in changes]
     with store.db.transaction(timeouts=False) as tx:
         result, generation = call('apply', {**header, 'changes': payload}, tx)
+        changed = set(result['changed'])
+        erased = [e['record']['id'] for e in changes if e['record'].get('erased') and e['record']['id'] in changed]
+        if erased:
+            from .erase_fence import record_project_erases
+            record_project_erases(store.s3, store.config, request['project_id'], erased)
         if store.control() != expected:
             raise MemoryError('context_stale')
     return result, generation
