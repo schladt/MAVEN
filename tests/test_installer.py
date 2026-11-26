@@ -290,7 +290,7 @@ class InstallerTests(unittest.TestCase):
             unused = home.parent / 'unused'
             args = argparse.Namespace(home=home)
             ui = Mock()
-            ui.choose.side_effect = ['separate', 'new', 'advanced', 'local']
+            ui.choose.side_effect = ['install', 'separate-new', 'install', 'separate-local']
             ui.form.side_effect = [{'home': str(home)}, {'home': str(unused)}]
             with using(ui):
                 install._options(args)
@@ -926,7 +926,7 @@ class HarnessFinishTests(unittest.TestCase):
     def test_ready_installer_menu_routes_harness_and_explicit_fresh_check_separately(self):
         self.completed()
         args, ui = argparse.Namespace(home=self.home), Mock()
-        ui.choose.return_value = 'harness'
+        ui.choose.side_effect = ['manage', 'harness']
         with using(ui):
             install._options(args)
         self.assertTrue(args.check_existing)
@@ -934,7 +934,9 @@ class HarnessFinishTests(unittest.TestCase):
         self.assertFalse(args.local_only)
         ui.form.assert_not_called()
         self.assertIn('harness', [value for _, value in ui.choose.call_args.args[1]])
-        ui.choose.return_value = 'existing'
+        self.assertEqual([value for _, value in ui.choose.call_args_list[0].args[1]],
+                         ['install', 'update-menu', 'uninstall', 'manage'])
+        ui.choose.side_effect = ['manage', 'existing']
         ui.form.return_value = {'home': str(self.home)}
         with using(ui):
             install._options(args)
@@ -944,7 +946,7 @@ class HarnessFinishTests(unittest.TestCase):
     def test_installer_exposes_separate_read_only_secrets_repair(self):
         self.completed()
         args, ui = argparse.Namespace(home=self.home), Mock()
-        ui.choose.return_value = 'repair-secrets'
+        ui.choose.side_effect = ['manage', 'repair-secrets']
         with using(ui):
             install._options(args)
         self.assertTrue(args.repair_secrets)
@@ -959,7 +961,7 @@ class HarnessFinishTests(unittest.TestCase):
     def test_installer_opens_deployment_access_without_restarting_setup(self):
         self.completed()
         args, ui = argparse.Namespace(home=self.home), Mock()
-        ui.choose.return_value = 'deployment-access'
+        ui.choose.side_effect = ['manage', 'deployment-access']
         with using(ui):
             install._options(args)
         self.assertIn('deployment-access', [value for _, value in ui.choose.call_args.args[1]])
@@ -987,7 +989,7 @@ class HarnessFinishTests(unittest.TestCase):
     def test_menu_home_entry_dispatches_home_operation_and_offers_turn_off_when_set(self):
         self.completed()
         args, ui = argparse.Namespace(home=self.home), Mock()
-        ui.choose.return_value = 'home'
+        ui.choose.side_effect = ['manage', 'home']
         with using(ui):
             install._options(args)
         self.assertIn('home', [value for _, value in ui.choose.call_args.args[1]])
@@ -997,7 +999,7 @@ class HarnessFinishTests(unittest.TestCase):
         self.assertEqual(command[-5:], ['tools.tui.administration', '--home', str(self.home),
                                        '--action', 'enable'])
         (self.home / 'home.json').write_text('{}')
-        ui.choose.side_effect = ['home', 'disable']
+        ui.choose.side_effect = ['manage', 'home', 'disable']
         with using(ui):
             install._options(args)
         self.assertEqual(args.home_action, 'disable')

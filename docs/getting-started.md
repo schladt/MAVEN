@@ -10,13 +10,15 @@ From the cloned or extracted source folder:
 python3 install.py
 ```
 
-The full-screen Textual interface starts with your goal: **connect existing memory**,
-**create a new instance**, or **Uninstall**. An existing installation shows its saved, unverified
-instance/account/region/profiles and offers **check or repair**, **update local
-software**, or **set up a separate instance**. Check/repair does not reinstall packages
-or automatically redeploy. A separate instance requires an unused private home.
-Software-only installation and certificate settings are under
-**Advanced options**. The private installation home defaults to `~/.maven`.
+The full-screen Textual interface starts with a short menu. Without an installation it
+offers **Install** (connect existing memory, create a new instance, or software only)
+and **Remove**. An existing installation shows its saved, unverified
+instance/account/region/profiles and offers **Install** (a separate instance or
+software only, in an unused private home), **Update** (everything, or local software
+only), **Remove**, and **Settings and repair** (connection check/repair, secrets,
+deployment access, MAVEN Home, harnesses, certificate and staging settings), plus
+**Resume unfinished setup** when one is pending. Check/repair does not reinstall packages
+or automatically redeploy. The private installation home defaults to `~/.maven`.
 
 Python 3.11+ with `venv` is required. If UI dependencies are missing, a brief initial
 prompt requests consent to download them into a temporary private runtime; system
@@ -173,7 +175,7 @@ cannot prove write permissions. No test resources are created by these probes.
 
 Importing `.env` does not copy credentials or reuse another machine's cache paths.
 For a separate deployment profile choose a different owner-private cache. To change
-an existing installation, select **Change deployment access** or run
+an existing installation, select **Settings and repair → Change deployment access** or run
 `maven-setup --home "$HOME/.maven" --deployment-access` for the same reviewed flow.
 The live preflight verifies the identity and reads CloudFormation; it does not
 create test resources or prove write permissions.
@@ -235,10 +237,10 @@ and reports its saved phase. Back only revises safe, unsubmitted choices.
 Unknown outcomes must be reconciled before retrying mutations; existing infrastructure
 must never be reinitialized to recover onboarding.
 
-Completed verified setup can continue local harness configuration without repeating cloud approvals if its recorded settings still match. To request a fresh connection check after completion choose **Check/repair**. Do not discard an unfinished operation or infer current AWS availability from a saved readiness receipt.
+Completed verified setup can continue local harness configuration without repeating cloud approvals if its recorded settings still match. To request a fresh connection check after completion choose **Settings and repair → Check or repair the connection**. Do not discard an unfinished operation or infer current AWS availability from a saved readiness receipt.
 
 To abandon the current unfinished setup, rerun `python3 install.py` and choose
-**Abandon unfinished setup and start over**. Review the exact operation and type its
+**Settings and repair → Start over**. Review the exact operation and type its
 displayed confirmation prefix. Declining leaves it unchanged. Approved abandonment:
 
 - Preserves the original operation, setup state and private `.env` contents in

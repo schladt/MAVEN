@@ -9,6 +9,7 @@ import subprocess
 import threading
 from collections.abc import Callable
 
+from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -183,6 +184,15 @@ class FormScreen(DialogScreen):
             self.dismiss(result)
 
 
+def _bulleted(label):
+    """One option per bullet; wrapped lines indent under the text, so a wrap never looks like a new option."""
+    row = Table.grid(padding=(0, 1))
+    row.add_column(width=1, no_wrap=True)
+    row.add_column(ratio=1)
+    row.add_row("●", Text(label))
+    return row
+
+
 class ChooseScreen(DialogScreen):
     """Visible action list, including the local operation dashboard."""
 
@@ -198,7 +208,7 @@ class ChooseScreen(DialogScreen):
             yield Label(self.heading, classes="heading", markup=False)
             if self.description:
                 yield TextArea(self.description, read_only=True, soft_wrap=True, id="choice-details")
-            yield OptionList(*(Option(Text(label), id=f"option-{index}") for index, (label, _) in enumerate(self.choices)), id="choices")
+            yield OptionList(*(Option(_bulleted(label), id=f"option-{index}") for index, (label, _) in enumerate(self.choices)), id="choices")
             yield Static("Up / Down: select • Enter: open • Tab: review details • Ctrl+Q: safe pause", classes="hint")
 
     def on_mount(self):

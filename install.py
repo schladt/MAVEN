@@ -490,6 +490,12 @@ def _advanced_options(args):
         args.stage_harnesses = Path(selected['stage_harnesses']) if selected['stage_harnesses'] else None
 
 
+def _submenu(ui, title, choices, description=''):
+    """A nested choice list with Back; returns None when the owner goes back."""
+    task = ui.choose(title, [*choices, ('Back', 'back')], description=description)
+    return None if task == 'back' else task
+
+
 def _options(args):
     ui = require()
     args.refresh_integrations = False
@@ -506,35 +512,57 @@ def _options(args):
         summary, pending, completed = _saved_installation(home) if existing else ('', None, False)
         ui.set_context('Local setup • No AWS identity verified yet • No cloud changes approved')
         if existing:
-            task = ui.choose('Your existing MAVEN installation', [
-                *([('Continue / configure coding harnesses — reuse prior readiness; local files only', 'harness')]
-                  if completed else []),
-                ('Resume unfinished setup — keep the original requests and approvals' if pending else
-                 'Check or repair this connection — verify the saved instance; no automatic redeployment', 'existing'),
-                *([('Repair secrets / integrations — import or verify exact portable locators; read-only checks', 'repair-secrets')]
-                  if not pending else []),
-                *([('Change deployment access — use an existing IAM role, a separate sign-in profile, or configure later',
-                    'deployment-access')] if (home / '.env').is_file() else []),
-                *([('Abandon unfinished setup and start over — preserve receipts and cloud resources', 'restart')]
+            task = ui.choose('Your MAVEN installation', [
+                *([('Resume unfinished setup — keep the original requests and approvals', 'existing')]
                   if pending else []),
-                *([('Update MAVEN — local software and harness skills, then database schema '
-                    'and cloud service, each separately reviewed', 'upgrade')] if completed and not pending else []),
-                *([('Set up or change MAVEN Home — choose, change or turn off the Home project', 'home')]
-                  if completed and not pending else []),
-                ('Update local MAVEN software — preserve cloud settings; no AWS login or cloud changes', 'update'),
-                ('Set up a separate instance — choose another private installation folder', 'separate'),
-                ('Uninstall — find an installation and choose what to remove', 'uninstall'),
-                ('Advanced options — software-only installation and custom local settings', 'advanced'),
+                ('Install — another instance, or software only', 'install'),
+                ('Update — MAVEN software and skills, optionally the cloud service', 'update-menu'),
+                ('Remove — choose what to uninstall', 'uninstall'),
+                ('Settings and repair — connection, secrets, access, Home, harnesses', 'manage'),
             ], description=summary)
+            if task == 'install':
+                task = _submenu(ui, 'Install', [
+                    ('Connect another folder to an existing cloud instance', 'separate-existing'),
+                    ('Create a new cloud instance in another folder', 'separate-new'),
+                    ('Install software only in another folder — no cloud connection', 'separate-local'),
+                ], 'The current installation is not changed.')
+            elif task == 'update-menu':
+                task = _submenu(ui, 'Update', [
+                    *([('Update everything — software and skills, then database and cloud service',
+                        'upgrade')] if completed and not pending else []),
+                    ('Update local software only — no AWS sign-in or cloud changes', 'update'),
+                ], 'Cloud settings are preserved. Each cloud change is reviewed before it is applied.')
+            elif task == 'manage':
+                task = _submenu(ui, 'Settings and repair', [
+                    *([('Configure coding harnesses — local files only', 'harness')] if completed else []),
+                    *([('Check or repair the connection — no automatic redeployment', 'existing')]
+                      if not pending else []),
+                    *([('Start over — abandon the unfinished setup; receipts and cloud resources are kept',
+                        'restart')] if pending else []),
+                    *([('Repair secrets and integrations', 'repair-secrets')] if not pending else []),
+                    *([('Change deployment access', 'deployment-access')] if (home / '.env').is_file() else []),
+                    *([('MAVEN Home — set up, change or turn off', 'home')] if completed and not pending else []),
+                    ('Software settings — certificates, custom skill folders, staging', 'settings'),
+                ])
         else:
             task = ui.choose('What would you like to do?', [
-                ('Connect to existing MAVEN — install software and connect to existing cloud memory', 'existing'),
-                ('Create a new MAVEN instance — review and provision billable AWS infrastructure', 'new'),
-                ('Uninstall — find an installation and choose what to remove', 'uninstall'),
-                ('Advanced options — install software without connecting to cloud memory', 'advanced'),
+                ('Install — connect to existing cloud memory or create a new instance', 'install'),
+                ('Remove — find an installation and choose what to remove', 'uninstall'),
             ], description='Choose your goal. The wizard explains each step before asking you to decide.\n'
                            'Maintenance access manages infrastructure; daily-use access operates memory.\n'
                            'They may be separate identities in the same AWS account. Neither is assumed yet.')
+            if task == 'install':
+                task = _submenu(ui, 'Install', [
+                    ('Connect to an existing MAVEN cloud instance', 'existing'),
+                    ('Create a new MAVEN instance — provisions billable AWS infrastructure', 'new'),
+                    ('Install software only — no cloud connection', 'local'),
+                    ('Software settings — certificates, custom skill folders, staging', 'settings'),
+                ])
+        if task is None:
+            continue
+        if task == 'settings':
+            _advanced_options(args)
+            continue
         if task in ('repair-secrets', 'deployment-access'):
             args.home, args.local_only, args.check_existing = home, False, True
             args.setup_mode, args.setup_operation, args.setup_fresh = 'existing', None, False
@@ -561,12 +589,11 @@ def _options(args):
         if task == 'home':
             action = 'enable'
             if (home / 'home.json').exists() or (home / 'home.json').is_symlink():
-                action = ui.choose('MAVEN Home', [
+                action = _submenu(ui, 'MAVEN Home', [
                     ('Change MAVEN Home — choose a different Home folder or project', 'enable'),
                     ('Turn off MAVEN Home — remove only this machine’s Home selection', 'disable'),
-                    ('Back to task selection', 'back'),
-                ], description=f'MAVEN Home is set up in {home / "home.json"}. Each change is reviewed before it is applied.')
-                if action == 'back':
+                ], f'MAVEN Home is set up in {home / "home.json"}. Each change is reviewed before it is applied.')
+                if action is None:
                     continue
             args.home, args.home_action = home, action
             return
@@ -577,27 +604,9 @@ def _options(args):
                 continue
             args.home, args.uninstall = selected, True
             return
-        separate = task == 'separate'
+        separate = task in ('separate-existing', 'separate-new', 'separate-local')
         if separate:
-            task = ui.choose('Set up a separate installation', [
-                ('Connect to an existing cloud instance from another private home', 'existing'),
-                ('Create new cloud infrastructure in another private home', 'new'),
-                ('Back — keep the current installation unchanged', 'back'),
-            ], description='The current installation will not be overwritten or disconnected.')
-            if task == 'back':
-                continue
-        if task == 'advanced':
-            advanced = ui.choose('Advanced options', [
-                ('Install software without connecting to cloud memory — no AWS login or cloud changes', 'local'),
-                ('Change optional software, certificate or staging settings', 'settings'),
-                ('Back to task selection', 'back'),
-            ], description='Software-only installs the MCP server and recovery tools. Memory will not work until you connect an instance.')
-            if advanced == 'settings':
-                _advanced_options(args)
-                continue
-            if advanced == 'back':
-                continue
-            task = 'local'
+            task = task.removeprefix('separate-')
         stage('Installation folder')
         default_home = home.with_name(home.name + '-new') if separate else home
         selected = ui.form('Where should MAVEN keep this installation?', [
@@ -606,7 +615,7 @@ def _options(args):
         ], description=('Use an unused folder for this separate installation. Existing files will not be replaced.'
                         if separate else 'Keep the suggested folder unless you need a separate installation. '
                         'Existing settings and recovery receipts are preserved.'),
-           details='Certificate bundles and custom staging paths are under Advanced options.',
+           details='Certificate bundles and custom staging paths are under Software settings.',
            back=True)
         if selected is None:
             continue
