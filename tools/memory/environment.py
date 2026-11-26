@@ -6,10 +6,14 @@ import json
 import logging
 import os
 from pathlib import Path
+import plistlib
 import re
 import shlex
+import shutil
 import ssl
 import stat
+import subprocess
+import sys
 
 import boto3
 from botocore.config import Config
@@ -139,11 +143,80 @@ def _role_binding(values):
     return role, account, name
 
 
+# AWS CLI opens its sign-in URL through Python's webbrowser, which honors BROWSER (%s is the URL).
+# A new private window carries no console session, so AWS asks for the password and a fresh MFA code.
+_LINUX_PRIVATE_BROWSERS = {
+    'google-chrome': ('google-chrome', '--incognito', '--new-window'),
+    'chromium': ('chromium', '--incognito', '--new-window'),
+    'chromium_chromium': ('chromium', '--incognito', '--new-window'),
+    'chromium-browser': ('chromium-browser', '--incognito', '--new-window'),
+    'brave-browser': ('brave-browser', '--incognito', '--new-window'),
+    'microsoft-edge': ('microsoft-edge', '--inprivate', '--new-window'),
+    'firefox': ('firefox', '--private-window'),
+    'firefox_firefox': ('firefox', '--private-window'),
+    'firefox-esr': ('firefox-esr', '--private-window'),
+}
+_MAC_PRIVATE_BROWSERS = {
+    'com.google.chrome': ('Google Chrome', '--incognito', '--new-window'),
+    'com.brave.browser': ('Brave Browser', '--incognito', '--new-window'),
+    'com.microsoft.edgemac': ('Microsoft Edge', '--inprivate', '--new-window'),
+    'org.chromium.chromium': ('Chromium', '--incognito', '--new-window'),
+}
+PRIVATE_BROWSERS = frozenset(
+    [shlex.join(argv) + ' %s' for argv in _LINUX_PRIVATE_BROWSERS.values()]
+    + [shlex.join(['/usr/bin/open', '-na', app, '--args', *flags]) + ' %s'
+       for app, *flags in _MAC_PRIVATE_BROWSERS.values()])
+
+
+def private_browser():
+    """BROWSER launcher for a private window of the desktop's default browser; None for a plain URL."""
+    if os.environ.get('SSH_CONNECTION') or os.environ.get('SSH_TTY'):
+        return None
+    try:
+        if sys.platform == 'darwin':
+            path = Path.home() / 'Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist'
+            with path.open('rb') as stream:
+                handlers = plistlib.load(stream).get('LSHandlers', [])
+            bundle = next((item.get('LSHandlerRoleAll') for item in handlers
+                           if isinstance(item, dict) and item.get('LSHandlerURLScheme') == 'https'), None)
+            selected = _MAC_PRIVATE_BROWSERS.get(str(bundle).lower())
+            if selected:
+                return shlex.join(['/usr/bin/open', '-na', selected[0], '--args', *selected[1:]]) + ' %s'
+        elif os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY'):
+            desktop = subprocess.run(['xdg-settings', 'get', 'default-web-browser'], stdin=subprocess.DEVNULL,
+                                     capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+            selected = _LINUX_PRIVATE_BROWSERS.get(desktop.removesuffix('.desktop'))
+            if selected and shutil.which(selected[0]):
+                return shlex.join(selected) + ' %s'
+    except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def fresh_sign_in(selected, browser):
+    """Force a new console sign-in: a private window via BROWSER, else a URL to open in one."""
+    if browser is not None and browser not in PRIVATE_BROWSERS:
+        raise ValueError('unsupported private browser launcher')
+    argv, environment = list(selected['argv']), dict(selected['environment'])
+    if browser:
+        environment['BROWSER'] = browser
+        note = ('AWS sign-in opens in a new private browser window, so AWS asks for your password and MFA. '
+                'If no window opens, open the printed URL in a private window.')
+    else:
+        argv.append('--remote')
+        note = ('Open the printed URL in a new private/incognito browser window (an existing console session '
+                'carries no fresh MFA), sign in with your password and MFA, then paste the code back here.')
+    command = ' '.join(key + '=' + shlex.quote(value) for key, value in environment.items()) + ' ' + shlex.join(argv)
+    return {**selected, 'argv': argv, 'environment': environment, 'command': command,
+            'fresh_mfa': True, 'note': note}
+
+
 def sign_in(values: dict[str, str], *, deploy: bool = False) -> dict:
     """Exact owner sign-in for a selected profile into MAVEN's own private login cache.
 
     A plain `aws login` writes the AWS default cache, which MAVEN never reads; only this
-    command (with AWS_LOGIN_CACHE_DIRECTORY) renews the sign-in MAVEN uses.
+    command (with AWS_LOGIN_CACHE_DIRECTORY) renews the sign-in MAVEN uses. Role elevation
+    needs fresh MFA, so its sign-in never reuses an existing browser console session.
     """
     purpose = 'Maintenance access' if deploy else 'Daily-use access'
     mode = deployment_mode(values) if deploy else 'profile'
@@ -156,30 +229,35 @@ def sign_in(values: dict[str, str], *, deploy: bool = False) -> dict:
     profile, cache, region = _login_selection(values, deploy=deploy)
     cache = str(cache)
     argv = ['aws', 'login', '--profile', profile, '--region', region]
-    return {'purpose': purpose, 'profile': profile,
-            'argv': argv, 'environment': {'AWS_LOGIN_CACHE_DIRECTORY': cache},
-            'command': 'AWS_LOGIN_CACHE_DIRECTORY=' + shlex.quote(cache) + ' ' + shlex.join(argv)}
+    selected = {'purpose': purpose, 'profile': profile,
+                'argv': argv, 'environment': {'AWS_LOGIN_CACHE_DIRECTORY': cache},
+                'command': 'AWS_LOGIN_CACHE_DIRECTORY=' + shlex.quote(cache) + ' ' + shlex.join(argv)}
+    return fresh_sign_in(selected, private_browser()) if mode == 'role' else selected
 
 
 def authentication_handoff(error, values, *, deploy=False):
     """Return executable, selected-cache login advice only for typed auth failures."""
     normalized = aws_error(error)
     try:
-        role_handoff = (deploy and deployment_mode(values) == 'role' and normalized.code in
-                        ('deployment_elevation_denied', 'deployment_session_expired'))
+        # Only role elevation raises these codes, whatever stage observed them.
+        role_handoff = (normalized.code in ('deployment_elevation_denied', 'deployment_session_expired')
+                        and deployment_mode(values) == 'role')
         if not role_handoff and normalized.code not in AUTHENTICATION_CODES:
             return None
-        exact = sign_in(values, deploy=deploy)
+        exact = sign_in(values, deploy=deploy or role_handoff)
     except MemoryClientError:
         return None
     reconnect = ('After owner sign-in, retry the same read-only inspection or resume the exact '
                  'retained operation. Do not replace an unresolved request or initialize another session.')
     if normalized.code == 'deployment_elevation_denied':
-        reconnect += (' AWS denied AssumeRole; stale MFA is one possible cause. If a fresh MFA challenge '
-                      'does not resolve it, stop and check the role trust and permissions.')
-    return {'type': 'aws_login', 'command': exact['argv'], 'environment': exact['environment'],
-            'reason': normalized.code, 'purpose': exact['purpose'], 'profile': exact['profile'],
-            'reconnect': reconnect}
+        reconnect += (' AWS denied AssumeRole; a console session without fresh MFA is the usual cause. If a fresh '
+                      'MFA sign-in does not resolve it, stop and check the role trust and permissions.')
+    handoff = {'type': 'aws_login', 'command': exact['argv'], 'environment': exact['environment'],
+               'reason': normalized.code, 'purpose': exact['purpose'], 'profile': exact['profile'],
+               'reconnect': reconnect}
+    if exact.get('fresh_mfa'):
+        handoff.update(fresh_mfa=True, note=exact['note'])
+    return handoff
 
 
 def _login_selection(values, *, deploy=False, region=None):

@@ -36,10 +36,10 @@ class SecretMCPTests(unittest.IsolatedAsyncioTestCase):
         self.session = Session()
         self.store = SecretStore(VALUES, self.session)
         for target, value in (
-            ('tools.secret_catalog.load_environment', VALUES),
+            ('tools.secret_catalog.ensure_store', VALUES),
             ('tools.secret_catalog.load_home', {'project_id': HOME_ID, 'instance_id': INSTANCE_ID, 'recovery_epoch': EPOCH}),
             ('tools.secret_catalog.SecretStore', self.store),
-            ('tools.mcp.secrets.load_environment', VALUES),
+            ('tools.mcp.secrets.ensure_store', VALUES),
             ('tools.mcp.secrets.SecretStore', self.store),
         ):
             replacement = patch(target, return_value=value)

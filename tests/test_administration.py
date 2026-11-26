@@ -290,9 +290,11 @@ class AdministrationTests(unittest.TestCase):
         wizard = self.saved_root_binding()
         before = wizard.env.read_bytes()
         self.verify_deployment.side_effect = MemoryClientError('deployment_elevation_denied')
-        result = self.choose_role()
+        with patch('tools.memory.environment.private_browser', return_value=None):
+            result = self.choose_role()
         self.assertEqual(result['state'], 'blocked')
-        self.assertEqual(result['handoff']['command'], ['aws', 'login', '--profile', 'daily', '--region', 'us-east-1'])
+        self.assertEqual(result['handoff']['command'], ['aws', 'login', '--profile', 'daily', '--region', 'us-east-1', '--remote'])
+        self.assertTrue(result['handoff']['fresh_mfa'])
         self.assertEqual(result['handoff']['expected_principal'], wizard.values['MAVEN_AWS_EXPECTED_PRINCIPAL'])
         self.assertFalse(result['handoff']['deploy_profile'])
         self.assertNotIn('MAVEN_DEPLOY_PROFILE', self.verify_deployment.call_args.args[0])
@@ -302,6 +304,31 @@ class AdministrationTests(unittest.TestCase):
         self.assertNotIn('handoff', denied)
         self.assertEqual(denied['state'], 'blocked')
         self.assertEqual(before, wizard.env.read_bytes())
+
+    def test_elevation_denied_from_any_stage_returns_a_usable_fresh_mfa_sign_in(self):
+        from tools import login
+        # Secrets setup observes elevation from a non-deployment step; it must still hand off.
+        cache = str(self.home / 'runtime/daily')
+        values = {'MAVEN_ACCOUNT_ID': '123456789012', 'MAVEN_AWS_REGION': 'us-east-1',
+                  'MAVEN_AWS_EXPECTED_PRINCIPAL': 'arn:aws:iam::123456789012:user/daily',
+                  'MAVEN_AWS_PROFILE': 'daily', 'MAVEN_AWS_LOGIN_CACHE': cache,
+                  'MAVEN_DEPLOY_MODE': 'role', 'MAVEN_DEPLOY_ROLE_ARN': self.role}
+        chrome = 'google-chrome --incognito --new-window %s'
+        base = ['aws', 'login', '--profile', 'daily', '--region', 'us-east-1']
+        for browser, command, environment in ((chrome, base, {'AWS_LOGIN_CACHE_DIRECTORY': cache, 'BROWSER': chrome}),
+                                              (None, [*base, '--remote'], {'AWS_LOGIN_CACHE_DIRECTORY': cache})):
+            state = {'kind': 'secrets_setup', 'step': 'secrets_prepare'}
+            with self.subTest(browser=browser), patch('tools.memory.environment.private_browser', return_value=browser):
+                self.assertTrue(self.controller._expired_login_handoff(
+                    state, MemoryClientError('deployment_elevation_denied'), values=values))
+                handoff = state['handoff']
+                self.assertEqual((handoff['command'], handoff['environment']), (command, environment))
+                self.assertTrue(handoff['fresh_mfa'])
+                self.assertFalse(handoff['deploy_profile'])
+                self.assertEqual(handoff['reason'], 'deployment_elevation_denied')
+                offered = login.offer(handoff, ['--home', str(self.home)], interactive=False)
+                self.assertEqual(offered['login_status'], 'manual')
+                self.assertIn('aws login --profile daily', offered['sign_in_command'])
 
     def test_changed_candidate_or_failed_final_probe_preserves_original_binding(self):
         wizard = self.saved_root_binding()

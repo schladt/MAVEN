@@ -13,9 +13,10 @@ from tools.coordination import private_lock
 from tools.home import load_home
 from tools.memory.boundary import private_path, read_private, save_private
 from tools.memory.client import MemoryClientError
-from tools.memory.environment import configured_client, load_environment
+from tools.memory.environment import configured_client
 from tools.memory.validation import MemoryError as ValidationError, digest, source as validate_source, validate
 from tools.recovery import DEFAULT_NEXT_ACTION
+from tools.secret_setup import ensure_store
 
 _MANAGED_METADATA = {'store_id', 'provider', 'storage_operation', 'storage_name', 'version', 'domain', 'service'}
 
@@ -31,7 +32,7 @@ def _error_code(error, fallback):
 class SecretCatalog:
     def __init__(self, home, client=None, store=None):
         self.home = Path(home).expanduser().absolute()
-        self.values = load_environment(self.home / '.env')
+        self.values = ensure_store(self.home / '.env')
         selected = load_home(self.home)
         if not selected or selected.get('invalid'):
             raise StoreError('select a valid MAVEN Home before using its secret catalog')

@@ -15,7 +15,7 @@ import termios
 import tty
 
 from tools.memory.client import MemoryClientError
-from tools.memory.environment import load_environment, sign_in
+from tools.memory.environment import fresh_sign_in, load_environment, sign_in
 from tools.setup_common import SetupPending, expected_account, inspect_login_identity, private_directory
 
 
@@ -45,8 +45,10 @@ def daily_handoff(env):
 def _selection(handoff):
     """Reconstruct only an allowlisted aws login; persisted state is not a shell program."""
     argv, environment = handoff['command'], handoff['environment']
-    if (handoff.get('type') != 'aws_login' or not isinstance(argv, list) or len(argv) != 6
-            or set(environment) != {'AWS_LOGIN_CACHE_DIRECTORY'}):
+    fresh = handoff.get('fresh_mfa') is True
+    if (handoff.get('type') != 'aws_login' or not isinstance(argv, list) or len(argv) not in (6, 7)
+            or not isinstance(environment, dict)
+            or set(environment) - ({'BROWSER'} if fresh else set()) != {'AWS_LOGIN_CACHE_DIRECTORY'}):
         raise ValueError('Invalid AWS sign-in handoff')
     # Old profile-mode checkpoints predate the explicit source marker.
     deploy = handoff.get('deploy_profile', handoff.get('purpose') == 'Maintenance access')
@@ -59,6 +61,9 @@ def _selection(handoff):
     if handoff.get('account', '').isdigit():
         values['MAVEN_ACCOUNT_ID'] = handoff['account']
     selected = sign_in(values, deploy=deploy)
+    if fresh:
+        # Role elevation: only an allowlisted private-window launcher or the plain-URL flow.
+        selected = fresh_sign_in(selected, environment.get('BROWSER'))
     if argv != selected['argv'] or environment != selected['environment']:
         raise ValueError('Invalid AWS sign-in handoff')
     return selected, values, deploy
@@ -90,8 +95,10 @@ def _confirm(fd, handoff):
         'Profile: ' + selected['profile'], 'Account: ' + handoff.get('account', 'Unknown'),
         'Expected principal: ' + handoff.get('expected_principal', 'Unknown')))
     line('AWS sign-in for ' + ''.join(c if c.isprintable() else '?' for c in detail))
+    if selected.get('note'):
+        line(selected['note'])
     if handoff.get('reason') == 'deployment_elevation_denied':
-        line('Elevation denied. Fresh MFA may help; AWS may also deny the role trust or permissions.')
+        line('Elevation denied. Fresh MFA usually resolves it; AWS may also deny the role trust or permissions.')
     original = termios.tcgetattr(fd)
     try:
         tty.setcbreak(fd, termios.TCSAFLUSH)

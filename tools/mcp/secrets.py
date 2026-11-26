@@ -7,9 +7,9 @@ from typing import Any, Literal
 from tools.aws.secret_store import DEFAULT_STREAM_LIMIT, SecretStore
 from tools.aws.secrets import StoreError
 from tools.memory.boundary import BoundaryError
-from tools.memory.environment import load_environment
 from tools.memory.validation import source as validate_source
 from tools.secret_catalog import SecretCatalog
+from tools.secret_setup import ensure_store
 
 
 def register_secret_tools(server, app, guarded):
@@ -30,7 +30,7 @@ def register_secret_tools(server, app, guarded):
                       operation_id: str | None = None, source: dict[str, str] | None = None,
                       max_bytes: int = DEFAULT_STREAM_LIMIT, expected_revision: int | None = None,
                       use_home: bool = False) -> dict[str, Any]:
-        """Use the explicitly configured secret store in a selected project or Home.
+        """Use the configured secret store in a selected project or Home; the account's existing store binds on first use.
 
         list returns paged names/metadata for SSM and encrypted files, never values. domain filters a dotted
         namespace, not a substring. lookup returns only the exact Home secret: setting, without a Home session
@@ -45,7 +45,7 @@ def register_secret_tools(server, app, guarded):
         Low-level maven-secrets CLI commands never write Home. No memory session/capture is started."""
         try:
             if action == 'list':
-                return {'status': 'ready', **SecretStore(load_environment(app.env)).list(domain, cursor, limit)}
+                return {'status': 'ready', **SecretStore(ensure_store(app.env)).list(domain, cursor, limit)}
             if action == 'store_and_catalog':
                 if source is None or not source_path:
                     raise StoreError('explicit storage requires the actual owner request and a private input path')

@@ -190,6 +190,48 @@ class SecretStoreTests(unittest.TestCase):
             self.assertEqual(cli.main(['list', '--domain', 'owner']), 0)
             self.assertEqual([item['name'] for item in json.loads(output.getvalue())['items']], ['owner.binary'])
 
+    def test_cli_get_put_and_use_stdin_need_no_terminal(self):
+        from contextlib import redirect_stderr
+        from unittest.mock import Mock
+        from tools.aws import secrets as cli
+        value = 'synthetic línea\nsecret '
+        ssm = Mock()
+        ssm.get_parameter.return_value = {'Parameter': {'Type': 'SecureString', 'Value': value}}
+        session = Mock(client=Mock(return_value=ssm))
+        pipe = io.TextIOWrapper(io.BytesIO(), encoding='ascii')
+        errors = io.StringIO()
+        with patch.object(cli, 'load_settings', return_value=VALUES), \
+                patch.object(cli, 'aws_session', return_value=session), \
+                patch('builtins.open', side_effect=AssertionError('/dev/tty must not be opened')), \
+                patch.object(cli.subprocess, 'run', return_value=Mock(returncode=0)) as program, \
+                redirect_stderr(errors):
+            with patch.object(cli.sys, 'stdout', pipe):
+                self.assertEqual(cli.main(['get', 'owner.api']), 0)
+            self.assertEqual(pipe.buffer.getvalue(), value.encode('utf-8'))  # exact bytes, no newline
+            ssm.get_parameter.assert_called_with(Name='/synthetic/secrets/owner.api', WithDecryption=True)
+            with patch.object(cli.sys, 'stdin', io.TextIOWrapper(io.BytesIO(b'new synthetic value'))), \
+                    patch.object(cli.sys, 'stdout', io.StringIO()):
+                self.assertEqual(cli.main(['replace', 'owner.api', '--stdin']), 0)
+            ssm.put_parameter.assert_called_once_with(
+                Name='/synthetic/secrets/owner.api', Value='new synthetic value', Type='SecureString',
+                KeyId='alias/aws/ssm', Tier='Standard', Overwrite=True)
+            self.assertEqual(cli.main(['use-stdin', 'owner.api', '--', 'trusted-program']), 0)
+            program.assert_called_once_with(['trusted-program'], input=value.encode('utf-8'), check=False)
+        self.assertEqual(errors.getvalue(), '')
+
+    def test_cli_get_refuses_a_terminal_before_reading_aws(self):
+        from contextlib import redirect_stderr
+        from unittest.mock import Mock
+        from tools.aws import secrets as cli
+        terminal, errors = Mock(isatty=Mock(return_value=True)), io.StringIO()
+        with patch.object(cli, 'load_settings', return_value=VALUES), \
+                patch.object(cli, 'aws_session') as session, \
+                patch.object(cli.sys, 'stdout', terminal), redirect_stderr(errors):
+            self.assertEqual(cli.main(['get', 'owner.api']), 2)
+        session.assert_not_called()
+        terminal.write.assert_not_called()
+        self.assertIn('pipe or file', errors.getvalue())
+
     def test_create_never_overwrites_and_replace_pins_readable_version(self):
         first = self.store.put('owner.api', b'first synthetic value')
         with self.assertRaises(ClientError):
@@ -442,7 +484,7 @@ class SecretCatalogTests(unittest.TestCase):
         self.session = Session()
         self.store = SecretStore(VALUES, self.session)
         self.cloud = CatalogCloud()
-        environment = patch('tools.secret_catalog.load_environment', return_value=VALUES)
+        environment = patch('tools.secret_catalog.ensure_store', return_value=VALUES)
         home = patch('tools.secret_catalog.load_home', return_value={
             'project_id': HOME_ID, 'instance_id': INSTANCE_ID, 'recovery_epoch': EPOCH})
         environment.start()
@@ -462,7 +504,7 @@ class SecretCatalogTests(unittest.TestCase):
         with patch('tools.secret_catalog.load_home', return_value=binding):
             with self.assertRaisesRegex(StoreError, 'recovery epoch'):
                 SecretCatalog(self.home, client=self.cloud, store=self.store)
-            with patch('tools.secret_catalog.load_environment', return_value={**VALUES, 'MAVEN_MEMORY_RECOVERY_EPOCH': new_epoch}):
+            with patch('tools.secret_catalog.ensure_store', return_value={**VALUES, 'MAVEN_MEMORY_RECOVERY_EPOCH': new_epoch}):
                 restored = SecretCatalog(self.home, client=self.cloud, store=self.store)
                 with self.assertRaisesRegex(StoreError, 'different Home, instance or store'):
                     restored.retry_catalog(pending['operation_id'])

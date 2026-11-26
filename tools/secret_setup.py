@@ -1,7 +1,9 @@
 """Required, explicitly reviewed secrets-store setup and integration repair.
 
 Only locators and AWS receipts are journaled. The separately retained bucket stack
-and wrapping parameter are never part of memory-service deletion.
+and wrapping parameter are never part of memory-service deletion. A host without
+locators binds the account's existing store on first use from that store's own
+verified description; that discovery never creates, adopts by name, or grants.
 """
 from __future__ import annotations
 
@@ -14,10 +16,10 @@ from secrets import token_bytes
 from uuid import UUID
 
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 from tools.interaction import Field
-from tools.setup_common import (SetupPending, check_login_identity, expected_account,
+from tools.setup_common import (SetupPending, atomic_private, check_login_identity, expected_account,
                                 inspect_login_identity, private_directory, setup_lock)
 
 SECRETS_KEYS = frozenset({
@@ -445,6 +447,165 @@ def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
 
+# A store describes itself inside its own value namespace. The leading underscore is not a
+# valid secret name, so listings, redaction and consumers never treat it as a secret.
+BINDING_MARKER = '_maven-store-binding'
+BINDING_RECEIPT = Path('runtime') / 'secrets-binding-published'
+DISCOVERY_NEXT = ('A host already bound to this store publishes it automatically the next time it uses '
+                  'maven-secrets; otherwise import the five MAVEN_SECRETS_* locators with '
+                  'maven-setup --repair-secrets. No store was created and no IAM policy was changed.')
+
+
+def _account_region(values):
+    account, region = expected_account(values), values.get('MAVEN_AWS_REGION')
+    if not re.fullmatch(r'[0-9]{12}', account) or not isinstance(region, str) or not region:
+        raise SetupPending('Connect this installation to its AWS account and region first; secrets-store '
+                           'discovery uses that daily identity.')
+    return account, region
+
+
+def binding_marker(values):
+    """Exact non-secret self-description of a configured store: (parameter name, document)."""
+    settings = validate_settings(values)
+    account, region = _account_region(values)
+    document = {'type': 'maven-secrets-binding', 'account': account, 'region': region, 'settings': settings}
+    return (settings['MAVEN_SECRETS_PARAMETER_PREFIX'] + BINDING_MARKER,
+            json.dumps(document, sort_keys=True, separators=(',', ':')))
+
+
+def publish_binding(values, session, *, replace=False):
+    """Describe a store in its own namespace; only a reviewed binding replaces a description."""
+    name, document = binding_marker(values)
+    ssm = _client(session, 'ssm')
+    try:
+        ssm.put_parameter(Name=name, Value=document, Type='String', Tier='Standard',
+                          DataType='text', Overwrite=replace)
+    except ClientError as error:
+        if _code(error) != 'ParameterAlreadyExists':
+            raise
+    finally:
+        ssm.close()
+
+
+def discover_binding(values, session):
+    """Find the account's one existing store by its own description and prove it is usable."""
+    account, region = _account_region(values)
+    ssm = _client(session, 'ssm')
+    try:
+        names, token, seen = [], None, set()
+        while True:
+            page = ssm.describe_parameters(ParameterFilters=[
+                {'Key': 'Name', 'Option': 'Contains', 'Values': [BINDING_MARKER]},
+                {'Key': 'Type', 'Option': 'Equals', 'Values': ['String']}],
+                MaxResults=50, **({'NextToken': token} if token else {}))
+            names.extend(item['Name'] for item in page.get('Parameters', [])
+                         if isinstance(item.get('Name'), str) and item['Name'].endswith('/' + BINDING_MARKER))
+            token = page.get('NextToken')
+            if not token:
+                break
+            if not isinstance(token, str) or token in seen:
+                raise SetupPending('Secrets-store discovery pagination did not advance; no binding was saved.')
+            seen.add(token)
+        if not names:
+            raise SetupPending(f'No existing MAVEN secrets store was found in account {account}, region {region}. '
+                               + DISCOVERY_NEXT)
+        if len(names) > 1:
+            raise SetupPending('Several MAVEN secrets stores describe themselves in this account and region ('
+                               + ', '.join(sorted(names)) + '). Select one with maven-setup --repair-secrets; '
+                               'none was chosen automatically.')
+        parameter = ssm.get_parameter(Name=names[0])['Parameter']
+    finally:
+        ssm.close()
+    try:
+        document = json.loads(parameter.get('Value'))
+    except (TypeError, ValueError):
+        document = None
+    if (parameter.get('Type') != 'String' or not isinstance(document, dict)
+            or document.get('type') != 'maven-secrets-binding'
+            or document.get('account') != account or document.get('region') != region
+            or not isinstance(document.get('settings'), dict) or set(document['settings']) != SECRETS_KEYS):
+        raise SetupPending('The discovered store description ' + names[0] + ' does not match this account and '
+                           'region; no binding was saved. ' + DISCOVERY_NEXT)
+    settings = validate_settings(document['settings'])
+    if names[0] != settings['MAVEN_SECRETS_PARAMETER_PREFIX'] + BINDING_MARKER:
+        raise SetupPending('The discovered store description lies outside the namespace it names; no binding was saved.')
+    wrapping = settings['MAVEN_SECRETS_FILE_KEY_PREFIX'] + settings['MAVEN_SECRETS_KEY_ID']
+    verify_use({**values, **settings}, session, {'wrapping_parameter': {'Name': wrapping}})
+    return settings
+
+
+def _save_discovered(env, values, settings):
+    """Append only the five locators; any concurrent settings change wins."""
+    from tools.memory.environment import ENV_KEYS, _load_environment
+    directory = env.parent / 'runtime' / 'setup'
+    private_directory(directory)
+    with setup_lock(directory):
+        current, raw = _load_environment(env, ENV_KEYS, with_raw=True)
+        if current != values:
+            raise SetupPending('Private settings changed during secrets-store discovery; retry. No binding was saved.')
+        text = raw.decode('utf-8')
+        if text and not text.endswith('\n'):
+            text += '\n'
+        atomic_private(env, text + ''.join(key + '=' + json.dumps(settings[key]) + '\n' for key in sorted(settings)))
+
+
+def _publish_once(env, values):
+    """Best effort, once per binding: let the account's other hosts discover this host's store."""
+    from tools.memory.client import MemoryClientError
+    from tools.memory.environment import selected_aws_session
+    receipt = env.parent / BINDING_RECEIPT
+    try:
+        _, document = binding_marker(values)
+        digest = hashlib.sha256(document.encode()).hexdigest()
+        if receipt.is_file() and receipt.read_text(encoding='utf-8').strip() == digest:
+            return
+        try:
+            publish_binding(values, selected_aws_session(values, region=values['MAVEN_AWS_REGION']))
+        except ClientError:
+            pass  # A definitive refusal is not retried on every use; reviewed Repair republishes.
+        private_directory(receipt.parent)
+        atomic_private(receipt, digest + '\n')
+    except (SetupPending, MemoryClientError, BotoCoreError, OSError, ValueError):
+        return  # Publication never blocks using the store; an unanswered attempt retries next use.
+
+
+def ensure_store(env):
+    """Return private settings, binding the account's existing store on first use.
+
+    Reference discovery, not adoption: only a store's own verified description is saved.
+    Nothing is created or granted, and a partial binding stays with Repair.
+    """
+    from tools.aws.secrets import StoreError
+    from tools.memory.client import AUTHENTICATION_CODES, MemoryClientError
+    from tools.memory.environment import load_environment, selected_aws_session, sign_in
+    env = Path(env)
+    values = load_environment(env)
+    if any(key in values for key in SECRETS_KEYS):
+        if configured(values):
+            _publish_once(env, values)
+        return values
+    try:
+        _, region = _account_region(values)
+        settings = discover_binding(values, selected_aws_session(values, region=region))
+        _save_discovered(env, values, settings)
+    except SetupPending as error:
+        raise StoreError(str(error)) from None
+    except MemoryClientError as error:
+        if error.code in AUTHENTICATION_CODES:
+            try:
+                command = sign_in(values)['command']
+            except MemoryClientError:
+                command = 'the MAVEN daily-use sign-in'
+            raise StoreError('Secrets-store discovery needs the daily AWS sign-in. Run ' + command
+                             + ' in a terminal, then retry.') from None
+        raise StoreError('Secrets-store discovery could not use the daily AWS identity (' + error.code + '). '
+                         + DISCOVERY_NEXT) from None
+    except (ClientError, BotoCoreError) as error:
+        raise StoreError('AWS refused or interrupted secrets-store discovery (' + str(_code(error)) + '). '
+                         + DISCOVERY_NEXT) from None
+    return {**values, **settings}
+
+
 def _cloud_binding(wizard, identifier):
     from tools.memory.environment import configured_client
     if str(UUID(identifier)) != identifier:
@@ -615,6 +776,8 @@ def advance(controller, state, wizard):
                                    'under every discovered wrapping-parameter KMS key. Preserve all historical wrapping material '
                                    'and S3 KMS keys/permissions while references exist; changing the current key ID does not migrate old files.',
                   'retention': 'Secrets bucket stack and wrapping SecureString remain independently retained when memory service is removed. Prefixes are only namespaces. Storage/requests can incur charges.',
+                  'discovery': 'After verification, write these non-secret locators to String parameter ' + binding_marker(values)[0]
+                               + ' (replacing an older description) so other hosts in this account bind this store on first use.',
                   'template': bucket_template(settings, state['operation_id']) if create else None,
                   'wrapping_creation': 'Generate a 32-byte random base64 SecureString encrypted by alias/aws/ssm, version 1, tagged with this operation. Never persist plaintext or regenerate uncertain writes. Only a definitively rejected permission request may retry creation after external access repair and an exact absence check.' if create else None}
         state['secrets_candidate'] = review
@@ -652,8 +815,13 @@ def advance(controller, state, wizard):
             state['effect_sequence'] = state.get('effect_sequence', 0) + 1
             controller._save(state)
         wizard.settings({**review['identity_settings'], **settings})
+        try:
+            publish_binding(values, sessions['daily'], replace=True)
+            discoverable = True
+        except ClientError:
+            discoverable = False  # Unverified write access; a later host use retries publication.
         result = {'secrets_ready': True, 'settings': settings, 'account': review['account'], 'region': review['region'],
-                  'metadata': metadata, 'access': probe, 'retained_independently': True}
+                  'metadata': metadata, 'access': probe, 'retained_independently': True, 'discoverable': discoverable}
         controller._receipt(state, 'secrets_verify', result)
         state['secrets_ready'] = result
         if state['kind'] == 'setup':

@@ -56,6 +56,17 @@ selected locators, or approve the exact private bucket and generated wrapping ke
 Repair/update preserve selected keys; read-only verification does not prove write
 permissions. Core memory does not depend on this store. Catalog operations require Home.
 
+A store describes itself with a non-secret String parameter,
+`MAVEN_SECRETS_PARAMETER_PREFIX` + `_maven-store-binding`, holding its account, region and
+five locators. Reviewed setup/Repair writes it, and a host already bound to the store
+publishes it once if it is missing. On a host with no `MAVEN_SECRETS_*` locators, the
+first `maven-secrets` or `maven_secrets` use finds exactly one such description in the
+daily identity's account and region, verifies the wrapping key decrypts and the
+object prefix lists, and appends the five locators to the private `.env` without
+a review step. Discovery never creates a store, adopts resources by name, or changes
+IAM; when none or several stores are found it stops with the next step (import the
+locators with `maven-setup --repair-secrets`). A partial binding stays with Repair.
+
 Small values use `MAVEN_SECRETS_PARAMETER_PREFIX`: SSM Standard `SecureString`
 parameters encrypted with `alias/aws/ssm`, limited to 4 KB of UTF-8. Grant only the
 selected namespace and necessary KMS permissions. Names are nonsecret lowercase
@@ -67,12 +78,18 @@ maven-secrets list --domain example.service --limit 20  # metadata only
 maven-secrets check service-token           # hidden comparison prompt
 maven-secrets replace service-token         # intentional existing-value update
 maven-secrets reveal service-token --tty    # explicit terminal-only disclosure
+maven-secrets get service-token | trusted-program   # exact value to a pipe or file
 maven-secrets use-stdin service-token -- trusted-program
+trusted-program | maven-secrets put service-token --stdin  # or replace --stdin
 ```
 
-`put`, `replace` and `check` also accept `--stdin` from a trusted pipe. Avoid shell
-history, tracing and programs that log stdin. `use-stdin` passes plaintext to the
-chosen program: the program is part of the trust boundary.
+`put`, `replace` and `check` also accept `--stdin` from a trusted pipe. `get` writes
+the exact UTF-8 value (no trailing newline) to stdout only when stdout is a pipe or
+file and refuses a terminal; with `put --stdin`, `use-stdin` and `get`, trusted local
+programs (agents, SSH sessions, launchd/systemd jobs) read and write without
+`/dev/tty`, and the value never enters argv, the environment or MAVEN output. Avoid
+shell history, tracing and programs that log stdin. `get` and `use-stdin` pass
+plaintext to the reading program: the program is part of the trust boundary.
 
 Encrypted-file operations additionally require:
 

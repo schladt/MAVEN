@@ -11,6 +11,7 @@ from tools.setup_common import inspect_login_identity, permission_preflight, ver
 
 
 ACCOUNT = '123456789012'
+CHROME = 'google-chrome --incognito --new-window %s'
 ROLE = f'arn:aws:iam::{ACCOUNT}:role/operations/releases'
 SOURCE = f'arn:aws:iam::{ACCOUNT}:user/developer'
 
@@ -41,6 +42,7 @@ class DeploymentCredentialsTests(unittest.TestCase):
         self.session = self.enterContext(patch.object(env.boto3, 'Session', return_value=self.elevated))
         self.enterContext(patch.object(env, '_deployment_time', side_effect=lambda: self.now))
         self.enterContext(patch.object(env, 'transport_ca_bundle', return_value=True))
+        self.enterContext(patch.object(env, 'private_browser', return_value=CHROME))
 
     def test_verified_source_and_role_are_used_for_read_without_deploy_profile(self):
         for identity in [verify_deployment_access(self.values), inspect_login_identity(self.values, deploy=True)]:
@@ -86,7 +88,7 @@ class DeploymentCredentialsTests(unittest.TestCase):
                 verify_deployment_access(self.values)
         self.cloud.describe_account_limits.assert_not_called()
 
-    def test_only_denied_elevation_or_expiry_offers_source_login(self):
+    def test_only_denied_elevation_or_expiry_offers_fresh_mfa_source_login(self):
         for method, exc, code, handoff in (
                 (self.daily.get_caller_identity, denied('GetCallerIdentity'), 'not_authorized', False),
                 (self.daily.assume_role, denied('AssumeRole'), 'deployment_elevation_denied', True),
@@ -99,10 +101,32 @@ class DeploymentCredentialsTests(unittest.TestCase):
             result = env.authentication_handoff(raised.exception, self.values, deploy=True)
             if handoff:
                 self.assertEqual(result['command'], ['aws', 'login', '--profile', 'developer', '--region', 'us-east-1'])
-                self.assertEqual(result['environment'], {'AWS_LOGIN_CACHE_DIRECTORY': '/private/daily'})
+                self.assertEqual(result['environment'], {'AWS_LOGIN_CACHE_DIRECTORY': '/private/daily', 'BROWSER': CHROME})
+                self.assertTrue(result['fresh_mfa'])
+                self.assertIn('private browser window', result['note'])
             else:
                 self.assertIsNone(result)
-        self.assertIsNone(env.authentication_handoff(MemoryClientError('deployment_elevation_denied'), self.values))
+        # Only elevation raises this code; a stage that did not say "deploy" still gets the handoff.
+        result = env.authentication_handoff(MemoryClientError('deployment_elevation_denied'), self.values)
+        self.assertEqual(result['environment']['BROWSER'], CHROME)
+        self.assertEqual(result['purpose'], 'Fresh MFA for deployment role ' + ROLE)
+        self.assertIn('fresh MFA', result['reconnect'])
+        # Daily-use sign-in keeps reusing the browser session; only elevation needs fresh MFA.
+        daily = env.authentication_handoff(MemoryClientError('selected_login_unavailable_or_expired'), self.values)
+        self.assertEqual(daily['environment'], {'AWS_LOGIN_CACHE_DIRECTORY': '/private/daily'})
+        self.assertNotIn('fresh_mfa', daily)
+
+    def test_printed_role_sign_in_falls_back_to_a_plain_url(self):
+        selected = env.sign_in(self.values, deploy=True)
+        self.assertEqual(selected['command'], "AWS_LOGIN_CACHE_DIRECTORY=/private/daily BROWSER='google-chrome "
+                         "--incognito --new-window %s' aws login --profile developer --region us-east-1")
+        with patch.object(env, 'private_browser', return_value=None):
+            selected = env.sign_in(self.values, deploy=True)
+        self.assertEqual(selected['argv'][-1], '--remote')
+        self.assertEqual(selected['environment'], {'AWS_LOGIN_CACHE_DIRECTORY': '/private/daily'})
+        self.assertIn('private/incognito', selected['note'])
+        with self.assertRaises(ValueError):
+            env.fresh_sign_in(selected, 'sh -c unsafe %s')
 
     def test_preflight_simulates_exact_role_not_source_or_guessed_path(self):
         self.iam.simulate_principal_policy.side_effect = lambda **kw: {'EvaluationResults': [
@@ -125,3 +149,56 @@ class DeploymentCredentialsTests(unittest.TestCase):
             self.assertIsNone(env.authentication_handoff(MemoryClientError('authentication_required'), selected, deploy=True))
         self.login.assert_not_called()
         self.daily.assume_role.assert_not_called()
+
+
+class PrivateBrowserTests(unittest.TestCase):
+    """Default-browser detection for fresh-MFA sign-in, without launching anything."""
+
+    def detect(self, platform, environ, **patches):
+        with patch.object(env.sys, 'platform', platform), patch.dict(env.os.environ, environ, clear=True), \
+                patch.object(env.subprocess, 'run', **patches.get('run', {})) as run, \
+                patch.object(env.shutil, 'which', return_value='/usr/bin/found'):
+            return env.private_browser(), run
+
+    def test_linux_uses_the_default_browsers_private_window(self):
+        for desktop, expected in (('google-chrome.desktop\n', CHROME),
+                                  ('firefox_firefox.desktop', 'firefox --private-window %s'),
+                                  ('microsoft-edge.desktop', 'microsoft-edge --inprivate --new-window %s'),
+                                  ('unknown.desktop', None)):
+            with self.subTest(desktop=desktop):
+                browser, run = self.detect('linux', {'DISPLAY': ':0'},
+                                           run={'return_value': Mock(stdout=desktop)})
+                self.assertEqual(browser, expected)
+                self.assertEqual(run.call_args.args[0], ['xdg-settings', 'get', 'default-web-browser'])
+                if expected:
+                    self.assertIn(expected, env.PRIVATE_BROWSERS)
+
+    def test_headless_ssh_or_failed_detection_uses_the_plain_url(self):
+        for platform, environ, run in (('linux', {}, {}), ('linux', {'DISPLAY': ':0', 'SSH_CONNECTION': 'x'}, {}),
+                                       ('darwin', {'SSH_TTY': '/dev/ttys001'}, {}),
+                                       ('linux', {'WAYLAND_DISPLAY': 'w'}, {'side_effect': OSError})):
+            with self.subTest(platform=platform, environ=environ):
+                browser, launched = self.detect(platform, environ, run=run)
+                self.assertIsNone(browser)
+                if not run:
+                    launched.assert_not_called()
+
+    def test_macos_reads_the_https_handler(self):
+        import plistlib
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as home:
+            path = Path(home) / 'Library/Preferences/com.apple.LaunchServices'
+            path.mkdir(parents=True)
+            for bundle, expected in (('com.google.chrome', "/usr/bin/open -na 'Google Chrome' --args --incognito "
+                                                           "--new-window %s"),
+                                     ('com.apple.safari', None)):
+                (path / 'com.apple.launchservices.secure.plist').write_bytes(plistlib.dumps({'LSHandlers': [
+                    {'LSHandlerURLScheme': 'mailto', 'LSHandlerRoleAll': 'com.apple.mail'},
+                    {'LSHandlerURLScheme': 'https', 'LSHandlerRoleAll': bundle}]}))
+                with self.subTest(bundle=bundle):
+                    browser, run = self.detect('darwin', {'HOME': home})
+                    self.assertEqual(browser, expected)
+                    run.assert_not_called()
+                    if expected:
+                        self.assertIn(expected, env.PRIVATE_BROWSERS)

@@ -910,6 +910,28 @@ class UiAvailabilityTests(unittest.TestCase):
         self.assertIn('tools.tui.administration', rendered)
         self.assertNotIn('maven-setup', rendered)
 
+    def test_fresh_mfa_sign_in_offers_private_window_and_plain_url_once(self):
+        import shlex
+        from tools.tui.administration import _instructions
+        browser = 'google-chrome --incognito --new-window %s'
+        command = ['aws', 'login', '--profile', 'daily', '--region', 'us-east-1']
+        handoff = {'type': 'aws_login', 'reason': 'deployment_elevation_denied', 'fresh_mfa': True,
+                   'command': command, 'environment': {'AWS_LOGIN_CACHE_DIRECTORY': '/private/cache', 'BROWSER': browser}}
+        result = {'kind': 'secrets_setup', 'step': 'secrets_prepare', 'state': 'blocked',
+                  'error': 'deployment_elevation_denied', 'handoff': handoff}
+        remote = ['env', 'AWS_LOGIN_CACHE_DIRECTORY=/private/cache', *command, '--remote']
+        for selected, local in ((handoff, True), (dict(handoff, command=[*command, '--remote'],
+                                                       environment={'AWS_LOGIN_CACHE_DIRECTORY': '/private/cache'}), False)):
+            with self.subTest(local=local):
+                rendered = _instructions({**result, 'handoff': selected}, Path('/private/home'), 'retained-operation')
+                line = rendered.split('Any device, in a private/incognito window: ', 1)[1].split('\n', 1)[0]
+                self.assertEqual(shlex.split(line), remote)
+                self.assertEqual('Private browser window on this machine: ' in rendered, local)
+                if local:
+                    line = rendered.split('Private browser window on this machine: ', 1)[1].split('\n', 1)[0]
+                    self.assertEqual(shlex.split(line), ['env', 'AWS_LOGIN_CACHE_DIRECTORY=/private/cache',
+                                                         'BROWSER=' + browser, *command])
+
 
 
 if __name__ == '__main__':

@@ -21,7 +21,8 @@ import warnings
 
 from botocore.exceptions import BotoCoreError, ClientError, ProfileNotFound
 
-from tools.aws.settings import load_settings, prefix, required
+from tools.aws import settings
+from tools.aws.settings import prefix, required
 from tools.memory.environment import MemoryClientError, selected_aws_session
 from tools.recovery import DEFAULT_NEXT_ACTION
 
@@ -36,6 +37,12 @@ class StoreError(Exception):
 
 class StorageRejected(StoreError):
     """Known rejection before publication; never an uncertain provider outcome."""
+
+
+def load_settings() -> dict[str, str]:
+    """Private settings; the account's existing store is bound here on first use."""
+    from tools.secret_setup import ensure_store
+    return ensure_store(settings.ENVIRONMENT)
 
 
 def parameter_name(name: str, *, values=None) -> str:
@@ -190,8 +197,9 @@ def file_action(args) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="MAVEN SSM secrets and encrypted S3 files")
     commands = parser.add_subparsers(dest="action", required=True)
-    for action in ("put", "replace", "check", "reveal", "use-stdin"):
-        command = commands.add_parser(action)
+    for action in ("put", "replace", "check", "get", "reveal", "use-stdin"):
+        command = commands.add_parser(action, help="write the exact value to a pipe or file, never a terminal"
+                                      if action == "get" else None)
         command.add_argument("name", help="short, non-sensitive name")
         if action in ("put", "replace", "check"):
             command.add_argument("--stdin", action="store_true", help="read an exact UTF-8 value from a pipe")
@@ -229,8 +237,8 @@ def main(argv=None) -> int:
             argv = args.command[1:] if args.command[:1] == ["--"] else args.command
             if not argv:
                 raise StoreError("provide a trusted program after --")
-            with open("/dev/tty", "rb"):
-                pass
+        elif args.action == "get" and sys.stdout.isatty():
+            raise StoreError("get writes only to a pipe or file; use reveal NAME --tty to view a value")
         elif args.action == "reveal":
             with open("/dev/tty", "w"):
                 pass
@@ -250,6 +258,10 @@ def main(argv=None) -> int:
             match = hmac.compare_digest(stored_value(client, name).encode("utf-8"), value.encode("utf-8"))
             print("Match." if match else "Mismatch.")
             return 0 if match else 1
+        elif args.action == "get":
+            # Exact UTF-8 bytes, no newline, for the reading program only; never argv or the environment.
+            sys.stdout.buffer.write(stored_value(client, name).encode("utf-8"))
+            sys.stdout.flush()
         elif args.action == "reveal":
             value = stored_value(client, name)
             with open("/dev/tty", "w", encoding="utf-8") as terminal:

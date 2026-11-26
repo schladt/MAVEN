@@ -145,7 +145,14 @@ A failed login offers manual recovery, not a readiness claim.
 MAVEN keeps the daily AWS login in its selected private cache. A separate deployment
 profile has its own private cache; role mode instead assumes the exact deployment
 role from the daily identity, requesting 900-second credentials held in process.
-The IAM trust policy, not MAVEN, determines whether fresh MFA is required.
+The IAM trust policy, not MAVEN, determines whether fresh MFA is required. Because
+`aws login` otherwise reuses the browser's existing console session (which carries no
+fresh MFA), every role-mode elevation sign-in MAVEN shows or runs forces a new console
+sign-in: it sets `BROWSER` to a private/incognito window of the default browser
+(Chrome, Chromium, Brave, Edge or Firefox on Linux; Chrome, Chromium, Brave or Edge on
+macOS). Otherwise, including over SSH, it uses `aws login --remote`; open that URL in a
+private window. A denied elevation (`deployment_elevation_denied`) always returns this
+sign-in handoff.
 A plain `aws login --profile …` writes to the AWS default cache, not this installation's.
 If a user-controlled login terminal is unavailable, run the exact manual command
 returned for the selected profile, cache and region; for example:

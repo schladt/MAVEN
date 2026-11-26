@@ -124,6 +124,27 @@ class TerminalTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     login.offer(altered, [], interactive=True)
 
+    def test_role_elevation_handoff_keeps_only_an_allowlisted_fresh_mfa_launcher(self):
+        browser = 'google-chrome --incognito --new-window %s'
+        fresh = dict(HANDOFF, purpose='Fresh MFA for deployment role arn:aws:iam::' + ACCOUNT + ':role/deploy',
+                     reason='deployment_elevation_denied', fresh_mfa=True,
+                     environment={**HANDOFF['environment'], 'BROWSER': browser})
+        remote = dict(fresh, environment=HANDOFF['environment'], command=[*HANDOFF['command'], '--remote'])
+        with patch('tools.login.sys.platform', 'linux'), patch('tools.login.subprocess.run') as launch:
+            result = login.offer(fresh, ['--home', '/private/home'], interactive=True)
+            self.assertEqual(result['login_status'], 'terminal_unavailable')
+            self.assertEqual(shlex.split(result['sign_in_command']),
+                             ['AWS_LOGIN_CACHE_DIRECTORY=/private/cache with spaces', 'BROWSER=' + browser,
+                              *HANDOFF['command']])
+            result = login.offer(remote, ['--home', '/private/home'], interactive=False)
+            self.assertEqual(shlex.split(result['sign_in_command'])[-1], '--remote')
+            launch.assert_not_called()
+            for altered in (dict(fresh, environment={**fresh['environment'], 'BROWSER': 'sh -c unsafe %s'}),
+                            dict(fresh, fresh_mfa=False), dict(HANDOFF, command=remote['command']),
+                            dict(fresh, command=remote['command'])):
+                with self.assertRaises(ValueError):
+                    login.offer(altered, [], interactive=False)
+
 
 class OperationTests(unittest.TestCase):
     def test_admin_verifies_source_but_never_advances_mutation_or_stale_handoff(self):

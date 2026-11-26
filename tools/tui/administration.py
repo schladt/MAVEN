@@ -198,7 +198,14 @@ def _instructions(result, home, identifier):
         command = ['env', *(key + '=' + value for key, value in handoff.get('environment', {}).items()),
                    *handoff['command']]
         exact = shlex.join(command)
-        if handoff.get('type') == 'aws_login':
+        if handoff.get('type') == 'aws_login' and handoff.get('fresh_mfa'):
+            remote = shlex.join(['env', *(key + '=' + value for key, value in handoff.get('environment', {}).items()
+                                          if key != 'BROWSER'),
+                                 *(arg for arg in handoff['command'] if arg != '--remote'), '--remote'])
+            local = [] if '--remote' in handoff['command'] else ['Private browser window on this machine: ' + exact]
+            instructions[:0] = [*local, 'Any device, in a private/incognito window: ' + remote,
+                                'Fresh MFA is required: an existing console session cannot satisfy it.', '']
+        elif handoff.get('type') == 'aws_login':
             instructions[:0] = ['Browser on this machine: ' + exact,
                                 'Browser on another device: ' + exact + ' --remote', '']
         else:
@@ -254,7 +261,9 @@ def _aws_login(ui, controller, result, home, identifier):
                 return {**current, 'login_status': 'handoff_changed'}
             # This TUI choice already confirmed launch; never ask for a second key.
             selected = owner_login.confirmed_command(handoff)
-            argv = [*selected['argv'], '--remote'] if choice == 'remote' else selected['argv']
+            argv = selected['argv']
+            if choice == 'remote' and '--remote' not in argv:
+                argv = [*argv, '--remote']
             login = ui.external(argv, env={**os.environ, **selected['environment']}, check=False)
             if login.returncode == 0:
                 ui.message('Sign-in command exited with status 0; checking the actual AWS identity.')

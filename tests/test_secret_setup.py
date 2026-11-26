@@ -31,6 +31,7 @@ NAME = SETTINGS['MAVEN_SECRETS_FILE_KEY_PREFIX'] + SETTINGS['MAVEN_SECRETS_KEY_I
 METADATA = {'Name': NAME, 'Type': 'SecureString', 'KeyId': 'alias/aws/ssm', 'Version': 1, 'DataType': 'text'}
 ACTUAL = {name: {'Account': ACCOUNT, 'Arn': VALUES[prefix + 'EXPECTED_PRINCIPAL']}
           for name, prefix in (('daily', 'MAVEN_AWS_'), ('maintenance', 'MAVEN_DEPLOY_'))}
+DOCUMENT = {'type': 'maven-secrets-binding', 'account': ACCOUNT, 'region': REGION, 'settings': SETTINGS}
 
 
 def aws_error(code):
@@ -268,7 +269,12 @@ class SecretSetupTests(unittest.TestCase):
         journal = self.controller._path(result['operation_id']).read_text()
         self.assertNotIn(base64.b64encode(b'x' * 32).decode(), journal)
         self.assertNotIn('ciphertext', journal)
-        self.clients['ssm'].put_parameter.assert_not_called()
+        # The only write is the store's non-secret self-description, so other hosts can bind it.
+        marker = SETTINGS['MAVEN_SECRETS_PARAMETER_PREFIX'] + secrets.BINDING_MARKER
+        self.clients['ssm'].put_parameter.assert_called_once_with(
+            Name=marker, Value=json.dumps(DOCUMENT, sort_keys=True, separators=(',', ':')), Type='String',
+            Tier='Standard', DataType='text', Overwrite=True)
+        self.assertTrue(result['outcome']['discoverable'])
         self.clients['s3'].put_object.assert_not_called()
 
     def test_missing_metadata_permission_returns_exact_external_policy_handoff(self):
@@ -409,6 +415,103 @@ class SecretSetupTests(unittest.TestCase):
         client.invoke.assert_called_once_with('/v1/memory/read', {'record_id': identifier})
         client.close.assert_called_once()
         self.assertFalse((self.home / 'home.json').exists())
+
+    def unbound(self, *documents, names=None):
+        """Remove this host's locators; the account's store describes itself with each document."""
+        self.wizard.settings({}, remove=tuple(SETTINGS))
+        names = names or [document['settings']['MAVEN_SECRETS_PARAMETER_PREFIX'] + secrets.BINDING_MARKER
+                          for document in documents]
+        ssm = self.clients['ssm']
+        ssm.describe_parameters.return_value = {'Parameters': [{'Name': name, 'Type': 'String'} for name in names]}
+        marker = dict(zip(names, documents))
+        ssm.get_parameter.side_effect = lambda **kwargs: {'Parameter': (
+            {'Name': kwargs['Name'], 'Type': 'String', 'Value': json.dumps(marker[kwargs['Name']])}
+            if kwargs['Name'] in marker else {**METADATA, 'Value': base64.b64encode(b'x' * 32).decode()})}
+        return (self.home / '.env').read_bytes()
+
+    def test_first_use_binds_the_accounts_existing_store_without_review(self):
+        before = self.unbound(DOCUMENT)
+        with patch('tools.memory.environment.selected_aws_session', return_value=Mock()) as selected:
+            values = secrets.ensure_store(self.home / '.env')
+        selected.assert_called_once()
+        self.assertEqual(values, VALUES)
+        self.assertEqual(Wizard(self.home).values, VALUES)
+        self.assertTrue((self.home / '.env').read_bytes().startswith(before))
+        self.clients['ssm'].describe_parameters.assert_called_once_with(ParameterFilters=[
+            {'Key': 'Name', 'Option': 'Contains', 'Values': [secrets.BINDING_MARKER]},
+            {'Key': 'Type', 'Option': 'Equals', 'Values': ['String']}], MaxResults=50)
+        # Usability is proven read-only: the wrapping key decrypts and the owned prefix lists.
+        self.clients['ssm'].get_parameter.assert_called_with(Name=NAME, WithDecryption=True)
+        self.clients['s3'].list_objects_v2.assert_called_once_with(
+            Bucket=SETTINGS['MAVEN_SECRETS_BUCKET'], ExpectedBucketOwner=ACCOUNT,
+            Prefix=SETTINGS['MAVEN_SECRETS_OBJECT_PREFIX'], MaxKeys=1)
+        self.clients['ssm'].put_parameter.assert_not_called()
+        self.clients['cloudformation'].create_stack.assert_not_called()
+
+    def test_undiscoverable_store_stops_with_next_step_and_saves_nothing(self):
+        from tools.aws.secrets import StoreError
+        other = {**DOCUMENT, 'settings': {**SETTINGS, 'MAVEN_SECRETS_PARAMETER_PREFIX': '/other/values/'}}
+        found_at = [SETTINGS['MAVEN_SECRETS_PARAMETER_PREFIX'] + secrets.BINDING_MARKER]
+        for documents, names, message in (
+                ((), None, 'No existing MAVEN secrets store.*repair-secrets'),
+                ((DOCUMENT, other), None, 'Several MAVEN secrets stores'),
+                (({**DOCUMENT, 'account': '210987654321'},), None, 'does not match this account'),
+                ((other,), found_at, 'outside the namespace it names')):
+            with self.subTest(message=message):
+                before = self.unbound(*documents, names=names)
+                with patch('tools.memory.environment.selected_aws_session', return_value=Mock()), \
+                        self.assertRaisesRegex(StoreError, message):
+                    secrets.ensure_store(self.home / '.env')
+                self.assertEqual((self.home / '.env').read_bytes(), before)
+                self.clients['ssm'].put_parameter.assert_not_called()
+                self.wizard.settings(SETTINGS)
+        before = self.unbound(DOCUMENT)
+        self.clients['s3'].list_objects_v2.side_effect = aws_error('AccessDenied')
+        with patch('tools.memory.environment.selected_aws_session', return_value=Mock()), \
+                self.assertRaisesRegex(StoreError, r'AccessDenied.*repair-secrets') as raised:
+            secrets.ensure_store(self.home / '.env')
+        self.assertNotIn('must not be persisted', str(raised.exception))
+        self.assertEqual((self.home / '.env').read_bytes(), before)
+
+    def test_expired_daily_sign_in_names_the_sign_in_and_partial_binding_stays_with_repair(self):
+        from tools.aws.secrets import StoreError
+        from tools.memory.client import MemoryClientError
+        before = self.unbound(DOCUMENT)
+        with patch('tools.memory.environment.selected_aws_session',
+                   side_effect=MemoryClientError('selected_login_unavailable_or_expired')), \
+                self.assertRaisesRegex(StoreError, 'daily AWS sign-in'):
+            secrets.ensure_store(self.home / '.env')
+        self.assertEqual((self.home / '.env').read_bytes(), before)
+        self.wizard.settings({'MAVEN_SECRETS_BUCKET': SETTINGS['MAVEN_SECRETS_BUCKET']})
+        with patch('tools.memory.environment.selected_aws_session') as selected:
+            values = secrets.ensure_store(self.home / '.env')
+        selected.assert_not_called()
+        self.assertEqual(values, self.wizard.values)
+
+    def test_bound_host_publishes_its_store_description_once(self):
+        from tools.memory.client import MemoryClientError
+        marker = SETTINGS['MAVEN_SECRETS_PARAMETER_PREFIX'] + secrets.BINDING_MARKER
+        receipt = self.home / secrets.BINDING_RECEIPT
+        with patch('tools.memory.environment.selected_aws_session', return_value=Mock()) as selected:
+            self.assertEqual(secrets.ensure_store(self.home / '.env'), VALUES)
+            self.assertEqual(secrets.ensure_store(self.home / '.env'), VALUES)
+        selected.assert_called_once()
+        self.clients['ssm'].put_parameter.assert_called_once_with(
+            Name=marker, Value=json.dumps(DOCUMENT, sort_keys=True, separators=(',', ':')), Type='String',
+            Tier='Standard', DataType='text', Overwrite=False)
+        self.assertTrue(receipt.is_file())
+        # An existing description is never replaced outside reviewed Repair.
+        receipt.unlink()
+        self.clients['ssm'].put_parameter.side_effect = aws_error('ParameterAlreadyExists')
+        with patch('tools.memory.environment.selected_aws_session', return_value=Mock()):
+            self.assertEqual(secrets.ensure_store(self.home / '.env'), VALUES)
+        self.assertTrue(receipt.is_file())
+        # Signed out or offline: using the store is never blocked and publication retries later.
+        receipt.unlink()
+        with patch('tools.memory.environment.selected_aws_session',
+                   side_effect=MemoryClientError('selected_login_unavailable_or_expired')):
+            self.assertEqual(secrets.ensure_store(self.home / '.env'), VALUES)
+        self.assertFalse(receipt.exists())
 
     def test_start_over_preserves_submitted_store_locators_before_binding(self):
         from tools.setup_restart import _retained_integrations
