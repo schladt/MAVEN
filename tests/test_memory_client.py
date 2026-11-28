@@ -1091,6 +1091,13 @@ class EnvironmentAndDisplayBoundaries(unittest.TestCase):
 
 
 class InstallationBoundaries(unittest.TestCase):
+    def test_runtime_parameter_boundary_preserves_internal_lf(self):
+        from tools.memory.deployment import _runtime_parameters
+        prefix = 'x' * 4095
+        self.assertEqual(_runtime_parameters(prefix + '\ny'), {
+            'RuntimeCode001': prefix[:-1], 'RuntimeCode002': 'x\ny'})
+        self.assertEqual(_runtime_parameters(prefix + 'y'), {'RuntimeCode001': prefix + 'y'})
+
     def test_prepare_accepts_zone_whitespace_without_accepting_missing_or_duplicate_zones(self):
         from tools.memory import bootstrap
         values = {'MAVEN_NOTIFICATION_EMAIL': 'owner@example.com', 'MAVEN_ENGINE_VERSION': '18.6',
@@ -1112,6 +1119,9 @@ class InstallationBoundaries(unittest.TestCase):
             fragments = [parameter_values[item['Ref']] for item in references]
             self.assertTrue(all(0 < len(fragment.encode()) <= 4096 for fragment in fragments))
             runtime = separator.join(fragments)
+            self.assertFalse(runtime.endswith('\n'))
+            self.assertEqual((package / 'runtime-index.py').read_bytes(), runtime.encode())
+            self.assertEqual(manifest['artifact_sha256']['runtime-index.py'], manifest['runtime_sha256'])
             self.assertEqual(hashlib.sha256(runtime.encode()).hexdigest(), manifest['runtime_sha256'])
             probe = """
 from tools.memory.validation import MemoryError, validate

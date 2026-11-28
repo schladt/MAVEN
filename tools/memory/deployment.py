@@ -157,11 +157,27 @@ def _bundle() -> tuple[str, dict[str, str], dict[str, str]]:
         "        module.__file__ = filename\n"
         "        exec(compile(_SOURCES[name], filename, 'exec'), module.__dict__)\n"
         "sys.meta_path.insert(0, _MemoryModules())\n"
-        "from tools.memory.service import handler\n"
+        # CloudFormation describes the last String parameter without a trailing LF.
+        "from tools.memory.service import handler"
     )
     if len(code.encode()) >= 4 * 1024 * 1024:
         raise ValueError("inline runtime exceeds the CloudFormation Lambda ZipFile limit")
     return code, modules, hashes
+
+
+def _runtime_parameters(code: str) -> dict[str, str]:
+    # The generated wrapper is ASCII. Preserve its internal newlines, but never
+    # leave one at the end of a parameter where CloudFormation can discard it.
+    runtime = {}
+    start = 0
+    while start < len(code):
+        end = min(start + 4096, len(code))
+        if end < len(code) and code[end - 1] == "\n":
+            # Each wrapper line ends in a non-space character; carry it with the LF.
+            end -= 2
+        runtime[f"RuntimeCode{len(runtime) + 1:03d}"] = code[start:end]
+        start = end
+    return runtime
 
 
 def _permissions(template: dict[str, Any]) -> dict[str, Any]:
@@ -243,8 +259,7 @@ def build(
     template = json.loads(template_source)
     # Runtime fragments are parameter values, outside the 51,200-byte template
     # body limit. Every fragment remains pinned in the reviewed package hashes.
-    runtime = {f"RuntimeCode{index // 4096 + 1:03d}": code[index:index + 4096]
-               for index in range(0, len(code), 4096)}
+    runtime = _runtime_parameters(code)
     template["Resources"]["MemoryFunction"]["Properties"]["Code"] = {
         "ZipFile": {"Fn::Join": ["", [{"Ref": name} for name in runtime]]}}
     del template["Parameters"]["RuntimeCode"]
