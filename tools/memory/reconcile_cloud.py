@@ -1,8 +1,11 @@
 """Session-free facade over the selected instance's signed IAM service (never the database)."""
-from tools.reconcile_records import KINDS, MAX_BATCH, record_uuid, redaction_target, validate_project_envelope
+from tools.reconcile_records import KINDS, MAX_BATCH, V2_KINDS, record_uuid, redaction_target, validate_project_envelope
 from .client import MemoryClientError
-from .reconcile_transport import TOKEN
+from .reconcile_transport import TAXONOMY_VERSION, TOKEN
 from .validation import MemoryError, validate
+
+
+_INVENTORY_KINDS = KINDS | V2_KINDS
 
 
 def _request(client, action, body):
@@ -52,7 +55,7 @@ def _item(entry):
         return (entry.keys() == required | {'name', 'when_to_use'}
                 and isinstance(entry['name'], str) and len(entry['name']) <= 120
                 and isinstance(entry['when_to_use'], str) and len(entry['when_to_use']) <= 400)
-    return (entry['kind'] in KINDS and entry.keys() <= required | {'state'}
+    return (entry['kind'] in _INVENTORY_KINDS and entry.keys() <= required | {'state'}
             and isinstance(entry.get('state', ''), str) and len(entry.get('state', '')) <= 80)
 
 
@@ -157,7 +160,7 @@ class CloudStore:
                 return records
 
     def apply(self, changes, expected_token):
-        response = self._call('apply', changes=changes, expected_token=expected_token)
+        response = self._call('apply', changes=changes, expected_token=expected_token, taxonomy_version=TAXONOMY_VERSION)
         changed, token = response.get('changed'), response.get('token')
         ids = [env['record']['id'] for env in changes]
         if not isinstance(changed, list) or any(not isinstance(rid, str) for rid in changed):

@@ -39,9 +39,11 @@ class ReplicaTests(unittest.TestCase):
         self.project, self.rid = uid(), uid()
         self.target = {'kind': 'project_record', 'project_id': self.project, 'id': self.rid}
         self.identity = {'instance_id': uid(), 'recovery_epoch': uid()}
-        self.first = make_change(None, 'note', {'text': SENSITIVE + ' first'}, 'observed', record_id=self.rid)
-        self.edit = make_change(self.first, 'note', {'text': SENSITIVE + ' second'}, SENSITIVE + ' correction', record_id=self.rid)
-        self.other = make_change(None, 'note', {'text': 'unrelated local-only contribution'}, 'local', record_id=uid())
+        self.first = make_change(None, 'entity', {'type': 'fixture', 'name': SENSITIVE + ' first'}, 'observed', record_id=self.rid)
+        self.edit = make_change(self.first, 'entity', {'type': 'fixture', 'name': SENSITIVE + ' second'},
+                                SENSITIVE + ' correction', record_id=self.rid)
+        self.other = make_change(None, 'entity', {'type': 'fixture', 'name': 'unrelated local-only contribution'},
+                                 'local', record_id=uid())
 
     def machine(self, name):
         root = self.base / name
@@ -313,7 +315,7 @@ class SQLDeliveryTests(unittest.TestCase):
         self.assertEqual(result['revision'], 1)
         cloud = CloudStore(client, project)
         rid = uid()
-        env = make_change(None, 'note', {'text': SENSITIVE}, 'local fixture', record_id=rid)
+        env = make_change(None, 'entity', {'type': 'fixture', 'name': SENSITIVE}, 'local fixture', record_id=rid)
         cloud.apply([env], cloud.inventory()['token'])
         conn.query('INSERT INTO maven.project_lifecycle(project_id,archived,generation,action_key,actor_id) '
                    f"VALUES('{project}',true,1,repeat('a',64),'fixture');")

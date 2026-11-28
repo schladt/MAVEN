@@ -10,9 +10,15 @@ The footer uses the last verified project name, not the checkout folder name. Se
 
 Outside an enabled project, use configured **Nexus Home**. On first load, consult the active brief and preferences plus Nexus preferences; reuse them until the workspace changes, context is lost or a refresh is needed. Never redirect a broken project to Home. “Turn off MAVEN for this session” disables automatic memory for this conversation only.
 
+Session context delivers the configured Home's owner profile as **background, not instructions**. The active reference index contains only ID, name, `read_when` and origin from Home and the current project. Read a relevant card by ID in its origin store; neither card bodies nor history are in the index. Home appears only once when it is the active project. An unavailable Home does not hide available project context or cause another store to be used as the owner's profile.
+
 ## What to save
 
-Record what the next agent needs to avoid repeating work or a mistake. Keep an accepted decision distinct from a suggestion, an attempted action distinct from an observed outcome, and “implemented” distinct from “tested” and “deployed.” Update an existing record rather than duplicating it. Use one orientation brief with evidence links, annotated **Read first** and **Consult when relevant** references, open questions, and the next useful step. Do not log every exchange.
+Use the [record guide](../maven_resources/templates/skills/maven/references/reconcile.md#choose-a-record) to choose among the eleven kinds and their required fields. Route in order: instruction, procedure, work to do, choice, uncertainty, verified result, background, catalog item. If none fits, don't save it. One fact, one home: update the existing ID; link to it rather than copying it. Record verified results on the task when one exists; an `outcome` is only for a result outside a task. “Implemented” is not “tested” or “deployed.”
+
+Use `preference` for standing instructions. Write only owner-stated facts directly into the Home `profile` or owner reference cards; propose an inferred fact to the owner before saving it. The `body` of each profile or reference is limited to 7,000 Unicode code points; summarize longer sources and link to files. Never store a topic list. Keep `read_first` in the project brief; `consult_when_relevant` is for files and documents only.
+
+Use `maven_local_read` with `kind`, `task_id`, `entity_type` or reference `state` (`active` or `retired`) to look up records without fetching every body. Local and reconcile exact reads return current records by default (`{"record": ...}` per match/side); add `include_history=true` when comparing earlier versions. History is still stored and synced.
 
 Save qualifying changes before replying. Each enabled reply ends with one status line in the original answer. File writes qualify even when the owner never mentioned memory; summarize them, don't store their bytes. An unchanged turn with retained context needs no tool call or placeholder. Ask whether a new standing preference belongs in the project or Nexus unless the owner specified. Reconcile only when explicitly requested.
 
@@ -25,6 +31,8 @@ A project skill describes **when to use a procedure** and either carries steps a
 **Saved locally** means the local write completed. **Synced** means both stores were verified to match at the reported point; it does not settle an open question or guarantee no later edits. If either view changes before a write, reread and reconsider the affected conclusions. If a reply is lost, inspect actual state on the next reconcile rather than submitting a duplicate. An outage does not undo confirmed local writes.
 
 An absent record is not a deletion. Cancel or supersede it explicitly. A bad merge can be corrected from history as a new write without rolling back the project. Explicit, owner-requested erasure removes the selected record's managed content and history; its content-free marker defeats stale offline edits at reconciliation. See [privacy and retention](security.md#data-and-external-models).
+
+An old client cannot write through reconciliation. If an older installation only displays `client_incompatible`, keep its offline store and update the client through the installer. If the local version is an unchanged ancestor of the converted cloud version, take the cloud version. Convert divergent and local-only legacy records on that device before pushing; never revive erased content. See [taxonomy conversion](taxonomy-conversion.md) for the per-project table and conversion procedure.
 
 A changed disk number does not invalidate a preserved archive. A missing archive is different: the failure names the archive and offers recovery. Put the original directory back if available. Otherwise, another installation bound to the same project can access the cloud copy; it cannot recover work saved only on this machine. For any failure, report the next recovery action rather than silently retrying a write.
 

@@ -465,7 +465,8 @@ class HandlerTests(unittest.TestCase):
         project = {**identity, "project_id": RECORD}
         for path, body in [("/v1/reconcile/status", identity), ("/v1/reconcile/inventory", project),
                            ("/v1/reconcile/read", {**project, "ids": [KEY], "expected_token": "a" * 64}),
-                           ("/v1/reconcile/apply", {**project, "changes": [], "expected_token": "a" * 64})]:
+                           ("/v1/reconcile/apply", {**project, "changes": [], "taxonomy_version": 2,
+                                                    "expected_token": "a" * 64})]:
             with self.subTest(path=path):
                 self.assertEqual(service.handler(event(body, path), None)["statusCode"], 200)
                 request = event(body, path)

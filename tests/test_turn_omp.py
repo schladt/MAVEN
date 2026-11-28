@@ -76,9 +76,9 @@ class OmpTests(unittest.TestCase):
         save_home(self.home, root=nexus, project_id=nexus_project, instance_id=instance, label='Nexus',
                   consent={'origin':'Test fixture', 'excerpt':'Use Nexus for standing preferences.'})
         pref = LocalStore(nexus, nexus_project)
-        local_write(pref, pref.inventory()['token'], 'setting', {'title':'Git commits are manual by default',
+        local_write(pref, pref.inventory()['token'], 'preference', {'title':'Git commits are manual by default',
                     'summary':'Leave changes uncommitted unless I explicitly ask you to make a commit.',
-                    'category':'preference', 'scope':'nexus'}, 'Owner preference in fixture')
+                    'scope':'nexus'}, 'Owner preference in fixture')
         active = LocalStore(self.cwd, project)
         before = (pref.inventory(), active.inventory())
         subprocess.run(['git', 'init', '-q'], cwd=self.cwd, env=self.env, check=True)
@@ -117,7 +117,7 @@ class OmpTests(unittest.TestCase):
         self.assertEqual([(r['kind'], r['summary']) for r in active.inventory()['items']],
                          [('decision', 'Build the widget offline')])
         # Another writer advances the store while OMP retains the last write token.
-        local_write(active, active.inventory()['token'], 'note', {'title':'Concurrent update'}, 'Fixture writer.')
+        local_write(active, active.inventory()['token'], 'risk', {'state':'open', 'title':'Concurrent update'}, 'Fixture writer.')
         concurrent = active.inventory()
         ask('Record the second decision.', 'Another writer changed the project.\nMAVEN · widget: not saved.',
             ['mcp__maven_local_write'])

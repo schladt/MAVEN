@@ -87,7 +87,7 @@ class CloudContractTests(unittest.TestCase):
                                              '022_reviewed_cleanup.sql', '023_retired_work_visibility.sql',
                                              '024_immutable_secret_consumption.sql', '025_project_reconciliation.sql',
                                              '026_reviewed_redaction.sql', '027_redaction_delivery.sql', '028_redaction_outbox.sql',
-                                             '029_narrow_erase_restore.sql'])
+                                             '029_narrow_erase_restore.sql', '030_reconcile_taxonomy.sql'])
         installed = {name: digest for name, digest, _ in bundle[:first_new]}
         old = {**store.control_document(CONFIG, 'ready'), 'schema_version': 1,
                'app_secret_arn': CONFIG['app_secret_arn'], 'app_secret_version': 'fixture-version'}
@@ -106,6 +106,7 @@ class CloudContractTests(unittest.TestCase):
         grants = '\n'.join(sql for sql in executed if sql.startswith('GRANT EXECUTE ON FUNCTION'))
         self.assertIn('maven.memory_request(text,jsonb,text,text,text,integer)', grants)
         self.assertIn('maven.reconcile_request(text,jsonb)', grants)
+        self.assertIn('maven.reconcile_taxonomy(jsonb)', grants)
         revocations = '\n'.join(sql for sql in executed if sql.startswith('REVOKE EXECUTE') and 'FROM maven_app' in sql)
         for obsolete in ('maven.memory_request_before_reconcile(text,jsonb,text,text,text,integer)',
                          'maven.memory_write(text,jsonb,text,text)', 'maven.change_fact(jsonb,text,text)'):

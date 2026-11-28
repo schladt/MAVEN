@@ -28,7 +28,8 @@ MIGRATION_FILES = ("001_foundation.sql", "002_fact_change.sql", "003_current_ver
                    "021_secret_adapter_scope_guard.sql", "022_reviewed_cleanup.sql",
                    "023_retired_work_visibility.sql", "024_immutable_secret_consumption.sql",
                    "025_project_reconciliation.sql", "026_reviewed_redaction.sql",
-                   "027_redaction_delivery.sql", "028_redaction_outbox.sql", "029_narrow_erase_restore.sql")
+                   "027_redaction_delivery.sql", "028_redaction_outbox.sql", "029_narrow_erase_restore.sql",
+                   "030_reconcile_taxonomy.sql")
 CLEANUP_LIMIT = 200
 _CLEANUP_REFUSAL = re.compile(r"cleanup_refused:([a-z_]{1,40})")
 
@@ -145,7 +146,8 @@ def _grant_instructions(db, tx):
     # transaction for reads, so their timeouts are the application role's session defaults.
     db.execute("GRANT EXECUTE ON FUNCTION maven.memory_service_state(), "
                "maven.memory_request(text,jsonb,text,text,text,integer), "
-               "maven.reconcile_request(text,jsonb), maven.redaction_delivery(jsonb) TO maven_app", transaction=tx)
+               "maven.reconcile_request(text,jsonb), maven.reconcile_taxonomy(jsonb), "
+               "maven.redaction_delivery(jsonb) TO maven_app", transaction=tx)
     db.execute("REVOKE EXECUTE ON FUNCTION maven.memory_request_before_reconcile(text,jsonb,text,text,text,integer), "
                "maven.memory_write(text,jsonb,text,text), maven.change_fact(jsonb,text,text) FROM maven_app", transaction=tx)
     db.execute("ALTER ROLE maven_app SET statement_timeout = '5s'", transaction=tx)
@@ -253,6 +255,7 @@ def _verify_application(db, config, *, pre_login=False):
                             "AND NOT has_schema_privilege(rolname, 'public', 'CREATE') "
                             "AND NOT has_function_privilege(rolname, 'maven.bootstrap_app(text)', 'EXECUTE') "
                             "AND has_function_privilege(rolname, 'maven.reconcile_request(text,jsonb)', 'EXECUTE') "
+                            "AND has_function_privilege(rolname, 'maven.reconcile_taxonomy(jsonb)', 'EXECUTE') "
                             "AND has_function_privilege(rolname, 'maven.redaction_delivery(jsonb)', 'EXECUTE') "
                             "AND NOT EXISTS (SELECT FROM pg_proc p WHERE p.pronamespace='maven'::regnamespace "
                             "AND (starts_with(p.proname,'redaction_') OR starts_with(p.proname,'narrow_')) "

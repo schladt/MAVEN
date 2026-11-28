@@ -160,7 +160,7 @@ class ApplicationVerificationTests(unittest.TestCase):
             GRANT USAGE ON SCHEMA maven TO maven_app;
             GRANT SELECT ON maven.service_state, maven.record_versions TO maven_app;
             GRANT EXECUTE ON FUNCTION maven.reconcile_request(text,jsonb), maven.instruction_read(jsonb),
-              maven.redaction_delivery(jsonb) TO maven_app;
+              maven.reconcile_taxonomy(jsonb), maven.redaction_delivery(jsonb) TO maven_app;
         """)
         admin._verify_application(db, config)
         db.query('SAVEPOINT missing_grant; REVOKE EXECUTE ON FUNCTION maven.reconcile_request(text,jsonb) FROM maven_app;')

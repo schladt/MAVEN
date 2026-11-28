@@ -16,6 +16,10 @@ def key(number):
     return str(UUID(int=number))
 
 
+def observation(title):
+    return {"title": title, "observed": title, "occurred_on": "2026-11-27"}
+
+
 def capture(store, record_id, kind, data, reason="Observed during project work"):
     return local_write(store, store.inventory()["token"], kind, data, reason, record_id=record_id)
 
@@ -27,7 +31,7 @@ def saved(store, record_id):
 def put_at(store, record_id, kind, data, timestamp):
     # Import a version with a known original timestamp, without changing the clock.
     store.apply([{"record": {"id": record_id, "kind": kind, "data": data, "written_at": timestamp},
-                  "history": []}], store.inventory()["token"])
+                  "history": []}], store.inventory()["token"], strict_current=False)
 
 
 def reviewed(view):
@@ -69,8 +73,8 @@ class ReconcileRoundtripTests(unittest.TestCase):
     def apply(self, view, *choices):
         return apply_review(self.local, self.cloud, list(choices), **reviewed(view))
 
-    def details(self, view, *ids):
-        result = read_details(self.local, self.cloud, list(ids), **reviewed(view))
+    def details(self, view, *ids, include_history=False):
+        result = read_details(self.local, self.cloud, list(ids), include_history=include_history, **reviewed(view))
         return {item["id"]: item for item in result["records"]}
 
     def test_paged_project_context_survives_selective_bidirectional_apply(self):
@@ -78,10 +82,11 @@ class ReconcileRoundtripTests(unittest.TestCase):
         for store in (self.local, self.cloud):
             put_at(store, accepted, "decision", {"state": "accepted", "title": "Keep SQLite for launch",
                    "source": "Signed launch criteria"}, "2020-01-01T00:00:00Z")
-        capture(self.local, proposal, "decision", {"state": "proposed", "title": "Move reporting at launch"})
+        capture(self.local, proposal, "decision", {"state": "proposed", "title": "Move reporting at launch",
+                                                   "rationale": "Separate reporting load from release traffic"})
         capture(self.cloud, risk, "risk", {"state": "open", "title": "PostgreSQL lacks launch certification"})
-        capture(self.local, action, "action", {"title": "Archived the build manifest"})
-        capture(self.cloud, outcome, "outcome", {"title": "Verified build manifest checksum"})
+        capture(self.local, action, "outcome", observation("Archived the build manifest"))
+        capture(self.cloud, outcome, "outcome", observation("Verified build manifest checksum"))
         before = self.inspect(limit=2)
         self.assertEqual((before["status"], before["total"], before["different"]), ("review_required", 5, 4))
         items = list(before["items"])
@@ -114,13 +119,15 @@ class ReconcileRoundtripTests(unittest.TestCase):
         for record_id in (action, outcome):
             self.assertIsNotNone(actual[record_id]["local"])
             self.assertEqual(actual[record_id]["local"], actual[record_id]["cloud"])
-            self.assertEqual(actual[record_id]["local"]["history"], [])
+            self.assertNotIn("history", actual[record_id]["local"])
 
     def test_equal_write_times_do_not_choose_between_contradictions(self):
         choice = key(1)
         stamp = "2025-12-01T12:00:00Z"
-        put_at(self.local, choice, "decision", {"state": "proposed", "title": "Release to production"}, stamp)
-        put_at(self.cloud, choice, "decision", {"state": "accepted", "title": "Hold release for legal signoff"}, stamp)
+        put_at(self.local, choice, "decision", {"state": "proposed", "title": "Release to production",
+                                                "rationale": "The candidate passed QA"}, stamp)
+        put_at(self.cloud, choice, "decision", {"state": "accepted", "title": "Hold release for legal signoff",
+                                                "rationale": "Legal has not approved release"}, stamp)
         before = self.inspect()
         self.assertEqual((before["status"], before["different"]), ("review_required", 1))
         versions = self.details(before, choice)[choice]
@@ -139,15 +146,47 @@ class ReconcileRoundtripTests(unittest.TestCase):
         self.apply(verified, take(choice, "cloud", "Reviewed again"))
         self.assertEqual(self.inspect(verify=True), verified)
 
+    def test_only_an_unchanged_offline_ancestor_can_take_the_cloud_conversion(self):
+        rid = key(1)
+        old = make_change(None, 'note', {'text': 'old'}, 'fixture', record_id=rid)
+        converted = make_change(old, 'entity', {'name': 'Alpha', 'type': 'project'}, 'convert', record_id=rid)
+        self.local.apply([old], self.local.orient()['token'], strict_current=False)
+        self.cloud.apply([converted], self.cloud.orient()['token'])
+        review = self.inspect()
+        self.assertNotIn('history', self.details(review, rid)[rid]['cloud'])
+        self.assertEqual(self.details(review, rid, include_history=True)[rid]['cloud'], converted)
+        self.apply(review, take(rid, 'local', 'Local version was already converted'))
+        self.assertEqual(saved(self.local, rid), converted)
+        self.assertEqual(saved(self.cloud, rid), converted)
+        divergent = make_change(converted, 'note', {'text': 'unpublished edit'}, 'old client', record_id=rid)
+        self.local.apply([divergent], self.local.orient()['token'], strict_current=False)
+        local_only = make_change(None, 'note', {'text': 'offline only'}, 'old client', record_id=key(2))
+        self.local.apply([local_only], self.local.orient()['token'], strict_current=False)
+        view = self.inspect()
+        for target, side in ((rid, 'cloud'), (key(2), 'local')):
+            with self.assertRaisesRegex(ValueError, 'convert it locally'):
+                self.apply(view, take(target, side, 'Reviewed offline version'))
+        self.assertEqual(self.inspect(), view)
+
+    def test_invalid_authored_merge_leaves_both_stores_unchanged(self):
+        rid = key(1)
+        capture(self.local, rid, 'outcome', observation('Build passed'))
+        view = self.inspect()
+        for kind, data, field in [('note', {'text': 'old kind'}, 'kind'),
+                                  ('outcome', {'title': 'Unverified'}, 'occurred_on')]:
+            with self.assertRaisesRegex(ValueError, field):
+                self.apply(view, {**take(rid, 'merge', 'Review'), 'kind': kind, 'data': data})
+        self.assertEqual(self.inspect(), view)
+
     def test_verify_never_reports_a_pair_of_snapshots_that_did_not_coexist(self):
         observed = key(1)
-        capture(self.local, observed, "outcome", {"title": "Artifact passed verification"})
+        capture(self.local, observed, "outcome", observation("Artifact passed verification"))
         original = saved(self.local, observed)
         local, cloud = self.local, self.cloud
 
         class BetweenSnapshots(LocalStore):
             def inventory(inner):
-                capture(local, observed, "outcome", {"title": "Later verification failed"})
+                capture(local, observed, "outcome", observation("Later verification failed"))
                 cloud.apply([original], cloud.inventory()["token"])
                 return super().inventory()
 
@@ -159,7 +198,7 @@ class ReconcileRoundtripTests(unittest.TestCase):
 
     def test_cloud_addition_at_commit_invalidates_review_of_another_id(self):
         ready, withdrawn = key(1), key(2)
-        capture(self.local, ready, "task", {"state": "completed", "title": "Clear release for launch"})
+        capture(self.local, ready, "task", {"state": "completed", "title": "Clear release for launch", "added_on": "2026-11-27"})
         before = self.inspect()
 
         def revoke_approval():
@@ -179,20 +218,20 @@ class ReconcileRoundtripTests(unittest.TestCase):
         # New evidence affects a different ID: revise the conclusion, not just the token.
         self.apply(fresh, take(withdrawn, "cloud", "Legal notice"),
                    {**take(ready, "merge", "Approval was withdrawn"), "kind": "task",
-                    "data": {"state": "blocked", "title": "Await renewed approval", "source": withdrawn}})
+                    "data": {"state": "blocked", "title": "Await renewed approval", "source": withdrawn, "added_on": "2026-11-27"}})
         self.assertEqual(self.inspect(verify=True)["status"], "synced")
         self.assertEqual(saved(self.cloud, ready)["record"]["data"]["state"], "blocked")
 
     def test_local_edit_after_cloud_commit_survives_partial_apply(self):
         release = key(1)
-        capture(self.local, release, "note", {"title": "Image built"})
-        capture(self.cloud, release, "note", {"title": "Image signed"})
+        capture(self.local, release, "outcome", observation("Image built"))
+        capture(self.cloud, release, "outcome", observation("Image signed"))
         before = self.inspect()
         reason = "Keep both verified observations"
-        merge = {**take(release, "merge", reason), "kind": "note", "data": {"title": "Image built and signed"}}
+        merge = {**take(release, "merge", reason), "kind": "outcome", "data": observation("Image built and signed")}
 
         def add_local_evidence():
-            capture(self.local, release, "note", {"title": "Image failed local verification"})
+            capture(self.local, release, "outcome", observation("Image failed local verification"))
 
         endpoint = AtCloudCommit(self.cloud, after=add_local_evidence)
         with self.assertRaises(StaleView):
@@ -202,7 +241,7 @@ class ReconcileRoundtripTests(unittest.TestCase):
         self.assertEqual(fresh["status"], "review_required")
         self.assertEqual(versions["local"]["record"]["data"]["title"], "Image failed local verification")
         self.assertEqual(versions["cloud"]["record"]["data"], merge["data"])
-        self.apply(fresh, {**merge, "data": {"title": "Image built and signed; local verification failed"}})
+        self.apply(fresh, {**merge, "data": observation("Image built and signed; local verification failed")})
         self.assertEqual(self.inspect(verify=True)["status"], "synced")
         history = saved(self.local, release)["history"]
         prior_titles = {revision["record"]["data"]["title"] for revision in history}
@@ -211,8 +250,9 @@ class ReconcileRoundtripTests(unittest.TestCase):
 
     def test_new_local_id_after_cloud_commit_invalidates_even_an_uncontested_download(self):
         evidence, ready, risk = key(1), key(2), key(3)
-        capture(self.local, evidence, "action", {"title": "Submitted launch checklist"})
-        capture(self.cloud, ready, "decision", {"state": "accepted", "title": "Launch may proceed"})
+        capture(self.local, evidence, "outcome", observation("Submitted launch checklist"))
+        capture(self.cloud, ready, "decision", {"state": "accepted", "title": "Launch may proceed",
+                                               "rationale": "Release checklist completed"})
         before = self.inspect()
 
         def discover_risk():
@@ -235,11 +275,11 @@ class ReconcileRoundtripTests(unittest.TestCase):
                 self._recover_existing_merge(key(i), retry_with)
 
     def _recover_existing_merge(self, report, retry_with):
-        capture(self.local, report, "note", {"title": "Windows tested"})
-        capture(self.cloud, report, "note", {"title": "Linux tested"})
+        capture(self.local, report, "outcome", observation("Windows tested"))
+        capture(self.cloud, report, "outcome", observation("Linux tested"))
         before = self.inspect()
-        merge = {**take(report, "merge", "Combine observed platforms"), "kind": "note",
-                 "data": {"title": "Tested on Windows and Linux"}}
+        merge = {**take(report, "merge", "Combine observed platforms"), "kind": "outcome",
+                 "data": observation("Tested on Windows and Linux")}
 
         def lose_reply():
             raise ConnectionError("lost reply after durable cloud commit")
@@ -247,7 +287,7 @@ class ReconcileRoundtripTests(unittest.TestCase):
         with self.assertRaises(ConnectionError):
             apply_review(self.local, AtCloudCommit(self.cloud, after=lose_reply), [merge], **reviewed(before))
         fresh = self.inspect()
-        versions = self.details(fresh, report)[report]
+        versions = self.details(fresh, report, include_history=True)[report]
         confirmed = versions["cloud"]
         self.assertEqual(fresh["different"], 1)
         self.assertEqual(confirmed["record"]["data"], merge["data"])
@@ -271,8 +311,8 @@ class ReconcileRoundtripTests(unittest.TestCase):
                 other = "cloud" if erased_side == "local" else "local"
                 target = key(i)
                 words = ("private initial wording", "private revised wording", "private later offline edit")
-                capture(eraser, target, "note", {"title": words[0]})
-                capture(eraser, target, "note", {"title": words[1]})
+                capture(eraser, target, "outcome", observation(words[0]))
+                capture(eraser, target, "outcome", observation(words[1]))
                 self.apply(self.inspect(), take(target, erased_side, "Share confirmed note"))
                 old = saved(offline, target)
                 local_write(eraser, eraser.inventory()["token"], None, None, "Owner requested erasure",
@@ -281,12 +321,12 @@ class ReconcileRoundtripTests(unittest.TestCase):
                 later = make_change(old, "note", {"title": words[2]}, "Edited offline", record_id=target)
                 stamp = datetime.fromisoformat(marker["record"]["written_at"]) + timedelta(days=1)
                 later["record"]["written_at"] = stamp.isoformat()
-                offline.apply([later], offline.inventory()["token"])
+                offline.apply([later], offline.inventory()["token"], strict_current=False)
 
                 before = self.inspect()
                 versions = self.details(before, target)[target]
                 self.assertIsNone(versions[other])
-                self.assertEqual(versions[erased_side], marker)
+                self.assertEqual(versions[erased_side], {'record': marker['record']})
                 for word in words:
                     self.assertNotIn(word, json.dumps([before, versions]))
                 # Even choosing the live (newer) side cannot restore the erased wording.
@@ -318,6 +358,7 @@ class ReconcileRoundtripTests(unittest.TestCase):
         self.apply(self.inspect(), *(take(rid, "local", "Initial project knowledge")
                                      for rid in (runbook, git_skill, brief)))
         capture(self.cloud, decision, "decision", {"state": "accepted", "title": "Retire staging",
+                "rationale": "Signed verification replaces the staging approval",
                 "source": "Owner approved signed candidate verification; promotion requires separate approval"})
 
         before = self.inspect()

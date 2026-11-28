@@ -11,8 +11,8 @@ from pathlib import Path
 from uuid import uuid4
 
 from .reconcile_records import (
-    MAX_BATCH, REDACTION_TIMESTAMP, accept_change, brief_id, canonical, record_uuid, summarize,
-    validate_project_envelope,
+    MAX_BATCH, REDACTION_TIMESTAMP, accept_change, brief_id, canonical, profile_id, record_uuid, summarize,
+    TaxonomyError, validate_current_data, validate_project_envelope,
 )
 
 
@@ -20,17 +20,18 @@ class StaleView(ValueError):
     """The supplied token does not identify this store's current project view."""
 
 
-def _directory(path, *, private):
-    try:
-        path.mkdir(mode=0o700)
-    except FileExistsError:
-        pass
-    else:
-        parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+def _directory(path, *, private, create=True):
+    if create:
         try:
-            os.fsync(parent)
-        finally:
-            os.close(parent)
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        else:
+            parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                os.fsync(parent)
+            finally:
+                os.close(parent)
     info = path.lstat()
     forbidden = 0o077 if private else 0o022
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & forbidden:
@@ -43,7 +44,7 @@ def _file_info(info):
         raise ValueError("unsafe local memory file")
 
 
-def _private_database(path):
+def _private_database(path, *, create=True):
     # Never let SQLite create a file with the process umask. A rollback journal
     # created by SQLite inherits the database's private mode. Refuse planted
     # links, including journal/WAL sidecars, before asking SQLite to open it.
@@ -53,6 +54,9 @@ def _private_database(path):
         except FileNotFoundError:
             continue
         _file_info(info)
+    if not create:
+        _file_info(path.lstat())
+        return
     # Never open/close an existing DB using a non-SQLite fd: close(2) could
     # release a concurrent connection's process-wide POSIX byte-range locks.
     # Serialize only private file creation, not the lifetime of the connection.
@@ -87,13 +91,24 @@ class LocalStore:
         self.brief_id = brief_id(project_id)
         self.path = self.root / ".maven" / "reconcile" / f"{project_id}.sqlite3"
         self.replica = None
+        self._existing_only = False
+
+    @classmethod
+    def open_copy(cls, path: Path, project_id: str):
+        """Select an existing standalone database, without selecting or initializing a project."""
+        path = Path(path).absolute()
+        store = cls(path.parent, project_id)
+        store.path = path
+        store._existing_only = True
+        return store
 
     @contextmanager
     def _transaction(self, *, write=False, redacting=False):
-        _directory(self.path.parent.parent, private=False)
-        _directory(self.path.parent, private=True)
-        _private_database(self.path)
-        db = sqlite3.connect(self.path, isolation_level=None)
+        if not self._existing_only:
+            _directory(self.path.parent.parent, private=False)
+        _directory(self.path.parent, private=True, create=not self._existing_only)
+        _private_database(self.path, create=not self._existing_only)
+        db = sqlite3.connect(self.path.absolute().as_uri() + "?mode=rw", uri=True, isolation_level=None)
         try:
             db.execute("PRAGMA trusted_schema=OFF")
             db.execute("PRAGMA synchronous=FULL")
@@ -101,7 +116,7 @@ class LocalStore:
             db.execute("PRAGMA secure_delete=ON")
             if db.execute("PRAGMA journal_mode").fetchone()[0] != "delete":
                 raise ValueError("unsupported local memory journal mode")
-            if db.execute("PRAGMA user_version").fetchone()[0] == 0:
+            if not self._existing_only and db.execute("PRAGMA user_version").fetchone()[0] == 0:
                 # Recheck after acquiring the write lock: concurrent first opens
                 # can both observe version zero. Never mint two initial tokens.
                 db.execute("BEGIN IMMEDIATE")
@@ -156,15 +171,38 @@ class LocalStore:
             if changed:
                 db.execute("UPDATE project SET token=? WHERE id=?", (str(uuid4()), self.project_id))
 
-    def inventory(self) -> dict:
+    def inventory(self, *, kind=None, task_id=None, entity_type=None, state=None) -> dict:
+        """Filter current rows in SQLite using the kind index; never fetch record history."""
+        filters = []
+        args = []
+        for value, implied, field in ((task_id, 'plan', 'task_id'), (entity_type, 'entity', 'type'),
+                                      (state, 'reference', 'state')):
+            if value is None:
+                continue
+            if kind not in (None, implied):
+                raise TaxonomyError(f'{field} lookup requires kind {implied}')
+            kind = implied
+            if field == 'task_id':
+                record_uuid(value)
+            if field == 'state' and value not in ('active', 'retired'):
+                raise TaxonomyError('reference.state must be active or retired')
+            filters.append(f"json_extract(record,'$.data.{field}')=?")
+            args.append(value)
+        if kind is not None:
+            filters.append("kind=?")
+            args.append(kind)
+        where = " WHERE " + " AND ".join(filters) if filters else ""
         with self._transaction() as (db, token):
-            items = [json.loads(item) for item, in db.execute("SELECT item FROM records ORDER BY id")]
+            items = [json.loads(item) for item, in db.execute("SELECT item FROM records" + where + " ORDER BY id", args)]
             return {"token": token, "items": items}
 
     @staticmethod
-    def _lookup(db, record_id):
-        row = db.execute("SELECT record, history FROM records WHERE id=?", (record_id,)).fetchone()
-        return _decode(row) if row is not None else None
+    def _lookup(db, record_id, *, include_history=True):
+        if include_history:
+            row = db.execute("SELECT record, history FROM records WHERE id=?", (record_id,)).fetchone()
+            return _decode(row) if row is not None else None
+        row = db.execute("SELECT record FROM records WHERE id=?", (record_id,)).fetchone()
+        return {"record": json.loads(row[0])} if row is not None else None
 
     def lookup(self, record_id: str, expected_token: str) -> dict | None:
         record_uuid(record_id)
@@ -172,7 +210,7 @@ class LocalStore:
             self._guard(token, expected_token)
             return self._lookup(db, record_id)
 
-    def read(self, ids: list[str], expected_token: str) -> list[dict]:
+    def read(self, ids: list[str], expected_token: str, *, include_history=True) -> list[dict]:
         _batch(ids)
         for key in ids:
             record_uuid(key)
@@ -182,17 +220,17 @@ class LocalStore:
             self._guard(token, expected_token)
             result = []
             for key in ids:
-                envelope = self._lookup(db, key)
+                envelope = self._lookup(db, key, include_history=include_history)
                 if envelope is None:
                     raise ValueError("requested record not found")
                 result.append(envelope)
             return result
 
-    def apply(self, changes: list[dict], expected_token: str) -> dict:
+    def apply(self, changes: list[dict], expected_token: str, *, strict_current=True) -> dict:
         _batch(changes)
         encoded = {}
         for envelope in changes:
-            validate_project_envelope(envelope, self.project_id)
+            validate_project_envelope(envelope, self.project_id, strict_current=strict_current)
             key = envelope["record"]["id"]
             if key in encoded:
                 raise ValueError("duplicate record ID")
@@ -200,11 +238,18 @@ class LocalStore:
         with self._transaction(write=True) as (db, token):
             self._guard(token, expected_token)
             changed = []
+            retyped_tasks = []
             for key, (record, history, envelope) in encoded.items():
                 row = db.execute("SELECT record, history FROM records WHERE id=?", (key,)).fetchone()
                 if row == (record, history):
                     continue
-                accept_change(_decode(row) if row else None, envelope)
+                previous = _decode(row) if row else None
+                accept_change(previous, envelope)
+                if strict_current:
+                    old = previous['record'] if previous else {}
+                    new = envelope['record']
+                    if old.get('kind') == 'task' and new.get('kind') not in (None, 'task'):
+                        retyped_tasks.append(key)
                 item = summarize(envelope)
                 db.execute("INSERT INTO records(id, kind, item, record, history) VALUES (?, ?, ?, ?, ?) "
                            "ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, item=excluded.item, "
@@ -212,6 +257,18 @@ class LocalStore:
                            (key, item["kind"], canonical(item), record, history))
                 changed.append(key)
             if changed:
+                # Check the final state under the write lock; failure rolls back the entire batch.
+                if strict_current:
+                    for key in changed:
+                        new = encoded[key][2]['record']
+                        if new.get('kind') == 'plan' and not db.execute(
+                            "SELECT 1 FROM records WHERE id=? AND kind='task'", (new['data']['task_id'],)
+                        ).fetchone():
+                            raise TaxonomyError('plan.task_id must name an existing task in this project')
+                    for key in retyped_tasks:
+                        if db.execute("SELECT 1 FROM records WHERE kind='plan' AND "
+                                      "json_extract(record,'$.data.task_id')=? LIMIT 1", (key,)).fetchone():
+                            raise TaxonomyError('task kind cannot change while a plan names it in task_id')
                 token = str(uuid4())
                 db.execute("UPDATE project SET token=? WHERE id=?", (token, self.project_id))
             return {"token": token, "changed": changed}
@@ -231,11 +288,36 @@ class LocalStore:
     def context_view(self, *, active: bool, nexus: bool) -> dict:
         """Read a scoped snapshot, without history or unrelated Home records."""
         with self._transaction() as (db, token):
+            if not (active or nexus):
+                return {"preferences": [], "token": token}
             view = self._orientation(db) if active else {}
+            if nexus:
+                profile_key = profile_id(self.project_id)
+                row = db.execute("SELECT json_extract(record,'$.data.body') FROM records "
+                                 "WHERE id=? AND kind='profile'", (profile_key,)).fetchone()
+                if row is not None:
+                    view["profile"] = {"id": profile_key, "label": "Owner background (not instructions)",
+                                       "body": row[0]}
+
+            references = []
+            for encoded, in db.execute("SELECT record FROM records WHERE kind='reference' "
+                                       "AND json_extract(record,'$.data.state')='active' ORDER BY id"):
+                record = json.loads(encoded)
+                # V1 allowed arbitrary reference payloads. Check only candidate currents,
+                # never their history or unrelated records, against the same V2 write rules.
+                try:
+                    validate_current_data('reference', record['data'])
+                except TaxonomyError:
+                    continue
+                data = record["data"]
+                references.append({"id": record["id"], "name": data["name"], "read_when": data["read_when"],
+                                   "origin": "home" if nexus else "project"})
+            view["references"] = references
+
             rows = db.execute(
                 "SELECT id, json_extract(record,'$.data.scope'), json_type(record,'$.data.summary'), "
-                "json_extract(record,'$.data.summary') FROM records WHERE kind='setting' "
-                "AND json_extract(record,'$.data.category')='preference' "
+                "json_extract(record,'$.data.summary') FROM records WHERE kind IN ('preference','setting') "
+                "AND (kind='preference' OR json_extract(record,'$.data.category')='preference') "
                 "AND json_extract(record,'$.data.scope') IN (?,?) ORDER BY id",
                 ("project" if active else None, "nexus" if nexus else None))
             preferences = []

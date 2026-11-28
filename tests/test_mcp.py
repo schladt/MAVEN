@@ -122,14 +122,35 @@ class OfflineStdioTests(unittest.IsolatedAsyncioTestCase):
                            'reason': 'Wrong selected project'}, ok=False)
                 await call(client, 'maven_reconcile', {**selected, 'action': 'verify'}, ok=False)
                 change = await call(client, 'maven_local_write', {**selected, 'expected_token': state['token'],
-                    'kind': 'action', 'data': {'summary': 'Adjusted fixture files'}, 'reason': 'Verified'})
+                    'kind': 'outcome', 'data': {'title': 'Adjusted fixture files', 'occurred_on': '2026-11-27',
+                    'observed': 'The generated files matched the expected result.'}, 'reason': 'Verified'})
                 self.assertTrue(change['changed'])
                 bad = await call(client, 'maven_local_write', {**selected, 'expected_token': change['token'],
                     'kind': 'setting', 'data': {'category': 'preference', 'summary': 'Unscoped'}, 'reason': 'Bad'},
                     ok=False)
+                self.assertIn('preference', bad['error'])
                 self.assertNotIn('changed', bad)
+                oversized = await call(client, 'maven_local_write', {**selected, 'expected_token': change['token'],
+                    'kind': 'reference', 'data': {'name': 'Test', 'read_when': 'At review', 'state': 'active',
+                    'as_of': '2026-11-27', 'body': 'x' * 7001}, 'reason': 'Check rejection'}, ok=False)
+                for detail in ('body', '7000', '7001'):
+                    self.assertIn(detail, oversized['error'])
+                self.assertNotIn('x' * 16, json.dumps(oversized))
                 again = (await call(client, 'maven_context', {'cwd': str(child)}))['active']
                 self.assertEqual(again['token'], change['token'])
                 self.assertEqual(again['brief'], state['brief'])
+                inventory = await call(client, 'maven_local_read', {**selected, 'kind': 'outcome'})
+                self.assertEqual([i['id'] for i in inventory['items']], [change['id']])
+                corrected = await call(client, 'maven_local_write', {**selected, 'expected_token': change['token'],
+                    'id': change['id'], 'kind': 'outcome', 'data': {'title': 'Fixture reproduced',
+                    'occurred_on': '2026-11-27', 'observed': 'A second run matched.'}, 'reason': 'Repeat run'})
+                self.assertTrue(corrected['changed'])
+                inventory = await call(client, 'maven_local_read', {**selected, 'kind': 'outcome'})
+                exact = {**selected, 'expected_token': inventory['token'], 'ids': [change['id']]}
+                current, = (await call(client, 'maven_local_read', exact))['records']
+                self.assertNotIn('history', current)
+                self.assertEqual(current['record']['data']['observed'], 'A second run matched.')
+                full, = (await call(client, 'maven_local_read', {**exact, 'include_history': True}))['records']
+                self.assertEqual(full['history'][0]['record']['data']['title'], 'Adjusted fixture files')
                 self.assertFalse((home / 'runtime' / 'turns').exists())
                 self.assertNotIn('maven_turn', [tool.name for tool in (await client.list_tools()).tools])

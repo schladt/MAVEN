@@ -30,7 +30,7 @@ export default function fixture(pi) {
         const id = view.match(/"project_id"\s*:\s*"([^"]+)"/)?.[1];
         const token = view.match(/"token"\s*:\s*"([^"]+)"/)?.[1];
         if (!latest && id && token) content = callTool('maven_local_write', {cwd, project_id: id,
-          expected_token: token, kind: 'decision', data: {title:'Build the widget offline',state:'accepted'},
+          expected_token: token, kind: 'decision', data: {title:'Build the widget offline',state:'accepted',rationale:'The widget must run without a network connection.'},
           reason: 'Owner requested the widget decision.'});
         else if (latest && !latest.isError && /"changed"\s*:\s*true/.test(txt(latest)))
           response = 'Recorded the widget decision.\nMAVEN · widget: saved locally.';
@@ -39,7 +39,7 @@ export default function fixture(pi) {
         if (!latest && saved) content = callTool('maven_local_write', {cwd,
           project_id: view.match(/"project_id"\s*:\s*"([^"]+)"/)[1],
           expected_token: saved.match(/"token"\s*:\s*"([^"]+)"/)[1], kind:'decision',
-          data:{title:'Competing change', state:'accepted'}, reason:'Second fixture request.'});
+          data:{title:'Competing change', state:'accepted', rationale:'The fixture requirements changed.'}, reason:'Second fixture request.'});
         else if (latest && txt(latest).includes('view_conflict'))
           response = 'Another writer changed the project.\nMAVEN · widget: not saved.';
       } else if (prompt.includes('Turn off MAVEN')) {

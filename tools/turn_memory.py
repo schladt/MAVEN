@@ -92,7 +92,7 @@ def consult(app, cwd):
     error = 'project_unavailable'
     try:
         tracked = select_project(cwd, app.home)
-        if tracked is None:
+        if tracked is None or tracked['mode'] == 'home':
             error = 'nexus_unavailable'
         selected = tracked or select_project(cwd, app.home, use_home=True)
         active, identity = _view(app, cwd, tracked, selected, active=True)
@@ -107,7 +107,7 @@ def consult(app, cwd):
     except Exception:
         # A damaged binding, guard, or unreadable store never enables a fallback. Do not
         # reflect file names or exception text across the workspace context boundary.
-        action = ('Check the selected Nexus Home in MAVEN setup, then load context again. '
+        action = ('Owner background is unavailable. Check the selected Nexus Home in MAVEN setup, then load context again. '
                   'You can continue with any project context already returned.'
                   if error == 'nexus_unavailable' else
                   'Open the intended project folder and ask MAVEN to inspect its local binding. '
@@ -132,26 +132,27 @@ def capture(app, cwd, *, project_id, use_home, expected_token, reason, kind=None
     if not selected or selected['project_id'] != project_id:
         raise ProjectError('workspace does not select the requested project')
     active = tracked is None or tracked == selected
-    preference = not erase and kind == 'setting' and data.get('category') == 'preference'
+    preference = not erase and kind == 'preference'
     if preference:
         scope = data.get('scope')
-        if scope not in ('project', 'nexus') or not all(
-                isinstance(data.get(key), str) and data[key].strip() for key in ('title', 'summary')):
-            raise ValueError('a preference requires its owner-selected scope, title and summary')
-        if (scope == 'nexus' and not use_home) or (scope == 'project' and not active):
+        if (scope == 'nexus' and selected['mode'] != 'home') or (scope == 'project' and not active):
             raise ProjectError('preference scope does not match the selected destination')
-    elif not active:
+    elif not active and kind not in ('profile', 'reference'):
         raise ProjectError('ordinary capture belongs to the active project')
 
     cohort = None
     if not active:
-        # Even an explicit Nexus preference cannot escape a retired/inaccessible workspace.
+        # Cross-project Home capture cannot escape a retired/inaccessible workspace.
         with _destination(app, cwd, tracked, tracked, active=True) as (_, _, identity):
             cohort = identity
     with _destination(app, cwd, tracked, selected, active=active, cohort=cohort) as (store, binding, _):
         prefix = binding + '.'
         if not isinstance(expected_token, str) or not expected_token.startswith(prefix):
             raise StaleView('workspace context is not bound to this destination; reload context')
+        if not active and kind == 'reference' and record_id:
+            previous = store.lookup(record_id, expected_token[len(prefix):])
+            if previous and previous['record'].get('kind') != 'reference':
+                raise ProjectError('only an existing Home reference may be edited across project boundaries')
         if record_id and preference:
             previous = store.lookup(record_id, expected_token[len(prefix):])
             if previous is not None:
@@ -159,7 +160,8 @@ def capture(app, cwd, *, project_id, use_home, expected_token, reason, kind=None
                 if old.get('erased'):
                     raise ValueError('erased records cannot be restored')
                 fields = old.get('data', {})
-                if old.get('kind') == 'setting' and fields.get('category') == 'preference':
+                if old.get('kind') == 'preference' or (old.get('kind') == 'setting'
+                                                       and fields.get('category') == 'preference'):
                     if fields.get('scope') != data['scope']:
                         raise ProjectError('a correction cannot change preference scope')
                 elif not active:

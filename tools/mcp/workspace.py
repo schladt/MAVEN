@@ -15,9 +15,12 @@ def register_workspace_tools(server, app, guarded):
         (reference/operational/artifact), origin, sensitivity=Sensitive, authorization and
         disposition (retain/archive/delete); removal needs confirm=true, deletion also reviewed=true.
         archive-plan needs record_id, digest, completed=true and confirm=true; source_path and
-        source_disposition (retain/archive) are optional. status takes record_id and digest;
-        omit output to preview publishable fields, or set output=team-status.md and check=true
-        to check without writing. Mutations may take a stable operation_id. receipt takes operation_id.
+        source_disposition (retain/archive) are optional. A task plan stays a plan marked done;
+        its archival receipt is separate. status takes record_id and digest of an entity with
+        type=workspace-metadata, name=project-status, scope=project and value containing
+        external_status_enabled=true and publishable. Omit output to preview publishable fields,
+        or set output=team-status.md and check=true to check without writing. Mutations may take
+        a stable operation_id. receipt takes operation_id.
         These operations neither reconcile with the cloud nor publish to Git.
         """
         with app.local(cwd) as store, workspace_lock(store.root):

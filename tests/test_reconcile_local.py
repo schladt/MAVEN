@@ -13,8 +13,8 @@ from tools.reconcile_local import LocalStore, StaleView
 from tools.reconcile_records import brief_id, make_change, summarize, tombstone
 
 
-def note(text, key=None):
-    return make_change(None, "note", {"text": text}, "observed", record_id=key or str(uuid4()))
+def note(text, key=None, *, prior=None, reason="observed"):
+    return make_change(prior, "entity", {"type": "observation", "name": text}, reason, record_id=key or str(uuid4()))
 
 
 class LocalStoreTests(unittest.TestCase):
@@ -24,6 +24,50 @@ class LocalStoreTests(unittest.TestCase):
         self.root = Path(tmp.name)
         self.project = str(uuid4())
         self.store = LocalStore(self.root, self.project)
+
+    def test_plan_and_task_validate_as_one_transaction_but_erasure_is_never_blocked(self):
+        task_id, plan_id = str(uuid4()), str(uuid4())
+        plan = make_change(None, 'plan', {'task_id': task_id, 'state': 'approved', 'steps': ['Check the log'],
+                                         'completion_check': 'The log shows completion'}, 'fixture', record_id=plan_id)
+        task = make_change(None, 'task', {'title': 'Review the run', 'added_on': '2026-11-27', 'state': 'open'},
+                           'fixture', record_id=task_id)
+        def apply(*entries):
+            return self.store.apply(list(entries), self.store.inventory()['token'], strict_current=True)
+        replacement = make_change(task, 'entity', {'type': 'run', 'name': 'First run'}, 'reclassify', record_id=task_id)
+        for invalid in ([plan], [replacement, plan]):
+            with self.assertRaisesRegex(ValueError, 'task_id'):
+                apply(*invalid)
+            self.assertFalse(self.store.inventory()['items'])
+        before = apply(plan, task)['token']
+        with self.assertRaisesRegex(ValueError, 'task_id'):
+            apply(replacement)
+        self.assertEqual(self.store.lookup(task_id, before), task)
+        after = apply(tombstone(task, record_id=task_id))['token']
+        self.assertTrue(self.store.lookup(task_id, after)['record']['erased'])
+        self.assertEqual(self.store.lookup(plan_id, after), plan)
+
+    def test_scoped_inventory_filters_only_matching_current_records(self):
+        task_id, other_task = str(uuid4()), str(uuid4())
+        entries = []
+        def add(kind, data, key=None):
+            key = key or str(uuid4())
+            entries.append(make_change(None, kind, data, 'fixture', record_id=key))
+            return key
+        for key in (task_id, other_task):
+            add('task', {'title': 'Inspect', 'state': 'open', 'added_on': '2026-11-27'}, key)
+        plans = [add('plan', {'task_id': key, 'steps': ['Check log'], 'state': 'proposed',
+                              'completion_check': 'Log present'}) for key in (task_id, other_task)]
+        devices = [add('entity', {'name': 'Alpha', 'type': t}) for t in ('workstation', 'project')]
+        cards = [add('reference', {'state': s, 'name': 'Environment', 'read_when': 'On setup',
+                                   'as_of': '2026-11-27', 'body': 'A scope.'}) for s in ('active', 'retired')]
+        self.store.apply(entries, self.store.orient()['token'], strict_current=True)
+        for kwargs, expected in [({'kind': 'task'}, [task_id, other_task]), ({'task_id': task_id}, plans[:1]),
+                                 ({'entity_type': 'project'}, devices[1:]), ({'state': 'retired'}, cards[1:]),
+                                 ({'kind': 'plan', 'task_id': str(uuid4())}, [])]:
+            with self.subTest(kwargs=kwargs):
+                self.assertCountEqual([item['id'] for item in self.store.inventory(**kwargs)['items']], expected)
+        with self.assertRaisesRegex(ValueError, 'requires kind plan'):
+            self.store.inventory(kind='entity', task_id=task_id)
 
     def test_offline_orientation_discovers_skills_not_procedures_or_link_content(self):
         first = self.store.orient()
@@ -59,7 +103,7 @@ class LocalStoreTests(unittest.TestCase):
         old = note("Old governing decision evidence", key)
         second = LocalStore(self.root, self.project)
         observed = self.store.apply([old], self.store.inventory()["token"])["token"]
-        actual_work = make_change(old, "note", {"text": "Owner clarified evidence"}, "owner clarification", record_id=key)
+        actual_work = note("Owner clarified evidence", key, prior=old, reason="owner clarification")
         new_risk = make_change(None, "risk", {"title": "Legal withdrew approval", "state": "open"}, "notification",
                                record_id=str(uuid4()))
         saved = second.apply([actual_work, new_risk], observed)
@@ -115,8 +159,7 @@ class LocalStoreTests(unittest.TestCase):
     def test_erasure_physically_purges_managed_content_and_atomically_fences_stale_imports(self):
         original = note("managed wording to scrub A" * 500)
         key = original["record"]["id"]
-        correction = make_change(original, "note", {"text": "managed wording to scrub B" * 500},
-                                 "managed reason to scrub", record_id=key)
+        correction = note("managed wording to scrub B" * 500, key, prior=original, reason="managed reason to scrub")
         token = self.store.apply([correction], self.store.inventory()["token"])["token"]
         self.assertIn(b"managed wording to scrub A", self.store.path.read_bytes())
         marker = tombstone(correction, record_id=key)
@@ -131,7 +174,7 @@ class LocalStoreTests(unittest.TestCase):
             self.assertNotIn(b"managed wording to scrub", file.read_bytes())
             self.assertNotIn(b"managed reason to scrub", file.read_bytes())
         # Even a newer offline live version loses. The entire failed batch rolls back.
-        late = make_change(correction, "note", {"text": "offline correction"}, "offline edit", record_id=key)
+        late = note("offline correction", key, prior=correction, reason="offline edit")
         late["record"]["written_at"] = "2099-01-01T00:00:00Z"
         with self.assertRaisesRegex(ValueError, "erased"):
             returned.apply([note("rolled back"), late], token)
@@ -142,11 +185,11 @@ class LocalStoreTests(unittest.TestCase):
     def test_correction_preserves_prior_wording_without_touching_other_records(self):
         old, unrelated = note("old"), note("separate")
         key = old["record"]["id"]
-        merged = make_change(old, "note", {"text": "wrong merge"}, "merged evidence", record_id=key)
+        merged = note("wrong merge", key, prior=old, reason="merged evidence")
         token = self.store.apply([merged, unrelated], self.store.inventory()["token"])["token"]
         with self.assertRaisesRegex(ValueError, "history"):
             self.store.apply([old], token)
-        undone = make_change(merged, "note", old["record"]["data"], "owner corrected mistaken merge", record_id=key)
+        undone = note(old["record"]["data"]["name"], key, prior=merged, reason="owner corrected mistaken merge")
         after = self.store.apply([undone], token)
         self.assertEqual(after["changed"], [key])
         self.assertEqual(self.store.read([unrelated["record"]["id"], key], after["token"]), [unrelated, undone])
@@ -166,6 +209,24 @@ class LocalStoreTests(unittest.TestCase):
         self.store.path.replace(switched.path)
         with self.assertRaisesRegex(ValueError, "another project"):
             switched.orient()
+
+    def test_existing_only_copy_never_creates_a_missing_store_or_initializes_an_empty_one(self):
+        path = self.root / "standalone.sqlite3"
+        store = LocalStore.open_copy(path, self.project)
+        with self.assertRaises(FileNotFoundError):
+            store.orient()
+        self.assertFalse(path.exists())
+        path.touch(mode=0o600)
+        with self.assertRaisesRegex(ValueError, 'unsupported local memory schema'):
+            store.orient()
+        self.assertEqual(path.stat().st_size, 0)
+
+    def test_default_store_write_rejects_legacy_currents(self):
+        old = make_change(None, 'note', {'text': 'unconverted'}, 'fixture', record_id=str(uuid4()))
+        token = self.store.orient()['token']
+        with self.assertRaisesRegex(ValueError, 'kind must be one of'):
+            self.store.apply([old], token)
+        self.assertEqual(self.store.inventory(), {'items': [], 'token': token})
 
     def test_rejects_symlinked_private_paths_and_unsafe_permissions(self):
         outside = self.root / "outside"
@@ -202,7 +263,7 @@ from pathlib import Path
 from tools.reconcile_local import LocalStore
 from tools.reconcile_records import make_change
 store = LocalStore(Path(sys.argv[1]), sys.argv[2])
-value = make_change(None, 'note', {'text':'saved before exit'}, 'observed', record_id=sys.argv[3])
+value = make_change(None, 'entity', {'type':'observation','name':'saved before exit'}, 'observed', record_id=sys.argv[3])
 store.apply([value], store.inventory()['token'])
 os._exit(0)
 """

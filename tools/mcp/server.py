@@ -18,6 +18,7 @@ from tools.memory.client import AUTHENTICATION_CODES, MemoryClientError
 from tools.project import ProjectError
 from tools.reconcile import apply_review, inspect_views, read_details, select_project
 from tools.reconcile_local import StaleView
+from tools.reconcile_records import TaxonomyError
 from tools.recovery import DEFAULT_NEXT_ACTION, recovery_action
 from tools.turn_memory import LocalApplication, capture, consult
 from tools.setup_common import SetupPending
@@ -102,6 +103,10 @@ def create_server(application=None):
                             'next_action': 'Preserve local work. Inspect fresh state before retrying.'}
                 if exc.code in AUTHENTICATION_CODES:
                     response['sign_in_command'] = app.sign_in()
+                elif exc.code == 'client_incompatible':
+                    response['next_action'] = 'Update MAVEN, then inspect again. Keep the offline store.'
+                if exc.detail and exc.code in ('client_incompatible', 'invalid_request'):
+                    response['detail'] = exc.detail
                 return response
             except ProjectError as exc:
                 return {'status': 'blocked', 'error': str(exc),
@@ -110,6 +115,9 @@ def create_server(application=None):
             except (AdminInputError, SetupPending, BoundaryError) as exc:
                 return {'status': 'blocked', 'error': str(exc),
                         'next_action': getattr(exc, 'next_action', None) or DEFAULT_NEXT_ACTION}
+            except TaxonomyError as exc:
+                return {'status': 'error', 'error': str(exc),
+                        'next_action': 'Correct the named record field or kind, then submit the corrected record.'}
             except (ValueError, KeyError, TypeError):
                 return {'status': 'error', 'error': 'invalid_record_or_request',
                         'next_action': 'Check ID, kind, fields, selected side, and batch limits against the skill.'}
@@ -136,14 +144,18 @@ def create_server(application=None):
     @server.tool(annotations=local_hint)
     @guarded
     def maven_local_read(cwd: str, project_id: str, ids: list[str] | None = None,
-                         expected_token: str | None = None, use_home: bool = False) -> dict[str, Any]:
-        """No IDs: compact local inventory. IDs: exact records & history against expected_token (max 50). Offline; previously received redactions are enforced first."""
+                         expected_token: str | None = None, use_home: bool = False, include_history: bool = False,
+                         kind: str | None = None, task_id: str | None = None, entity_type: str | None = None,
+                         state: str | None = None) -> dict[str, Any]:
+        """Offline inventory, optionally filtered by kind, plan task_id, entity_type or reference state. Exact IDs (max 50) need the inventory token. History is opt-in."""
         with app.local(cwd, project_id=project_id, use_home=use_home) as store:
             if ids is None:
-                return {'status': 'local', **store.inventory()}
+                return {'status': 'local', **store.inventory(kind=kind, task_id=task_id, entity_type=entity_type, state=state)}
+            if any(value is not None for value in (kind, task_id, entity_type, state)):
+                raise TaxonomyError('Use inventory filters without exact IDs')
             if not expected_token:
                 raise ValueError('missing expected_token')
-            return {'status': 'local', 'records': store.read(ids, expected_token)}
+            return {'status': 'local', 'records': store.read(ids, expected_token, include_history=include_history)}
 
     @server.tool()
     @guarded
@@ -160,8 +172,8 @@ def create_server(application=None):
                         local_token: str | None = None, cloud_token: str | None = None,
                         ids: list[str] | None = None, choices: list[Choice] | None = None,
                         after_id: str | None = None, limit: int = 100, use_home: bool = False,
-                        interactive_login: bool = False) -> dict[str, Any]:
-        """Inspect, read, apply reviewed choices, or verify. All actions receive and locally enforce terminal markers first, even for archived projects. Only apply uploads choices. Supply both original tokens for paging. Interactive login resumes only a fresh inspection."""
+                        interactive_login: bool = False, include_history: bool = False) -> dict[str, Any]:
+        """Inspect, read current records (include_history for revisions), apply reviewed choices, or verify. Terminal markers are enforced first. Only apply uploads choices. Supply both observed tokens for paging; sign-in resumes only a fresh inspection."""
         from tools.memory.reconcile_cloud import CloudStore
         from tools.project import load_project, require_binding
 
@@ -190,7 +202,7 @@ def create_server(application=None):
                 if not local_token or not cloud_token:
                     raise ValueError('both tokens required')
                 if action == 'read':
-                    return read_details(store, cloud, ids or [], local_token, cloud_token)
+                    return read_details(store, cloud, ids or [], local_token, cloud_token, include_history=include_history)
                 return apply_review(store, cloud, [c.model_dump(exclude_none=True) for c in choices or []], local_token, cloud_token)
 
         try:

@@ -13,9 +13,51 @@ import uuid
 
 from tools.memory.boundary import BoundaryError, private_path, read_private, save_private
 from tools.memory.validation import MemoryError as CredentialError, reject_secrets
-from tools.reconcile_records import digest as fingerprint, make_change, record_uuid
+from tools.reconcile_records import TaxonomyError, digest as fingerprint, make_change, record_uuid, validate_current_data
 
 SECTIONS = ('Progress', 'Milestones', 'Blockers', 'Next Steps', 'Client Actions')
+
+
+def _metadata_data(key, value):
+    return {'type': 'workspace-metadata', 'name': key, 'scope': 'project', 'value': value}
+
+
+def _archived_plan_data(record_id, data):
+    name = next((data[k] for k in ('title', 'name') if isinstance(data.get(k), str) and data[k].strip()), record_id)
+    return {'type': 'workspace-archived-plan', 'name': name, 'state': 'archived', 'plan': data}
+
+
+def _legacy_entity(record):
+    """Recognize only old workspace shapes, never standing preferences or arbitrary actions."""
+    kind, data = record.get('kind'), record.get('data', {})
+    if (kind == 'setting' and set(data) == {'key', 'scope', 'value'} and data['scope'] == 'project'
+            and isinstance(data['key'], str) and isinstance(data['value'], dict)):
+        return _metadata_data(data['key'], data['value'])
+    if (kind == 'action' and set(data) == {'name', 'state', 'summary'}
+            and data['name'] in ('intake', 'archive-plan', 'status') and data['state'] in ('started', 'completed')):
+        return dict(data, type='workspace-operation')
+    if kind == 'plan' and data.get('state') == 'archived':
+        return _archived_plan_data(record['id'], data)
+    return None
+
+
+def _converted_from(envelope, prior_digest):
+    """Receipt pins survive exactly one lossless, in-place taxonomy conversion, not a content edit."""
+    if not envelope or not prior_digest or envelope['record'].get('kind') != 'entity':
+        return False
+    history = envelope['history']
+    for i, entry in enumerate(history):
+        if _legacy_entity(entry['record']) == envelope['record']['data']:
+            parent = {'record': entry['record'], 'history': history[:i] + history[i + 1:]}
+            if fingerprint(parent) == prior_digest:
+                return True
+    return False
+
+
+def _is_metadata(record, key):
+    data = record['data']
+    return (record['kind'] == 'entity' and data.get('type') == 'workspace-metadata'
+            and data.get('name') == key and data.get('scope') == 'project' and isinstance(data.get('value'), dict))
 
 
 def sha(path):
@@ -123,11 +165,12 @@ class Workspace:
         if private_path(self.root, path).exists():
             journal = read_private(self.root, path)
             if (journal.get('project_id') != self.memory.project_id
+                    or operation_id is not None and journal.get('operation_id') != operation_id
                     or journal.get('name') != name or journal.get('request') != request):
                 raise BoundaryError('workspace operation identity belongs to a different exact request')
         else:
             journal = {'operation_id': operation_id or str(uuid.uuid4()), 'project_id': self.memory.project_id,
-                       'name': name, 'request': request, 'phase': 'prepared', 'effects': {}}
+                       'taxonomy_version': 2, 'name': name, 'request': request, 'phase': 'prepared', 'effects': {}}
             save_private(self.root, path, journal)
         return path, journal
 
@@ -139,26 +182,45 @@ class Workspace:
         token, previous = self.memory.snapshot(record_id)
         actual = fingerprint(previous) if previous else None
         effects = journal['effects']
-        if step not in effects:
-            if actual != expected:
-                raise BoundaryError('workspace record changed before the reviewed effect')
-            envelope = make_change(previous, kind, data, reason, record_id=record_id)
-            effects[step] = {'before': expected, 'envelope': envelope}
+        effect = effects.get(step)
+        if effect:
+            target = effect['envelope']
+            saved = target['record']
+            if saved['id'] != record_id:
+                raise BoundaryError('workspace effect does not belong to the selected record')
+            matches = saved.get('kind') == kind and saved.get('data') == data
+            target_digest = fingerprint(target)
+            exact = actual in (effect['before'], target_digest)
+            if not exact or not matches:
+                # A v1 journal may have been persisted either side of its SQLite commit.
+                # Rebuild from the *actual* pinned parent, never replay a removed kind.
+                legacy_data = _legacy_entity(saved) if journal.get('taxonomy_version', 1) == 1 else None
+                if step == 'archive':
+                    legacy = saved.get('kind') == 'plan' and legacy_data is not None and (
+                        saved['data'] == dict(journal['plan']['data'], state='archived'))
+                else:
+                    legacy = legacy_data is not None and all(
+                        legacy_data.get(k) == data.get(k) for k in ('type', 'name', 'state'))
+                if not legacy or not (exact or _converted_from(previous, effect['before'])
+                                      or _converted_from(previous, target_digest)):
+                    raise BoundaryError('local record changed; preserve files and inspect the receipt')
+                effect = None
+        elif actual != expected:
+            raise BoundaryError('workspace record changed before the reviewed effect')
+        if not effect:
+            target = make_change(previous, kind, data, reason, record_id=record_id)
+            effects[step] = {'before': actual, 'envelope': target}
             save_private(self.root, path, journal)
-        effect = effects[step]
-        target = effect['envelope']
         if actual != fingerprint(target):
-            if actual != effect['before']:
-                raise BoundaryError('local record changed; preserve files and inspect the receipt')
-            token = self.memory.store.apply([target], token)['token']
+            token = self.memory.store.apply([target], token, strict_current=True)['token']
         if self.memory.store.read([record_id], token)[0] != target:
             raise BoundaryError('workspace effect has no exact local read-back')
         return self.memory.view(target)
 
     def _store(self, path, journal, step, key, value):
-        previous = None if step in journal['effects'] else self.setting(key)
-        return self._effect(path, journal, step, 'setting',
-            {'key': key, 'value': value, 'scope': 'project'}, record_id=self.setting_id(key),
+        previous = None if step in journal['effects'] else self.metadata(
+            key, legacy=journal.get('taxonomy_version', 1) == 1)
+        return self._effect(path, journal, step, 'entity', _metadata_data(key, value), record_id=self.metadata_id(key),
             expected=previous['digest'] if previous else None,
             reason='Record explicitly governed workspace metadata')
 
@@ -169,8 +231,8 @@ class Workspace:
         if state == 'started' and 'completed' in journal['effects']:
             return
         started = journal['effects'].get('started')
-        return self._effect(path, journal, state, 'action',
-            {'name': journal['name'], 'state': state, 'summary': summary},
+        return self._effect(path, journal, state, 'entity',
+            {'type': 'workspace-operation', 'name': journal['name'], 'state': state, 'summary': summary},
             record_id=journal['operation_id'],
             expected=fingerprint(started['envelope']) if state == 'completed' else None,
             reason='Record governed local source disposition')
@@ -180,18 +242,21 @@ class Workspace:
         result = dict(result, operation_id=journal['operation_id'])
         self._phase(path, journal, 'completed', result=result)
         return result
-    def setting_id(self, key):
+
+    def metadata_id(self, key):
         return str(uuid.uuid5(uuid.UUID(self.memory.project_id), 'workspace:' + key))
 
-    def setting(self, key):
-        _, envelope = self.memory.snapshot(self.setting_id(key))
+    def metadata(self, key, *, legacy=False):
+        _, envelope = self.memory.snapshot(self.metadata_id(key))
         if envelope is None:
             return None
         if envelope['record'].get('erased'):
             raise BoundaryError('workspace metadata was erased')
         record = self.memory.view(envelope)
-        if record['kind'] != 'setting' or record['data']['key'] != key:
-            raise BoundaryError('workspace setting identity conflicts with existing DB metadata')
+        if not _is_metadata(record, key):
+            old = _legacy_entity(envelope['record']) if legacy else None
+            if not old or old['type'] != 'workspace-metadata' or old['name'] != key:
+                raise BoundaryError('workspace metadata identity conflicts with existing DB metadata')
         return record
 
 
@@ -238,7 +303,7 @@ class Workspace:
             if identity(source) != initial:
                 raise BoundaryError('source changed while hashing; retained')
             key = 'intake-' + hashlib.sha256((str(source.relative_to(self.root)) + '\0' + source_hash).encode()).hexdigest()
-            previous = self.setting(key)
+            previous = self.metadata(key, legacy=journal.get('taxonomy_version', 1) == 1)
             if previous and any(previous['data']['value'].get(field) != value for field, value in
                                 (('kind', kind), ('origin', origin), ('sensitivity', sensitivity))):
                 raise BoundaryError('source classification conflicts with earlier acquisition; reconcile first')
@@ -293,6 +358,10 @@ class Workspace:
             plan = self.memory.read(record_id)
             if plan['digest'] != digest or plan['kind'] != 'plan' or plan['data'].get('state') == 'archived':
                 raise BoundaryError('archive requires the exact current local plan')
+            archived = self.metadata('archive-' + record_id, legacy=journal.get('taxonomy_version', 1) == 1)
+            if (archived and archived['data']['value'].get('state') == 'archived'
+                    and archived['data']['value'].get('plan') == self.memory.ref(plan)):
+                raise BoundaryError('the exact local plan has already been archived')
             metadata = {'plan': self.memory.ref(plan), 'owner_confirmed': True,
                         'actual_completion_attested': True, 'state': 'archive-authorized',
                         'source_disposition': source_disposition,
@@ -311,6 +380,19 @@ class Workspace:
                         initial=list(initial) if initial else None)
         metadata = dict(journal['metadata'])
         source = private_path(self.root, source_path) if source_path is not None else None
+        plan = journal['plan']
+        if plan['kind'] != 'plan' or self.memory.ref(plan) != {'record_id': record_id, 'digest': digest}:
+            raise BoundaryError('archive journal does not identify the selected plan')
+        try:
+            validate_current_data('plan', plan['data'])
+        except TaxonomyError:
+            kind, data = 'entity', _archived_plan_data(record_id, plan['data'])
+        else:
+            # A deleted or retyped task is not grounds to silently recategorize an orphan.
+            _, task = self.memory.snapshot(plan['data']['task_id'])
+            if not task or task['record'].get('kind') != 'task':
+                raise BoundaryError('plan.task_id must name an existing task in this project')
+            kind, data = 'plan', dict(plan['data'], state='done')
         if source is not None:
             stored = private_path(self.root, metadata['stored_path'])
             if journal['phase'] == 'preserving':
@@ -320,8 +402,7 @@ class Workspace:
         if journal['phase'] == 'preserving':
             self._phase(path, journal, 'preserved')
         self._operation(path, journal, 'started', metadata)
-        plan = journal['plan']
-        updated = self._effect(path, journal, 'archive', 'plan', dict(plan['data'], state='archived'),
+        updated = self._effect(path, journal, 'archive', kind, data,
             record_id=record_id, expected=digest, reason='Archive completed plan; retain history')
         key = 'archive-' + record_id
         if 'archived' not in journal['effects']:
@@ -348,9 +429,17 @@ class Workspace:
             if output != 'team-status.md':
                 raise BoundaryError('external status output must use the governed team-status.md path')
             path, journal = self._begin('status', dict(record_id=record_id, digest=digest, output=output), operation_id)
-        record = self.memory.read(record_id)
-        value = record['data'].get('value', {})
-        if (record['digest'] != digest or record['kind'] != 'setting' or record['data'].get('key') != 'project-status'
+        legacy_journal = journal is not None and journal.get('taxonomy_version', 1) == 1
+        _, source = self.memory.snapshot(record_id)
+        if not source or source['record'].get('erased'):
+            raise BoundaryError('local workspace record unavailable')
+        record = self.memory.view(source)
+        value = record['data'].get('value')
+        if not _is_metadata(record, 'project-status'):
+            old = _legacy_entity(source['record']) if legacy_journal else None
+            if not old or old['type'] != 'workspace-metadata' or old['name'] != 'project-status':
+                raise BoundaryError('status requires the exact project-status workspace metadata entity')
+        if ((record['digest'] != digest and not (legacy_journal and _converted_from(source, digest)))
                 or value.get('external_status_enabled') is not True):
             raise BoundaryError('external status is disabled or its current DB source receipt is stale')
         fields = value.get('publishable')
@@ -369,33 +458,43 @@ class Workspace:
         if output != 'team-status.md':
             raise BoundaryError('external status output must use the governed team-status.md path')
         target = private_path(self.root, output)
-        previous = self.setting('team-status-receipt')
+        previous = self.metadata('team-status-receipt', legacy=legacy_journal)
         before = target.read_bytes() if target.exists() and target.is_file() else None
         output_hash = hashlib.sha256(rendered.encode()).hexdigest()
         prior = previous['data']['value'] if previous else {}
         owned = False
         if before is not None and prior.get('output_sha256') == hashlib.sha256(before).hexdigest():
             saved = self.receipt(operation_id=prior.get('operation_id'))
-            owned = (saved.get('name') == 'status' and saved.get('phase') == 'completed'
-                     and saved['result'].get('receipt') == self.memory.ref(previous))
+            pinned = saved.get('result', {}).get('receipt', {})
+            if (saved.get('name') == 'status' and saved.get('phase') == 'completed'
+                    and pinned.get('record_id') == previous['record_id']):
+                owned = pinned == self.memory.ref(previous)
+                if not owned:
+                    _, receipt = self.memory.snapshot(previous['record_id'])
+                    owned = (receipt is not None and fingerprint(receipt) == previous['digest']
+                             and _converted_from(receipt, pinned.get('digest')))
         installed = bool(journal and journal['phase'] in ('installing', 'installed', 'completed')
                          and before == rendered.encode())
         if target.exists() and not owned and not installed:
             raise BoundaryError('status destination collision or local modification; existing content retained')
-        current = bool(previous and previous['data']['value'].get('source') == self.memory.ref(record)
-                       and previous['data']['value'].get('output_sha256') == output_hash and before == rendered.encode())
+        source_ref = prior.get('source')
+        current = (prior.get('output_sha256') == output_hash and before == rendered.encode()
+                   and isinstance(source_ref, dict) and source_ref.get('record_id') == record_id
+                   and (source_ref.get('digest') == record['digest']
+                        or _converted_from(source, source_ref.get('digest'))))
         if check:
             return dict(result, current=current)
         if journal.get('result'):
             return dict(journal['result'], current=current)
-        metadata = {'source': self.memory.ref(record), 'output_path': output, 'output_sha256': output_hash,
-                    'operation_id': journal['operation_id']}
+        # Keep a pending operation's reviewed source pin stable across a lossless retype.
+        metadata = {'source': {'record_id': record_id, 'digest': digest}, 'output_path': output,
+                    'output_sha256': output_hash, 'operation_id': journal['operation_id']}
         if 'before_sha256' not in journal:
             self._phase(path, journal, 'prepared',
                         before_sha256=hashlib.sha256(before).hexdigest() if before is not None else None)
         self._operation(path, journal, 'started', metadata)
         if not installed:
-            if self.memory.read(record_id)['digest'] != digest:
+            if self.memory.read(record_id)['digest'] != record['digest']:
                 raise BoundaryError('DB status source changed during generation')
             before_hash = hashlib.sha256(before).hexdigest() if before is not None else None
             if before_hash != journal['before_sha256']:

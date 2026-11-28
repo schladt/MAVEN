@@ -7,7 +7,10 @@ import stat
 from uuid import UUID, uuid4
 
 from tools.project import ProjectError, load_project, project_label
-from tools.reconcile_records import brief_id, combine_history, digest, make_change, tombstone
+from tools.reconcile_records import (
+    TaxonomyError, brief_id, combine_history, digest, make_change, profile_id, tombstone,
+    validate_current_data, validate_project_envelope,
+)
 from tools.reconcile_local import StaleView
 
 
@@ -68,6 +71,15 @@ def _by_id(inventory):
 
 
 def local_write(store, expected_token, kind, data, reason, *, record_id=None, erase=False):
+    if not erase:
+        validate_current_data(kind, data)
+    if kind == 'profile':
+        if getattr(store, 'selection', {}).get('mode') != 'home':
+            raise TaxonomyError('profile may only be written to the configured Home')
+        reserved = profile_id(store.project_id)
+        if record_id is not None and record_id != reserved:
+            raise TaxonomyError('profile requires its reserved Home record ID')
+        record_id = reserved
     if kind == 'brief' and not record_id:
         record_id = brief_id(store.project_id)
     if erase and (not record_id or kind is not None or data is not None):
@@ -80,7 +92,7 @@ def local_write(store, expected_token, kind, data, reason, *, record_id=None, er
         raise ValueError('erased records cannot be restored')
     entry = (tombstone(prior, record_id=record_id) if erase else
              make_change(prior, kind, data, reason, record_id=record_id))
-    result = store.apply([entry], expected_token)
+    result = store.apply([entry], expected_token, strict_current=True)
     return {'status': 'local', 'id': record_id, **result, 'cloud_checked': False}
 
 
@@ -146,10 +158,14 @@ def _details(local, cloud, ids, left, right):
     return fetch(local, a, left['token']), fetch(cloud, b, right['token'])
 
 
-def read_details(local, cloud, ids, local_token, cloud_token):
+def read_details(local, cloud, ids, local_token, cloud_token, *, include_history=False):
     left, right = _views(local, cloud, local_token, cloud_token)
     a, b = _details(local, cloud, ids, left, right)
-    return {'status': 'review', 'records': [{'id': key, 'local': a.get(key), 'cloud': b.get(key)} for key in ids]}
+    # Validate complete envelopes against the reviewed digests before projecting what the caller asked for.
+    def visible(entry):
+        return entry if include_history or entry is None else {'record': entry['record']}
+    return {'status': 'review', 'records': [
+        {'id': key, 'local': visible(a.get(key)), 'cloud': visible(b.get(key))} for key in ids]}
 
 
 def _covers(entry, parents):
@@ -176,20 +192,36 @@ def apply_review(local, cloud, choices, local_token, cloud_token):
         if markers:
             entry = min(markers, key=lambda e: (datetime.fromisoformat(e['record']['written_at']), e['record']['written_at']))
         else:
+            local_entry = local_entries.get(key)
+            descendant = None
+            if local_entry and a[key]['digest'] != b.get(key, {}).get('digest'):
+                try:
+                    validate_project_envelope(local_entry, local.project_id, strict_current=True)
+                except TaxonomyError as exc:
+                    descendant = cloud_entries.get(key)
+                    if not descendant or not _covers(descendant, [local_entry]):
+                        raise TaxonomyError(f'Unconverted offline record {key}: {exc}. '
+                                            'Use maven-taxonomy to convert it locally before reconciling.') from None
             if take == 'merge':
+                validate_current_data(choice['kind'], choice['data'])
+                if choice['kind'] == 'profile' and getattr(local, 'selection', {}).get('mode') != 'home':
+                    raise TaxonomyError('profile may only be authored in the configured Home')
                 matches = [p for p in parents if p['record']['kind'] == choice['kind']
                            and digest(p['record']['data']) == digest(choice['data'])]
                 source = next((p for p in matches if _covers(p, parents)), matches[0] if matches else None)
                 if source is None:
                     source = make_change(parents[0], choice['kind'], choice['data'], choice['reason'], record_id=key)
             elif take in ('local', 'cloud'):
-                source = (local_entries if take == 'local' else cloud_entries).get(key)
+                # Never resurrect a pre-conversion version of a converted descendant.
+                source = descendant or (local_entries if take == 'local' else cloud_entries).get(key)
                 if source is None:
                     raise ValueError('chosen side has no such record')
             else:
                 raise ValueError('choose local, cloud, merge, or propagate an existing erasure')
             entry = source if _covers(source, parents) else combine_history(source['record'], parents, choice['reason'])
         hashed = digest(entry)
+        if hashed != a.get(key, {}).get('digest') or hashed != b.get(key, {}).get('digest'):
+            validate_project_envelope(entry, local.project_id, strict_current=True)
         if a.get(key, {}).get('digest') != hashed:
             to_local.append(entry)
         if b.get(key, {}).get('digest') != hashed:
@@ -197,6 +229,6 @@ def apply_review(local, cloud, choices, local_token, cloud_token):
     # CAS even when there is nothing to upload: a new unrelated cloud record invalidates this review.
     local.read([], local_token)
     result = cloud.apply(to_cloud, cloud_token)
-    local_result = local.apply(to_local, local_token)
+    local_result = local.apply(to_local, local_token, strict_current=True)
     return {'status': 'applied', 'verify_required': True, 'local_token': local_result['token'],
             'cloud_token': result['token'], 'ids': ids}

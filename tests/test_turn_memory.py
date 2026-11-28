@@ -11,7 +11,7 @@ from tools.home import save_home
 from tools.memory.boundary import save_private
 from tools.project import ProjectError
 from tools.project_switch import barrier_path
-from tools.reconcile import local_write
+from tools.reconcile_records import make_change
 from tools.reconcile_local import LocalStore, StaleView
 from tools.reconcile_redaction import Replica
 from tools.setup_common import SetupPending
@@ -23,7 +23,7 @@ def uid():
 
 
 def preference(scope, summary, **extra):
-    return {'category': 'preference', 'title': 'Owner preference', 'scope': scope, 'summary': summary, **extra}
+    return {'title': 'Owner preference', 'scope': scope, 'summary': summary, **extra}
 
 
 class TurnMemoryTests(unittest.TestCase):
@@ -53,12 +53,43 @@ class TurnMemoryTests(unittest.TestCase):
                   label='Nexus', consent={'origin': 'owner', 'excerpt': 'Use Nexus as Home.'})
 
     def seed(self, store, kind, data, record_id=None):
-        return local_write(store, store.inventory()['token'], kind, data, 'owner request', record_id=record_id)['id']
+        # Model existing v1 records on disk independently of the v2 authoring boundary.
+        token = store.inventory()['token']
+        key = record_id or (store.brief_id if kind == 'brief' else uid())
+        entry = make_change(store.lookup(key, token), kind, data, 'fixture import', record_id=key)
+        store.apply([entry], token, strict_current=False)
+        return key
 
-    def write(self, view, *, cwd=None, kind='action', data=None, **options):
+    def write(self, view, *, cwd=None, kind='risk', data=None, **options):
         return capture(self.app, cwd or self.project.root, **({'project_id': view['project_id'],
                        'use_home': view['use_home'], 'expected_token': view['token'], **options}),
-                       kind=kind, data={'summary': 'Changed project files'} if data is None else data, reason='Observed')
+                       kind=kind, data={'state': 'open', 'title': 'Fixture risk'} if data is None else data, reason='Observed')
+
+    def test_profile_requires_configured_home_not_a_matching_project_uuid(self):
+        from tools.reconcile_records import profile_id
+        clone = self.bind(self.base / 'other-copy-of-home', self.nexus.project_id)
+        view = consult(self.app, clone.root)
+        with self.assertRaisesRegex(ValueError, 'configured Home'):
+            self.write(view['active'], cwd=clone.root, kind='profile', data={'body': 'Unrelated copy.'})
+        with self.assertRaisesRegex(ValueError, 'reserved'):
+            self.write(view['nexus'], cwd=clone.root, kind='profile', record_id=uid(), data={'body': 'Wrong ID.'})
+        saved = self.write(view['nexus'], cwd=clone.root, kind='profile', data={'body': 'Owner-stated background.'})
+        self.assertEqual(saved['id'], profile_id(self.nexus.project_id))
+        self.assertFalse(clone.inventory()['items'])
+
+    def test_home_reference_authored_and_corrected_from_another_project(self):
+        other = self.seed(self.nexus, 'entity', {'type': 'instrument', 'name': 'Meter'})
+        home = consult(self.app, self.project.root)['nexus']
+        data = {'name': 'Instruments', 'read_when': 'Before calibrating', 'state': 'active',
+                'as_of': '2026-11-27', 'body': 'Fixture background.'}
+        saved = self.write(home, kind='reference', data=data)
+        result = consult(self.app, self.project.root)
+        self.assertEqual([r['id'] for r in result['nexus']['references']], [saved['id']])
+        self.assertFalse(result['active']['references'])
+        with self.assertRaises(ProjectError):
+            self.write(result['nexus'], kind='reference', data=data, record_id=other)
+        self.write(result['nexus'], kind='reference', data={**data, 'state': 'retired'}, record_id=saved['id'])
+        self.assertFalse(consult(self.app, self.project.root)['nexus']['references'])
 
     def test_footer_label_is_bound_to_project_and_epoch_not_checkout_name(self):
         from tools.project import save_project_name
@@ -72,7 +103,7 @@ class TurnMemoryTests(unittest.TestCase):
             self.assertEqual(context['nexus']['label'], 'Nexus')
 
     def test_clipboard_only_fresh_project_consults_manual_commit_preference_without_git_or_copy(self):
-        key = self.seed(self.nexus, 'setting', preference('nexus', 'I commit manually. Provide the message only.'))
+        key = self.seed(self.nexus, 'preference', preference('nexus', 'I commit manually. Provide the message only.'))
         nested = self.project.root / 'src'
         nested.mkdir()
         with patch('subprocess.run', side_effect=AssertionError('must not invoke Git or a shell')), \
@@ -88,15 +119,15 @@ class TurnMemoryTests(unittest.TestCase):
         self.assertFalse((self.home / 'runtime/sessions.json').exists())
 
     def test_scoped_read_excludes_unrelated_home_material_and_displaced_wording(self):
-        key = self.seed(self.nexus, 'setting', preference('nexus', 'old wording not for display'))
-        self.seed(self.nexus, 'setting', preference('nexus', 'Use reviewed destination',
+        key = self.seed(self.nexus, 'preference', preference('nexus', 'old wording not for display'))
+        self.seed(self.nexus, 'preference', preference('nexus', 'Use reviewed destination',
                                                    commentary='extra private field'), key)
         self.seed(self.nexus, 'brief', {'purpose': 'private Home brief'})
-        self.seed(self.nexus, 'setting', preference('project', 'private Home project preference'))
+        self.seed(self.nexus, 'preference', preference('project', 'private Home project preference'))
         self.seed(self.nexus, 'setting', {'scope': 'nexus', 'summary': 'unrelated Home setting'})
         self.seed(self.nexus, 'note', {'summary': 'unrelated Home note'})
-        self.seed(self.project, 'setting', preference('nexus', 'misplaced Nexus setting'))
-        project_key = self.seed(self.project, 'setting', preference('project', 'Keep the SQLite schema'))
+        self.seed(self.project, 'preference', preference('nexus', 'misplaced Nexus setting'))
+        project_key = self.seed(self.project, 'preference', preference('project', 'Keep the SQLite schema'))
         self.seed(self.project, 'brief', {'purpose': 'Read this briefing'})
         skill = self.seed(self.project, 'skill', {'name': 'Verify', 'when_to_use': 'Before release',
                                                 'steps': ['private procedure'], 'verification': 'Check result'})
@@ -115,7 +146,7 @@ class TurnMemoryTests(unittest.TestCase):
         first = consult(self.app, self.project.root)
         second = self.bind(self.base / 'second')
         with self.assertRaises(StaleView):
-            self.write(first['nexus'], cwd=second.root, kind='setting',
+            self.write(first['nexus'], cwd=second.root, kind='preference',
                        data=preference('nexus', 'From another workspace'))
         self.assertEqual(self.nexus.inventory()['items'], [])
         second_view = consult(self.app, second.root)
@@ -123,18 +154,18 @@ class TurnMemoryTests(unittest.TestCase):
 
     def test_active_home_keeps_project_and_nexus_preferences_distinct_on_correction(self):
         view = consult(self.app, self.nexus.root)['active']
-        saved = self.write(view, cwd=self.nexus.root, kind='setting', data=preference('project', 'Only here'))
+        saved = self.write(view, cwd=self.nexus.root, kind='preference', data=preference('project', 'Only here'))
         with self.assertRaises(ProjectError):
             self.write(view, cwd=self.nexus.root, expected_token=saved['token'], record_id=saved['id'],
-                       kind='setting', data=preference('nexus', 'Apply everywhere instead'))
+                       kind='preference', data=preference('nexus', 'Apply everywhere instead'))
         fresh = consult(self.app, self.nexus.root)['active']
         self.assertEqual(fresh['token'], saved['token'])
         self.assertEqual(fresh['preferences'], [{'id': saved['id'], 'scope': 'project', 'summary': 'Only here'}])
 
     def test_active_home_reads_once_and_requires_new_projection_then_allows_untracked_capture(self):
         self.seed(self.nexus, 'brief', {'purpose': 'Only when active'})
-        self.seed(self.nexus, 'setting', preference('nexus', 'global'))
-        self.seed(self.nexus, 'setting', preference('project', 'scoped to the Home project'))
+        self.seed(self.nexus, 'preference', preference('nexus', 'global'))
+        self.seed(self.nexus, 'preference', preference('project', 'scoped to the Home project'))
         separate = consult(self.app, self.project.root)
         with patch.object(LocalStore, 'context_view', autospec=True, side_effect=LocalStore.context_view) as reads:
             same = consult(self.app, self.nexus.root)
@@ -158,21 +189,21 @@ class TurnMemoryTests(unittest.TestCase):
         view = consult(self.app, self.project.root)
         for side, scope in [('active', None), ('active', 'nexus'), ('nexus', 'project')]:
             with self.subTest(side=side, scope=scope), self.assertRaises(ValueError):
-                self.write(view[side], kind='setting', data=preference(scope, 'Requested'))
+                self.write(view[side], kind='preference', data=preference(scope, 'Requested'))
         with self.assertRaises(ProjectError):
             self.write(view['nexus'])
         with self.assertRaises(ProjectError):
             self.write(view['active'], project_id=self.nexus.project_id)
         with self.assertRaises(ValueError):
-            self.write(view['active'], data={'credentials': 'not ordinary memory'})
+            self.write(view['active'], data={'state': 'open', 'title': 'Fixture risk', 'credentials': 'not ordinary memory'})
         self.assertFalse(self.project.inventory()['items'])
         self.assertFalse(self.nexus.inventory()['items'])
-        receipt = self.write(view['nexus'], kind='setting', data=preference('nexus', 'Use the manual workflow'))
+        receipt = self.write(view['nexus'], kind='preference', data=preference('nexus', 'Use the manual workflow'))
         self.assertTrue(receipt['changed'])
         self.assertEqual(self.project.inventory()['items'], [])
         fresh = consult(self.app, self.project.root)
         self.assertEqual(fresh['nexus']['token'], receipt['token'])
-        self.write(fresh['active'], kind='setting', data=preference('project', 'Pin this project convention'))
+        self.write(fresh['active'], kind='preference', data=preference('project', 'Pin this project convention'))
         fresh = consult(self.app, self.project.root)
         self.assertEqual([p['summary'] for p in fresh['active']['preferences']], ['Pin this project convention'])
         self.assertEqual([p['summary'] for p in fresh['nexus']['preferences']], ['Use the manual workflow'])
@@ -183,9 +214,10 @@ class TurnMemoryTests(unittest.TestCase):
         self.assertTrue(created['changed'])
         with self.assertRaises(StaleView):
             self.write(view, record_id=created['id'])
-        updated = self.write(view, expected_token=created['token'], record_id=created['id'], data={'summary': 'Corrected'})
+        corrected = {'state': 'mitigated', 'title': 'Corrected risk'}
+        updated = self.write(view, expected_token=created['token'], record_id=created['id'], data=corrected)
         self.assertEqual(updated['id'], created['id'])
-        retry = self.write(view, expected_token=updated['token'], record_id=updated['id'], data={'summary': 'Corrected'})
+        retry = self.write(view, expected_token=updated['token'], record_id=updated['id'], data=corrected)
         self.assertFalse(retry['changed'])
         self.assertEqual(retry['token'], updated['token'])
         inventory = self.project.inventory()
@@ -234,7 +266,7 @@ class TurnMemoryTests(unittest.TestCase):
     def test_two_bound_roots_with_same_project_uuid_still_have_isolated_projections(self):
         checkout = self.bind(self.base / 'other-checkout', self.nexus.project_id)
         self.seed(checkout, 'brief', {'purpose': 'Independent checkout'})
-        self.seed(self.nexus, 'setting', preference('nexus', 'Use the configured copy only'))
+        self.seed(self.nexus, 'preference', preference('nexus', 'Use the configured copy only'))
         result = consult(self.app, checkout.root)
         self.assertEqual(result['status'], 'consulted')
         self.assertEqual(result['active']['brief']['data']['purpose'], 'Independent checkout')
@@ -242,7 +274,7 @@ class TurnMemoryTests(unittest.TestCase):
         self.assertEqual(result['nexus']['preferences'][0]['summary'], 'Use the configured copy only')
         self.assertNotEqual(result['nexus']['token'], result['active']['token'])
         with self.assertRaises(StaleView):
-            self.write(result['active'], cwd=checkout.root, use_home=True, kind='setting',
+            self.write(result['active'], cwd=checkout.root, use_home=True, kind='preference',
                        data=preference('nexus', 'Wrong checkout token'))
 
     def test_instance_environment_is_still_authoritative_offline(self):
@@ -276,7 +308,7 @@ class TurnMemoryTests(unittest.TestCase):
                 self.assertEqual((result['status'], result['error']), ('unavailable', 'project_unavailable'))
                 self.assertIsNone(result['active'])
                 with self.assertRaises(ProjectError):
-                    self.write(good['active'], cwd=bound, kind='setting', data=preference('nexus', 'Never write this'))
+                    self.write(good['active'], cwd=bound, kind='preference', data=preference('nexus', 'Never write this'))
         self.assertEqual(self.nexus.inventory()['items'], [])
 
     def test_missing_invalid_undeliverable_and_foreign_cohort_home_leave_valid_project_usable(self):
@@ -305,19 +337,19 @@ class TurnMemoryTests(unittest.TestCase):
                     self.assertEqual(consult(self.app, self.untracked)['status'], 'unavailable')
 
     def test_learned_replica_markers_prevent_stale_capture_and_resurrection(self):
-        key = self.seed(self.nexus, 'setting', preference('nexus', 'Remove this old preference'))
+        key = self.seed(self.nexus, 'setting', preference('nexus', 'Remove this old preference', category='preference'))
         view = consult(self.app, self.project.root)
         replica = Replica(self.home, self.ident['instance_id'])
         with replica.locked():
             replica.remember([{'kind': 'project_record', 'project_id': self.nexus.project_id, 'id': key}])
         with self.assertRaises(StaleView):
-            self.write(view['nexus'], record_id=key, kind='setting', data=preference('nexus', 'Revive'))
+            self.write(view['nexus'], record_id=key, kind='preference', data=preference('nexus', 'Revive'))
         after = consult(self.app, self.project.root)
         self.assertEqual(after['nexus']['preferences'], [])
         with self.assertRaisesRegex(ValueError, 'erased'):
-            self.write(after['nexus'], record_id=key, kind='setting', data=preference('nexus', 'Revive'))
+            self.write(after['nexus'], record_id=key, kind='preference', data=preference('nexus', 'Revive'))
         with replica.locked():
             replica.remember([{'kind': 'project', 'id': self.project.project_id}])
         self.assertEqual(consult(self.app, self.project.root)['status'], 'unavailable')
         with self.assertRaisesRegex(SetupPending, 'retired'):
-            self.write(after['nexus'], kind='setting', data=preference('nexus', 'Do not capture'))
+            self.write(after['nexus'], kind='preference', data=preference('nexus', 'Do not capture'))

@@ -32,6 +32,16 @@ class ProjectPackagingTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 resource_path(value)
 
+    def test_packaged_record_guide_covers_current_write_kinds(self):
+        from tools.reconcile_records import V2_KINDS
+        guide = resource_path('templates/skills/maven/references/reconcile.md').read_text()
+        rows = [line.split('|') for line in guide.splitlines() if line.startswith('| `')]
+        self.assertCountEqual([row[1].strip(' `') for row in rows], V2_KINDS)
+        for _, kind, question, required, _ in rows:
+            with self.subTest(kind=kind.strip()):
+                self.assertTrue(question.rstrip().endswith('?'))
+                self.assertTrue(required.strip())
+
     def test_installed_wheel_provisions_complete_bundle_outside_checkout(self):
         checkout = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:
