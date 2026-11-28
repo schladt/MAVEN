@@ -316,6 +316,8 @@ def main(argv=None) -> int:
         environment['MAVEN_HOME'] = str(handoff['home'])
         with tempfile.TemporaryDirectory(prefix='maven-handoff-') as neutral:
             result = run_terminal(_handoff_command(handoff), cwd=neutral, env=environment)
+        if handoff.get('skipped_skill_notice'):
+            _notify('Local software installed; skill update incomplete.\n' + handoff['skipped_skill_notice'])
         if result:
             _notify(f'Selected task exited {result}; its original private operation is retained. '
                     'Resume that exact operation in this home after addressing the child diagnostic.', file=sys.stderr)
@@ -755,6 +757,7 @@ def _install(args, handoff=None):
             skill_conflicts.extend({'target': name, 'status': 'conflict', 'component': 'skill',
                                     'reason': 'Custom profile has no selected canonical skill root; use --skill-dir.'}
                                    for name in custom)
+        requested_roots = dict.fromkeys(roots)
         from tools.update import pending_owned_skills
         try:
             plan, retired_skills, ready_roots = skill_cutover_plan(home, roots, conflicts=skill_conflicts)
@@ -774,6 +777,8 @@ def _install(args, handoff=None):
             message(str(exc))
             deferred, roots, ready_roots, plan, integrations, retired_skills = True, [], [], [], [], []
             selected_harnesses, require_stopped = [], False
+        skipped_notice = '\n'.join(f'Skipped skill root (conflict): {root}'
+                                   for root in requested_roots if root not in ready_roots)
         pending_targets = [home / 'activate', *(root / name for root in ready_roots for name in SKILL_FILES)]
         pending_skills = pending_owned_skills(home, pending_targets)
         review_files = bool(roots or integrations or refresh)
@@ -788,12 +793,13 @@ def _install(args, handoff=None):
                 f'Next: {"local tools only; no AWS/project setup" if args.local_only else "installed maven-setup for explicit cloud selection"}',
                 'Shell profiles: unchanged',
                 'Skill roots:\n' + ('\n'.join(map(str, roots)) or '(none)'),
+                *([skipped_notice] if skipped_notice else []),
                 'Original unfinished file intents to reconcile:\n' + json.dumps(pending_skills, indent=2),
                 'Preserved skill conflicts:\n' + ('\n'.join(
                     str(item['target']) + ': ' + item['reason'] for item in skill_conflicts) or '(none)'),
                 'Skill files to create or update:\n' + ('\n'.join(
                     str(target) + (' (update installer-owned copy)' if expected else '')
-                    for target, _, expected in plan) or '(none; existing identical skills preserved)'),
+                    for target, _, expected in plan) or '(none)'),
                 'Exact owned legacy skills to retire:\n' + ('\n'.join(
                     str(path) for path, _ in retired_skills) or '(none)'),
                 f'Integration mode: {"inactive staging" if staging else "live"}',
@@ -826,6 +832,8 @@ def _install(args, handoff=None):
                        'Quit after installation does not uninstall the software; rerun to continue setup.')
             if deferred:
                 summary += '\nHarness integration has a local conflict and will be skipped; its existing files are preserved.'
+            if skipped_notice:
+                summary += '\n' + skipped_notice
             if require_stopped:
                 summary += ('\nRunning harness sessions do not block installation; restart them to load MAVEN. '
                             'A harness that saves its own configuration file while running can overwrite the '
@@ -937,6 +945,11 @@ def _install(args, handoff=None):
                     'affected harnesses with --harness-stopped.')
         else:
             _notify('No harness configuration was modified.')
+        conflicts = [*skill_conflicts, *(
+            {'target': str(change.path), 'status': 'conflict', 'reason': change.receipt['conflict']}
+            for change in integrations if change.receipt and change.receipt.get('conflict'))]
+        if skipped_notice:
+            _notify(skipped_notice)
         checkpoint()
         if handoff is not None:
             handoff['home'] = home
@@ -945,19 +958,20 @@ def _install(args, handoff=None):
                        [str(change.path) for change in integrations if change.before != change.after
                         and not (change.receipt and change.receipt.get('conflict'))] +
                        [str(target) for target, _ in retired_skills])
-            conflicts = [*skill_conflicts, *(
-                {'target': str(change.path), 'status': 'conflict', 'reason': change.receipt['conflict']}
-                for change in integrations if change.receipt.get('conflict'))]
+            handoff['skipped_skill_notice'] = skipped_notice
             handoff['integration'] = {
                 'status': ('partial' if changed else 'conflict') if conflicts else
                     'written' if changed else 'unchanged' if selected_harnesses else 'skipped',
                 'selected': selected_harnesses, 'written': changed, 'targets': conflicts,
                 'reconciled': [saved['intent']['target'] for saved in pending_skills],
-                'reason': ('Harness integration deferred; live files were not changed.' if deferred else
-                           'Cloud access was not checked during this software installation.'),
+                'reason': skipped_notice or ('Harness integration deferred; live files were not changed.' if deferred else
+                                             'Cloud access was not checked during this software installation.'),
             }
         if args.local_only:
-            _notify('\nLocal-only installation complete; AWS and project setup have NOT been performed.')
+            if skipped_notice or conflicts or deferred:
+                _notify('\nLocal software installed; harness integration incomplete. AWS and project setup were not performed.')
+            else:
+                _notify('\nLocal-only installation complete; AWS and project setup have NOT been performed.')
             _notify('After activation, run maven-setup to connect an instance. Enable projects later in your harness.')
             return 0
         return 0

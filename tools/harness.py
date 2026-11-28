@@ -110,6 +110,17 @@ def _active_manifest(home):
     return prior if prior.get('active', True) else {}
 
 
+def _same_skill_receipt(left, right):
+    """Across runs a device can be renumbered. Keep every other ownership fact exact."""
+    if left == right:
+        return True
+    if not isinstance(left, dict) or not isinstance(right, dict) or left.keys() != {''} or right.keys() != {''}:
+        return False
+    a, b = left[''], right['']
+    return (isinstance(a, dict) and isinstance(b, dict) and a.get('type') == 'file' and 'dev' in a and 'dev' in b
+            and a == (b | {'dev': a['dev']}))
+
+
 def skill_plan(roots: list[Path], home: Path | None = None, *,
                conflicts: list[dict] | None = None, bodies: dict[str, bytes] | None = None) -> list[tuple[Path, bytes, dict | None]]:
     """Plan the complete bundle or leave that root alone, including identical unowned files."""
@@ -146,18 +157,19 @@ def skill_plan(roots: list[Path], home: Path | None = None, *,
                     if len(intents) != 1:
                         raise ValueError(f'Ambiguous unfinished skill intents; preserved: {target}')
                     intent = intents[0]
-                    if (actual is not None and actual == intent.get('published')
-                            and expected in (actual, intent['expected'])):
+                    if (actual is not None and _same_skill_receipt(actual, intent.get('published'))
+                            and (_same_skill_receipt(expected, actual) or _same_skill_receipt(expected, intent['expected']))):
                         expected = actual
-                    elif actual != expected or (expected != intent['expected'] and before != body):
+                    elif (not _same_skill_receipt(actual, expected)
+                          or (not _same_skill_receipt(expected, intent['expected']) and before != body)):
                         raise ValueError(f'Interrupted skill or ownership changed; preserved: {target}')
                 if key in shared or unknown:
                     raise ValueError(f'Shared or uncertain skill ownership; preserved: {target}')
                 if before is not None:
-                    if expected is None or actual != expected:
+                    if expected is None or not _same_skill_receipt(actual, expected):
                         raise ValueError(f'Existing skill differs from installer ownership; preserved: {target}')
                     if before != body:
-                        candidates.append((target, body, expected))
+                        candidates.append((target, body, actual))
                 elif expected is not None:
                     raise ValueError(f'Previously owned skill is missing; preserved: {target}')
                 else:
@@ -229,11 +241,12 @@ def retired_skill_plan(home: Path, roots: list[Path], *, conflicts: list[dict] |
         try:
             before = _read(path)
             expected = prior.get('owned', {}).get(str(path))
+            actual = inventory(path) if before is not None else None
             if (not expected or str(path) not in prior.get('skill_references', [])
-                    or str(path) in shared or unknown or (before is not None and inventory(path) != expected)):
+                    or str(path) in shared or unknown or (actual is not None and not _same_skill_receipt(actual, expected))):
                 raise ValueError(f'Legacy skill is modified, shared or unowned; preserved: {path}. '
                                  'Review its removal separately or use an inactive staging home.')
-            result.append((path, expected if before is not None else {'absent': expected}))
+            result.append((path, actual if actual is not None else {'absent': expected}))
         except (OSError, ValueError) as error:
             if conflicts is None:
                 raise
@@ -264,7 +277,7 @@ def verify_skill_bundle(home, roots):
             target = root / name
             key = str(target)
             if (_read(target) != body or key in shared or unknown or key not in prior.get('skill_references', [])
-                    or inventory(target) != prior.get('owned', {}).get(key)):
+                    or not _same_skill_receipt(inventory(target), prior.get('owned', {}).get(key))):
                 raise ValueError(f'Replacement bundle is not verified; preserved: {target}')
 
 
@@ -286,7 +299,7 @@ def retire_skills(home, plan) -> None:
             recorded = manifest['owned'].get(str(path))
             reviewed = expected.get('absent', expected)
             if (str(path) in shared or uncertain or actual != (None if 'absent' in expected else expected)
-                    or recorded != reviewed or str(path) not in manifest['skill_references']):
+                    or not _same_skill_receipt(recorded, reviewed) or str(path) not in manifest['skill_references']):
                 raise ValueError(f'Legacy skill changed or shared since review; preserved: {path}')
             manifest['skill_references'].remove(str(path))
             del manifest['owned'][str(path)]

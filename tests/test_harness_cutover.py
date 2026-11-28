@@ -391,6 +391,11 @@ class HarnessIntegrationTests(unittest.TestCase):
         old.write_text('obsolete owned skill')
         old.chmod(0o600)
         record_installation(self.home, self.source, [old], [old])
+        # A historical receipt from before a volume renumber still identifies this legacy leaf.
+        from tools.uninstall.common import save_private
+        manifest = read_private(self.home / MANIFEST)
+        manifest['owned'][str(old)]['']['dev'] += 1
+        save_private(self.home / MANIFEST, manifest)
         retiring = retired_skill_plan(self.home, [root])
         writes = skill_plan([root], self.home)
         apply_owned_skills(self.home, self.source, writes[:-1], [path for path, _, _ in writes[:-1]])

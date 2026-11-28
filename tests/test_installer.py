@@ -704,6 +704,48 @@ class HarnessFinishTests(unittest.TestCase):
         ui.choose.return_value = 'skip'
         return ui
 
+    def test_local_update_menu_names_skipped_skill_root_in_review_and_completion(self):
+        from tools.uninstall.local import record_installation
+        root = self.user / 'skills'
+        owner_file = root / 'maven/SKILL.md'
+        owner_file.parent.mkdir(parents=True)
+        owner_file.write_text('Owner guidance\n')
+        owner_file.chmod(0o600)
+        (self.home / 'venv/pyvenv.cfg').touch()
+        self.launcher.chmod(0o755)
+        ready = self.user / 'other-skills'
+        record_installation(self.home, Path(install.__file__).parent, [], [], skill_roots=[root, ready])
+        ui = self.ui()
+        ui.choose.side_effect = ['update-menu', 'update']
+        ui.form.side_effect = [{'home': str(self.home)}, {}]
+
+        def workflow(title, stages, operation):
+            with using(ui):
+                return operation(ui)
+
+        with patch.object(sys.stdin, 'isatty', return_value=True), \
+                patch('tools.tui.bootstrap.ensure_ui', return_value=None), \
+                patch('tools.tui.run_workflow', side_effect=workflow), \
+                patch('tools.tui.bootstrap.run_terminal', return_value=0), \
+                patch.object(install, '_prerequisites'), patch.object(install, '_install_command'), \
+                patch('tools.update.record_package_inputs'), \
+                patch.object(install.subprocess, 'run', return_value=Mock(returncode=0)), \
+                redirect_stdout(io.StringIO()) as terminal:
+            self.assertEqual(install.main(['--home', str(self.home)]), 0)
+        notice = f'Skipped skill root (conflict): {root}'
+        ui.review.assert_called_once()
+        self.assertIn(notice, ui.review.call_args.args[1].splitlines())
+        self.assertEqual(ui.form.call_args.args[0], 'MAVEN setup result')
+        self.assertIn(notice, ui.form.call_args.kwargs['description'].splitlines())
+        self.assertIn(notice, terminal.getvalue().splitlines())
+        self.assertIn('skill update incomplete', terminal.getvalue())
+        self.assertNotIn(f'Skipped skill root (conflict): {ready}', terminal.getvalue())
+        self.assertTrue((ready / 'maven/SKILL.md').is_file())
+        self.assertFalse(any('Local-only installation complete' in call.args[0]
+                             for call in ui.message.call_args_list))
+        self.assertEqual(owner_file.read_text(), 'Owner guidance\n')
+        self.assertEqual(list((root / 'maven').iterdir()), [owner_file])
+
     def test_exact_launcher_repair_preserves_bytes_and_other_files(self):
         from tools.tui.harness import configure_harnesses
         from tools.uninstall.common import read_private

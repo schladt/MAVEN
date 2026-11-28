@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from tools import update
 from tools.harness import skill_plan, write_skill
+from tools.uninstall.common import read_private, save_private
 from tools.uninstall import local
 
 
@@ -109,7 +110,6 @@ class LocalUpdateTests(unittest.TestCase):
         self.assertIn('tools/extra.py', report['software']['removed'])
 
     def test_skill_write_interruption_recovers_original_ownership_before_next_upgrade(self):
-        from tools.uninstall.common import read_private
         root = self.base / 'custom-skills'
         plan = skill_plan([root], self.home)
         target, body, _ = plan[0]
@@ -139,7 +139,6 @@ class LocalUpdateTests(unittest.TestCase):
         self.assertEqual(entry[0].read_bytes(), b'owner edit')
 
     def test_interrupted_legacy_skill_intent_is_not_reinstalled(self):
-        from tools.uninstall.common import read_private, save_private
         for index, leaf in enumerate(('maven-reconcile/SKILL.md', 'maven-secrets/SKILL.md',
                                       'maven-update/SKILL.md', 'maven-maintenance/SKILL.md',
                                       'maven/SKILL.md', 'maven/references/reconcile.md')):
@@ -208,6 +207,99 @@ class LocalUpdateTests(unittest.TestCase):
         report = update.local_report(self.home, self.checkout)
         self.assertFalse(report['skills_current'])
         self.assertEqual(report['skills']['stale'], [str(root / relative)])
+
+    def _bundle_with_device_drift(self):
+        root = self.base / 'custom-skills'
+        shipped = self.checkout / 'maven_resources/templates/skills'
+        resources = patch('tools.harness.resource_path', return_value=shipped)
+        resources.start()
+        self.addCleanup(resources.stop)
+        entries = skill_plan([root], self.home)
+        outdated = entries[-1][0]
+        targets = []
+        for target, body, _ in entries:
+            write_skill(target, b'old revision\n' if target == outdated else body, None)
+            targets.append(target)
+        local.record_installation(self.home, self.checkout, targets, targets)
+        path = self.home / local.MANIFEST
+        manifest = read_private(path)
+        for target in targets:
+            manifest['owned'][str(target)]['']['dev'] += 1
+        save_private(path, manifest)
+        return root, targets, outdated
+
+    def test_bundle_and_resume_report_accept_only_device_drift(self):
+        root, targets, outdated = self._bundle_with_device_drift()
+        # The administration resume check also requires the software to match.
+        (self.checkout / 'tools/changed.py').write_text('old\n')
+        (self.checkout / 'tools/added.py').unlink()
+        (self.checkout / 'tools/removed.py').write_text('gone\n')
+        report = update.local_report(self.home, self.checkout)
+        self.assertEqual(report['preserved'], [])
+        self.assertEqual(report['skills']['stale'], [str(outdated)])
+        unchanged = {path: local.inventory(path) for path in targets if path != outdated}
+        writes = skill_plan([root], self.home)
+        self.assertEqual([path for path, _, _ in writes], [outdated])
+        update.install_skill_bundle(self.home, self.checkout, [root], writes, [])
+        self.assertEqual(outdated.read_bytes(), writes[0][1])
+        self.assertEqual({path: local.inventory(path) for path in unchanged}, unchanged)
+        self.assertTrue(update.local_report(self.home, self.checkout)['current'])
+
+    def test_device_drift_does_not_hide_hash_inode_or_type_conflicts(self):
+        root, targets, outdated = self._bundle_with_device_drift()
+        edited, replaced, changed_type = targets[:3]
+        body = edited.read_bytes()
+        edited.write_bytes(bytes([body[0] ^ 1]) + body[1:])
+        temporary = replaced.with_suffix('.replacement')
+        temporary.write_bytes(replaced.read_bytes())
+        temporary.chmod(replaced.stat().st_mode & 0o7777)
+        temporary.replace(replaced)
+        changed_type.unlink()
+        changed_type.mkdir()
+        before = {path: local.inventory(path) for path in targets}
+        conflicts = []
+        writes = skill_plan([root], self.home, conflicts=conflicts)
+        self.assertEqual(writes, [])
+        self.assertEqual({item['target'] for item in conflicts}, {str(path) for path in targets[:3]})
+        report = update.local_report(self.home, self.checkout)
+        self.assertFalse(report['skills_current'])
+        self.assertEqual({item['target'] for item in report['preserved']}, {str(path) for path in targets[:3]})
+        self.assertEqual({path: local.inventory(path) for path in targets}, before)
+        self.assertEqual(outdated.read_bytes(), b'old revision\n')
+
+    def test_unpublished_skill_intent_rechecks_old_file_after_device_renumber(self):
+        root, _, outdated = self._bundle_with_device_drift()
+        writes = skill_plan([root], self.home)
+        with patch('tools.harness.write_skill', side_effect=OSError('interrupted')):
+            with self.assertRaisesRegex(OSError, 'interrupted'):
+                update.install_skill_bundle(self.home, self.checkout, [root], writes, [])
+        pending, = update.pending_owned_skills(self.home)
+        journal = Path(pending['path'])
+        intent = read_private(journal)
+        intent['expected']['']['dev'] += 1
+        save_private(journal, intent)
+        update.apply_owned_skills(self.home, self.checkout, [], [outdated])
+        self.assertEqual(outdated.read_bytes(), writes[0][1])
+        self.assertTrue(read_private(journal)['completed'])
+
+    def test_published_skill_intent_recovers_after_device_renumber(self):
+        root, _, outdated = self._bundle_with_device_drift()
+        writes = skill_plan([root], self.home)
+        with patch.object(local, 'record_installation', side_effect=OSError('interrupted')):
+            with self.assertRaisesRegex(OSError, 'interrupted'):
+                update.install_skill_bundle(self.home, self.checkout, [root], writes, [])
+        pending, = update.pending_owned_skills(self.home)
+        journal = Path(pending['path'])
+        intent = read_private(journal)
+        for field in ('published', 'expected'):
+            intent[field]['']['dev'] += 1
+        save_private(journal, intent)
+        published = local.inventory(outdated)
+        resume = skill_plan([root], self.home)
+        update.install_skill_bundle(self.home, self.checkout, [root], resume, [])
+        self.assertEqual(local.inventory(outdated), published)
+        self.assertEqual(read_private(self.home / local.MANIFEST)['owned'][str(outdated)], published)
+        self.assertTrue(read_private(journal)['completed'])
 
     def test_owned_unmodified_skill_is_upgraded_and_modified_skill_is_preserved(self):
         roots = [self.base / '.omp/agent/skills']

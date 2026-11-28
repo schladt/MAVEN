@@ -256,7 +256,8 @@ def pending_owned_skills(home, targets=None):
 def apply_owned_skills(home, source, plan, references, *, activation=False):
     """Apply only reviewed leaves; pin publication and check sharing under the installation locks."""
     from contextlib import nullcontext
-    from tools.harness import _read, _active_manifest, skill_root, SKILL_FILES, write_skill
+    from operator import eq
+    from tools.harness import _read, _active_manifest, _same_skill_receipt, skill_root, SKILL_FILES, write_skill
     from tools.uninstall.common import save_private
     from tools.uninstall.local import _shared_skills, _sharing_locks, inventory, record_installation
     home = Path(home)
@@ -278,11 +279,15 @@ def apply_owned_skills(home, source, plan, references, *, activation=False):
                 continue
             if key in pending:
                 raise ValueError(f'Ambiguous unfinished skill intents; preserved: {key}')
-            pending[key] = journal, intent
-            candidate = Path(key), base64.b64decode(intent['body'], validate=True), intent['expected']
-            if key in selected and selected[key] != candidate:
+            reviewed = selected.get(key)
+            pending[key] = journal, intent, reviewed is None
+            target = Path(key)
+            matches = eq if target == home / 'activate' else _same_skill_receipt
+            body = base64.b64decode(intent['body'], validate=True)
+            if reviewed is None:
+                selected[key] = target, body, intent['expected']
+            elif reviewed[1] != body or not matches(reviewed[2], intent['expected']):
                 raise ValueError(f'Interrupted skill candidate changed; original intent retained: {key}')
-            selected[key] = candidate
         shared, unknown = _shared_skills(home, []) if lock_shared else (set(), False)
         for key, (target, body, expected) in selected.items():
             root = skill_root(target)
@@ -297,20 +302,24 @@ def apply_owned_skills(home, source, plan, references, *, activation=False):
                 raise ValueError(f'Ambiguous installer ownership; preserved: {target}')
             before = _read(target)
             actual = inventory(target) if before is not None else None
+            matches = _same_skill_receipt if is_skill else eq
             if key in pending:
-                path, intent = pending[key]
-                if (before == body and actual is not None and actual in (intent.get('published'), recorded)
-                        and recorded in (expected, actual)):
+                path, intent, resume_only = pending[key]
+                if (before == body and actual is not None
+                        and (matches(actual, intent.get('published')) or matches(actual, recorded))
+                        and (matches(recorded, expected) or matches(recorded, actual))):
                     record_installation(home, intent['source'], [target], [target] if is_skill else [],
                                         registry_locked=lock_shared, pinned={key: actual})
                     save_private(path, {**intent, 'completed': True})
                     continue
+                if resume_only and matches(actual, expected):
+                    expected = actual  # Pin this run's file before publishing an interrupted write.
             else:
                 path = directory / (str(uuid4()) + '.json')
                 intent = {'schema': 1, 'home': str(home), 'source': str(source), 'target': key,
                           'body': base64.b64encode(body).decode(), 'expected': expected,
                           'skill_reference': is_skill, 'completed': False}
-            if recorded != expected or actual != expected:
+            if not matches(recorded, expected) or actual != expected:
                 raise ValueError(f'Skill or ownership changed since review; preserved: {target}')
             save_private(path, intent)
 
