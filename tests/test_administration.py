@@ -406,6 +406,25 @@ class AdministrationTests(unittest.TestCase):
         self.assertTrue(result['outcome']['instance_ready'])
         self.assertFalse(result['outcome']['secrets_ready'])
 
+    def test_code_only_service_update_requires_review(self):
+        mocks = self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'MemoryFunction',
+                                      'ResourceType': 'AWS::Lambda::Function', 'Replacement': 'False'}])
+        cloud = mocks['_cloud'].return_value
+        stack = cloud.describe_stacks.return_value['Stacks'][0]
+        manifest, template, _ = mocks['_package'].return_value
+        cloud.get_template.return_value = {'TemplateBody': json.loads(template)}
+        mocks['_package'].return_value = manifest, template, [
+            *stack['Parameters'], {'ParameterKey': 'RuntimeCode001', 'ParameterValue': 'new handler'}]
+        stack['Parameters'].append({'ParameterKey': 'RuntimeCode001', 'ParameterValue': 'old handler'})
+        mocks['schema_status'].return_value = {'state': 'current', 'applied': 30}
+        answers = {'identity': {'profile': 'owner', 'cache': str(self.home / 'runtime/login')},
+                   'deploy_access': {'mode': 'profile'},
+                   'deploy_identity': {'profile': 'maintainer', 'cache': str(self.home / 'runtime/deploy-login')}}
+        with patch('tools.memory.bootstrap.apply') as apply:
+            result = self.run_update(answers, stop_at='service_update')
+            self.assertEqual(result['pending_interaction']['review']['changes'][0]['logical_id'], 'MemoryFunction')
+            apply.assert_not_called()
+
     def test_redaction_upgrade_deploys_protections_before_ledger_genesis(self):
         mocks = self.update_fixture([{'Action': 'Modify', 'LogicalResourceId': 'JournalBucketPolicy',
                                       'ResourceType': 'AWS::S3::BucketPolicy', 'Replacement': 'False'}])

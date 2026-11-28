@@ -383,6 +383,8 @@ If any skill file has been edited, replaced, or is shared, the installer names t
 
 For cloud activation, review the exact ordered database migrations (including `025_project_reconciliation.sql`) and the matching service change set against the selected instance. Updates that remove or replace a database, secret, bucket or key are refused. Do not clear a maintenance barrier or mark an uncertain database operation complete; preserve its journal, inspect the outcome, and obtain fresh approval for changed SQL. Confirm the signed service reports the expected instance, recovery epoch and `project_reconcile_v1` capability before reporting cloud readiness. A package, local check or installed harness entry proves none of this.
 
+The service update compares the stack template **and its parameter values**. The Lambda code is stored in those parameters, so a code-only change still needs a service change-set review. If an older updater skipped that review and the operation is already complete, install the corrected local software and start a new full update. Already-applied migrations are not reapplied.
+
 This is a software and infrastructure update, **not a legacy memory import or purge**. Any one-time Home migration, verification, cleanup of legacy clients and destructive removal need separate exact-target approval; they are not part of ordinary reconcile. Secure grants and cloud policy activation remain independent. For the separately reviewed migration of a retired Google environment locator, see [integrations](integrations.md#google-removal-and-independent-integrations).
 
 ## Uninstall and retirement

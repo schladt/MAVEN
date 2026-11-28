@@ -1604,12 +1604,15 @@ class AdminOperations:
                     update.build_service_package(stack, package, wizard.values['MAVEN_MEMORY_INSTANCE_ID'])
                 except ValueError as error:
                     raise SetupPending('Cannot rebuild the service with the stack\'s deployment inputs: ' + str(error)) from None
-            manifest, template, _ = bootstrap._package(package)
-            if any(update.stack_parameters(stack).get(key) != value
+            manifest, template, parameters = bootstrap._package(package)
+            deployed_parameters = update.stack_parameters(stack)
+            if any(deployed_parameters.get(key) != value
                    for key, value in manifest['deployment_inputs'].items()):
                 self._refresh_service_candidate(state, wizard, service_directory)
                 return
-            if json.loads(template) == deployed:
+            # The template references RuntimeCode parameters; their values carry the Lambda source.
+            if json.loads(template) == deployed and all(
+                    deployed_parameters.get(p['ParameterKey']) == p['ParameterValue'] for p in parameters):
                 live = bootstrap._outputs(stack)
                 self._receipt(state, step, {'service': 'current', 'stack': stack['StackId']})
                 if live != _connection_config(wizard.values):
